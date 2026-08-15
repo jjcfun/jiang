@@ -1,9 +1,10 @@
 // JIL drop elaboration，把隐式析构义务转换为显式 CFG cleanup。
 
 import context = "../context.jiang";
+import compiler_store = "../store.jiang";
+import database = "../db.jiang";
 import diagnostic_helper = "../diagnostic/helper.jiang";
 import layout = "../layout.jiang";
-import database = "../db.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import qid = "../id.jiang";
@@ -16,18 +17,35 @@ import token = "../syntax/token.jiang";
 import jil = "./model.jiang";
 
 @region(a)
-struct DropFlagMap: Copyable {
+struct DropContext: Movable {
+    @life(a)
+    compiler_store.CompilerStore& store;
+    @life(a)
+    database.QueryEngine&! query;
+
+    public init(
+        self,
+        compiler_store.CompilerStore& store,
+        database.QueryEngine&! query
+    ) {
+        self.store = store;
+        self.query = query;
+    }
+}
+
+@region(a)
+struct DropFlagMap: Movable {
     public Int*! flag_indexes;
     @life(a)
-    public list.ArrayList<ProjectionDropFlag>& projection_flags;
+    public list.ArrayList<ProjectionDropFlag> projection_flags!;
     public Int length!;
     public Int flag_count!;
 
-    public init(self, Int length, list.ArrayList<ProjectionDropFlag>& projection_flags) {
+    public init(self, Int length) {
         unsafe {
             self.length = length;
             self.flag_count = 0;
-            self.projection_flags = projection_flags;
+            self.projection_flags = list.ArrayList<ProjectionDropFlag>();
             self.flag_indexes = unsafe {
                 Int$.alloc(length)
             };
@@ -36,6 +54,12 @@ struct DropFlagMap: Copyable {
                 self.flag_indexes[index] = -1;
                 index = index + 1;
             }
+        }
+    }
+
+    deinit(self) {
+        if (self.length > 0) {
+            unsafe { self.flag_indexes$.dealloc(); }
         }
     }
 
@@ -55,7 +79,7 @@ struct DropFlagMap: Copyable {
         }
     }
 
-    public Void add_flag_for(self, jil.LocalId local_id, Int flag_index) {
+    public Void add_flag_for(Self&! self, jil.LocalId local_id, Int flag_index) {
         unsafe {
             Int index = local_id.to_index();
             if (index < 0 || index >= self.length) {
@@ -66,7 +90,7 @@ struct DropFlagMap: Copyable {
         }
     }
 
-    public Void add_projection_flag(self, jil.Place place, Int flag_index) {
+    public Void add_projection_flag(Self&! self, jil.Place place, Int flag_index) {
         if (place.projection.length == 0) { return; }
         if (self.projection_flag_for(place) != null) { return; }
         self.projection_flags.add(ProjectionDropFlag(
@@ -112,8 +136,8 @@ struct DropTemps: Copyable {
 
 @life(return: input)
 public jil.Store^ elaborate_package(
-    context.CompilerContext& ctx,
-    jil.Store^ input
+    context.CompilerContext&! ctx,
+    jil.Store^ input!
 ) {
     layout.LayoutStore& layouts = ctx.query.layout.store();
     return elaborate_package(ctx, input, layouts);
@@ -121,60 +145,39 @@ public jil.Store^ elaborate_package(
 
 @life(return: input)
 public jil.Store^ elaborate_package(
-    context.CompilerContext& ctx,
-    jil.Store^ input,
+    context.CompilerContext&! ctx,
+    jil.Store^ input!,
     layout.LayoutStore& layouts
 ) {
-    if (input.has_errors() || layouts.has_errors()) {
-        input.mark_error();
+    if (input.program.has_errors() || layouts.has_errors()) {
+        input.program.mark_error();
         return input;
     }
 
+    DropContext drop_ctx! = DropContext(ctx.store$.ref(), ctx.query$.mut_ref());
+    jil.Storage& output = input.storage$.ref();
     Int function_index! = 0;
-    while (function_index < input.functions.len()) {
-        jil.Function function = input.functions.get(function_index);
-        if (input.is_drop_elaborated(function.id)) {
+    while (function_index < input.program.functions.len()) {
+        jil.Function function = input.program.functions.get(function_index);
+        if (input.drop_elaboration.contains(function.id)) {
             function_index = function_index + 1;
             continue;
         }
-        jil.Function elaborated = elaborate_function(ctx, input$.ref(), function);
-        input.functions.set(function_index, elaborated);
-        input.mark_drop_elaborated(function.id);
+        jil.Function elaborated = elaborate_function_with_context(
+            drop_ctx$.mut_ref(), output, function
+        );
+        input.program.functions$.mut_ref().set(function_index, elaborated);
+        input.drop_elaboration$.mut_ref().mark(function.id);
         function_index = function_index + 1;
     }
-    if (input.has_errors()) {
+    if (input.program.has_errors()) {
         diagnostic_helper.add_package_error(ctx, "drop elaboration failed", "drop_elaboration_failed");
     }
     return input;
 }
 
-Void copy_globals(jil.Store& input, jil.Store& output) {
-    Int index! = 0;
-    while (index < input.globals.len()) {
-        jil.Global global = input.globals.get(index);
-        output.add_global(jil.Global (
-            id: global.id,
-            origin: global.origin,
-            type_id: global.type_id,
-            span: global.span,
-            read_only: global.read_only,
-            is_external: global.is_external,
-            initializer: copy_optional_static_value(output, global.initializer)
-        ));
-        index = index + 1;
-    }
-}
-
 @life(return: output)
-jil.StaticValue? copy_optional_static_value(jil.Store& output, jil.StaticValue? value) {
-    if (value is .some(static_value)) {
-        return copy_static_value(output, static_value);
-    }
-    return null;
-}
-
-@life(return: output)
-jil.FunctionRef copy_function_ref(jil.Store& output, jil.FunctionRef function_ref) {
+jil.FunctionRef copy_function_ref(jil.Storage& output, jil.FunctionRef function_ref) {
     return jil.FunctionRef (
         target: function_ref.target,
         type_args: output.type_arg_array(function_ref.type_args),
@@ -186,31 +189,20 @@ jil.FunctionRef copy_function_ref(jil.Store& output, jil.FunctionRef function_re
     );
 }
 
-@life(return: output)
-jil.StaticValue copy_static_value(jil.Store& output, jil.StaticValue value) {
-    if (value is .scalar(scalar)) {
-        return jil.scalar_static_value(scalar);
-    }
-    if (value is .function(function_ref)) {
-        return jil.function_static_value(copy_function_ref(output, function_ref));
-    }
-    if (value is .global_address(global_ref)) {
-        return jil.global_address_static_value(global_ref);
-    }
-    guard value is .aggregate(fields) else {
-        list.ArrayList<jil.StaticField> empty! = list.ArrayList<jil.StaticField>();
-        return jil.StaticValue.aggregate(output.static_field_array(empty$.ref()));
-    }
-    list.ArrayList<jil.StaticField> copied! = list.ArrayList<jil.StaticField>(fields.length);
-    Int index! = 0;
-    while (index < fields.length) {
-        copied.add(jil.StaticField (
-            type_id: fields[index].type_id,
-            value: copy_static_value(output, fields[index].value)
-        ));
-        index = index + 1;
-    }
-    return jil.StaticValue.aggregate(output.static_field_array(copied$.ref()));
+@life(return: (
+    output & function.a,
+    output & function.b,
+    output & function.c,
+    output & function.d
+))
+public jil.Function elaborate_function(
+    compiler_store.CompilerStore& store,
+    database.QueryEngine&! query,
+    jil.Storage& output,
+    jil.Function function
+) {
+    DropContext ctx! = DropContext(store, query);
+    return elaborate_function_with_context(ctx$.mut_ref(), output, function);
 }
 
 @life(return: (
@@ -219,9 +211,9 @@ jil.StaticValue copy_static_value(jil.Store& output, jil.StaticValue value) {
     output & function.c,
     output & function.d
 ))
-public jil.Function elaborate_function(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+jil.Function elaborate_function_with_context(
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Function function
 ) {
     jil.Body body! = function.body;
@@ -257,18 +249,18 @@ public jil.Function elaborate_function(
         );
     }
 
-    list.ArrayList<ProjectionDropFlag> projection_flags! =
-        list.ArrayList<ProjectionDropFlag>();
-    DropFlagMap flags = build_drop_flags(ctx, body, projection_flags$.ref());
+    DropFlagMap flags! = build_drop_flags(ctx, body);
     // cleanup 临时位既用于自定义 deinit 的 unit 结果，也用于 owner pointer 的 free statement。
     Bool needs_cleanup_result = flags.flag_count > 0 || body_has_drop_terminator(body);
     Bool needs_slice_drop_temps = body_needs_contiguous_drop_temps(ctx, body);
-    DropTemps temps = drop_temps(body, flags, needs_cleanup_result, needs_slice_drop_temps);
+    DropTemps temps = drop_temps(
+        body, flags$.ref(), needs_cleanup_result, needs_slice_drop_temps
+    );
     jil.LocalDecl[]& locals = copy_locals_with_drop_flags(
         ctx,
         output,
         body.locals,
-        flags,
+        flags$.ref(),
         needs_cleanup_result,
         needs_slice_drop_temps
     );
@@ -276,19 +268,21 @@ public jil.Function elaborate_function(
 
     Int original_block_count = body.blocks.length;
     list.ArrayList<jil.Block> blocks! = copy_blocks(output, body.blocks);
-    instrument_drop_flag_blocks(ctx, output, body, flags, original_block_count, blocks$.ref());
+    instrument_drop_flag_blocks(
+        ctx, output, body, flags$.ref(), original_block_count, blocks$.mut_ref()
+    );
     elaborate_storage_dead_blocks(
         ctx,
         output,
         body,
-        flags,
+        flags$.ref(),
         temps,
         original_block_count,
-        blocks$.ref()
+        blocks$.mut_ref()
     );
 
     elaborate_drop_terminator_blocks(
-        ctx, output, body, flags, temps, original_block_count, blocks$.ref()
+        ctx, output, body, flags$.ref(), temps, original_block_count, blocks$.mut_ref()
     );
 
     jil.Body storage_body = body_with_blocks(output, body, blocks$.ref());
@@ -297,10 +291,10 @@ public jil.Function elaborate_function(
         ctx,
         output,
         storage_body,
-        flags,
+        flags$.ref(),
         temps,
         return_block_count,
-        blocks$.ref()
+        blocks$.mut_ref()
     );
 
     jil.Block[]& final_blocks = output.block_array(blocks$.ref());
@@ -332,7 +326,7 @@ public jil.Function elaborate_function(
     );
 }
 
-Bool function_needs_drop_elaboration(context.CompilerContext& ctx, jil.Body body) {
+Bool function_needs_drop_elaboration(DropContext&! ctx, jil.Body body) {
     if (body_has_drop_terminator(body)) { return true; }
     Int index! = 0;
     while (index < body.locals.length) {
@@ -356,13 +350,13 @@ Bool body_has_drop_terminator(jil.Body body) {
 }
 
 Void elaborate_drop_terminator_blocks(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     Int original_block_count,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     Int block_index! = 0;
     while (block_index < original_block_count) {
@@ -385,14 +379,14 @@ Void elaborate_drop_terminator_blocks(
 
 @life(return: output & block & drop_term)
 jil.Block expanded_drop_terminator_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
     jil.DropTerminator drop_term,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(block.statements.length);
     Int index! = 0;
@@ -409,7 +403,7 @@ jil.Block expanded_drop_terminator_block(
         block,
         drop_term.place,
         place_type(ctx, body, drop_term.place),
-        statements$.ref(),
+        statements$.mut_ref(),
         drop_term.target,
         blocks
     );
@@ -428,7 +422,7 @@ jil.Body body_with_locals(jil.Body body, jil.LocalDecl[]& locals) {
 }
 
 @life(return: output & body)
-jil.Body body_with_blocks(jil.Store& output, jil.Body body, list.ArrayList<jil.Block>& blocks) {
+jil.Body body_with_blocks(jil.Storage& output, jil.Body body, list.ArrayList<jil.Block>& blocks) {
     return jil.Body (
         id: body.id,
         span: body.span,
@@ -440,7 +434,7 @@ jil.Body body_with_blocks(jil.Store& output, jil.Body body, list.ArrayList<jil.B
 }
 
 @life(return: output)
-list.ArrayList<jil.Block> copy_blocks(jil.Store& output, jil.Block[]& source_blocks) {
+list.ArrayList<jil.Block> copy_blocks(jil.Storage& output, jil.Block[]& source_blocks) {
     list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(source_blocks.length);
     Int block_index! = 0;
     while (block_index < source_blocks.length) {
@@ -452,7 +446,7 @@ list.ArrayList<jil.Block> copy_blocks(jil.Store& output, jil.Block[]& source_blo
 
 @life(return: output)
 jil.CoroutineFrameLayout? copy_coroutine_frame_layout(
-    jil.Store& output,
+    jil.Storage& output,
     jil.CoroutineFrameLayout? layout
 ) {
     guard layout is .some(value) else { return null; }
@@ -491,7 +485,7 @@ jil.CoroutineFrameLayout? copy_coroutine_frame_layout(
 
 @life(return: (output, output))
 jil.TaskRegion[]& copy_task_regions(
-    jil.Store& output,
+    jil.Storage& output,
     jil.TaskRegion[]& source
 ) {
     list.ArrayList<jil.TaskRegion> regions! = list.ArrayList<jil.TaskRegion>(source.length);
@@ -505,7 +499,7 @@ jil.TaskRegion[]& copy_task_regions(
 
 @life(return: output)
 jil.CoroutineLocalFrameField[]& copy_coroutine_local_mappings(
-    jil.Store& output,
+    jil.Storage& output,
     jil.CoroutineLocalFrameField[]& mappings
 ) {
     list.ArrayList<jil.CoroutineLocalFrameField> copied! =
@@ -520,7 +514,7 @@ jil.CoroutineLocalFrameField[]& copy_coroutine_local_mappings(
 
 @life(return: output)
 jil.CoroutineSuspendPoint[]& copy_coroutine_suspend_points(
-    jil.Store& output,
+    jil.Storage& output,
     jil.CoroutineSuspendPoint[]& points
 ) {
     list.ArrayList<jil.CoroutineSuspendPoint> copied! =
@@ -535,7 +529,7 @@ jil.CoroutineSuspendPoint[]& copy_coroutine_suspend_points(
 
 @life(return: output)
 jil.CoroutineStateDispatch copy_coroutine_state_dispatch(
-    jil.Store& output,
+    jil.Storage& output,
     jil.CoroutineStateDispatch dispatch
 ) {
     list.ArrayList<jil.CoroutineResumeCase> cases! =
@@ -553,7 +547,7 @@ jil.CoroutineStateDispatch copy_coroutine_state_dispatch(
 }
 
 @life(return: output & block)
-jil.Block copy_block(jil.Store& output, jil.Block& block) {
+jil.Block copy_block(jil.Storage& output, jil.Block& block) {
     return jil.Block (
         id: block.id,
         span: block.span,
@@ -563,7 +557,7 @@ jil.Block copy_block(jil.Store& output, jil.Block& block) {
 }
 
 @life(return: (output, output))
-jil.Statement[]& copy_statements(jil.Store& output, jil.Statement[]& statements) {
+jil.Statement[]& copy_statements(jil.Storage& output, jil.Statement[]& statements) {
     list.ArrayList<jil.Statement> copied! = list.ArrayList<jil.Statement>(statements.length);
     Int index! = 0;
     while (index < statements.length) {
@@ -574,7 +568,7 @@ jil.Statement[]& copy_statements(jil.Store& output, jil.Statement[]& statements)
 }
 
 @life(return: output & statement)
-jil.Statement copy_statement(jil.Store& output, jil.Statement& statement) {
+jil.Statement copy_statement(jil.Storage& output, jil.Statement& statement) {
     return jil.Statement (
         span: statement.span,
         kind: copy_statement_kind(output, statement.kind$.ref())
@@ -582,7 +576,7 @@ jil.Statement copy_statement(jil.Store& output, jil.Statement& statement) {
 }
 
 @life(return: output & kind)
-jil.StatementKind copy_statement_kind(jil.Store& output, jil.StatementKind& kind) {
+jil.StatementKind copy_statement_kind(jil.Storage& output, jil.StatementKind& kind) {
     if (kind is .assign_stmt(assign_stmt)) {
         return jil.assign_statement_kind(jil.AssignStatement (
             destination: copy_place(output, assign_stmt.destination),
@@ -676,12 +670,16 @@ jil.StatementKind copy_statement_kind(jil.Store& output, jil.StatementKind& kind
     if (kind is .storage_live_stmt(storage_live)) {
         return jil.storage_live_statement_kind(storage_live);
     }
-    guard kind is .storage_dead_stmt(storage_dead) else { return jil.storage_dead_statement_kind(jil.StorageDeadStatement (local_id: jil.LocalId(0))); }
+    guard kind is .storage_dead_stmt(storage_dead) else {
+        return jil.storage_dead_statement_kind(jil.StorageDeadStatement (
+            local_id: jil.LocalId(0)
+        ));
+    }
     return jil.storage_dead_statement_kind(storage_dead);
 }
 
 @life(return: output & terminator)
-jil.Terminator copy_terminator(jil.Store& output, jil.Terminator& terminator) {
+jil.Terminator copy_terminator(jil.Storage& output, jil.Terminator& terminator) {
     return jil.Terminator (
         span: terminator.span,
         kind: copy_terminator_kind(output, terminator.kind$.ref())
@@ -689,7 +687,7 @@ jil.Terminator copy_terminator(jil.Store& output, jil.Terminator& terminator) {
 }
 
 @life(return: output & kind)
-jil.TerminatorKind copy_terminator_kind(jil.Store& output, jil.TerminatorKind& kind) {
+jil.TerminatorKind copy_terminator_kind(jil.Storage& output, jil.TerminatorKind& kind) {
     if (kind is .call_term(call_term)) {
         return jil.call_terminator_kind(jil.CallTerminator (
             callee: copy_callee(output, call_term.callee$.ref()),
@@ -763,7 +761,7 @@ jil.TerminatorKind copy_terminator_kind(jil.Store& output, jil.TerminatorKind& k
 }
 
 @life(return: output)
-jil.CallCallee copy_callee(jil.Store& output, jil.CallCallee& callee) {
+jil.CallCallee copy_callee(jil.Storage& output, jil.CallCallee& callee) {
     if (callee is .indirect_operand(operand)) {
         return jil.indirect_operand_callee(copy_operand(output, operand$.ref()));
     }
@@ -808,12 +806,15 @@ jil.CallCallee copy_callee(jil.Store& output, jil.CallCallee& callee) {
 }
 
 @life(return: output)
-jil.Rvalue copy_rvalue(jil.Store& output, jil.Rvalue& value) {
+jil.Rvalue copy_rvalue(jil.Storage& output, jil.Rvalue& value) {
     if (value is .use_value(use_value)) {
         return jil.use_rvalue(jil.UseRvalue (value: copy_operand(output, use_value.value$.ref())));
     }
     if (value is .unary_value(unary_value)) {
-        return jil.unary_rvalue(jil.UnaryRvalue (op: unary_value.op, value: copy_operand(output, unary_value.value$.ref())));
+        return jil.unary_rvalue(jil.UnaryRvalue (
+            op: unary_value.op,
+            value: copy_operand(output, unary_value.value$.ref())
+        ));
     }
     if (value is .binary_value(binary_value)) {
         return jil.binary_rvalue(jil.BinaryRvalue (
@@ -976,7 +977,7 @@ jil.Rvalue copy_rvalue(jil.Store& output, jil.Rvalue& value) {
 
 @life(return: (output, output))
 jil.InlineAsmOperand[]& copy_inline_asm_operands(
-    jil.Store& output,
+    jil.Storage& output,
     jil.InlineAsmOperand[]& operands
 ) {
     list.ArrayList<jil.InlineAsmOperand> copied! = list.ArrayList<jil.InlineAsmOperand>(operands.length);
@@ -989,7 +990,7 @@ jil.InlineAsmOperand[]& copy_inline_asm_operands(
 }
 
 @life(return: output)
-jil.InlineAsmOperand copy_inline_asm_operand(jil.Store& output, jil.InlineAsmOperand operand) {
+jil.InlineAsmOperand copy_inline_asm_operand(jil.Storage& output, jil.InlineAsmOperand operand) {
     if (operand is .input(input)) {
         return .input(jil.InlineAsmInput (
             constraint_symbol: input.constraint_symbol,
@@ -1003,7 +1004,7 @@ jil.InlineAsmOperand copy_inline_asm_operand(jil.Store& output, jil.InlineAsmOpe
 }
 
 @life(return: (output, output))
-jil.Operand[]& copy_operands(jil.Store& output, jil.Operand[]& operands) {
+jil.Operand[]& copy_operands(jil.Storage& output, jil.Operand[]& operands) {
     list.ArrayList<jil.Operand> copied! = list.ArrayList<jil.Operand>(operands.length);
     Int index! = 0;
     while (index < operands.length) {
@@ -1014,7 +1015,7 @@ jil.Operand[]& copy_operands(jil.Store& output, jil.Operand[]& operands) {
 }
 
 @life(return: output)
-jil.Operand? copy_optional_operand(jil.Store& output, jil.Operand? operand) {
+jil.Operand? copy_optional_operand(jil.Storage& output, jil.Operand? operand) {
     if (operand is .some(value)) {
         jil.Operand copied = copy_operand(output, value$.ref());
         return copied;
@@ -1023,7 +1024,7 @@ jil.Operand? copy_optional_operand(jil.Store& output, jil.Operand? operand) {
 }
 
 @life(return: output)
-jil.Operand copy_operand(jil.Store& output, jil.Operand& operand) {
+jil.Operand copy_operand(jil.Storage& output, jil.Operand& operand) {
     if (operand is .copy_operand(copy_operand)) {
         return jil.copy_operand_value(jil.CopyOperand (place: copy_place(output, copy_operand.place)));
     }
@@ -1053,7 +1054,7 @@ jil.Operand copy_operand(jil.Store& output, jil.Operand& operand) {
 }
 
 @life(return: output)
-jil.Place? copy_optional_place(jil.Store& output, jil.Place? place) {
+jil.Place? copy_optional_place(jil.Storage& output, jil.Place? place) {
     if (place is .some(value)) {
         jil.Place copied = copy_place(output, value);
         return copied;
@@ -1062,7 +1063,7 @@ jil.Place? copy_optional_place(jil.Store& output, jil.Place? place) {
 }
 
 @life(return: (output, output))
-jil.Place[]& copy_places(jil.Store& output, jil.Place[]& places) {
+jil.Place[]& copy_places(jil.Storage& output, jil.Place[]& places) {
     list.ArrayList<jil.Place> copied! = list.ArrayList<jil.Place>(places.length);
     Int index! = 0;
     while (index < places.length) {
@@ -1073,20 +1074,19 @@ jil.Place[]& copy_places(jil.Store& output, jil.Place[]& places) {
 }
 
 @life(return: output)
-jil.Place copy_place(jil.Store& output, jil.Place place) {
+jil.Place copy_place(jil.Storage& output, jil.Place place) {
     if (place.base is .global(global_ref)) {
         return jil.global_place(global_ref, output.projection_slice(place.projection));
     }
     return jil.local_place(place.local_id, output.projection_slice(place.projection));
 }
 
-@life(return: projection_flags)
+@life(return: body)
 DropFlagMap build_drop_flags(
-    context.CompilerContext& ctx,
-    jil.Body body,
-    list.ArrayList<ProjectionDropFlag>& projection_flags
+    DropContext&! ctx,
+    jil.Body body
 ) {
-    DropFlagMap flags! = DropFlagMap(body.locals.length, projection_flags);
+    DropFlagMap flags! = DropFlagMap(body.locals.length);
     Int next_flag! = body.locals.length;
     Int local_index! = 0;
     while (local_index < body.locals.length) {
@@ -1097,13 +1097,13 @@ DropFlagMap build_drop_flags(
         }
         local_index = local_index + 1;
     }
-    collect_projection_move_flags(body, flags$.ref());
+    collect_projection_move_flags(body, flags$.mut_ref());
     return flags;
 }
 
 DropTemps drop_temps(
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     Bool needs_cleanup_result,
     Bool needs_slice_drop_temps
 ) {
@@ -1127,7 +1127,7 @@ DropTemps drop_temps(
     );
 }
 
-Bool local_has_drop_flag(context.CompilerContext& ctx, jil.LocalDecl local, jil.LocalId return_local) {
+Bool local_has_drop_flag(DropContext&! ctx, jil.LocalDecl local, jil.LocalId return_local) {
     if (local.id.to_index() == return_local.to_index()) {
         return false;
     }
@@ -1141,7 +1141,7 @@ Bool local_has_drop_flag(context.CompilerContext& ctx, jil.LocalDecl local, jil.
     return query.type_needs_runtime_drop(ctx.query$.mut_ref(), local.type_id);
 }
 
-Bool local_is_init_self(context.CompilerContext& ctx, jil.LocalDecl local) {
+Bool local_is_init_self(DropContext&! ctx, jil.LocalDecl local) {
     guard local.def_id is .some(local_def) else { return false; }
     guard local.name is .some(symbol) else { return false; }
     if (!string.equal(ctx.store.symbols.text(symbol), "self")) {
@@ -1153,10 +1153,10 @@ Bool local_is_init_self(context.CompilerContext& ctx, jil.LocalDecl local) {
 
 @life()
 jil.LocalDecl[]& copy_locals_with_drop_flags(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.LocalDecl[]& locals,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     Bool needs_cleanup_result,
     Bool needs_slice_drop_temps
 ) {
@@ -1201,7 +1201,7 @@ jil.LocalDecl[]& copy_locals_with_drop_flags(
     }
 }
 
-jil.LocalDecl drop_flag_local(context.CompilerContext& ctx, jil.LocalId flag, token.Span span) {
+jil.LocalDecl drop_flag_local(DropContext&! ctx, jil.LocalId flag, token.Span span) {
     return jil.LocalDecl (
         id: flag,
         kind: jil.LocalKind.compiler_temp,
@@ -1214,7 +1214,7 @@ jil.LocalDecl drop_flag_local(context.CompilerContext& ctx, jil.LocalId flag, to
     );
 }
 
-jil.LocalDecl slice_drop_index_local(context.CompilerContext& ctx, jil.LocalId id, token.Span span) {
+jil.LocalDecl slice_drop_index_local(DropContext&! ctx, jil.LocalId id, token.Span span) {
     return jil.LocalDecl (
         id: id,
         kind: jil.LocalKind.compiler_temp,
@@ -1227,7 +1227,7 @@ jil.LocalDecl slice_drop_index_local(context.CompilerContext& ctx, jil.LocalId i
     );
 }
 
-jil.LocalDecl deinit_result_local(context.CompilerContext& ctx, jil.LocalId id, token.Span span) {
+jil.LocalDecl deinit_result_local(DropContext&! ctx, jil.LocalId id, token.Span span) {
     return jil.LocalDecl (
         id: id,
         kind: jil.LocalKind.compiler_temp,
@@ -1240,7 +1240,7 @@ jil.LocalDecl deinit_result_local(context.CompilerContext& ctx, jil.LocalId id, 
     );
 }
 
-Bool body_needs_contiguous_drop_temps(context.CompilerContext& ctx, jil.Body body) {
+Bool body_needs_contiguous_drop_temps(DropContext&! ctx, jil.Body body) {
     Int index! = 0;
     while (index < body.locals.length) {
         if (type_needs_contiguous_drop_loop(ctx, body.locals[index].type_id)) {
@@ -1251,7 +1251,7 @@ Bool body_needs_contiguous_drop_temps(context.CompilerContext& ctx, jil.Body bod
     return false;
 }
 
-Bool type_needs_contiguous_drop_loop(context.CompilerContext& ctx, qid.TypeId type_id) {
+Bool type_needs_contiguous_drop_loop(DropContext&! ctx, qid.TypeId type_id) {
     contiguous.ContiguousQuery query = contiguous.ContiguousQuery(ctx.store$.ref());
     if (query.info_for_type(type_id) is .some(info)) {
         if (info.static_count is .some(count)) {
@@ -1294,7 +1294,7 @@ Bool type_needs_contiguous_drop_loop(context.CompilerContext& ctx, qid.TypeId ty
     return false;
 }
 
-Bool type_list_needs_contiguous_drop_loop(context.CompilerContext& ctx, qid.TypeId[]& type_ids) {
+Bool type_list_needs_contiguous_drop_loop(DropContext&! ctx, qid.TypeId[]& type_ids) {
     Int index! = 0;
     while (index < type_ids.length) {
         if (type_needs_contiguous_drop_loop(ctx, type_ids[index])) { return true; }
@@ -1304,12 +1304,12 @@ Bool type_list_needs_contiguous_drop_loop(context.CompilerContext& ctx, qid.Type
 }
 
 Void instrument_drop_flag_blocks(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     Int original_block_count,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     Int block_index! = 0;
     while (block_index < original_block_count) {
@@ -1330,22 +1330,22 @@ Void instrument_drop_flag_blocks(
 
 @life(return: output & block)
 jil.Block instrument_drop_flag_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     jil.Block block,
     Bool is_entry,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
     if (is_entry) {
-        push_initial_drop_flags(ctx, output, body, flags, statements$.ref());
+        push_initial_drop_flags(ctx, output, body, flags, statements$.mut_ref());
     }
     Int index! = 0;
     while (index < block.statements.length) {
         instrument_drop_flag_statement(
-            ctx, output, body, flags, block.statements[index], statements$.ref()
+            ctx, output, body, flags, block.statements[index], statements$.mut_ref()
         );
         index = index + 1;
     }
@@ -1354,18 +1354,18 @@ jil.Block instrument_drop_flag_block(
         output,
         flags,
         block.terminator,
-        statements$.ref(),
+        statements$.mut_ref(),
         blocks
     );
     return replace_block(output, block, statements$.ref(), terminator);
 }
 
 Void push_initial_drop_flags(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
-    list.ArrayList<jil.Statement>& statements
+    DropFlagMap& flags,
+    list.ArrayList<jil.Statement>&! statements
 ) {
     Int index! = 0;
     while (index < body.locals.length) {
@@ -1381,12 +1381,12 @@ Void push_initial_drop_flags(
 }
 
 Void instrument_drop_flag_statement(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     jil.Statement statement,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (statement.kind is .storage_live_stmt(storage_live)) {
         statements.add(statement);
@@ -1431,7 +1431,7 @@ Void instrument_drop_flag_statement(
 }
 
 Bool task_consume_clears_root_flag(
-    context.CompilerContext& ctx,
+    DropContext&! ctx,
     jil.Body body,
     jil.LocalId local_id
 ) {
@@ -1441,12 +1441,12 @@ Bool task_consume_clears_root_flag(
 
 @life(return: output & terminator)
 jil.Terminator instrument_drop_flag_terminator(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Terminator terminator,
-    list.ArrayList<jil.Statement>& statements,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Statement>&! statements,
+    list.ArrayList<jil.Block>&! blocks
 ) {
     if (terminator.kind is .goto_term(goto_term)) {
         return instrument_goto_drop_flag_terminator(
@@ -1480,12 +1480,12 @@ jil.Terminator instrument_drop_flag_terminator(
 
 @life(return: output & source)
 jil.Terminator instrument_goto_drop_flag_terminator(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.GotoTerminator goto_term,
     jil.Terminator source,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     guard goto_term.initialized_place is .some(initialized_place) else { return source; }
     if (!call_destination_needs_flag(initialized_place, flags)) {
@@ -1504,12 +1504,12 @@ jil.Terminator instrument_goto_drop_flag_terminator(
 }
 
 Void push_call_callee_move_flag_clear(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.CallCallee callee,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (callee is .indirect_operand(operand)) {
         push_operand_move_flag_clear(ctx, output, flags, operand, span, statements);
@@ -1529,35 +1529,35 @@ Void push_call_callee_move_flag_clear(
     }
 }
 
-Bool call_destination_needs_flag(jil.Place destination, DropFlagMap flags) {
+Bool call_destination_needs_flag(jil.Place destination, DropFlagMap& flags) {
     if (place_has_root_flag(destination, flags)) { return true; }
     return flags.projection_flag_for(destination) != null;
 }
 
-Bool place_has_root_flag(jil.Place place, DropFlagMap flags) {
+Bool place_has_root_flag(jil.Place place, DropFlagMap& flags) {
     if (place.projection.length != 0) { return false; }
     guard jil.place_local_id(place) is .some(local_id) else { return false; }
     return flags.has_flag(local_id);
 }
 
 jil.BlockId append_call_destination_flag_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Place place,
     jil.Terminator source,
     jil.BlockId original_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
     if (place_has_root_flag(place, flags)) {
         push_root_drop_flags(
-            ctx, output, flags, place.local_id, true, source.span, statements$.ref()
+            ctx, output, flags, place.local_id, true, source.span, statements$.mut_ref()
         );
     } else {
         push_projection_drop_flags(
-            ctx, output, flags, place, true, source.span, statements$.ref()
+            ctx, output, flags, place, true, source.span, statements$.mut_ref()
         );
     }
     blocks.add(jil.Block (
@@ -1598,13 +1598,13 @@ jil.Terminator call_terminator_with_target(
 }
 
 Void elaborate_storage_dead_blocks(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     Int original_block_count,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     Int block_index! = 0;
     while (block_index < original_block_count) {
@@ -1622,13 +1622,13 @@ Void elaborate_storage_dead_blocks(
 }
 
 Void elaborate_storage_dead_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     list.ArrayList<jil.Statement> kept! = list.ArrayList<jil.Statement>(block.statements.length);
     Int statement_index! = 0;
@@ -1642,7 +1642,7 @@ Void elaborate_storage_dead_block(
                 flags,
                 temps,
                 block,
-                kept$.ref(),
+                kept$.mut_ref(),
                 statement_index,
                 local,
                 blocks
@@ -1656,9 +1656,9 @@ Void elaborate_storage_dead_block(
 }
 
 jil.LocalDecl? storage_dead_needs_drop(
-    context.CompilerContext& ctx,
+    DropContext&! ctx,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     jil.Statement statement
 ) {
     guard statement.kind is .storage_dead_stmt(storage_dead) else {
@@ -1672,16 +1672,16 @@ jil.LocalDecl? storage_dead_needs_drop(
 }
 
 Void split_storage_dead_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
-    list.ArrayList<jil.Statement>& kept,
+    list.ArrayList<jil.Statement>&! kept,
     Int statement_index,
     jil.LocalDecl local,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId continuation = append_storage_dead_continuation(
         output,
@@ -1709,10 +1709,10 @@ Void split_storage_dead_block(
 }
 
 jil.BlockId append_storage_dead_continuation(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block block,
     Int statement_index,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId continuation = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> rest! = list.ArrayList<jil.Statement>();
@@ -1731,19 +1731,26 @@ jil.BlockId append_storage_dead_continuation(
 }
 
 jil.BlockId append_local_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block source_block,
     jil.LocalDecl local,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId drop_id = jil.BlockId.from_index(blocks.len());
     blocks.add(placeholder_block(output, drop_id, source_block, next_target));
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
-    push_set_drop_flag(ctx, output, flags.flag_for(local.id), false, source_block.terminator.span, statements$.ref());
+    push_set_drop_flag(
+        ctx,
+        output,
+        flags.flag_for(local.id),
+        false,
+        source_block.terminator.span,
+        statements$.mut_ref()
+    );
     blocks.set(drop_id.to_index(), drop_block(
         ctx,
         output,
@@ -1753,7 +1760,7 @@ jil.BlockId append_local_drop_block(
         source_block,
         local_place(output, local.id),
         local.type_id,
-        statements$.ref(),
+        statements$.mut_ref(),
         next_target,
         blocks
     ));
@@ -1761,13 +1768,13 @@ jil.BlockId append_local_drop_block(
 }
 
 Void elaborate_return_blocks(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     Int original_block_count,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     Int block_index! = 0;
     while (block_index < original_block_count) {
@@ -1777,13 +1784,13 @@ Void elaborate_return_blocks(
 }
 
 Void elaborate_return_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     if (block.terminator.kind is .return_term(return_term)) {
         elaborate_return_path(ctx, output, body, flags, temps, block, return_term, blocks);
@@ -1795,14 +1802,14 @@ Void elaborate_return_block(
 }
 
 Void elaborate_return_path(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
     jil.ReturnTerminator return_term,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId final_return = jil.BlockId.from_index(blocks.len());
     blocks.add(return_block(output, final_return, block, return_term));
@@ -1812,14 +1819,14 @@ Void elaborate_return_path(
 }
 
 Void elaborate_cancel_path(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
     jil.CancelTerminator cancel_term,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId final_cancel = jil.BlockId.from_index(blocks.len());
     blocks.add(cancel_block(output, final_cancel, block, cancel_term));
@@ -1828,14 +1835,14 @@ Void elaborate_cancel_path(
 }
 
 jil.BlockId append_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Body body,
-    DropFlagMap flags,
+    DropFlagMap& flags,
     DropTemps temps,
     jil.Block block,
     jil.BlockId final_return,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId target! = final_return;
     Int local_index! = body.locals.length - 1;
@@ -1860,7 +1867,7 @@ jil.BlockId append_drop_chain(
     return target;
 }
 
-Bool return_fallback_needs_drop(context.CompilerContext& ctx, jil.LocalDecl local, DropFlagMap flags) {
+Bool return_fallback_needs_drop(DropContext&! ctx, jil.LocalDecl local, DropFlagMap& flags) {
     if (!flags.has_flag(local.id)) {
         return false;
     }
@@ -1869,16 +1876,16 @@ Bool return_fallback_needs_drop(context.CompilerContext& ctx, jil.LocalDecl loca
     return local.kind == .param && !is_self_param(ctx, local);
 }
 
-Bool is_self_param(context.CompilerContext& ctx, jil.LocalDecl local) {
+Bool is_self_param(DropContext&! ctx, jil.LocalDecl local) {
     guard local.name is .some(name) else {
         return false;
     }
-    return name.to_index() == ctx.store.symbols.intern("self").to_index();
+    return string.equal(ctx.store.symbols.text(name), "self");
 }
 
 @life(return: output)
 jil.Block return_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.BlockId id,
     jil.Block source_block,
     jil.ReturnTerminator return_term
@@ -1896,7 +1903,7 @@ jil.Block return_block(
 
 @life(return: output)
 jil.Block cancel_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.BlockId id,
     jil.Block source_block,
     jil.CancelTerminator cancel_term
@@ -1914,7 +1921,7 @@ jil.Block cancel_block(
 
 @life(return: output)
 jil.Block placeholder_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.BlockId id,
     jil.Block source_block,
     jil.BlockId target
@@ -1932,17 +1939,17 @@ jil.Block placeholder_block(
 
 @life(return: output & source_block & place)
 jil.Block drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
-    DropFlagMap? flags,
+    DropFlagMap&? flags,
     jil.BlockId id,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId type_id,
-    list.ArrayList<jil.Statement>& statements,
+    list.ArrayList<jil.Statement>&! statements,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     DropExpansion expansion = append_drop_expansion_chain(
         ctx,
@@ -1965,8 +1972,8 @@ jil.Block drop_block(
 
 @life(return: output & source_block)
 jil.Terminator drop_terminator(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId type_id,
@@ -1994,15 +2001,15 @@ jil.Terminator drop_terminator(
 }
 
 DropExpansion append_drop_expansion_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
-    DropFlagMap? flags,
+    DropFlagMap&? flags,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId type_id,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     if (info.data is .optional(optional_type)) {
@@ -2081,13 +2088,13 @@ DropExpansion append_drop_expansion_chain(
 }
 
 jil.BlockId append_closure_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     guard temps.cleanup_result is .some(cleanup_result) else {
         return next_target;
@@ -2123,14 +2130,14 @@ jil.BlockId append_closure_drop_block(
 }
 
 DropExpansion append_owner_pointer_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     types.HandleType handle_type,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     guard temps.cleanup_result is .some(cleanup_result) else {
         return DropExpansion(next_target, false);
@@ -2199,11 +2206,11 @@ DropExpansion append_owner_pointer_drop_chain(
 }
 
 jil.BlockId append_task_owner_release_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     jil.Place place,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(1);
@@ -2222,27 +2229,27 @@ jil.BlockId append_task_owner_release_block(
     return id;
 }
 
-Bool handle_is_trait_object(context.CompilerContext& ctx, types.HandleType handle_type) {
+Bool handle_is_trait_object(DropContext&! ctx, types.HandleType handle_type) {
     if (handle_type.kind != .owner_pointer && handle_type.kind != .reference) {
         return false;
     }
     return type_is_trait_any(ctx, handle_type.element);
 }
 
-Bool type_is_trait_any(context.CompilerContext& ctx, qid.TypeId type_id) {
+Bool type_is_trait_any(DropContext&! ctx, qid.TypeId type_id) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     guard info.data is .trait_companion(companion) else { return false; }
     return companion.kind == .any;
 }
 
 jil.BlockId append_trait_object_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.LocalId cleanup_result,
     jil.Block source_block,
     jil.Place place,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     token.Span span = source_block.terminator.span;
@@ -2276,12 +2283,12 @@ jil.BlockId append_trait_object_drop_block(
 }
 
 jil.BlockId append_owner_pointer_free_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.LocalId cleanup_result,
     jil.Block source_block,
     jil.Place place,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
@@ -2302,15 +2309,15 @@ jil.BlockId append_owner_pointer_free_block(
 }
 
 DropExpansion append_contiguous_element_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId element_type,
     jil.Operand count,
     jil.BlockId done_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     guard temps.slice_drop_index is .some(index_local) else { return DropExpansion(done_target, true); }
     guard temps.slice_drop_condition is .some(condition_local) else { return DropExpansion(done_target, true); }
@@ -2359,12 +2366,12 @@ DropExpansion append_contiguous_element_drop_chain(
 }
 
 jil.BlockId append_contiguous_drop_init_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     jil.LocalId index_local,
     jil.Operand count,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
@@ -2385,12 +2392,12 @@ jil.BlockId append_contiguous_drop_init_block(
 }
 
 jil.BlockId append_contiguous_drop_decrement_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Block source_block,
     jil.LocalId index_local,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
@@ -2416,8 +2423,8 @@ jil.BlockId append_contiguous_drop_decrement_block(
 
 @life(return: output)
 jil.Block contiguous_drop_condition_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.BlockId id,
     jil.Block source_block,
     jil.LocalId index_local,
@@ -2453,14 +2460,14 @@ jil.Block contiguous_drop_condition_block(
 }
 
 DropExpansion append_optional_payload_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     types.OptionalType optional_type,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     if (!type_needs_drop(ctx, optional_type.element)) {
         return DropExpansion(next_target, false);
@@ -2482,14 +2489,14 @@ DropExpansion append_optional_payload_drop_chain(
 }
 
 DropExpansion append_error_union_payload_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     types.ErrorUnionType error_union_type,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     Bool value_needs_drop = type_needs_drop(ctx, error_union_type.value);
     Bool error_needs_drop = type_needs_drop(ctx, error_union_type.error);
@@ -2530,15 +2537,15 @@ DropExpansion append_error_union_payload_drop_chain(
 }
 
 DropExpansion append_owned_field_drop_chain(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
-    DropFlagMap? flags,
+    DropFlagMap&? flags,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId type_id,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     if (!type_has_drop_expandable_fields(ctx, type_id)) {
         return DropExpansion(next_target, false);
@@ -2567,7 +2574,7 @@ DropExpansion append_owned_field_drop_chain(
     return DropExpansion(target, expanded);
 }
 
-Bool type_has_drop_expandable_fields(context.CompilerContext& ctx, qid.TypeId type_id) {
+Bool type_has_drop_expandable_fields(DropContext&! ctx, qid.TypeId type_id) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     if (info.data is .closure_environment_type(_)) { return true; }
     guard info.data is .named(named) else {
@@ -2577,32 +2584,32 @@ Bool type_has_drop_expandable_fields(context.CompilerContext& ctx, qid.TypeId ty
     return kind == .struct_def;
 }
 
-layout.TypeLayout layout_for_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+layout.TypeLayout layout_for_type(DropContext&! ctx, qid.TypeId type_id) {
     layout.LayoutId layout_id = database.layout_of_type(
         ctx.query$.mut_ref(), ctx.store$.ref(), type_id
     );
     return ctx.query.layout.layout(layout_id);
 }
 
-Bool field_needs_drop(context.CompilerContext& ctx, layout.FieldLayout field) {
+Bool field_needs_drop(DropContext&! ctx, layout.FieldLayout field) {
     return type_needs_drop(ctx, field.field_type);
 }
 
-Bool type_needs_drop(context.CompilerContext& ctx, qid.TypeId type_id) {
+Bool type_needs_drop(DropContext&! ctx, qid.TypeId type_id) {
     drop_semantics.DropQuery query = drop_semantics.DropQuery(ctx.store$.ref());
     return query.type_needs_runtime_drop(ctx.query$.mut_ref(), type_id);
 }
 
 jil.BlockId append_field_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place owner_place,
     layout.FieldLayout field,
     Int field_index,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     return append_place_drop_block(
         ctx,
@@ -2618,15 +2625,15 @@ jil.BlockId append_field_drop_block(
 }
 
 jil.BlockId append_place_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
-    DropFlagMap? flags,
+    DropFlagMap&? flags,
     jil.Block source_block,
     jil.Place place,
     qid.TypeId type_id,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     blocks.add(placeholder_block(output, id, source_block, next_target));
@@ -2640,7 +2647,7 @@ jil.BlockId append_place_drop_block(
         source_block,
         place,
         type_id,
-        statements$.ref(),
+        statements$.mut_ref(),
         next_target,
         blocks
     ));
@@ -2648,15 +2655,15 @@ jil.BlockId append_place_drop_block(
 }
 
 jil.BlockId append_layout_field_drop_block(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     DropTemps temps,
     jil.Block source_block,
     jil.Place owner_place,
     Int field_index,
     qid.TypeId field_type,
     jil.BlockId next_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     blocks.add(placeholder_block(output, id, source_block, next_target));
@@ -2671,7 +2678,7 @@ jil.BlockId append_layout_field_drop_block(
         source_block,
         field_place_value,
         field_type,
-        statements$.ref(),
+        statements$.mut_ref(),
         next_target,
         blocks
     );
@@ -2680,12 +2687,12 @@ jil.BlockId append_layout_field_drop_block(
 }
 
 jil.BlockId append_layout_tag_branch(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     jil.Place owner_place,
     jil.BlockId true_target,
     jil.BlockId false_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     jil.Place tag_place = field_index_place(output, owner_place, 0);
@@ -2707,7 +2714,7 @@ jil.BlockId append_layout_tag_branch(
 }
 
 @life(return: output)
-jil.Place field_place(jil.Store& output, jil.Place owner_place, layout.FieldLayout field, Int field_index) {
+jil.Place field_place(jil.Storage& output, jil.Place owner_place, layout.FieldLayout field, Int field_index) {
     if (field.field_def == null) {
         return field_index_place(output, owner_place, field_index);
     }
@@ -2726,7 +2733,7 @@ jil.Place field_place(jil.Store& output, jil.Place owner_place, layout.FieldLayo
 }
 
 @life(return: output)
-jil.Place field_index_place(jil.Store& output, jil.Place owner_place, Int field_index) {
+jil.Place field_index_place(jil.Storage& output, jil.Place owner_place, Int field_index) {
     list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(owner_place.projection.length + 1);
     Int index! = 0;
     while (index < owner_place.projection.length) {
@@ -2738,7 +2745,7 @@ jil.Place field_index_place(jil.Store& output, jil.Place owner_place, Int field_
     return place_with_projection(output, owner_place, projection$.ref());
 }
 
-qid.TypeId place_type(context.CompilerContext& ctx, jil.Body body, jil.Place place) {
+qid.TypeId place_type(DropContext&! ctx, jil.Body body, jil.Place place) {
     qid.TypeId current! = place_base_type(ctx, body, place);
     Int index! = 0;
     while (index < place.projection.length) {
@@ -2757,14 +2764,14 @@ qid.TypeId place_type(context.CompilerContext& ctx, jil.Body body, jil.Place pla
     return current;
 }
 
-qid.TypeId place_base_type(context.CompilerContext& ctx, jil.Body body, jil.Place place) {
+qid.TypeId place_base_type(DropContext&! ctx, jil.Body body, jil.Place place) {
     if (place.base is .global(global_ref)) {
         return global_ref.type_id;
     }
     return body.locals[place.local_id.to_index()].type_id;
 }
 
-qid.TypeId pointer_like_element_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+qid.TypeId pointer_like_element_type(DropContext&! ctx, qid.TypeId type_id) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     if (info.data is .handle_type(handle)) {
         return handle.element;
@@ -2773,7 +2780,7 @@ qid.TypeId pointer_like_element_type(context.CompilerContext& ctx, qid.TypeId ty
 }
 
 @life(return: output)
-jil.Place indexed_place(jil.Store& output, jil.Place owner_place, jil.LocalId index_local) {
+jil.Place indexed_place(jil.Storage& output, jil.Place owner_place, jil.LocalId index_local) {
     list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(owner_place.projection.length + 1);
     Int index! = 0;
     while (index < owner_place.projection.length) {
@@ -2785,7 +2792,7 @@ jil.Place indexed_place(jil.Store& output, jil.Place owner_place, jil.LocalId in
 }
 
 @life(return: output)
-jil.Place deref_place(jil.Store& output, jil.Place owner_place) {
+jil.Place deref_place(jil.Storage& output, jil.Place owner_place) {
     list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(owner_place.projection.length + 1);
     Int index! = 0;
     while (index < owner_place.projection.length) {
@@ -2797,7 +2804,7 @@ jil.Place deref_place(jil.Store& output, jil.Place owner_place) {
 }
 
 @life(return: output)
-jil.Place deref_raw_place(jil.Store& output, jil.Place owner_place) {
+jil.Place deref_raw_place(jil.Storage& output, jil.Place owner_place) {
     list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(owner_place.projection.length + 1);
     Int index! = 0;
     while (index < owner_place.projection.length) {
@@ -2808,13 +2815,13 @@ jil.Place deref_raw_place(jil.Store& output, jil.Place owner_place) {
     return place_with_projection(output, owner_place, projection$.ref());
 }
 
-jil.Place local_place(jil.Store& output, jil.LocalId local_id) {
+jil.Place local_place(jil.Storage& output, jil.LocalId local_id) {
     return jil.local_place(local_id, output.empty_projection());
 }
 
 @life(return: output)
 jil.Place place_with_projection(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Place owner_place,
     list.ArrayList<jil.PlaceElem>& projection
 ) {
@@ -2833,8 +2840,8 @@ jil.Terminator goto_terminator(jil.Block source_block, jil.BlockId target) {
 
 @life(return: output)
 jil.Terminator custom_deinit_terminator(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.Block source_block,
     jil.Place place,
     qid.DefId deinit_def,
@@ -2869,7 +2876,7 @@ jil.Terminator custom_deinit_terminator(
 }
 
 @life(return: ctx & output)
-qid.TypeId[]& custom_deinit_type_args(context.CompilerContext& ctx, jil.Store& output, qid.TypeId type_id) {
+qid.TypeId[]& custom_deinit_type_args(DropContext&! ctx, jil.Storage& output, qid.TypeId type_id) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     if (info.data is .named(named)) {
         return named.type_args;
@@ -2877,14 +2884,14 @@ qid.TypeId[]& custom_deinit_type_args(context.CompilerContext& ctx, jil.Store& o
     return output.empty_type_args();
 }
 
-qid.TypeId deinit_function_type(context.CompilerContext& ctx, qid.DefId deinit_def) {
+qid.TypeId deinit_function_type(DropContext&! ctx, qid.DefId deinit_def) {
     if (ctx.store.typeck.def_type(deinit_def) is .some(type_id)) {
         return type_id;
     }
     return ctx.store.types.invalid_type();
 }
 
-qid.DefId? custom_deinit_def_for_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+qid.DefId? custom_deinit_def_for_type(DropContext&! ctx, qid.TypeId type_id) {
     types.TypeInfo info = ctx.store.types.get(type_id);
     guard info.data is .named(named) else {
         return null;
@@ -2895,7 +2902,7 @@ qid.DefId? custom_deinit_def_for_type(context.CompilerContext& ctx, qid.TypeId t
     return model_def.custom_deinit_def;
 }
 
-qid.DefId? custom_deinit_call_target_for_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+qid.DefId? custom_deinit_call_target_for_type(DropContext&! ctx, qid.TypeId type_id) {
     guard custom_deinit_def_for_type(ctx, type_id) is .some(deinit_def) else {
         return null;
     }
@@ -2912,14 +2919,14 @@ qid.DefId? custom_deinit_call_target_for_type(context.CompilerContext& ctx, qid.
 }
 
 jil.BlockId append_drop_flag_branch(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Block source_block,
     jil.LocalDecl local,
     jil.BlockId drop_target,
     jil.BlockId skip_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
@@ -2928,7 +2935,7 @@ jil.BlockId append_drop_flag_branch(
         output,
         flags,
         block_with_id(source_block, id),
-        statements$.ref(),
+        statements$.mut_ref(),
         local,
         drop_target,
         skip_target
@@ -2936,7 +2943,7 @@ jil.BlockId append_drop_flag_branch(
     return id;
 }
 
-jil.LocalId? projection_drop_flag(DropFlagMap? flags, jil.Place place) {
+jil.LocalId? projection_drop_flag(DropFlagMap&? flags, jil.Place place) {
     if (flags is .some(flag_map)) {
         return flag_map.projection_flag_for(place);
     }
@@ -2944,12 +2951,12 @@ jil.LocalId? projection_drop_flag(DropFlagMap? flags, jil.Place place) {
 }
 
 jil.BlockId append_projection_drop_flag_branch(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     jil.LocalId flag,
     jil.BlockId drop_target,
     jil.BlockId skip_target,
-    list.ArrayList<jil.Block>& blocks
+    list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
     blocks.add(jil.Block(
@@ -2970,11 +2977,11 @@ jil.BlockId append_projection_drop_flag_branch(
 
 @life(return: output)
 jil.Block branch_on_drop_flag(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Block source_block,
-    list.ArrayList<jil.Statement>& statements,
+    list.ArrayList<jil.Statement>&! statements,
     jil.LocalDecl local,
     jil.BlockId drop_target,
     jil.BlockId skip_target
@@ -3005,7 +3012,7 @@ jil.Block block_with_id(jil.Block block, jil.BlockId id) {
 }
 
 @life(return: output)
-jil.Block goto_block(jil.Store& output, jil.Block source_block, jil.BlockId target) {
+jil.Block goto_block(jil.Storage& output, jil.Block source_block, jil.BlockId target) {
     list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
     Int index! = 0;
     while (index < source_block.statements.length) {
@@ -3017,7 +3024,7 @@ jil.Block goto_block(jil.Store& output, jil.Block source_block, jil.BlockId targ
 
 @life(return: output)
 jil.Block goto_block_with_statements(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     list.ArrayList<jil.Statement>& statements,
     jil.BlockId target
@@ -3035,7 +3042,7 @@ jil.Block goto_block_with_statements(
 
 @life(return: output & source_block)
 jil.Block replace_block_statements(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     list.ArrayList<jil.Statement>& statements
 ) {
@@ -3044,7 +3051,7 @@ jil.Block replace_block_statements(
 
 @life(return: output & source_block & terminator)
 jil.Block replace_block(
-    jil.Store& output,
+    jil.Storage& output,
     jil.Block source_block,
     list.ArrayList<jil.Statement>& statements,
     jil.Terminator terminator
@@ -3057,7 +3064,7 @@ jil.Block replace_block(
     );
 }
 
-Void collect_projection_move_flags(jil.Body body, DropFlagMap& flags) {
+Void collect_projection_move_flags(jil.Body body, DropFlagMap&! flags) {
     Int block_index! = 0;
     while (block_index < body.blocks.length) {
         jil.Block block = body.blocks[block_index];
@@ -3073,7 +3080,7 @@ Void collect_projection_move_flags(jil.Body body, DropFlagMap& flags) {
     }
 }
 
-Void collect_statement_projection_move_flags(Int local_count, jil.Statement statement, DropFlagMap& flags) {
+Void collect_statement_projection_move_flags(Int local_count, jil.Statement statement, DropFlagMap&! flags) {
     if (statement.kind is .assign_stmt(assign_stmt)) {
         collect_rvalue_projection_move_flags(local_count, assign_stmt.value, flags);
         return;
@@ -3086,7 +3093,7 @@ Void collect_statement_projection_move_flags(Int local_count, jil.Statement stat
 Void collect_terminator_projection_move_flags(
     Int local_count,
     jil.Terminator terminator,
-    DropFlagMap& flags
+    DropFlagMap&! flags
 ) {
     guard terminator.kind is .call_term(call_term) else { return; }
     collect_call_callee_projection_move_flags(local_count, call_term.callee, flags);
@@ -3096,7 +3103,7 @@ Void collect_terminator_projection_move_flags(
 Void collect_call_callee_projection_move_flags(
     Int local_count,
     jil.CallCallee callee,
-    DropFlagMap& flags
+    DropFlagMap&! flags
 ) {
     if (callee is .indirect_operand(operand)) {
         collect_operand_projection_move_flag(local_count, operand, flags);
@@ -3116,7 +3123,7 @@ Void collect_call_callee_projection_move_flags(
     }
 }
 
-Void collect_rvalue_projection_move_flags(Int local_count, jil.Rvalue value, DropFlagMap& flags) {
+Void collect_rvalue_projection_move_flags(Int local_count, jil.Rvalue value, DropFlagMap&! flags) {
     if (value is .use_value(use_value)) {
         collect_operand_projection_move_flag(local_count, use_value.value, flags);
     }
@@ -3163,7 +3170,7 @@ Void collect_rvalue_projection_move_flags(Int local_count, jil.Rvalue value, Dro
 Void collect_optional_operand_projection_move_flag(
     Int local_count,
     jil.Operand? operand,
-    DropFlagMap& flags
+    DropFlagMap&! flags
 ) {
     if (operand is .some(value)) {
         collect_operand_projection_move_flag(local_count, value, flags);
@@ -3173,7 +3180,7 @@ Void collect_optional_operand_projection_move_flag(
 Void collect_operand_array_projection_move_flags(
     Int local_count,
     jil.Operand[]& operands,
-    DropFlagMap& flags
+    DropFlagMap&! flags
 ) {
     Int index! = 0;
     while (index < operands.length) {
@@ -3182,13 +3189,13 @@ Void collect_operand_array_projection_move_flags(
     }
 }
 
-Void collect_operand_projection_move_flag(Int local_count, jil.Operand operand, DropFlagMap& flags) {
+Void collect_operand_projection_move_flag(Int local_count, jil.Operand operand, DropFlagMap&! flags) {
     if (operand is .move_operand(move_operand)) {
         add_projection_move_flag(local_count, move_operand.place, flags);
     }
 }
 
-Void add_projection_move_flag(Int local_count, jil.Place place, DropFlagMap& flags) {
+Void add_projection_move_flag(Int local_count, jil.Place place, DropFlagMap&! flags) {
     if (place.projection.length == 0) { return; }
     guard jil.place_local_id(place) is .some(local_id) else { return; }
     if (!flags.has_flag(local_id)) { return; }
@@ -3196,12 +3203,12 @@ Void add_projection_move_flag(Int local_count, jil.Place place, DropFlagMap& fla
 }
 
 Void push_move_flag_clears(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Rvalue value,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (value is .use_value(use_value)) {
         push_operand_move_flag_clear(ctx, output, flags, use_value.value, span, statements);
@@ -3241,12 +3248,12 @@ Void push_move_flag_clears(
 }
 
 Void push_inline_asm_move_flag_clears(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.InlineAsmRvalue value,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     Int index! = 0;
     while (index < value.operands.length) {
@@ -3258,12 +3265,12 @@ Void push_inline_asm_move_flag_clears(
 }
 
 Void push_optional_operand_move_flag_clear(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Operand? operand,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (operand is .some(value)) {
         push_operand_move_flag_clear(ctx, output, flags, value, span, statements);
@@ -3271,12 +3278,12 @@ Void push_optional_operand_move_flag_clear(
 }
 
 Void push_operand_array_move_flag_clears(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Operand[]& operands,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     Int index! = 0;
     while (index < operands.length) {
@@ -3286,12 +3293,12 @@ Void push_operand_array_move_flag_clears(
 }
 
 Void push_operand_move_flag_clear(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Operand operand,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (operand is .move_operand(move_operand)) {
         if (place_has_root_flag(move_operand.place, flags)) {
@@ -3309,12 +3316,12 @@ Void push_operand_move_flag_clear(
 }
 
 Void push_forget_flag_clear(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Place place,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     if (place_has_root_flag(place, flags)) {
         push_root_drop_flags(ctx, output, flags, place.local_id, false, span, statements);
@@ -3326,13 +3333,13 @@ Void push_forget_flag_clear(
 }
 
 Void push_projection_drop_flags(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.Place place,
     Bool value,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     Int index! = 0;
     while (index < flags.projection_flags.len()) {
@@ -3345,13 +3352,13 @@ Void push_projection_drop_flags(
 }
 
 Void push_root_drop_flags(
-    context.CompilerContext& ctx,
-    jil.Store& output,
-    DropFlagMap flags,
+    DropContext&! ctx,
+    jil.Storage& output,
+    DropFlagMap& flags,
     jil.LocalId local_id,
     Bool value,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     push_set_drop_flag(ctx, output, flags.flag_for(local_id), value, span, statements);
     Int index! = 0;
@@ -3427,12 +3434,12 @@ Bool drop_place_elems_equal(jil.PlaceElem lhs, jil.PlaceElem rhs) {
 }
 
 Void push_set_drop_flag(
-    context.CompilerContext& ctx,
-    jil.Store& output,
+    DropContext&! ctx,
+    jil.Storage& output,
     jil.LocalId flag,
     Bool value,
     token.Span span,
-    list.ArrayList<jil.Statement>& statements
+    list.ArrayList<jil.Statement>&! statements
 ) {
     statements.add(jil.Statement (
         span: span,
@@ -3443,7 +3450,7 @@ Void push_set_drop_flag(
     ));
 }
 
-jil.Operand bool_operand(context.CompilerContext& ctx, Bool value, token.Span span) {
+jil.Operand bool_operand(DropContext&! ctx, Bool value, token.Span span) {
     return jil.const_operand_value(jil.Const (
         type_id: ctx.store.types.bool_type(),
         span: span,
@@ -3451,7 +3458,7 @@ jil.Operand bool_operand(context.CompilerContext& ctx, Bool value, token.Span sp
     ));
 }
 
-jil.Operand uint_operand(context.CompilerContext& ctx, Int value, token.Span span) {
+jil.Operand uint_operand(DropContext&! ctx, Int value, token.Span span) {
     return jil.const_operand_value(jil.Const (
         type_id: ctx.store.types.uint_type(),
         span: span,
@@ -3459,7 +3466,7 @@ jil.Operand uint_operand(context.CompilerContext& ctx, Int value, token.Span spa
     ));
 }
 
-jil.Operand drop_flag_operand(jil.Store& output, jil.LocalId flag) {
+jil.Operand drop_flag_operand(jil.Storage& output, jil.LocalId flag) {
     return jil.copy_operand_value(jil.CopyOperand (place: flag_place(output, flag)));
 }
 
@@ -3468,13 +3475,13 @@ jil.Operand copy_operand_for_place(jil.Place place) {
 }
 
 @life(return: output)
-jil.Place flag_place(jil.Store& output, jil.LocalId flag) {
+jil.Place flag_place(jil.Storage& output, jil.LocalId flag) {
     return jil.local_place(flag, output.empty_projection());
 }
 
 
 @life()
-jil.LocalDecl[]& copy_locals(jil.Store& output, jil.LocalDecl[]& locals) {
+jil.LocalDecl[]& copy_locals(jil.Storage& output, jil.LocalDecl[]& locals) {
     unsafe {
         jil.LocalDecl*! copied = output.alloc_local_array(locals.length);
         Int index! = 0;
