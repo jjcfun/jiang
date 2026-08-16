@@ -29,6 +29,11 @@ import call = "./call.jiang";
 import dispatch = "./dispatch.jiang";
 import builder = "./builder.jiang";
 
+public union SuspendRecordLocation: Copyable {
+    jil.LocalId local;
+    jil.LocalId pointer;
+}
+
 public extend body_context.BodyLowerer {
     public Bool is_coroutine_suspend_def(self, qid.DefId target_def) {
         guard self.lowerer.store.resolve.core_functions.coroutine_suspend
@@ -49,15 +54,17 @@ public extend body_context.BodyLowerer {
     ) {
         token.Span span = self.lowerer.model_span(node_id);
         jil.TaskStateLayout state = self.current_task_state_layout();
-        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.LocalId pointer = self.current_task_cancellation_state_pointer(state, span);
         jil.BlockId check = self.reserve_block(span);
         jil.BlockId observe = self.reserve_block(span);
         jil.BlockId complete = self.reserve_block(span);
-        self.branch_on_non_null_pointer(pointer, check, complete, span);
+        self.branch_on_non_null_pointer(
+            self.place_for_local(pointer), check, complete, span
+        );
         self.start_block(check);
         jil.Place request = coroutine_task_abi.task_state_field_place(
             self.lowerer.storage,
-            self.project_deref(pointer, true),
+            self.project_deref(self.place_for_local(pointer), true),
             state.cancellation_requested
         );
         jil.LocalId claimed = self.add_temp(
@@ -159,32 +166,47 @@ public extend body_context.BodyLowerer {
             self.jil_place_type(destination), span
         );
         jil.LocalId record_local = self.add_temp(layout.type_id, span);
-        jil.Place record = self.place_for_local(record_local);
-        self.initialize_suspend_continuation(layout, record, destination, span);
-        self.check_cancellation_before_suspend_registration(record, layout, span);
+        SuspendRecordLocation record_pointer = .local(record_local);
+        self.initialize_suspend_continuation(layout, record_pointer, destination, span);
+        self.check_cancellation_before_suspend_registration(record_pointer, layout, span);
         jil.LocalId continuation_local = self.add_temp(continuation_type, span);
-        jil.Place continuation = self.place_for_local(continuation_local);
-        self.initialize_suspend_handle(layout, record, continuation, span);
+        self.initialize_suspend_handle(layout, record_pointer, continuation_local, span);
         if (self.call_suspend_registration_lambda(
-                registration_id, continuation, record, layout, span
+                registration_id, continuation_local, record_pointer, layout, span
             )
         ) {
             return;
         }
         jil.LocalId registration_local = self.add_temp(registration_type, span);
-        jil.Place registration = self.place_for_local(registration_local);
-        self.lower_into_place(registration_id, registration);
-        self.call_suspend_registration(registration, continuation, record, layout, span);
+        self.lower_into_place(registration_id, self.place_for_local(registration_local));
+        self.call_suspend_registration(
+            registration_local, continuation_local, record_pointer, layout, span
+        );
+    }
+
+    @life(return: self.b)
+    public jil.Place suspend_record_place(self, SuspendRecordLocation record_pointer) {
+        if (record_pointer is .local(record)) {
+            return self.place_for_local(record);
+        }
+        if (record_pointer is .pointer(pointer)) {
+            return self.project_deref(self.place_for_local(pointer), true);
+        }
+        assert(false);
+        return self.place_for_local(jil.LocalId.from_index(0));
     }
 
     public Void check_cancellation_before_suspend_registration(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place request = self.project_deref(
-            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer),
+                layout.cancel_request_pointer_field_index
+            ),
             true
         );
         jil.LocalId requested = self.add_temp(self.jil_place_type(request), span);
@@ -209,11 +231,11 @@ public extend body_context.BodyLowerer {
             default_target: registration
         )), span);
         self.start_block(cancelled);
-        self.clear_suspend_registration_target(record, layout, span);
+        self.clear_suspend_registration_target(record_pointer, layout, span);
         jil.BlockId parked = self.reserve_block(span);
         // 当前协程即将挂起，新的 continuation 接替当前执行链。
         // 取消路径可能已经发布父 continuation，因此这里必须允许 handoff 覆盖旧目标。
-        self.call_suspend_resume(record, layout, parked, true, span);
+        self.call_suspend_resume(record_pointer, layout, parked, true, span);
         self.start_block(parked);
         self.finish_block(jil.suspend_pending_terminator_kind(jil.SuspendPendingTerminator (
             target: parked,
@@ -224,12 +246,15 @@ public extend body_context.BodyLowerer {
 
     public Void clear_suspend_registration_target(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place word = self.project_deref(
-            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer),
+                layout.cancel_word_pointer_field_index
+            ),
             true
         );
         jil.LocalId cleared = self.add_temp(self.lowerer.store.types.bool_type(), span);
@@ -248,12 +273,14 @@ public extend body_context.BodyLowerer {
     public Void initialize_suspend_continuation(
         Self&! self,
         jil.SuspendContinuationLayout layout,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.Place destination,
         token.Span span
     ) {
         self.push_assign(
-            self.project_constant_index(record, layout.result_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.result_field_index
+            ),
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
                 place: destination,
                 frame_root: false
@@ -261,7 +288,9 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.context_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.context_field_index
+            ),
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
                 place: self.place_for_local(self.return_local()),
                 frame_root: true
@@ -269,7 +298,9 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.resume_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.resume_field_index
+            ),
             jil.use_rvalue(jil.UseRvalue (
                 value: jil.function_operand_value(jil.FunctionRef (
                     target: .source(self.def_id),
@@ -286,12 +317,16 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.executor_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.executor_field_index
+            ),
             jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.task_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.task_field_index
+            ),
             jil.current_task_rvalue(jil.CurrentTaskRvalue (
                 observed: false,
                 cancellation_context: true
@@ -299,43 +334,52 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_atomic_store(
-            self.project_constant_index(record, layout.phase_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.phase_field_index
+            ),
             self.int_operand(suspend_registering, span),
             span
         );
-        self.initialize_suspend_cancel_target(layout, record, span);
+        self.initialize_suspend_cancel_target(layout, record_pointer, span);
     }
 
     public Void initialize_suspend_cancel_target(
         Self&! self,
         jil.SuspendContinuationLayout layout,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         token.Span span
     ) {
         jil.TaskStateLayout state = self.current_task_state_layout();
-        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.LocalId pointer = self.current_task_cancellation_state_pointer(state, span);
         jil.BlockId inherited = self.reserve_block(span);
         jil.BlockId fallback = self.reserve_block(span);
         jil.BlockId complete = self.reserve_block(span);
-        self.branch_on_non_null_pointer(pointer, inherited, fallback, span);
+        self.branch_on_non_null_pointer(
+            self.place_for_local(pointer), inherited, fallback, span
+        );
         self.start_block(inherited);
-        jil.Place task = self.project_deref(pointer, true);
+        jil.Place task = self.project_deref(self.place_for_local(pointer), true);
         jil.Place word = coroutine_task_abi.task_state_field_place(
             self.lowerer.storage, task, state.cancel_target_word
         );
         jil.Place request = coroutine_task_abi.task_state_field_place(
             self.lowerer.storage, task, state.cancellation_requested
         );
-        self.store_suspend_field_address(record, layout.cancel_request_pointer_field_index, request, span);
-        self.store_suspend_field_address(record, layout.cancel_word_pointer_field_index, word, span);
+        self.store_suspend_field_address(
+            record_pointer, layout.cancel_request_pointer_field_index, request, span
+        );
+        self.store_suspend_field_address(
+            record_pointer, layout.cancel_word_pointer_field_index, word, span
+        );
         self.push_atomic_store(word, jil.const_operand_value(self.int_const(3, span)), span);
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(fallback);
         jil.Place fallback_request = self.project_constant_index(
-            record, layout.fallback_cancel_request_field_index
+            self.suspend_record_place(record_pointer),
+            layout.fallback_cancel_request_field_index
         );
         jil.Place fallback_word = self.project_constant_index(
-            record, layout.fallback_cancel_word_field_index
+            self.suspend_record_place(record_pointer), layout.fallback_cancel_word_field_index
         );
         self.push_atomic_store(
             fallback_request, jil.const_operand_value(self.int_const(0, span)), span
@@ -344,10 +388,13 @@ public extend body_context.BodyLowerer {
             fallback_word, jil.const_operand_value(self.int_const(3, span)), span
         );
         self.store_suspend_field_address(
-            record, layout.cancel_request_pointer_field_index, fallback_request, span
+            record_pointer,
+            layout.cancel_request_pointer_field_index,
+            fallback_request,
+            span
         );
         self.store_suspend_field_address(
-            record, layout.cancel_word_pointer_field_index, fallback_word, span
+            record_pointer, layout.cancel_word_pointer_field_index, fallback_word, span
         );
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(complete);
@@ -355,13 +402,13 @@ public extend body_context.BodyLowerer {
 
     public Void store_suspend_field_address(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         Int field_index,
         jil.Place value,
         token.Span span
     ) {
         self.push_assign(
-            self.project_constant_index(record, field_index),
+            self.project_constant_index(self.suspend_record_place(record_pointer), field_index),
             jil.address_of_rvalue(jil.AddressOfRvalue (
                 mutable_pointer: true,
                 place: value
@@ -372,7 +419,7 @@ public extend body_context.BodyLowerer {
 
     public jil.Operand suspend_cancel_target_word(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
@@ -380,7 +427,7 @@ public extend body_context.BodyLowerer {
         self.push_assign(
             self.place_for_local(pointer),
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
-                place: record,
+                place: self.suspend_record_place(record_pointer),
                 frame_root: false
             )),
             span
@@ -412,8 +459,8 @@ public extend body_context.BodyLowerer {
     public Void initialize_suspend_handle(
         Self&! self,
         jil.SuspendContinuationLayout layout,
-        jil.Place record,
-        jil.Place continuation,
+        SuspendRecordLocation record_pointer,
+        jil.LocalId continuation,
         token.Span span
     ) {
         jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
@@ -421,12 +468,12 @@ public extend body_context.BodyLowerer {
         self.push_assign(
             pointer_place,
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
-                place: record,
+                place: self.suspend_record_place(record_pointer),
                 frame_root: false
             )),
             span
         );
-        jil.Place state = self.project_constant_index(continuation, 0);
+        jil.Place state = self.project_constant_index(self.place_for_local(continuation), 0);
         self.push_assign(
             state,
             jil.cast_rvalue(jil.CastRvalue (
@@ -440,28 +487,30 @@ public extend body_context.BodyLowerer {
 
     public Void call_suspend_registration(
         Self&! self,
-        jil.Place registration,
-        jil.Place continuation,
-        jil.Place record,
+        jil.LocalId registration,
+        jil.LocalId continuation,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place vtable = self.project_deref(
-            self.project_constant_index(registration, 1), true
+            self.project_constant_index(self.place_for_local(registration), 1), true
         );
         jil.Place function = self.project_constant_index(vtable, 0);
         jil.CallCallee callee = jil.indirect_operand_callee(self.operand_for_place(function));
-        jil.Operand environment = self.operand_for_place(self.project_constant_index(registration, 0));
+        jil.Operand environment = self.operand_for_place(
+            self.project_constant_index(self.place_for_local(registration), 0)
+        );
         self.finish_suspend_registration_call(
-            callee, environment, continuation, record, layout, span
+            callee, environment, continuation, record_pointer, layout, span
         );
     }
 
     public Bool call_suspend_registration_lambda(
         Self&! self,
         sem.NodeId registration_id,
-        jil.Place continuation,
-        jil.Place record,
+        jil.LocalId continuation,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
@@ -483,7 +532,7 @@ public extend body_context.BodyLowerer {
             jil.direct_function_callee(function),
             environment,
             continuation,
-            record,
+            record_pointer,
             layout,
             span
         );
@@ -494,14 +543,14 @@ public extend body_context.BodyLowerer {
         Self&! self,
         jil.CallCallee callee,
         jil.Operand environment,
-        jil.Place continuation,
-        jil.Place record,
+        jil.LocalId continuation,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
         args.add(environment);
-        args.add(self.operand_for_place(continuation));
+        args.add(self.operand_for_place(self.place_for_local(continuation)));
         jil.LocalId result = self.add_temp(self.lowerer.store.types.unit_type(), span);
         jil.BlockId next = self.reserve_block(span);
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
@@ -516,16 +565,18 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), span);
         self.start_block(next);
-        self.finish_suspend_registration(record, layout, span);
+        self.finish_suspend_registration(record_pointer, layout, span);
     }
 
     public Void finish_suspend_registration(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
-        jil.Place phase = self.project_constant_index(record, layout.phase_field_index);
+        jil.Place phase = self.project_constant_index(
+            self.suspend_record_place(record_pointer), layout.phase_field_index
+        );
         jil.LocalId parked = self.add_temp(self.lowerer.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(parked),
@@ -573,7 +624,7 @@ public extend body_context.BodyLowerer {
             default_target: await_publish
         )), span);
         self.start_block(check_cancel);
-        self.check_cancellation_before_suspend_registration(record, layout, span);
+        self.check_cancellation_before_suspend_registration(record_pointer, layout, span);
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(complete);
     }
@@ -597,9 +648,11 @@ public extend body_context.BodyLowerer {
         jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
             self.type_for_node(value_id), span
         );
-        jil.Place record = self.suspend_record_for_receiver(receiver_id, layout, span);
+        SuspendRecordLocation record_pointer = self.suspend_record_for_receiver(
+            receiver_id, layout, span
+        );
         self.push_assign(destination, self.unit_rvalue(span), span);
-        self.resume_suspend_record(value_id, record, layout, span);
+        self.resume_suspend_record(value_id, record_pointer, layout, span);
     }
 
     public Void lower_continuation_on_cancel(
@@ -627,8 +680,12 @@ public extend body_context.BodyLowerer {
         jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
             result_type, span
         );
-        jil.Place record = self.suspend_record_for_receiver(receiver_id, layout, span);
-        self.register_suspend_cancel_handler(handler_id, handler, record, layout, span);
+        SuspendRecordLocation record_pointer = self.suspend_record_for_receiver(
+            receiver_id, layout, span
+        );
+        self.register_suspend_cancel_handler(
+            handler_id, handler, record_pointer, layout, span
+        );
         self.push_assign(destination, self.unit_rvalue(span), span);
     }
 
@@ -652,7 +709,7 @@ public extend body_context.BodyLowerer {
         Self&! self,
         sem.NodeId handler_id,
         sem.Lambda handler,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
@@ -662,39 +719,51 @@ public extend body_context.BodyLowerer {
             handler_id, handler, drop, span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.handler_context_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.handler_context_field_index
+            ),
             jil.use_rvalue(jil.UseRvalue (value: context)),
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.handler_drop_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.handler_drop_field_index
+            ),
             jil.use_rvalue(jil.UseRvalue (value: jil.function_operand_value(drop))),
             span
         );
         self.push_assign(
-            self.project_constant_index(record, layout.handler_function_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.handler_function_field_index
+            ),
             jil.use_rvalue(jil.UseRvalue (value: jil.function_operand_value(invoke))),
             span
         );
         self.push_atomic_store(
             self.project_deref(
-                self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+                self.project_constant_index(
+                    self.suspend_record_place(record_pointer),
+                    layout.cancel_word_pointer_field_index
+                ),
                 true
             ),
-            self.suspend_cancel_target_word(record, layout, span),
+            self.suspend_cancel_target_word(record_pointer, layout, span),
             span
         );
-        self.invoke_suspend_cancel_handler_if_requested(record, layout, span);
+        self.invoke_suspend_cancel_handler_if_requested(record_pointer, layout, span);
     }
 
     public Void invoke_suspend_cancel_handler_if_requested(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place request = self.project_deref(
-            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer),
+                layout.cancel_request_pointer_field_index
+            ),
             true
         );
         jil.LocalId requested = self.add_temp(self.jil_place_type(request), span);
@@ -716,19 +785,22 @@ public extend body_context.BodyLowerer {
             default_target: complete
         )), span);
         self.start_block(invoke);
-        self.invoke_suspend_cancel_handler(record, layout, span);
+        self.invoke_suspend_cancel_handler(record_pointer, layout, span);
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(complete);
     }
 
     public Void invoke_suspend_cancel_handler(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place word = self.project_deref(
-            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer),
+                layout.cancel_word_pointer_field_index
+            ),
             true
         );
         jil.LocalId claimed = self.add_temp(self.lowerer.store.types.bool_type(), span);
@@ -736,7 +808,7 @@ public extend body_context.BodyLowerer {
             self.place_for_local(claimed),
             jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
                 place: word,
-                expected: self.suspend_cancel_target_word(record, layout, span),
+                expected: self.suspend_cancel_target_word(record_pointer, layout, span),
                 desired: jil.const_operand_value(self.int_const(2, span)),
                 mode: .coroutine_atomic
             )),
@@ -752,12 +824,17 @@ public extend body_context.BodyLowerer {
         self.start_block(invoke);
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
         args.add(self.operand_for_place(
-            self.project_constant_index(record, layout.handler_context_field_index)
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.handler_context_field_index
+            )
         ));
         jil.LocalId result = self.add_temp(self.lowerer.store.types.unit_type(), span);
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: jil.indirect_operand_callee(self.operand_for_place(
-                self.project_constant_index(record, layout.handler_function_field_index)
+                self.project_constant_index(
+                    self.suspend_record_place(record_pointer),
+                    layout.handler_function_field_index
+                )
             )),
             args: self.lowerer.storage.operand_array(args$.ref()),
             current_effects: self.current_effects,
@@ -801,8 +878,7 @@ public extend body_context.BodyLowerer {
         return member_access.base;
     }
 
-    @life(return: self.b)
-    public jil.Place suspend_record_for_receiver(
+    public SuspendRecordLocation suspend_record_for_receiver(
         Self&! self,
         sem.NodeId receiver_id,
         jil.SuspendContinuationLayout layout,
@@ -814,9 +890,8 @@ public extend body_context.BodyLowerer {
         }
         jil.Place state = self.project_constant_index(receiver, 0);
         jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
-        jil.Place pointer_place = self.place_for_local(pointer);
         self.push_assign(
-            pointer_place,
+            self.place_for_local(pointer),
             jil.cast_rvalue(jil.CastRvalue (
                 kind: jil.CastKind.int_to_ptr,
                 value: self.operand_for_place(state),
@@ -824,17 +899,19 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
-        return self.project_deref(pointer_place, true);
+        return .pointer(pointer);
     }
 
     public Void resume_suspend_record(
         Self&! self,
         sem.NodeId value_id,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
-        jil.Place phase = self.project_constant_index(record, layout.phase_field_index);
+        jil.Place phase = self.project_constant_index(
+            self.suspend_record_place(record_pointer), layout.phase_field_index
+        );
         jil.LocalId observed = self.add_temp(self.jil_place_type(phase), span);
         jil.LocalId claimed = self.add_temp(self.lowerer.store.types.bool_type(), span);
         jil.LocalId schedule = self.add_temp(self.lowerer.store.types.bool_type(), span);
@@ -903,35 +980,52 @@ public extend body_context.BodyLowerer {
             else_target: inspect
         )), span);
         self.start_block(publish);
-        self.clear_suspend_cancel_handler(record, layout, span);
-        jil.Place result_pointer = self.project_constant_index(record, layout.result_field_index);
-        self.lower_into_place(value_id, self.project_deref(result_pointer, true));
-        self.push_atomic_store(phase, self.int_operand(suspend_resumed, span), span);
+        self.clear_suspend_cancel_handler(record_pointer, layout, span);
+        self.lower_into_place(
+            value_id,
+            self.project_deref(
+                self.project_constant_index(
+                    self.suspend_record_place(record_pointer), layout.result_field_index
+                ),
+                true
+            )
+        );
+        self.push_atomic_store(
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.phase_field_index
+            ),
+            self.int_operand(suspend_resumed, span),
+            span
+        );
         self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
             condition: self.operand_for_place(self.place_for_local(schedule)),
             then_target: enqueue,
             else_target: complete
         )), span);
         self.start_block(enqueue);
-        self.call_suspend_resume(record, layout, complete, false, span);
+        self.call_suspend_resume(record_pointer, layout, complete, false, span);
         self.start_block(complete);
     }
 
     public Void clear_suspend_cancel_handler(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         token.Span span
     ) {
         jil.Place word = self.project_deref(
-            self.project_constant_index(record, layout.cancel_word_pointer_field_index), true
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer),
+                layout.cancel_word_pointer_field_index
+            ),
+            true
         );
         jil.LocalId claimed = self.add_temp(self.lowerer.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(claimed),
             jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
                 place: word,
-                expected: self.suspend_cancel_target_word(record, layout, span),
+                expected: self.suspend_cancel_target_word(record_pointer, layout, span),
                 desired: jil.const_operand_value(self.int_const(0, span)),
                 mode: .coroutine_atomic
             )),
@@ -945,26 +1039,30 @@ public extend body_context.BodyLowerer {
             else_target: complete
         )), span);
         self.start_block(drop);
-        self.call_suspend_handler_drop(record, layout, complete, span);
+        self.call_suspend_handler_drop(record_pointer, layout, complete, span);
         self.start_block(complete);
-        self.clear_suspend_registration_target(record, layout, span);
+        self.clear_suspend_registration_target(record_pointer, layout, span);
     }
 
     public Void call_suspend_handler_drop(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         jil.BlockId complete,
         token.Span span
     ) {
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
         args.add(self.operand_for_place(
-            self.project_constant_index(record, layout.handler_context_field_index)
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.handler_context_field_index
+            )
         ));
         jil.LocalId result = self.add_temp(self.lowerer.store.types.unit_type(), span);
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: jil.indirect_operand_callee(self.operand_for_place(
-                self.project_constant_index(record, layout.handler_drop_field_index)
+                self.project_constant_index(
+                    self.suspend_record_place(record_pointer), layout.handler_drop_field_index
+                )
             )),
             args: self.lowerer.storage.operand_array(args$.ref()),
             current_effects: self.current_effects,
@@ -979,7 +1077,7 @@ public extend body_context.BodyLowerer {
 
     public Void call_suspend_resume(
         Self&! self,
-        jil.Place record,
+        SuspendRecordLocation record_pointer,
         jil.SuspendContinuationLayout layout,
         jil.BlockId complete,
         Bool handoff,
@@ -987,14 +1085,22 @@ public extend body_context.BodyLowerer {
     ) {
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
         args.add(self.operand_for_place(
-            self.project_constant_index(record, layout.context_field_index)
+            self.project_constant_index(
+                self.suspend_record_place(record_pointer), layout.context_field_index
+            )
         ));
         jil.LocalId result = self.add_temp(self.lowerer.store.types.unit_type(), span);
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: jil.dynamic_task_enqueue_callee(
-                self.operand_for_place(self.project_constant_index(record, layout.executor_field_index)),
-                self.operand_for_place(self.project_constant_index(record, layout.task_field_index)),
-                self.operand_for_place(self.project_constant_index(record, layout.resume_field_index)),
+                self.operand_for_place(self.project_constant_index(
+                    self.suspend_record_place(record_pointer), layout.executor_field_index
+                )),
+                self.operand_for_place(self.project_constant_index(
+                    self.suspend_record_place(record_pointer), layout.task_field_index
+                )),
+                self.operand_for_place(self.project_constant_index(
+                    self.suspend_record_place(record_pointer), layout.resume_field_index
+                )),
                 handoff
             ),
             args: self.lowerer.storage.operand_array(args$.ref()),
@@ -1394,12 +1500,14 @@ public extend body_context.BodyLowerer {
         token.Span span
     ) {
         jil.TaskStateLayout state = self.current_task_state_layout();
-        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.LocalId pointer = self.current_task_cancellation_state_pointer(state, span);
         jil.BlockId exchange = self.reserve_block(span);
         jil.BlockId complete = self.reserve_block(span);
-        self.branch_on_non_null_pointer(pointer, exchange, complete, span);
+        self.branch_on_non_null_pointer(
+            self.place_for_local(pointer), exchange, complete, span
+        );
         self.start_block(exchange);
-        jil.Place task = self.project_deref(pointer, true);
+        jil.Place task = self.project_deref(self.place_for_local(pointer), true);
         jil.Place target = coroutine_task_abi.task_state_field_place(
             self.lowerer.storage, task, state.cancel_target_word
         );
@@ -1424,13 +1532,15 @@ public extend body_context.BodyLowerer {
         token.Span span
     ) {
         jil.TaskStateLayout state = self.current_task_state_layout();
-        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.LocalId pointer = self.current_task_cancellation_state_pointer(state, span);
         jil.BlockId exchange = self.reserve_block(span);
         jil.BlockId initialized = self.reserve_block(span);
         jil.BlockId complete = self.reserve_block(span);
-        self.branch_on_non_null_pointer(pointer, exchange, initialized, span);
+        self.branch_on_non_null_pointer(
+            self.place_for_local(pointer), exchange, initialized, span
+        );
         self.start_block(exchange);
-        jil.Place task = self.project_deref(pointer, true);
+        jil.Place task = self.project_deref(self.place_for_local(pointer), true);
         jil.Place target = coroutine_task_abi.task_state_field_place(
             self.lowerer.storage, task, state.cancel_target_word
         );
