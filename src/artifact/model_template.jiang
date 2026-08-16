@@ -6,11 +6,17 @@
 
 import context = "../context.jiang";
 import sem = "../sema/model.jiang";
+import sem_store = "../sema/model/store.jiang";
 import store_api = "../store.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
+import incremental_store = "../incremental/symbol_store.jiang";
 import def = "../resolve/def.jiang";
+import interner = "../resolve/interner.jiang";
+import source_map = "../source/source_map.jiang";
+import arena = "../support/arena.jiang";
 import list = "../support/list.jiang";
+import map = "../support/map.jiang";
 import memory = "../support/memory.jiang";
 import token = "../syntax/token.jiang";
 
@@ -147,7 +153,7 @@ public TemplateDecodeResult decode_body_result(
     reader.read_locals(body$.mut_ref());
     reader.read_nodes();
     if (!reader.ok) { return reader.decode_result(); }
-    store.model.load_body(owner_def, body);
+    reader.load_body(body);
     return reader.decode_result();
 }
 
@@ -176,13 +182,23 @@ struct TemplateLocal: Copyable {
     sem.NodeId? type_ref;
 }
 
-@region(a, b)
+@region(a, b, c, d, e, f, g)
 struct TemplateReader: Movable {
     @life(a)
-    store_api.CompilerStore&! store;
+    def.DefStore&! defs;
+    @life(b)
+    source_map.SourceMap&! source_map;
+    @life(c)
+    interner.SymbolStore&! symbols;
+    @life(d)
+    arena.Arena& model_storage;
+    @life(e)
+    map.WyHashMap<qid.DefId, sem.Def>&! model_defs;
+    @life(f)
+    incremental_store.IncrementalSymbolStore& incremental;
     qid.DefId owner_def;
 
-    @life(b)
+    @life(g)
     UInt8[]& bytes;
     Int offset!;
     Int node_base!;
@@ -190,7 +206,12 @@ struct TemplateReader: Movable {
     qkey.StableSymbolId? missing_stable_id!;
 
     init(self, store_api.CompilerStore&! store, qid.DefId owner_def, UInt8[]& bytes) {
-        self.store = store;
+        self.defs = store.defs$.mut_ref();
+        self.source_map = store.source_map$.mut_ref();
+        self.symbols = store.symbols$.mut_ref();
+        self.model_storage = store.model.storage$.ref();
+        self.model_defs = store.model.defs$.mut_ref();
+        self.incremental = store.incremental$.ref();
         self.owner_def = owner_def;
         self.bytes = bytes;
         self.offset = 0;
@@ -201,6 +222,10 @@ struct TemplateReader: Movable {
 
     TemplateDecodeResult decode_result(self) {
         return TemplateDecodeResult(ok: self.ok, missing_stable_id: self.missing_stable_id);
+    }
+
+    Void load_body(Self&! self, sem.Body body) {
+        sem_store.load_body_into_defs(self.model_defs, self.owner_def, body);
     }
 
     Bool read_header(Self&! self) {
@@ -264,9 +289,9 @@ struct TemplateReader: Movable {
     }
 
     qid.DefId create_local_def(Self&! self, qid.SymbolId symbol) {
-        def.DefRecord owner = self.store.defs.get(self.owner_def);
+        def.DefRecord owner = self.defs.get(self.owner_def);
         token.Span span = token.Span();
-        qid.DefId def_id = self.store.defs.create(
+        qid.DefId def_id = self.defs.create(
             .local_def,
             .value_name,
             .private_visibility,
@@ -276,7 +301,7 @@ struct TemplateReader: Movable {
             owner.decl_namespace_id,
             null
         );
-        self.store.source_map.set_sourceless_def_span(def_id, span);
+        self.source_map.set_sourceless_def_span(def_id, span);
         return def_id;
     }
 
@@ -290,7 +315,9 @@ struct TemplateReader: Movable {
                 self.ok = false;
                 return;
             }
-            sem.NodeId inserted = self.store.model.add_node(self.owner_def, data);
+            sem.NodeId inserted = sem_store.add_node_to_defs(
+                self.model_defs, self.owner_def, data
+            );
             if (inserted != node_id) {
                 self.ok = false;
                 return;
@@ -385,9 +412,20 @@ struct TemplateReader: Movable {
             return .effect_type_ref(self.read_effect_type_ref());
         }
         if (tag == .tuple_type_ref) {
+            list.ArrayList<sem.NodeId> items = self.read_model_id_list();
+            Bool has_contract_names = self.read_bool();
+            list.ArrayList<qid.SymbolId> contract_names! =
+                list.ArrayList<qid.SymbolId>();
+            if (has_contract_names) {
+                contract_names = self.read_symbol_list();
+            }
+            qid.SymbolId[]&? frozen_contract_names! = null;
+            if (has_contract_names) {
+                frozen_contract_names = self.freeze_symbols(contract_names);
+            }
             sem.TupleTypeRef tuple_type_ref = sem.TupleTypeRef (
-                items: self.read_model_id_array(),
-                contract_names: self.read_optional_symbol_array()
+                items: self.freeze_model_ids(items),
+                contract_names: frozen_contract_names
             );
             return .tuple_type_ref(tuple_type_ref);
         }
@@ -401,9 +439,13 @@ struct TemplateReader: Movable {
 
     sem.Block read_block(Self&! self) {
         sem.EffectSet effects = self.read_effect_set();
-        sem.NodeId[]& statements = self.read_model_id_array();
+        list.ArrayList<sem.NodeId> statements = self.read_model_id_list();
         sem.NodeId? result = self.read_optional_model_id();
-        return sem.Block (effects: effects, statements: statements, result: result);
+        return sem.Block (
+            effects: effects,
+            statements: self.freeze_model_ids(statements),
+            result: result
+        );
     }
 
     sem.NameRef read_name_ref(Self&! self) {
@@ -445,31 +487,34 @@ struct TemplateReader: Movable {
     }
 
     sem.InlineAsm read_inline_asm(Self&! self) {
+        sem.NodeId result_type = self.read_model_id();
+        qid.SymbolId code_symbol = self.read_symbol();
+        list.ArrayList<sem.InlineAsmOperand> operands = self.read_inline_asm_operand_list();
+        list.ArrayList<qid.SymbolId> clobbers = self.read_symbol_list();
+        Bool volatile = self.read_bool();
+        Bool memory = self.read_bool();
+        Bool noreturn = self.read_bool();
         return sem.InlineAsm (
-            result_type: self.read_model_id(),
-            code_symbol: self.read_symbol(),
-            operands: self.read_inline_asm_operands(),
-            clobbers: self.read_symbol_array(),
-            volatile: self.read_bool(),
-            memory: self.read_bool(),
-            noreturn: self.read_bool()
+            result_type: result_type,
+            code_symbol: code_symbol,
+            operands: self.freeze_inline_asm_operands(operands),
+            clobbers: self.freeze_symbols(clobbers),
+            volatile: volatile,
+            memory: memory,
+            noreturn: noreturn
         );
     }
 
-    sem.InlineAsmOperand[]& read_inline_asm_operands(Self&! self) {
-        unsafe {
-            Int count = self.read_int();
-            Int capacity = max_one(count);
-            sem.InlineAsmOperand*! stored = self.store.model.storage.alloc_array<sem.InlineAsmOperand>(
-                capacity
-            );
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = self.read_inline_asm_operand();
-                index = index + 1;
-            }
-            return stored[0..count];
+    list.ArrayList<sem.InlineAsmOperand> read_inline_asm_operand_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<sem.InlineAsmOperand> values! =
+            list.ArrayList<sem.InlineAsmOperand>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(self.read_inline_asm_operand());
+            index = index + 1;
         }
+        return values;
     }
 
     sem.InlineAsmOperand read_inline_asm_operand(Self&! self) {
@@ -498,24 +543,29 @@ struct TemplateReader: Movable {
 
     sem.Call read_call(Self&! self) {
         sem.NodeId callee = self.read_model_id();
-        sem.NodeId[]& type_args = self.read_model_id_array();
-        sem.CallArg[]& args = self.read_call_args();
+        list.ArrayList<sem.NodeId> type_args = self.read_model_id_list();
+        list.ArrayList<sem.CallArg> args = self.read_call_arg_list();
         sem.CallTarget? target! = null;
         if (self.read_bool()) {
             target = sem.CallTarget (def_id: self.read_def(), signature_id: null);
         }
-        return sem.Call (callee: callee, type_args: type_args, args: args, target: target);
+        return sem.Call (
+            callee: callee,
+            type_args: self.freeze_model_ids(type_args),
+            args: self.freeze_call_args(args),
+            target: target
+        );
     }
 
     sem.ImplicitCall read_implicit_call(Self&! self) {
         sem.NodeId base = self.read_model_id();
         sem.ImplicitOp op = implicit_op_from_tag(self.read_int());
-        sem.NodeId[]& args = self.read_model_id_array();
+        list.ArrayList<sem.NodeId> args = self.read_model_id_list();
         Bool optional_chain = self.read_bool();
         return sem.ImplicitCall (
             base: base,
             op: op,
-            args: args,
+            args: self.freeze_model_ids(args),
             optional_chain: optional_chain
         );
     }
@@ -547,48 +597,47 @@ struct TemplateReader: Movable {
 
     sem.Lambda read_lambda(Self&! self) {
         Int param_count = self.read_int();
-        sem.LambdaParam[]& params = self.read_lambda_params();
-        sem.LambdaCapture[]& captures = self.read_lambda_captures();
+        list.ArrayList<sem.LambdaParam> params = self.read_lambda_param_list();
+        list.ArrayList<sem.LambdaCapture> captures = self.read_lambda_capture_list();
+        qid.DefId function_def = self.read_def();
+        sem.NodeId body = self.read_model_id();
         return sem.Lambda (
             param_count: param_count,
-            params: params,
-            captures: captures,
-            function_def: self.read_def(),
-            body: self.read_model_id()
+            params: self.freeze_lambda_params(params),
+            captures: self.freeze_lambda_captures(captures),
+            function_def: function_def,
+            body: body
         );
     }
 
-    sem.LambdaParam[]& read_lambda_params(Self&! self) {
-        unsafe {
-            Int count = self.read_int();
-            sem.LambdaParam*! stored = self.store.model.storage.alloc_array<sem.LambdaParam>(max_one(count));
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = sem.LambdaParam (
-                    index: self.read_int(),
-                    local_id: sem.LocalId.from_index(self.read_int())
-                );
-                index = index + 1;
-            }
-            return stored[0..count];
+    list.ArrayList<sem.LambdaParam> read_lambda_param_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<sem.LambdaParam> values! = list.ArrayList<sem.LambdaParam>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(sem.LambdaParam (
+                index: self.read_int(),
+                local_id: sem.LocalId.from_index(self.read_int())
+            ));
+            index = index + 1;
         }
+        return values;
     }
 
-    sem.LambdaCapture[]& read_lambda_captures(Self&! self) {
-        unsafe {
-            Int count = self.read_int();
-            sem.LambdaCapture*! stored = self.store.model.storage.alloc_array<sem.LambdaCapture>(max_one(count));
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = sem.LambdaCapture (
-                    index: self.read_int(),
-                    local_id: sem.LocalId.from_index(self.read_int()),
-                    value: self.read_model_id()
-                );
-                index = index + 1;
-            }
-            return stored[0..count];
+    list.ArrayList<sem.LambdaCapture> read_lambda_capture_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<sem.LambdaCapture> values! =
+            list.ArrayList<sem.LambdaCapture>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(sem.LambdaCapture (
+                index: self.read_int(),
+                local_id: sem.LocalId.from_index(self.read_int()),
+                value: self.read_model_id()
+            ));
+            index = index + 1;
         }
+        return values;
     }
 
     sem.Let read_let(Self&! self) {
@@ -646,24 +695,43 @@ struct TemplateReader: Movable {
     }
 
     sem.Switch read_switch(Self&! self) {
-        unsafe {
-            sem.NodeId value = self.read_model_id();
-            Int count = self.read_int();
-            Int capacity = max_one(count);
-            sem.SwitchCase*! stored = self.store.model.storage.alloc_array<sem.SwitchCase>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                sem.NodeId[]& patterns = self.read_model_id_array();
-                sem.NodeId body = self.read_model_id();
-                stored[index] = sem.SwitchCase (
-                    patterns: patterns,
-                    body: body
-                );
-                index = index + 1;
+        sem.NodeId value = self.read_model_id();
+        Int count = self.read_int();
+        list.ArrayList<Int> pattern_counts! = list.ArrayList<Int>(count);
+        list.ArrayList<sem.NodeId> patterns! = list.ArrayList<sem.NodeId>();
+        list.ArrayList<sem.NodeId> bodies! = list.ArrayList<sem.NodeId>(count);
+        Int index! = 0;
+        while (index < count) {
+            list.ArrayList<sem.NodeId> case_patterns = self.read_model_id_list();
+            pattern_counts.add(case_patterns.len());
+            Int pattern_index! = 0;
+            while (pattern_index < case_patterns.len()) {
+                patterns.add(case_patterns.get(pattern_index));
+                pattern_index = pattern_index + 1;
             }
-            sem.SwitchCase[]& cases = stored[0..count];
-            return sem.Switch (value: value, cases: cases);
+            bodies.add(self.read_model_id());
+            index = index + 1;
         }
+        list.ArrayList<sem.SwitchCase> cases! = list.ArrayList<sem.SwitchCase>(count);
+        index = 0;
+        Int pattern_offset! = 0;
+        while (index < count) {
+            Int pattern_count = pattern_counts.get(index);
+            list.ArrayList<sem.NodeId> case_patterns! =
+                list.ArrayList<sem.NodeId>(pattern_count);
+            Int pattern_index! = 0;
+            while (pattern_index < pattern_count) {
+                case_patterns.add(patterns.get(pattern_offset + pattern_index));
+                pattern_index = pattern_index + 1;
+            }
+            cases.add(sem.SwitchCase (
+                patterns: self.freeze_model_ids(case_patterns),
+                body: bodies.get(index)
+            ));
+            pattern_offset = pattern_offset + pattern_count;
+            index = index + 1;
+        }
+        return sem.Switch (value: value, cases: self.freeze_switch_cases(cases));
     }
 
     sem.Catch read_catch(Self&! self) {
@@ -695,10 +763,21 @@ struct TemplateReader: Movable {
     }
 
     sem.NamedTypeRef read_named_type_ref(Self&! self) {
+        qid.DefId def_id = self.read_def();
+        list.ArrayList<sem.NodeId> args = self.read_model_id_list();
+        Bool has_contract_names = self.read_bool();
+        list.ArrayList<qid.SymbolId> contract_names! = list.ArrayList<qid.SymbolId>();
+        if (has_contract_names) {
+            contract_names = self.read_symbol_list();
+        }
+        qid.SymbolId[]&? frozen_contract_names! = null;
+        if (has_contract_names) {
+            frozen_contract_names = self.freeze_symbols(contract_names);
+        }
         return sem.NamedTypeRef (
-            def_id: self.read_def(),
-            args: self.read_model_id_array(),
-            contract_names: self.read_optional_symbol_array()
+            def_id: def_id,
+            args: self.freeze_model_ids(args),
+            contract_names: frozen_contract_names
         );
     }
 
@@ -753,10 +832,14 @@ struct TemplateReader: Movable {
     }
 
     sem.FunctionTypeRef read_function_type_ref(Self&! self) {
-        sem.NodeId[]& params = self.read_model_id_array();
+        list.ArrayList<sem.NodeId> params = self.read_model_id_list();
         sem.NodeId result = self.read_model_id();
         sem.EffectSet effects = self.read_effect_set();
-        return sem.FunctionTypeRef (params: params, result: result, effects: effects);
+        return sem.FunctionTypeRef (
+            params: self.freeze_model_ids(params),
+            result: result,
+            effects: effects
+        );
     }
 
     sem.EffectTypeRef read_effect_type_ref(Self&! self) {
@@ -766,11 +849,165 @@ struct TemplateReader: Movable {
         );
     }
 
+    list.ArrayList<sem.NodeId> read_model_id_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(self.read_model_id());
+            index = index + 1;
+        }
+        return values;
+    }
+
+    list.ArrayList<qid.SymbolId> read_symbol_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<qid.SymbolId> values! = list.ArrayList<qid.SymbolId>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(self.read_symbol());
+            index = index + 1;
+        }
+        return values;
+    }
+
+    list.ArrayList<sem.CallArg> read_call_arg_list(Self&! self) {
+        Int count = self.read_int();
+        list.ArrayList<sem.CallArg> values! = list.ArrayList<sem.CallArg>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(sem.CallArg (
+                label: self.read_optional_symbol(),
+                value: self.read_model_id(),
+                trailing: self.read_bool()
+            ));
+            index = index + 1;
+        }
+        return values;
+    }
+
+    @life(return: self.a)
+    sem.NodeId[]& freeze_model_ids(self, list.ArrayList<sem.NodeId> values) {
+        unsafe {
+            Int count = values.len();
+            sem.NodeId*! stored =
+                self.model_storage.alloc_array<sem.NodeId>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: self.a)
+    qid.SymbolId[]& freeze_symbols(self, list.ArrayList<qid.SymbolId> values) {
+        unsafe {
+            Int count = values.len();
+            qid.SymbolId*! stored =
+                self.model_storage.alloc_array<qid.SymbolId>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: self.a)
+    sem.InlineAsmOperand[]& freeze_inline_asm_operands(
+        self,
+        list.ArrayList<sem.InlineAsmOperand> values
+    ) {
+        unsafe {
+            Int count = values.len();
+            sem.InlineAsmOperand*! stored =
+                self.model_storage.alloc_array<sem.InlineAsmOperand>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: self.a)
+    sem.CallArg[]& freeze_call_args(self, list.ArrayList<sem.CallArg> values) {
+        unsafe {
+            Int count = values.len();
+            sem.CallArg*! stored =
+                self.model_storage.alloc_array<sem.CallArg>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: self.a)
+    sem.LambdaParam[]& freeze_lambda_params(
+        self,
+        list.ArrayList<sem.LambdaParam> values
+    ) {
+        unsafe {
+            Int count = values.len();
+            sem.LambdaParam*! stored =
+                self.model_storage.alloc_array<sem.LambdaParam>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: self.a)
+    sem.LambdaCapture[]& freeze_lambda_captures(
+        self,
+        list.ArrayList<sem.LambdaCapture> values
+    ) {
+        unsafe {
+            Int count = values.len();
+            sem.LambdaCapture*! stored =
+                self.model_storage.alloc_array<sem.LambdaCapture>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: (self.a, self.a))
+    sem.SwitchCase[]& freeze_switch_cases(
+        self,
+        list.ArrayList<sem.SwitchCase> values
+    ) {
+        unsafe {
+            Int count = values.len();
+            sem.SwitchCase*! stored =
+                self.model_storage.alloc_array<sem.SwitchCase>(max_one(count));
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
     sem.NodeId[]& read_model_id_array(Self&! self) {
         unsafe {
             Int count = self.read_int();
             Int capacity = max_one(count);
-            sem.NodeId*! stored = self.store.model.storage.alloc_array<sem.NodeId>(capacity);
+            sem.NodeId*! stored = self.model_storage.alloc_array<sem.NodeId>(capacity);
             Int index! = 0;
             while (index < count) {
                 stored[index] = self.read_model_id();
@@ -780,47 +1017,10 @@ struct TemplateReader: Movable {
         }
     }
 
-    qid.SymbolId[]& read_symbol_array(Self&! self) {
-        unsafe {
-            Int count = self.read_int();
-            Int capacity = max_one(count);
-            qid.SymbolId*! stored = self.store.model.storage.alloc_array<qid.SymbolId>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = self.read_symbol();
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    qid.SymbolId[]&? read_optional_symbol_array(Self&! self) {
-        if (!self.read_bool()) { return null; }
-        return self.read_symbol_array();
-    }
-
-    sem.CallArg[]& read_call_args(Self&! self) {
-        unsafe {
-            Int count = self.read_int();
-            Int capacity = max_one(count);
-            sem.CallArg*! stored = self.store.model.storage.alloc_array<sem.CallArg>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = sem.CallArg (
-                    label: self.read_optional_symbol(),
-                    value: self.read_model_id(),
-                    trailing: self.read_bool()
-                );
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
     sem.FieldInit[]& read_field_inits(Self&! self, Int count) {
         unsafe {
             Int capacity = max_one(count);
-            sem.FieldInit*! stored = self.store.model.storage.alloc_array<sem.FieldInit>(capacity);
+            sem.FieldInit*! stored = self.model_storage.alloc_array<sem.FieldInit>(capacity);
             Int index! = 0;
             while (index < count) {
                 stored[index] = sem.FieldInit (
@@ -855,7 +1055,7 @@ struct TemplateReader: Movable {
     qid.DefId read_def(Self&! self) {
         if (self.read_bool()) {
             qkey.StableSymbolId stable_id = qkey.StableSymbolId(self.read_u64(), self.read_u64());
-            if (self.store.incremental.current_def_for_stable(stable_id) is .some(def_id)) {
+            if (self.incremental.current_def_for_stable(stable_id) is .some(def_id)) {
                 return def_id;
             }
             self.missing_stable_id = stable_id;
@@ -876,7 +1076,7 @@ struct TemplateReader: Movable {
             }
             buffer[length] = 0;
             UInt8* frozen = buffer$.as(UInt8*);
-            return self.store.symbols.intern(frozen[0..length]);
+            return self.symbols.intern(frozen[0..length]);
         }
     }
 
