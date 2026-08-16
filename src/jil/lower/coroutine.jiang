@@ -11,6 +11,7 @@ import store = "../../resolve/store.jiang";
 import source = "../../source.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
 import types = "../../sema/type.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
@@ -54,19 +55,23 @@ public extend lower_context.Context {
     public Void prepare_coroutine_plans(Self&! self) {
         list.ArrayList<jil.FunctionId> worklist! =
             list.ArrayList<jil.FunctionId>();
+        list.ArrayList<jil.FunctionId> confined! = list.ArrayList<jil.FunctionId>();
+        list.ArrayList<jil.FunctionId> rtc! = list.ArrayList<jil.FunctionId>();
         Int function_count = self.program.functions.len();
         Int index! = 0;
         while (index < function_count) {
             jil.Function function = self.program.functions.get(index);
-            self.collect_confined_task_roots(function, worklist$.mut_ref());
-            self.collect_direct_rtc_children(function, worklist$.mut_ref());
+            self.collect_confined_task_roots(function, confined$.mut_ref());
+            self.collect_direct_rtc_children(function, confined$.mut_ref(), rtc$.mut_ref());
             index = index + 1;
         }
+        self.publish_confined_candidates(confined$.mut_ref(), worklist$.mut_ref());
+        self.publish_rtc_candidates(rtc$.mut_ref());
         index = 0;
         while (index < worklist.len()) {
-            self.collect_confined_children(
-                self.program.function(worklist.get(index)), worklist$.mut_ref()
-            );
+            confined.clear();
+            self.collect_confined_children(self.program.function(worklist.get(index)), confined$.mut_ref());
+            self.publish_confined_candidates(confined$.mut_ref(), worklist$.mut_ref());
             index = index + 1;
         }
         self.prepare_rtc_resume_shims(worklist$.ref());
@@ -75,22 +80,24 @@ public extend lower_context.Context {
     public Void collect_direct_rtc_children(
         Self&! self,
         jil.Function function,
-        list.ArrayList<jil.FunctionId>&! worklist
+        list.ArrayList<jil.FunctionId>&! confined,
+        list.ArrayList<jil.FunctionId>&! rtc
     ) {
         Int block_index! = 0;
         while (block_index < function.body.blocks.length) {
             jil.Terminator terminator = function.body.blocks[block_index].terminator;
             if (terminator.kind is .call_term(call)) {
-                self.create_direct_rtc_resume_shim(call, worklist);
+                self.collect_direct_rtc_candidates(call, confined, rtc);
             }
             block_index = block_index + 1;
         }
     }
 
-    public Void create_direct_rtc_resume_shim(
-        Self&! self,
+    public Void collect_direct_rtc_candidates(
+        self,
         jil.CallTerminator call,
-        list.ArrayList<jil.FunctionId>&! worklist
+        list.ArrayList<jil.FunctionId>&! confined,
+        list.ArrayList<jil.FunctionId>&! rtc
     ) {
         if (call.suspend_wake != .direct_child) { return; }
         guard coroutine_rtc.eligible_child(
@@ -100,9 +107,9 @@ public extend lower_context.Context {
         jil.Function function = self.program.function(function_id);
         if (!self.direct_rtc_binding_is_satisfied(call, function)) { return; }
         if (coroutine_rtc.body_has_cross_executor_child(function.body)) {
-            self.demand_confined_variant(child, worklist);
+            confined.add(function_id);
         }
-        self.create_rtc_resume_shim(child);
+        rtc.add(function_id);
     }
 
     public Bool direct_rtc_binding_is_satisfied(
@@ -138,7 +145,7 @@ public extend lower_context.Context {
         }
         guard source.coroutine_frame is .some(frame) else { return; }
         Bool has_direct_child = coroutine_rtc.body_has_direct_rtc_child(
-            source.body, self.coroutine_plans$.ref()
+            self.program, source.body, self.coroutine_plans$.ref()
         );
         if (!has_direct_child) {
             jil.Function selected = coroutine_local_variant.select_task_roots(
@@ -192,17 +199,23 @@ public extend lower_context.Context {
         Self&! self,
         list.ArrayList<jil.FunctionId>& confined
     ) {
+        list.ArrayList<jil.FunctionId> candidates! = list.ArrayList<jil.FunctionId>();
         Int function_index! = 0;
         while (function_index < confined.len()) {
             jil.Function function = self.program.function(
                 confined.get(function_index)
             );
-            self.collect_rtc_children(function);
+            self.collect_rtc_children(function, candidates$.mut_ref());
             function_index = function_index + 1;
         }
+        self.publish_rtc_candidates(candidates$.mut_ref());
     }
 
-    public Void collect_rtc_children(Self&! self, jil.Function function) {
+    public Void collect_rtc_children(
+        self,
+        jil.Function function,
+        list.ArrayList<jil.FunctionId>&! candidates
+    ) {
         Int block_index! = 0;
         while (block_index < function.body.blocks.length) {
             jil.Terminator terminator = function.body.blocks[block_index].terminator;
@@ -211,82 +224,113 @@ public extend lower_context.Context {
                         self.program, self.storage, self.rtc_eligible$.ref(), call
                     ) is .some(child)
                 ) {
-                    self.create_rtc_resume_shim(child);
+                    if (self.program.function_id_for_ref(child) is .some(function_id)) {
+                        candidates.add(function_id);
+                    }
                 }
             }
             block_index = block_index + 1;
         }
     }
 
-    public Void create_rtc_resume_shim(Self&! self, jil.FunctionRef child) {
-        jil.FunctionKey key = jil.FunctionKey(
-            jil.function_target_provenance_def(child.target), child.type_args, child.const_args
-        );
-        if (self.coroutine_plans.get(key).rtc_resume != null) { return; }
+    public Void publish_rtc_candidates(
+        Self&! self,
+        list.ArrayList<jil.FunctionId>&! candidates
+    ) {
+        Int index! = 0;
+        while (index < candidates.len()) {
+            self.create_rtc_resume_shim(candidates.get(index));
+            index = index + 1;
+        }
+    }
+
+    public Void create_rtc_resume_shim(Self&! self, jil.FunctionId function_id) {
+        if (self.coroutine_plans.get(function_id).rtc_resume != null) { return; }
+        jil.Function child = self.program.function(function_id);
+        qid.DefId child_def = jil.function_provenance_def(child.origin);
+        token.Span child_span = child.span;
+        list.ArrayList<qid.TypeId> type_args! = self.owned_type_args(child.type_args);
+        list.ArrayList<comptime_value.ComptimeValue> const_args! =
+            self.owned_const_args(child.const_args);
         jil.GeneratedFunctionOrigin origin = self.coroutine_variant_origin(
-            jil.function_target_provenance_def(child.target),
+            child_def,
             "__rtc_resume_",
             .coroutine_resume_rtc,
-            child.span
+            child_span
         );
         jil.FunctionId resume_id = self.program.reserve_generated_function(
             self.storage,
-            origin, child.type_args, child.const_args, child.span
+            origin, type_args.slice(), const_args.slice(), child_span
         );
-        self.coroutine_plans.set_rtc_resume(key, resume_id);
+        self.coroutine_plans.set_rtc_resume(function_id, resume_id);
     }
 
     public Void collect_confined_task_roots(
-        Self&! self,
+        self,
         jil.Function function,
-        list.ArrayList<jil.FunctionId>&! worklist
+        list.ArrayList<jil.FunctionId>&! candidates
     ) {
         guard function.coroutine_frame is .some(frame) else { return; }
         Int index! = 0;
         while (index < frame.task_regions.length) {
             jil.TaskRegion region = frame.task_regions[index];
             if (region.storage.sync == .local_serial) {
-                self.demand_confined_variant(region.child_resume, worklist);
+                self.collect_confined_candidate(region.child_resume, candidates);
             }
             index = index + 1;
         }
     }
 
     public Void collect_confined_children(
-        Self&! self,
+        self,
         jil.Function function,
-        list.ArrayList<jil.FunctionId>&! worklist
+        list.ArrayList<jil.FunctionId>&! candidates
     ) {
-        self.collect_confined_task_roots(function, worklist);
+        self.collect_confined_task_roots(function, candidates);
         Int index! = 0;
         while (index < function.body.blocks.length) {
             jil.Terminator terminator = function.body.blocks[index].terminator;
             if (terminator.kind is .call_term(call)) {
                 if (!async_start_is_detached(call.async_start)) {
-                    self.demand_confined_variant(call.suspend_child, worklist);
+                    self.collect_confined_candidate(call.suspend_child, candidates);
                 }
             }
             index = index + 1;
         }
     }
 
-    public Void demand_confined_variant(
-        Self&! self,
+    public Void collect_confined_candidate(
+        self,
         jil.FunctionRef? candidate,
-        list.ArrayList<jil.FunctionId>&! worklist
+        list.ArrayList<jil.FunctionId>&! candidates
     ) {
         guard candidate is .some(function_ref) else { return; }
         if (!function_ref.coroutine_resume) { return; }
-        jil.FunctionKey key = jil.FunctionKey(
-            jil.function_target_provenance_def(function_ref.target),
-            function_ref.type_args,
-            function_ref.const_args
-        );
-        if (self.coroutine_plans.get(key).confined_resume != null) { return; }
         guard self.confined_source_function_id(function_ref) is .some(function_id) else { return; }
+        candidates.add(function_id);
+    }
+
+    public Void publish_confined_candidates(
+        Self&! self,
+        list.ArrayList<jil.FunctionId>&! candidates,
+        list.ArrayList<jil.FunctionId>&! worklist
+    ) {
+        Int index! = 0;
+        while (index < candidates.len()) {
+            self.demand_confined_variant(candidates.get(index), worklist);
+            index = index + 1;
+        }
+    }
+
+    public Void demand_confined_variant(
+        Self&! self,
+        jil.FunctionId function_id,
+        list.ArrayList<jil.FunctionId>&! worklist
+    ) {
+        if (self.coroutine_plans.get(function_id).confined_resume != null) { return; }
         jil.Function function = self.program.function(function_id);
         if (!self.function_has_confined_variant(function)) { return; }
-        self.create_confined_coroutine_shims(function);
+        self.create_confined_coroutine_shims(function_id);
         worklist.add(function_id);
     }
 
@@ -303,21 +347,48 @@ public extend lower_context.Context {
         return !self.async_lambda_function_is_detached(jil.function_provenance_def(function.origin));
     }
 
-    public Void create_confined_coroutine_shims(Self&! self, jil.Function function) {
-        jil.FunctionKey key = jil.FunctionKey(
-            jil.function_provenance_def(function.origin), function.type_args, function.const_args
-        );
+    public Void create_confined_coroutine_shims(Self&! self, jil.FunctionId function_id) {
+        jil.Function function = self.program.function(function_id);
+        qid.DefId function_def = jil.function_provenance_def(function.origin);
+        token.Span function_span = function.span;
+        list.ArrayList<qid.TypeId> type_args! = self.owned_type_args(function.type_args);
+        list.ArrayList<comptime_value.ComptimeValue> const_args! =
+            self.owned_const_args(function.const_args);
         jil.GeneratedFunctionOrigin origin = self.coroutine_variant_origin(
-            jil.function_provenance_def(function.origin),
+            function_def,
             "__confined_resume_",
             .coroutine_resume_confined,
-            function.span
+            function_span
         );
         jil.FunctionId resume_id = self.program.reserve_generated_function(
             self.storage,
-            origin, function.type_args, function.const_args, function.span
+            origin, type_args.slice(), const_args.slice(), function_span
         );
-        self.coroutine_plans.set_confined_resume(key, resume_id);
+        self.coroutine_plans.set_confined_resume(function_id, resume_id);
+    }
+
+    list.ArrayList<qid.TypeId> owned_type_args(self, qid.TypeId[]& source) {
+        list.ArrayList<qid.TypeId> result! = list.ArrayList<qid.TypeId>(source.length);
+        Int index! = 0;
+        while (index < source.length) {
+            result.add(source[index]);
+            index = index + 1;
+        }
+        return result;
+    }
+
+    list.ArrayList<comptime_value.ComptimeValue> owned_const_args(
+        self,
+        comptime_value.ComptimeValue[]& source
+    ) {
+        list.ArrayList<comptime_value.ComptimeValue> result! =
+            list.ArrayList<comptime_value.ComptimeValue>(source.length);
+        Int index! = 0;
+        while (index < source.length) {
+            result.add(source[index]);
+            index = index + 1;
+        }
+        return result;
     }
 
     public jil.GeneratedFunctionOrigin coroutine_variant_origin(
@@ -401,10 +472,7 @@ public extend lower_context.Context {
         jil.CoroutineFrameLayout& layout,
         coroutine_frame_rewrite.ResumeFunctionLowering resume
     ) {
-        jil.FunctionKey key = jil.FunctionKey(
-            jil.function_provenance_def(source.origin), source.type_args, source.const_args
-        );
-        guard self.coroutine_plans.get(key).confined_resume is .some(resume_id) else {
+        guard self.coroutine_plans.get(source.id).confined_resume is .some(resume_id) else {
             return;
         }
         coroutine_frame_rewrite.ResumeFunctionLowering variant_resume! = resume;
@@ -444,10 +512,7 @@ public extend lower_context.Context {
         jil.Function source,
         jil.CoroutineFrameLayout& layout
     ) {
-        jil.FunctionKey key = jil.FunctionKey(
-            jil.function_provenance_def(source.origin), source.type_args, source.const_args
-        );
-        guard self.coroutine_plans.get(key).rtc_resume is .some(resume_id) else {
+        guard self.coroutine_plans.get(source.id).rtc_resume is .some(resume_id) else {
             return;
         }
         jil.Function optimized = self.coroutine_source_with_rtc_calls(
