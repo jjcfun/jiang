@@ -44,15 +44,23 @@ public extend body_context.BodyLowerer {
             self.mark_unsupported(node_id);
             return;
         }
-        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
-        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
-        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+        FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
+        guard self.async_call_target_function(
+            target_def, function_args.type_args, function_args.const_args
+        ) is .some(function) else {
             self.mark_unsupported(node_id);
             return;
         }
         if (function.is_external) {
             self.lower_external_async_task(
-                node_id, call, target_def, type_args, const_args, layout$.ref(), destination, span
+                node_id,
+                call,
+                target_def,
+                function_args.type_args,
+                function_args.const_args,
+                layout$.ref(),
+                destination,
+                span
             );
             return;
         }
@@ -220,27 +228,30 @@ public extend body_context.BodyLowerer {
         jil.LocalId pointer_local = self.add_temp(
             continuation_layout.pointer_type_id, span
         );
-        jil.Place pointer_place = self.place_for_local(pointer_local);
         self.push_assign(
-            pointer_place,
+            self.place_for_local(pointer_local),
             jil.alloc_box_rvalue(jil.AllocBoxRvalue (
                 value_type: continuation_layout.type_id
             )),
             span
         );
-        jil.Place frame = coroutine_task_abi.task_field_place(
-            self.lowerer.storage, task_place, layout.task_abi.frame_field
+        qid.TypeId frame_type = self.jil_place_type(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, layout.task_abi.frame_field
+            )
         );
         self.push_assign(
-            frame,
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, layout.task_abi.frame_field
+            ),
             jil.cast_rvalue(jil.CastRvalue (
                 kind: jil.CastKind.ptr_to_ptr,
-                value: self.operand_for_place(pointer_place),
-                target_type: self.jil_place_type(frame)
+                value: self.operand_for_place(self.place_for_local(pointer_local)),
+                target_type: frame_type
             )),
             span
         );
-        return self.project_deref(pointer_place, true);
+        return self.project_deref(self.place_for_local(pointer_local), true);
     }
 
     public Void initialize_external_task_continuation(
@@ -385,12 +396,11 @@ public extend body_context.BodyLowerer {
         jil.TaskSyncMode sync
     ) {
         guard self.async_call_target_def(call) is .some(target_def) else { return null; }
-        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
-        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
         return self.task_completion_function_ref(
             target_def,
-            type_args,
-            const_args,
+            function_args.type_args,
+            function_args.const_args,
             layout,
             sync,
             self.lowerer.model_span(node_id)
@@ -406,12 +416,11 @@ public extend body_context.BodyLowerer {
         guard self.async_call_target_def(call) is .some(target_def) else {
             return null;
         }
-        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
-        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
         return jil.FunctionRef (
             target: .source(target_def),
-            type_args: self.lowerer.storage.type_arg_array(type_args),
-            const_args: self.lowerer.storage.const_arg_array(const_args),
+            type_args: self.lowerer.storage.type_arg_array(function_args.type_args),
+            const_args: self.lowerer.storage.const_arg_array(function_args.const_args),
             coroutine_resume: true,
             coroutine_completion: false,
             type_id: layout.task_abi.resume_function_type_id,
@@ -428,10 +437,10 @@ public extend body_context.BodyLowerer {
         jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
         if (self.task_place_requires_stable_address(task_place)) {
             if (self.task_owner_pointer_place(task_place) is .some(owner)) {
-                task_root = self.stable_owned_task_root(owner, task_local, storage, span);
+                task_root = self.stable_owned_task_root(owner, span);
                 task_place = self.project_deref(task_root, false);
             } else {
-                task_place = self.stable_task_place(task_place, storage, span);
+                task_place = self.stable_task_place(task_place, span);
             }
         }
         self.statements.add(jil.Statement (
@@ -444,14 +453,18 @@ public extend body_context.BodyLowerer {
                 repeatable: self.loop_targets.len() > 0
             ))
         ));
-        self.lower_await_task_ready(task_place, span);
-        self.branch_await_task_result(task_place, task_root, task_state, span);
+        self.lower_await_task_ready(task_place, storage, span);
+        self.branch_await_task_result(
+            task_place, task_root, task_state, task_local, storage, span
+        );
         self.push_assign(destination, jil.use_rvalue(jil.UseRvalue (
             value: self.operand_for_place(coroutine_task_abi.task_field_place(
                 self.lowerer.storage, task_place, task_state.result
             ))
         )), span);
-        self.release_consumed_task(task_place, task_root, true, span);
+        self.release_consumed_task(
+            task_place, task_root, task_local, storage, true, span
+        );
     }
 
     // await may resume in a later invocation. Preserve the resolved Task address instead of
@@ -459,10 +472,8 @@ public extend body_context.BodyLowerer {
     public jil.Place stable_task_place(
         Self&! self,
         jil.Place task_place,
-        jil.TaskStoragePlan storage,
         token.Span span
     ) {
-        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
         qid.TypeId pointer_type = self.raw_pointer_type(self.jil_place_type(task_place), span);
         jil.LocalId pointer = self.add_temp(pointer_type, span);
         self.push_assign(
@@ -473,23 +484,17 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
-        jil.Place stable = self.project_deref(self.place_for_local(pointer), true);
-        self.bind_task_place_identity(stable, task_local);
-        self.set_task_storage_plan(task_local, storage);
-        return stable;
+        return self.project_deref(self.place_for_local(pointer), true);
     }
 
     public jil.Place stable_owned_task_root(
         Self&! self,
         jil.Place owner,
-        jil.LocalId task_local,
-        jil.TaskStoragePlan storage,
         token.Span span
     ) {
         jil.LocalId pointer = self.add_temp(self.jil_place_type(owner), span);
-        jil.Place pointer_place = self.place_for_local(pointer);
         self.push_assign(
-            pointer_place,
+            self.place_for_local(pointer),
             jil.use_rvalue(jil.UseRvalue (
                 value: jil.move_operand_value(jil.MoveOperand (place: owner))
             )),
@@ -502,10 +507,7 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
-        jil.Place stable = self.project_deref(pointer_place, false);
-        self.bind_task_place_identity(stable, task_local);
-        self.set_task_storage_plan(task_local, storage);
-        return pointer_place;
+        return self.place_for_local(pointer);
     }
 
     public jil.Place? task_owner_pointer_place(self, jil.Place task_place) {
@@ -538,21 +540,29 @@ public extend body_context.BodyLowerer {
         jil.Place task_place,
         jil.Place task_root,
         jil.TaskStateLayout task_state,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
         token.Span span
     ) {
-        jil.Place state_place = coroutine_task_abi.task_field_place(
-            self.lowerer.storage, task_place, task_state.state
+        qid.TypeId state_type = self.jil_place_type(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, task_state.state
+            )
         );
+        jil.LocalId state_local = self.add_temp(state_type, span);
         jil.Rvalue state_value! = jil.use_rvalue(jil.UseRvalue(
-            value: self.operand_for_place(state_place)
+            value: self.operand_for_place(coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, task_state.state
+            ))
         ));
-        if (self.task_storage_plan(task_place).sync == .concurrent) {
+        if (storage.sync == .concurrent) {
             state_value = jil.atomic_load_rvalue(jil.AtomicLoadRvalue(
-                place: state_place,
+                place: coroutine_task_abi.task_field_place(
+                    self.lowerer.storage, task_place, task_state.state
+                ),
                 mode: .coroutine_atomic
             ));
         }
-        jil.LocalId state_local = self.add_temp(self.jil_place_type(state_place), span);
         self.push_assign(self.place_for_local(state_local), state_value, span);
         jil.BlockId cancelled_block = self.reserve_block(span);
         jil.BlockId result_block = self.reserve_block(span);
@@ -564,7 +574,9 @@ public extend body_context.BodyLowerer {
             default_target: result_block
         )), span);
         self.start_block(cancelled_block);
-        self.release_consumed_task(task_place, task_root, false, span);
+        self.release_consumed_task(
+            task_place, task_root, task_local, storage, false, span
+        );
         self.finish_block(self.goto_terminator(self.cancellation_entry), span);
         self.start_block(result_block);
     }
@@ -586,10 +598,10 @@ public extend body_context.BodyLowerer {
         jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
         if (self.task_place_requires_stable_address(task_place)) {
             if (self.task_owner_pointer_place(task_place) is .some(owner)) {
-                task_root = self.stable_owned_task_root(owner, task_local, storage, span);
+                task_root = self.stable_owned_task_root(owner, span);
                 task_place = self.project_deref(task_root, false);
             } else {
-                task_place = self.stable_task_place(task_place, storage, span);
+                task_place = self.stable_task_place(task_place, span);
             }
         }
         self.statements.add(jil.Statement (
@@ -603,9 +615,11 @@ public extend body_context.BodyLowerer {
             ))
         ));
         self.request_task_cancellation(task_place, task_state, span);
-        self.lower_await_task_ready(task_place, span);
+        self.lower_await_task_ready(task_place, storage, span);
         self.push_assign(destination, self.unit_rvalue(span), span);
-        self.release_consumed_task(task_place, task_root, false, span);
+        self.release_consumed_task(
+            task_place, task_root, task_local, storage, false, span
+        );
     }
 
     public jil.Place task_receiver_place(Self&! self, sem.NodeId value) {
@@ -625,17 +639,19 @@ public extend body_context.BodyLowerer {
         Self&! self,
         jil.Place task_place,
         jil.Place task_root,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
         Bool result_consumed,
         token.Span span
     ) {
         jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
-        jil.Place task_pointer = self.task_state_pointer(task_place, task_state, span);
+        jil.LocalId task_pointer = self.task_state_pointer(task_place, task_state, span);
         self.statements.add(jil.Statement (
             span: span,
             kind: jil.task_release_statement_kind(jil.TaskReleaseStatement (
                 task: task_root,
-                task_pointer: task_pointer,
-                task_local: self.task_identity_for_place(task_place),
+                task_pointer: self.place_for_local(task_pointer),
+                task_local: task_local,
                 frame: coroutine_task_abi.task_field_place(
                     self.lowerer.storage, task_place, task_state.frame
                 ),
@@ -647,7 +663,7 @@ public extend body_context.BodyLowerer {
                 ),
                 result_drop: self.task_result_drop_function(task_state, span),
                 result_consumed: result_consumed,
-                storage: self.task_storage_plan(task_place)
+                storage: storage
             ))
         ));
         self.push_assign(
@@ -710,13 +726,12 @@ public extend body_context.BodyLowerer {
         jil.LocalId pointer_local = self.add_coroutine_capture_temp(
             pointer_type, span, task_local, .auxiliary
         );
-        jil.Place pointer_place = self.place_for_local(pointer_local);
         self.push_assign(
-            pointer_place,
+            self.place_for_local(pointer_local),
             jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: layout.frame_type_id)),
             span
         );
-        return self.project_deref(pointer_place, true);
+        return self.project_deref(self.place_for_local(pointer_local), true);
     }
 
     public jil.TaskSyncMode task_sync_mode(self, jil.CoroutineFrameLayout& child) {
@@ -911,14 +926,14 @@ public extend body_context.BodyLowerer {
         jil.Place executor_place = coroutine_task_abi.task_field_place(
             self.lowerer.storage, task_place, task_state.execution_executor
         );
-        jil.Place task_pointer_place = self.task_state_pointer(task_place, task_state, span);
+        jil.LocalId task_pointer = self.task_state_pointer(task_place, task_state, span);
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(0);
         args.add(jil.copy_operand_value(jil.CopyOperand (place: frame_pointer_place)));
         jil.BlockId next_block = self.reserve_block(span);
         jil.Operand resume_operand = self.operand_for_place(resume_function_place);
         jil.CallCallee callee! = jil.dynamic_task_enqueue_callee(
             self.operand_for_place(executor_place),
-            self.operand_for_place(task_pointer_place),
+            self.operand_for_place(self.place_for_local(task_pointer)),
             resume_operand,
             false
         );
@@ -1160,24 +1175,34 @@ public extend body_context.BodyLowerer {
         }
     }
 
-    public Void lower_await_task_ready(Self&! self, jil.Place task_place, token.Span span) {
+    public Void lower_await_task_ready(
+        Self&! self,
+        jil.Place task_place,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
         jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
-        jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
         jil.BlockId check_block = self.reserve_block(span);
         jil.BlockId ready_block = self.reserve_block(span);
         jil.BlockId pending_block = self.reserve_block(span);
         self.finish_block(self.goto_terminator(check_block), span);
         self.start_block(check_block);
-        jil.Place state_place = coroutine_task_abi.task_field_place(
-            self.lowerer.storage, task_place, task_state.state
+        qid.TypeId state_type = self.jil_place_type(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, task_state.state
+            )
         );
-        jil.LocalId state_local = self.add_temp(self.jil_place_type(state_place), span);
+        jil.LocalId state_local = self.add_temp(state_type, span);
         jil.Rvalue state_value! = jil.use_rvalue(jil.UseRvalue (
-            value: self.operand_for_place(state_place)
+            value: self.operand_for_place(coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, task_state.state
+            ))
         ));
         if (storage.sync == .concurrent) {
             state_value = jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
-                place: state_place,
+                place: coroutine_task_abi.task_field_place(
+                    self.lowerer.storage, task_place, task_state.state
+                ),
                 mode: .coroutine_atomic
             ));
         }
@@ -1199,7 +1224,13 @@ public extend body_context.BodyLowerer {
         if (self.current_effects.has_async) {
             if (storage.sync == .local_serial) {
                 self.lower_serial_task_waiter_registration(
-                    task_place, state_place, ready_block, check_block, span
+                    task_place,
+                    coroutine_task_abi.task_field_place(
+                        self.lowerer.storage, task_place, task_state.state
+                    ),
+                    ready_block,
+                    check_block,
+                    span
                 );
                 return;
             }
@@ -1207,7 +1238,13 @@ public extend body_context.BodyLowerer {
             return;
         }
         self.lower_blocking_task_waiter_registration(
-            task_place, state_place, ready_block, check_block, span
+            task_place,
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, task_state.state
+            ),
+            ready_block,
+            check_block,
+            span
         );
     }
 
@@ -1292,10 +1329,11 @@ public extend body_context.BodyLowerer {
         jil.LocalId waiter_local = self.add_coroutine_capture_temp(
             waiter_layout.type_id, span, task_local, .task_waiter
         );
-        jil.Place waiter = self.place_for_local(waiter_local);
         self.register_current_task_cancel_child(task_place, span);
         self.push_assign(
-            self.project_constant_index(waiter, waiter_layout.context_field_index),
+            self.project_constant_index(
+                self.place_for_local(waiter_local), waiter_layout.context_field_index
+            ),
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
                 place: self.place_for_local(self.return_local()),
                 frame_root: true
@@ -1303,7 +1341,9 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_assign(
-            self.project_constant_index(waiter, waiter_layout.resume_field_index),
+            self.project_constant_index(
+                self.place_for_local(waiter_local), waiter_layout.resume_field_index
+            ),
             jil.use_rvalue(jil.UseRvalue (
                 value: jil.function_operand_value(jil.FunctionRef (
                     target: .source(self.def_id),
@@ -1312,7 +1352,10 @@ public extend body_context.BodyLowerer {
                     coroutine_resume: true,
                     coroutine_completion: false,
                     type_id: self.jil_place_type(
-                        self.project_constant_index(waiter, waiter_layout.resume_field_index)
+                        self.project_constant_index(
+                            self.place_for_local(waiter_local),
+                            waiter_layout.resume_field_index
+                        )
                     ),
                     span: span
                 ))
@@ -1320,12 +1363,16 @@ public extend body_context.BodyLowerer {
             span
         );
         self.push_assign(
-            self.project_constant_index(waiter, waiter_layout.executor_field_index),
+            self.project_constant_index(
+                self.place_for_local(waiter_local), waiter_layout.executor_field_index
+            ),
             jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
             span
         );
         self.push_assign(
-            self.project_constant_index(waiter, waiter_layout.task_field_index),
+            self.project_constant_index(
+                self.place_for_local(waiter_local), waiter_layout.task_field_index
+            ),
             jil.current_task_rvalue(jil.CurrentTaskRvalue (
                 observed: false,
                 cancellation_context: true
@@ -1336,7 +1383,7 @@ public extend body_context.BodyLowerer {
         self.push_assign(
             self.place_for_local(waiter_pointer),
             jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
-                place: waiter,
+                place: self.place_for_local(waiter_local),
                 frame_root: false
             )),
             span
@@ -1461,37 +1508,41 @@ public extend body_context.BodyLowerer {
         jil.TaskStateLayout task_state,
         token.Span span
     ) {
-        jil.Place state_pointer = self.task_state_pointer(task_place, task_state, span);
+        jil.LocalId state_pointer = self.task_state_pointer(task_place, task_state, span);
         self.request_task_cancellation_pointer(state_pointer, task_state, span);
     }
 
     public Void request_task_cancellation_pointer(
         Self&! self,
-        jil.Place state_pointer,
+        jil.LocalId state_pointer,
         jil.TaskStateLayout task_state,
         token.Span span
     ) {
-        jil.LocalId pointer_local = self.add_temp(self.jil_place_type(state_pointer), span);
-        self.push_assign(
-            self.place_for_local(pointer_local),
-            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(state_pointer))),
+        self.push_atomic_store(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(state_pointer), true),
+                task_state.cancellation_requested
+            ),
+            jil.const_operand_value(self.int_const(1, span)),
             span
         );
-        jil.Place state = self.project_deref(self.place_for_local(pointer_local), true);
-        jil.Place request = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, state, task_state.cancellation_requested
+        qid.TypeId target_type = self.jil_place_type(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(state_pointer), true),
+                task_state.cancel_target_word
+            )
         );
-        self.push_atomic_store(
-            request, jil.const_operand_value(self.int_const(1, span)), span
-        );
-        jil.Place target = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, state, task_state.cancel_target_word
-        );
-        jil.LocalId observed = self.add_temp(self.jil_place_type(target), span);
+        jil.LocalId observed = self.add_temp(target_type, span);
         self.push_assign(
             self.place_for_local(observed),
             jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
-                place: target,
+                place: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.storage,
+                    self.project_deref(self.place_for_local(state_pointer), true),
+                    task_state.cancel_target_word
+                ),
                 mode: .coroutine_atomic
             )),
             span
@@ -1506,33 +1557,34 @@ public extend body_context.BodyLowerer {
             default_target: enqueue
         )), span);
         self.start_block(enqueue);
-        self.enqueue_task_cancellation(
-            state, self.place_for_local(pointer_local), task_state, span
-        );
+        self.enqueue_task_cancellation(state_pointer, task_state, span);
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(complete);
     }
 
     public Void enqueue_task_cancellation(
         Self&! self,
-        jil.Place state,
-        jil.Place task_pointer,
+        jil.LocalId state_pointer,
         jil.TaskStateLayout task_state,
         token.Span span
     ) {
-        jil.Place executor = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, state, task_state.execution_executor
+        qid.TypeId executor_type = self.jil_place_type(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(state_pointer), true),
+                task_state.execution_executor
+            )
         );
-        jil.Place frame = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, state, task_state.frame
-        );
-        jil.Place resume = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, state, task_state.resume_function
-        );
-        jil.LocalId observed_executor = self.add_temp(self.jil_place_type(executor), span);
+        jil.LocalId observed_executor = self.add_temp(executor_type, span);
         self.push_assign(
             self.place_for_local(observed_executor),
-            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(executor))),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(
+                coroutine_task_abi.task_state_field_place(
+                    self.lowerer.storage,
+                    self.project_deref(self.place_for_local(state_pointer), true),
+                    task_state.execution_executor
+                )
+            ))),
             span
         );
         jil.BlockId enqueue = self.reserve_block(span);
@@ -1541,14 +1593,22 @@ public extend body_context.BodyLowerer {
             self.place_for_local(observed_executor), enqueue, complete, span
         );
         self.start_block(enqueue);
-        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
-        args.add(self.operand_for_place(frame));
         jil.LocalId result = self.add_temp(self.lowerer.store.types.unit_type(), span);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.operand_for_place(coroutine_task_abi.task_state_field_place(
+            self.lowerer.storage,
+            self.project_deref(self.place_for_local(state_pointer), true),
+            task_state.frame
+        )));
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: jil.dynamic_task_enqueue_callee(
                 self.operand_for_place(self.place_for_local(observed_executor)),
-                self.operand_for_place(task_pointer),
-                self.operand_for_place(resume),
+                self.operand_for_place(self.place_for_local(state_pointer)),
+                self.operand_for_place(coroutine_task_abi.task_state_field_place(
+                    self.lowerer.storage,
+                    self.project_deref(self.place_for_local(state_pointer), true),
+                    task_state.resume_function
+                )),
                 false
             ),
             args: self.lowerer.storage.operand_array(args$.ref()),
@@ -1578,24 +1638,39 @@ public extend body_context.BodyLowerer {
             self.place_for_local(parent_pointer), register, complete, span
         );
         self.start_block(register);
-        jil.Place parent_value = self.project_deref(self.place_for_local(parent_pointer), true);
-        jil.Place target_word = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, parent_value, parent_state.cancel_target_word
+        qid.TypeId target_type = self.jil_place_type(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(parent_pointer), true),
+                parent_state.cancel_target_word
+            )
         );
-        jil.Place child_word = self.task_cancel_target_word(child_task, target_word, span);
+        jil.LocalId child_word = self.task_cancel_target_word(child_task, target_type, span);
         self.push_atomic_store(
-            target_word,
-            self.operand_for_place(child_word),
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(parent_pointer), true),
+                parent_state.cancel_target_word
+            ),
+            self.operand_for_place(self.place_for_local(child_word)),
             span
         );
-        jil.Place parent_request = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, parent_value, parent_state.cancellation_requested
+        qid.TypeId request_type = self.jil_place_type(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(parent_pointer), true),
+                parent_state.cancellation_requested
+            )
         );
-        jil.LocalId request = self.add_temp(self.jil_place_type(parent_request), span);
+        jil.LocalId request = self.add_temp(request_type, span);
         self.push_assign(
             self.place_for_local(request),
             jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
-                place: parent_request,
+                place: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.storage,
+                    self.project_deref(self.place_for_local(parent_pointer), true),
+                    parent_state.cancellation_requested
+                ),
                 mode: .coroutine_atomic
             )),
             span
@@ -1630,17 +1705,24 @@ public extend body_context.BodyLowerer {
             self.place_for_local(pointer), prepare, complete, span
         );
         self.start_block(prepare);
-        jil.Place parent = self.project_deref(self.place_for_local(pointer), true);
-        jil.Place target_word = coroutine_task_abi.task_state_field_place(
-            self.lowerer.storage, parent, state.cancel_target_word
+        qid.TypeId target_type = self.jil_place_type(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.storage,
+                self.project_deref(self.place_for_local(pointer), true),
+                state.cancel_target_word
+            )
         );
-        jil.Place child_word = self.task_cancel_target_word(child_task, target_word, span);
+        jil.LocalId child_word = self.task_cancel_target_word(child_task, target_type, span);
         jil.LocalId cleared = self.add_temp(self.lowerer.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(cleared),
             jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
-                place: target_word,
-                expected: self.operand_for_place(child_word),
+                place: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.storage,
+                    self.project_deref(self.place_for_local(pointer), true),
+                    state.cancel_target_word
+                ),
+                expected: self.operand_for_place(self.place_for_local(child_word)),
                 desired: jil.const_operand_value(self.int_const(0, span)),
                 mode: .coroutine_atomic
             )),
@@ -1650,26 +1732,25 @@ public extend body_context.BodyLowerer {
         self.start_block(complete);
     }
 
-    @life(return: self.b)
-    public jil.Place task_cancel_target_word(
+    public jil.LocalId task_cancel_target_word(
         Self&! self,
         jil.Place task,
-        jil.Place target_word,
+        qid.TypeId target_type,
         token.Span span
     ) {
-        jil.LocalId encoded = self.add_temp(self.jil_place_type(target_word), span);
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task);
+        jil.LocalId task_pointer = self.task_state_pointer(task, task_state, span);
+        jil.LocalId encoded = self.add_temp(target_type, span);
         self.push_assign(
             self.place_for_local(encoded),
             jil.cast_rvalue(jil.CastRvalue (
                 kind: jil.CastKind.ptr_to_int,
-                value: self.operand_for_place(self.task_state_pointer(
-                    task, self.task_state_layout_for_task(task), span
-                )),
-                target_type: self.jil_place_type(target_word)
+                value: self.operand_for_place(self.place_for_local(task_pointer)),
+                target_type: target_type
             )),
             span
         );
-        return self.place_for_local(encoded);
+        return encoded;
     }
 
     public jil.TaskStateLayout current_task_state_layout(Self&! self) {
@@ -1695,8 +1776,7 @@ public extend body_context.BodyLowerer {
         return pointer;
     }
 
-    @life(return: self.b)
-    public jil.Place task_state_pointer(
+    public jil.LocalId task_state_pointer(
         Self&! self,
         jil.Place task_place,
         jil.TaskStateLayout state,
@@ -1712,7 +1792,7 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
-        return self.place_for_local(pointer);
+        return pointer;
     }
 
     public Void branch_on_task_present(
@@ -1723,14 +1803,18 @@ public extend body_context.BodyLowerer {
         jil.BlockId absent,
         token.Span span
     ) {
-        jil.Place state_place = coroutine_task_abi.task_field_place(
-            self.lowerer.storage, task_place, state.state
+        qid.TypeId state_type = self.jil_place_type(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.storage, task_place, state.state
+            )
         );
-        jil.LocalId value = self.add_temp(self.jil_place_type(state_place), span);
+        jil.LocalId value = self.add_temp(state_type, span);
         self.push_assign(
             self.place_for_local(value),
             jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
-                place: state_place,
+                place: coroutine_task_abi.task_field_place(
+                    self.lowerer.storage, task_place, state.state
+                ),
                 mode: .coroutine_atomic
             )),
             span
@@ -1857,10 +1941,13 @@ public extend body_context.BodyLowerer {
         guard self.async_call_target_def(call) is .some(target_def) else {
             return null;
         }
-        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
-        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
-        self.ensure_async_call_target(target_def, type_args, const_args);
-        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+        FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
+        self.ensure_async_call_target(
+            target_def, function_args.type_args, function_args.const_args
+        );
+        guard self.async_call_target_function(
+            target_def, function_args.type_args, function_args.const_args
+        ) is .some(function) else {
             return null;
         }
         return function.coroutine_frame;
