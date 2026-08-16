@@ -218,7 +218,9 @@ public extend body_context.BodyLowerer {
         guard self.lowerer.store.defs.get(get_def).owner_def is .some(owner_def) else {
             return null;
         }
-        qid.SymbolId symbol = self.lowerer.store.symbols.intern("subscript_set");
+        guard self.lowerer.store.symbols.find("subscript_set") is .some(symbol) else {
+            return null;
+        }
         return self.member_def_by_symbol(owner_def, symbol);
     }
 
@@ -264,6 +266,8 @@ public extend body_context.BodyLowerer {
             self.lower_assert_operands(node_id, args);
             return;
         }
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.BlockId next_block = self.reserve_block(span);
         qid.TypeId[]& type_args = self.selected_member_type_args(node_id);
         comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, node_id, function_def);
         qid.TypeId function_type = self.function_type_for_ref(function_def, type_args, const_args);
@@ -272,7 +276,6 @@ public extend body_context.BodyLowerer {
         } else {
             self.lowerer.ensure_external_function(function_def);
         }
-        jil.BlockId next_block = self.reserve_block(self.lowerer.model_span(node_id));
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: self.function_callee_with_args(
                 node_id,
@@ -288,7 +291,7 @@ public extend body_context.BodyLowerer {
             initialized_place: null,
             exclusive_places: self.lowerer.storage.empty_places(),
             cleanup: null
-        )), self.lowerer.model_span(node_id));
+        )), span);
         self.start_block(next_block);
     }
 
@@ -299,14 +302,14 @@ public extend body_context.BodyLowerer {
         jil.Place destination,
         token.Span span
     ) {
-        comptime_value.ComptimeValue[]& const_args = self.lowerer.storage.empty_const_args();
-        qid.TypeId function_type = self.function_type_for_ref(function_def, type_args, const_args);
+        jil.BlockId next_block = self.reserve_block(span);
         if (type_args.length > 0) {
-            self.lowerer.ensure_function_instance_with_const_args(function_def, type_args, const_args);
+            self.lowerer.ensure_function_instance(function_def, type_args);
         } else {
             self.lowerer.ensure_external_function(function_def);
         }
-        jil.BlockId next_block = self.reserve_block(span);
+        comptime_value.ComptimeValue[]& const_args = self.lowerer.storage.empty_const_args();
+        qid.TypeId function_type = self.function_type_for_ref(function_def, type_args, const_args);
         self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: self.direct_function_callee(function_def, function_type, type_args, const_args, span),
             args: self.lowerer.storage.operand_slice(args.slice()),
@@ -370,16 +373,28 @@ public extend body_context.BodyLowerer {
         qid.TypeId function_type
     ) {
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>();
-        types.FunctionType signature = self.function_type_or_empty(function_type);
         self.add_receiver_call_operand(call, target_def, args$.mut_ref());
         Int param_offset = args.len();
-        if (self.lowerer.typeck.ordered_call_args(node_id) is .some(ordered)) {
-            self.add_ordered_call_operands(args$.mut_ref(), ordered.values, signature, param_offset);
+        if (self.lowerer.typeck.ordered_call_args(node_id) is .some(_)) {
+            Int ordered_count = self.lowerer.typeck.ordered_call_arg_count(node_id);
+            Int ordered_index! = 0;
+            while (ordered_index < ordered_count) {
+                sem.NodeId value = self.lowerer.typeck.ordered_call_arg_at(node_id, ordered_index);
+                jil.Operand operand = self.lower_call_arg_operand(
+                    value, function_type, ordered_index + param_offset
+                );
+                args.add(operand);
+                ordered_index = ordered_index + 1;
+            }
             return args;
         }
         Int index! = 0;
         while (index < call.args.length) {
-            args.add(self.lower_call_arg_operand(call.args[index].value, signature, index + param_offset));
+            sem.NodeId value = call.args[index].value;
+            jil.Operand operand = self.lower_call_arg_operand(
+                value, function_type, index + param_offset
+            );
+            args.add(operand);
             index = index + 1;
         }
         return args;
@@ -453,13 +468,14 @@ public extend body_context.BodyLowerer {
             reference_type = self.lowerer.store.types.mutable_type(reference_type, span);
         }
         jil.LocalId reference_local = self.add_temp(reference_type, span);
-        jil.Place reference_place = self.place_for_local(reference_local);
         self.push_assign(
-            reference_place,
+            self.place_for_local(reference_local),
             jil.borrow_rvalue(jil.BorrowRvalue (place: source)),
             span
         );
-        return jil.copy_operand_value(jil.CopyOperand (place: reference_place));
+        return jil.copy_operand_value(jil.CopyOperand (
+            place: self.place_for_local(reference_local)
+        ));
     }
 
     public jil.Place? receiver_pointee_place(Self&! self, sem.NodeId receiver) {
@@ -498,9 +514,8 @@ public extend body_context.BodyLowerer {
             return place;
         }
         jil.LocalId local = self.add_temp(self.type_for_node(receiver), span);
-        jil.Place place = self.place_for_local(local);
-        self.lower_into_place(receiver, place);
-        return place;
+        self.lower_into_place(receiver, self.place_for_local(local));
+        return self.place_for_local(local);
     }
 
     public Bool function_has_receiver_abi(self, qid.DefId function_def) {
@@ -516,37 +531,29 @@ public extend body_context.BodyLowerer {
         return signature.has_receiver;
     }
 
-    public Void add_ordered_call_operands(Self&! self,
-        list.ArrayList<jil.Operand>&! args,
-        sem.NodeId[]& values,
-        types.FunctionType signature,
-        Int param_offset
-    ) {
-        Int index! = 0;
-        while (index < values.length) {
-            args.add(self.lower_call_arg_operand(values[index], signature, index + param_offset));
-            index = index + 1;
-        }
-    }
-
     public jil.Operand lower_call_arg_operand(
         Self&! self,
         sem.NodeId value,
-        types.FunctionType signature,
+        qid.TypeId function_type,
         Int param_index
     ) {
-        if (param_index < 0 || param_index >= signature.params.length) {
+        guard self.lowerer.store.types.function_type_head(function_type)
+            is .some(signature) else {
             return self.lower_to_operand(value);
         }
-        qid.TypeId param_type = signature.params[param_index];
+        if (param_index < 0 || param_index >= signature.param_count) {
+            return self.lower_to_operand(value);
+        }
+        qid.TypeId param_type = self.lowerer.store.types.function_type_param_at(
+            function_type, param_index
+        );
         if (self.mutable_reference_reborrow_operand(value, param_type) is .some(operand)) {
             return operand;
         }
         token.Span span = self.lowerer.model_span(value);
         jil.LocalId local = self.add_temp(param_type, span);
-        jil.Place place = self.place_for_local(local);
-        self.lower_into_place(value, place);
-        return self.operand_for_place(place);
+        self.lower_into_place(value, self.place_for_local(local));
+        return self.operand_for_place(self.place_for_local(local));
     }
 
     public jil.Operand? mutable_reference_reborrow_operand(Self&! self, sem.NodeId value, qid.TypeId param_type) {
