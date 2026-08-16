@@ -380,8 +380,46 @@ public struct LifetimeProjectionPathNode: Copyable {
 
 struct LifetimeProjectionPathEntry: Copyable {
     LifetimeProjectionPathNode node;
-    Int hash;
     Int collision_next;
+}
+
+struct LifetimeProjectionInterner: Movable {
+    list.ArrayList<LifetimeProjectionPathEntry> entries!;
+    map.WyHashMap<Int, Int> heads!;
+
+    init(self) {
+        self.entries = list.ArrayList<LifetimeProjectionPathEntry>();
+        self.heads = map.WyHashMap<Int, Int>();
+    }
+
+    LifetimeProjectionPathId intern(Self&! self, LifetimeProjectionPathNode node) {
+        Int hash = lifetime_projection_hash(node);
+        Int current! = self.head(hash);
+        while (current >= 0) {
+            LifetimeProjectionPathEntry entry = self.entries.get(current);
+            if (lifetime_projection_equal(entry.node, node)) {
+                return LifetimeProjectionPathId(current);
+            }
+            current = entry.collision_next;
+        }
+        Int index = self.entries.len();
+        Int next = self.head(hash);
+        self.entries.add(LifetimeProjectionPathEntry (
+            node: node,
+            collision_next: next
+        ));
+        self.heads.set(hash, index);
+        return LifetimeProjectionPathId(index);
+    }
+
+    LifetimeProjectionPathNode path(self, LifetimeProjectionPathId id) {
+        return self.entries.get(id.index).node;
+    }
+
+    Int head(self, Int hash) {
+        if (self.heads.get(hash) is .some(value)) { return value$.get(); }
+        return -1;
+    }
 }
 
 public enum LifetimeRootKind {
@@ -475,14 +513,95 @@ Int lifetime_projection_hash(LifetimeProjectionPathNode node) {
     return (((Int(node.kind) + 1) * 31 + parent) * 31 + field) * 31 + node.tuple_index;
 }
 
-@region(a)
 public struct LifetimeContract: Copyable {
     public LifetimeContractId id;
+}
+
+@region(a)
+struct LifetimeContractEntry: Copyable {
+    LifetimeContractId id;
 
     @life(a)
-    public LifetimeFlow[]& flows;
-    Int hash;
+    LifetimeFlow[]& flows;
     Int collision_next;
+}
+
+struct LifetimeContractInterner: Movable {
+    list.ArrayList<LifetimeContractEntry> entries!;
+    map.WyHashMap<Int, Int> heads!;
+
+    init(self) {
+        self.entries = list.ArrayList<LifetimeContractEntry>();
+        self.heads = map.WyHashMap<Int, Int>();
+    }
+
+    LifetimeContract intern(Self&! self, arena.Arena& storage, LifetimeFlow[]& flows) {
+        Int hash = self.contract_hash(flows);
+        Int current! = self.head(hash);
+        while (current >= 0) {
+            LifetimeContractEntry entry = self.entries.get(current);
+            if (self.matches(entry, flows)) { return LifetimeContract(id: entry.id); }
+            current = entry.collision_next;
+        }
+        Int next = self.head(hash);
+        LifetimeContractEntry entry = LifetimeContractEntry (
+            id: LifetimeContractId(self.entries.len()),
+            flows: copy_lifetime_contract_flows(storage, flows),
+            collision_next: next
+        );
+        self.entries.add(entry);
+        self.heads.set(hash, entry.id.index);
+        return LifetimeContract(id: entry.id);
+    }
+
+    Int flow_count(self, LifetimeContract contract) {
+        return self.entries.get(contract.id.index).flows.length;
+    }
+
+    LifetimeFlow flow_at(self, LifetimeContract contract, Int index) {
+        return self.entries.get(contract.id.index).flows[index];
+    }
+
+    Int head(self, Int hash) {
+        if (self.heads.get(hash) is .some(value)) { return value$.get(); }
+        return -1;
+    }
+
+    Bool matches(self, LifetimeContractEntry entry, LifetimeFlow[]& flows) {
+        if (entry.flows.length != flows.length) { return false; }
+        Int index! = 0;
+        while (index < entry.flows.length) {
+            if (!lifetime_flow_equal(entry.flows[index], flows[index])) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Int contract_hash(self, LifetimeFlow[]& flows) {
+        Int hash! = 17;
+        Int index! = 0;
+        while (index < flows.length) {
+            hash = hash * 31 + lifetime_flow_hash(flows[index]);
+            index = index + 1;
+        }
+        return hash;
+    }
+
+}
+
+@life(return: storage)
+LifetimeFlow[]& copy_lifetime_contract_flows(arena.Arena& storage, LifetimeFlow[]& flows) {
+    unsafe {
+        Int capacity! = flows.length;
+        if (capacity == 0) { capacity = 1; }
+        LifetimeFlow*! stored = storage.alloc_array<LifetimeFlow>(capacity);
+        Int index! = 0;
+        while (index < flows.length) {
+            stored[index] = flows[index];
+            index = index + 1;
+        }
+        return stored[0..flows.length];
+    }
 }
 
 @region(a)
@@ -490,7 +609,6 @@ public struct FunctionType: Copyable {
     @life(a)
     public qid.TypeId[]& params;
     public qid.TypeId result;
-    @life(a)
     public LifetimeContract lifetime_contract;
     public EffectSet effects;
     public FunctionKind kind;
@@ -559,10 +677,9 @@ public struct TypeStore: Movable {
     public map.WyHashMap<qid.DefId, qid.TypeId> named_type_defs!;
     public map.WyHashMap<Int, qid.TypeId> task_state_types!;
     table.MultiTable<Int, qid.TypeId> canonical_substitution_types!;
-    list.ArrayList<LifetimeContract> lifetime_contracts!;
-    map.WyHashMap<Int, Int> lifetime_contract_heads!;
-    list.ArrayList<LifetimeProjectionPathEntry> lifetime_projection_paths!;
-    map.WyHashMap<Int, Int> lifetime_projection_path_heads!;
+    Mutex<LifetimeContractInterner>^ lifetime_contracts;
+    arena.Arena^ lifetime_contract_storage;
+    Mutex<LifetimeProjectionInterner>^ lifetime_projections;
     arena.Arena storage!;
     BuiltinTypeIds builtins;
 
@@ -572,10 +689,9 @@ public struct TypeStore: Movable {
         self.named_type_defs = map.WyHashMap<qid.DefId, qid.TypeId>();
         self.task_state_types = map.WyHashMap<Int, qid.TypeId>();
         self.canonical_substitution_types = table.MultiTable<Int, qid.TypeId>();
-        self.lifetime_contracts = list.ArrayList<LifetimeContract>();
-        self.lifetime_contract_heads = map.WyHashMap<Int, Int>();
-        self.lifetime_projection_paths = list.ArrayList<LifetimeProjectionPathEntry>();
-        self.lifetime_projection_path_heads = map.WyHashMap<Int, Int>();
+        self.lifetime_contracts = new Mutex<LifetimeContractInterner>(LifetimeContractInterner());
+        self.lifetime_contract_storage = new arena.Arena();
+        self.lifetime_projections = new Mutex<LifetimeProjectionInterner>(LifetimeProjectionInterner());
         self.storage = arena.Arena();
         self.intern_lifetime_contract(null);
         qid.TypeId invalid = self.create(.invalid(), token.Span());
@@ -656,7 +772,7 @@ public struct TypeStore: Movable {
             kind: function_type.kind,
             call_ownership: function_type.call_ownership,
             lifetime_contract_id: function_type.lifetime_contract.id,
-            lifetime_flow_count: function_type.lifetime_contract.flows.length
+            lifetime_flow_count: self.lifetime_contract_flow_count(function_type.lifetime_contract)
         );
     }
 
@@ -781,7 +897,7 @@ public struct TypeStore: Movable {
     public LifetimeFlow? function_type_lifetime_flow_at(self, qid.TypeId id, Int index) {
         TypeInfo info = self.get(id);
         guard info.data is .function_type(function_type) else { return null; }
-        return function_type.lifetime_contract.flows[index];
+        return self.lifetime_contract_flow_at(function_type.lifetime_contract, index);
     }
 
     public Bool has(self, qid.TypeId id) {
@@ -1319,23 +1435,24 @@ public struct TypeStore: Movable {
     public LifetimeContract intern_lifetime_contract(self, LifetimeFlow[]&? flows) {
         list.ArrayList<LifetimeFlow> canonical! = self.canonical_lifetime_flows(flows);
         LifetimeFlow[]& values = canonical.slice();
-        Int hash = self.lifetime_contract_hash(values);
-        Int current! = -1;
-        if (self.lifetime_contract_heads.get(hash) is .some(head)) {
-            current = head$.get();
-        }
-        while (current >= 0) {
-            LifetimeContract contract = self.lifetime_contracts.get(current);
-            if (self.lifetime_contract_matches(contract, values)) {
-                return contract;
-            }
-            current = contract.collision_next;
-        }
-        return self.add_lifetime_contract(hash, values);
+        arena.Arena& storage = self.lifetime_contract_storage$.ref();
+        return self.lifetime_contracts.with_lock({ [values, ref storage] interner =>
+            interner.intern(storage, values)
+        });
     }
 
     public LifetimeContract empty_lifetime_contract(self) {
-        return self.lifetime_contracts.get(0);
+        return LifetimeContract(id: LifetimeContractId(0));
+    }
+
+    public Int lifetime_contract_flow_count(self, LifetimeContract contract) {
+        return self.lifetime_contracts.with_lock({ [contract] interner => interner.flow_count(contract) });
+    }
+
+    public LifetimeFlow lifetime_contract_flow_at(self, LifetimeContract contract, Int index) {
+        return self.lifetime_contracts.with_lock({ [contract, index] interner =>
+            interner.flow_at(contract, index)
+        });
     }
 
     public LifetimeProjectionPathId intern_lifetime_projection(
@@ -1351,76 +1468,11 @@ public struct TypeStore: Movable {
             field_def: field_def,
             tuple_index: tuple_index
         );
-        Int hash = lifetime_projection_hash(node);
-        Int current! = self.lifetime_projection_head(hash);
-        while (current >= 0) {
-            LifetimeProjectionPathEntry entry = self.lifetime_projection_paths.get(current);
-            if (lifetime_projection_equal(entry.node, node)) {
-                return LifetimeProjectionPathId(current);
-            }
-            current = entry.collision_next;
-        }
-        return self.add_lifetime_projection_path(node, hash);
+        return self.lifetime_projections.with_lock({ [node] interner => interner.intern(node) });
     }
 
     public LifetimeProjectionPathNode lifetime_projection_path(self, LifetimeProjectionPathId id) {
-        return self.lifetime_projection_paths.get(id.index).node;
-    }
-
-    Int lifetime_projection_head(self, Int hash) {
-        if (self.lifetime_projection_path_heads.get(hash) is .some(head)) {
-            return head$.get();
-        }
-        return -1;
-    }
-
-    LifetimeProjectionPathId add_lifetime_projection_path(
-        self,
-        LifetimeProjectionPathNode node,
-        Int hash
-    ) {
-        Int index = self.lifetime_projection_paths.len();
-        self.lifetime_projection_paths.add(LifetimeProjectionPathEntry (
-            node: node,
-            hash: hash,
-            collision_next: self.lifetime_projection_head(hash)
-        ));
-        self.lifetime_projection_path_heads.set(hash, index);
-        return LifetimeProjectionPathId(index);
-    }
-
-    LifetimeContract add_lifetime_contract(
-        self,
-        Int hash,
-        LifetimeFlow[]& flows
-    ) {
-        Int next! = -1;
-        if (self.lifetime_contract_heads.get(hash) is .some(head)) {
-            next = head$.get();
-        }
-        LifetimeContract contract = LifetimeContract (
-            id: LifetimeContractId(self.lifetime_contracts.len()),
-            flows: self.copy_lifetime_flows(flows),
-            hash: hash,
-            collision_next: next
-        );
-        self.lifetime_contracts.add(contract);
-        self.lifetime_contract_heads.set(hash, contract.id.index);
-        return contract;
-    }
-
-    Bool lifetime_contract_matches(
-        self,
-        LifetimeContract contract,
-        LifetimeFlow[]& flows
-    ) {
-        if (contract.flows.length != flows.length) { return false; }
-        Int index! = 0;
-        while (index < contract.flows.length) {
-            if (!lifetime_flow_equal(contract.flows[index], flows[index])) { return false; }
-            index = index + 1;
-        }
-        return true;
+        return self.lifetime_projections.with_lock({ [id] interner => interner.path(id) });
     }
 
     list.ArrayList<LifetimeFlow> canonical_lifetime_flows(
@@ -1544,30 +1596,6 @@ public struct TypeStore: Movable {
             return -1;
         }
         return left.tuple_index - right.tuple_index;
-    }
-
-    Int lifetime_contract_hash(self, LifetimeFlow[]& flows) {
-        Int hash! = 17;
-        Int index! = 0;
-        while (index < flows.length) {
-            hash = hash * 31 + lifetime_flow_hash(flows[index]);
-            index = index + 1;
-        }
-        return hash;
-    }
-
-    LifetimeFlow[]& copy_lifetime_flows(self, LifetimeFlow[]& flows) {
-        unsafe {
-            Int capacity! = flows.length;
-            if (capacity == 0) { capacity = 1; }
-            LifetimeFlow*! stored = self.storage.alloc_array<LifetimeFlow>(capacity);
-            Int index! = 0;
-            while (index < flows.length) {
-                stored[index] = flows[index];
-                index = index + 1;
-            }
-            return stored[0..flows.length];
-        }
     }
 
     public qid.TypeId task_type(self, qid.TypeId result, DomainEffect? domain, token.Span span) {
