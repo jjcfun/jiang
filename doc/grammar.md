@@ -132,10 +132,17 @@ Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
 struct / union 的 `@region(a, b: a)` 中，每个 item 声明一个 public region；
 `target: source` 同时声明 target 并表示 outlives 约束，每个 target 只能出现一次。单-slot
+region 使用普通名字；`value?` 声明 shape 由字段类型推断的 region，必须位于固定 region 之后。
+`value?: anchor` 还允许省略字段 binding，并用 `anchor` 填充推断 shape 的全部 slots；只有一个
+固定 region 时，`value?` 默认使用该唯一 region。
 字段 binding 写作 `@life(a)`，多-slot
 字段 binding 可以按位置写作 `@life(a, b)`，或按 type occurrence 的具名位置写作
 `@life(left: a, right: b)`；两种模式不能混用，target 必须唯一且完整。callable
 contract 同样使用 `target: source`，但只允许具名 target，不支持 `[0]` 位置路径。
+reference 字段的第一个位置固定绑定外层 borrow。只写第一项时，pointee 的全部 slots 使用
+同一 source；显式绑定 pointee 时必须把完整 shape 作为第二项，例如 `@life(r, (a, b))`，
+不能扁平化或只绑定一部分。函数 contract 的 reference 参数根名表示外层 borrow；pointee 的
+公开 region 通过 `input.a` 访问，`(T t)& input` 中的 `input.t` 表示完整 pointee shape。
 
 同一个声明前的 attribute 按源码顺序应用，并且都作用在当前声明自己的 namespace 上。
 当前声明的泛型参数会先进入这个 namespace；后面的 attribute 可以引用前面 attribute

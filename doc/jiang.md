@@ -615,6 +615,15 @@ source 也必须由同一 annotation 声明，但可以写在 target 之前或�
 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；named 模式不能与位置模式
 混用，也不能使用 `self` source。
 
+`@region(anchor, value?: anchor)` 中的 `value` shape 由绑定字段的实际类型推断。字段省略
+`value` binding 时，`anchor` 会填充该 shape 的全部 slots；显式绑定时仍必须提供完整 shape。
+
+reference 的完整 Shape 是 `reference(shape(T))`，外层 borrow 与 pointee Shape 是两个逻辑
+位置。若 `Pair` 的 Shape 是 `(a, b)`，则 reference 字段可以只写 `@life(r)`，用 `r` 填充
+pointee 的两个 slots；也可以写 `@life(r, (a, b))` 精确绑定，但不能写成扁平的
+`@life(r, a, b)` 或部分 binding。函数契约中，`input` 表示外层 borrow，`input.a` 表示
+pointee 的公开 region；`(T t)& input` 还可用 `input.t` 表示完整 `shape(T)`。
+
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
 ```jiang
