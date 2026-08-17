@@ -102,8 +102,9 @@ public extend body_context.BodyLowerer {
         Bool is_suspend_point = self.function_type_is_async(self.type_for_node(callee_id));
         token.Span span = self.lowerer.model_span(node_id);
         jil.BlockId next_block = self.builder.reserve_block(span);
+        jil.LocalId callee_local = self.add_temp(self.type_for_node(callee_id), span);
+        self.lower_into_place(callee_id, self.place_for_local(callee_local));
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(arg_count);
-        jil.CallCallee callee = jil.indirect_operand_callee(self.lower_to_operand(callee_id));
         Int index! = 0;
         while (index < arg_count) {
             sem.NodeId value = self.lowerer.model.call_arg_at(node_id, index).value;
@@ -113,7 +114,9 @@ public extend body_context.BodyLowerer {
         types.LifetimeFlow[]& return_lifetime_flows =
             self.call_return_lifetime_flows(callee_id, 0);
         self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
-            callee: callee,
+            callee: jil.indirect_operand_callee(
+                self.operand_for_place(self.place_for_local(callee_local))
+            ),
             args: self.lowerer.storage.operand_slice(args.slice()),
             current_effects: self.current_effects,
             is_suspend_point: is_suspend_point,
@@ -127,7 +130,23 @@ public extend body_context.BodyLowerer {
         self.builder.start_block(next_block);
     }
 
-    public Void consume_closure_callee_if_needed(Self&! self, sem.NodeId callee_id, token.Span span) {
+    public Void consume_closure_callee_if_needed(
+        Self&! self,
+        sem.NodeId callee_id,
+        token.Span span
+    ) {
+        support.StablePlaceLocation owner = self.stable_place_location(
+            self.pointer_base_place(callee_id)
+        );
+        self.consume_closure_callee_at(callee_id, owner$.ref(), span);
+    }
+
+    public Void consume_closure_callee_at(
+        Self&! self,
+        sem.NodeId callee_id,
+        support.StablePlaceLocation& owner,
+        token.Span span
+    ) {
         types.TypeInfo callable_info = self.lowerer.store.types.get(self.type_for_node(callee_id));
         types.TypeInfo function_info! = callable_info;
         Bool heap! = false;
@@ -138,21 +157,18 @@ public extend body_context.BodyLowerer {
         guard function_info.data is .function_type(function_type) else { return; }
         if (function_type.call_ownership != .consuming) { return; }
         Bool async_call = function_type.effects.has_async;
-        support.StablePlaceLocation owner = self.stable_place_location(
-            self.pointer_base_place(callee_id)
-        );
         if (heap) {
             if (!async_call) {
                 support.StablePlaceLocation closure = self.stable_place_location(
-                    self.project_deref(self.stable_place(owner$.ref()), false)
+                    self.project_deref(self.stable_place(owner), false)
                 );
                 self.free_consumed_closure_environment(
                     self.stable_place(closure$.ref()), span
                 );
             }
-            self.free_consumed_closure_owner(self.stable_place(owner$.ref()), span);
+            self.free_consumed_closure_owner(self.stable_place(owner), span);
         }
-        self.push_forget_place_at_span(self.stable_place(owner$.ref()), span);
+        self.push_forget_place_at_span(self.stable_place(owner), span);
     }
 
     Void free_consumed_closure_environment(Self&! self, jil.Place closure_place, token.Span span) {
@@ -193,12 +209,14 @@ public extend body_context.BodyLowerer {
         Int arg_count = self.lowerer.model.call_arg_count(node_id);
         qid.TypeId source_type = self.type_for_node(callee_id);
         qid.TypeId abi_type = self.lowerer.external_async_abi_function_type(source_type, span);
+        jil.LocalId source_callee = self.add_temp(source_type, span);
+        self.lower_into_place(callee_id, self.place_for_local(source_callee));
         jil.LocalId abi_callee = self.add_temp(abi_type, span);
         self.builder.push_assign(
             self.place_for_local(abi_callee),
             jil.cast_rvalue(jil.CastRvalue (
                 kind: jil.CastKind.ptr_to_ptr,
-                value: self.lower_to_operand(callee_id),
+                value: self.operand_for_place(self.place_for_local(source_callee)),
                 target_type: abi_type
             )),
             span
@@ -231,11 +249,15 @@ public extend body_context.BodyLowerer {
             index = index + 1;
         }
         args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        types.LifetimeFlow[]& return_lifetime_flows =
+            self.type_return_lifetime_flows(source_type, 0);
+        jil.Operand[]& lifetime_operands =
+            self.lowerer.storage.operand_array(lifetime_args$.ref());
         self.finish_async_indirect_start(
             self.operand_for_place(self.place_for_local(abi_callee)),
             args$.ref(),
-            self.type_return_lifetime_flows(source_type, 0),
-            self.lowerer.storage.operand_array(lifetime_args$.ref()),
+            return_lifetime_flows,
+            lifetime_operands,
             destination,
             span
         );
@@ -250,9 +272,38 @@ public extend body_context.BodyLowerer {
         Int arg_count = self.lowerer.model.call_arg_count(node_id);
         token.Span span = self.lowerer.model_span(node_id);
         jil.BlockId next_block = self.builder.reserve_block(span);
+        support.StablePlaceLocation owner = self.stable_place_location(
+            self.pointer_base_place(callee_id)
+        );
+        jil.Place closure_place = self.closure_callee_place_from_owner(
+            self.stable_place(owner$.ref())
+        );
+        jil.Place call_place = self.project_constant_index(
+            self.project_deref(self.project_constant_index(closure_place, 1), true), 0
+        );
+        qid.TypeId call_type = self.jil_place_type(call_place);
+        support.StablePlaceLocation call_location = self.stable_place_location(call_place);
+        jil.Place env_place = self.project_constant_index(closure_place, 0);
+        qid.TypeId env_type = self.jil_place_type(env_place);
+        support.StablePlaceLocation env_location = self.stable_place_location(env_place);
+        jil.LocalId call_local = self.add_temp(call_type, span);
+        jil.LocalId env_local = self.add_temp(env_type, span);
+        self.builder.push_assign(
+            self.place_for_local(call_local),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(
+                self.stable_place(call_location$.ref())
+            ))),
+            span
+        );
+        self.builder.push_assign(
+            self.place_for_local(env_local),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(
+                self.stable_place(env_location$.ref())
+            ))),
+            span
+        );
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(arg_count + 1);
-        jil.CallCallee callee = jil.indirect_operand_callee(self.closure_call_operand(callee_id));
-        args.add(self.closure_env_operand(callee_id));
+        args.add(self.operand_for_place(self.place_for_local(env_local)));
         Int index! = 0;
         while (index < arg_count) {
             sem.NodeId value = self.lowerer.model.call_arg_at(node_id, index).value;
@@ -262,7 +313,9 @@ public extend body_context.BodyLowerer {
         types.LifetimeFlow[]& return_lifetime_flows =
             self.call_return_lifetime_flows(callee_id, 1);
         self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
-            callee: callee,
+            callee: jil.indirect_operand_callee(
+                self.operand_for_place(self.place_for_local(call_local))
+            ),
             args: self.lowerer.storage.operand_slice(args.slice()),
             current_effects: self.current_effects,
             is_suspend_point: false,
@@ -274,7 +327,7 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), span);
         self.builder.start_block(next_block);
-        self.consume_closure_callee_if_needed(callee_id, span);
+        self.consume_closure_callee_at(callee_id, owner$.ref(), span);
     }
 
     public types.LifetimeFlow[]& call_return_lifetime_flows(
@@ -569,7 +622,14 @@ public extend body_context.BodyLowerer {
     }
 
     public jil.Place closure_callee_place(Self&! self, sem.NodeId callee_id) {
-        jil.Place place! = self.pointer_base_place(callee_id);
+        return self.closure_callee_place_from_owner(
+            self.pointer_base_place(callee_id)
+        );
+    }
+
+    @life(return: self & owner)
+    public jil.Place closure_callee_place_from_owner(self, jil.Place owner) {
+        jil.Place place! = owner;
         types.TypeInfo info = self.lowerer.store.types.get(self.jil_place_type(place));
         guard info.data is .handle_type(handle) else {
             return place;
@@ -1839,26 +1899,26 @@ public extend body_context.BodyLowerer {
             self.mark_unsupported(node_id);
             return;
         }
-        monomorph.SubstitutionMap substitutions = self.nominal_substitution(named.def_id, named.type_args);
-        guard self.lowerer.model.def(named.def_id) is .some(owner_model) else {
+        qid.DefId owner_def = named.def_id;
+        monomorph.SubstitutionMap substitutions = self.nominal_substitution(owner_def, named.type_args);
+        guard self.lowerer.model.def(owner_def) is .some(owner_model) else {
             self.mark_unsupported(node_id);
             return;
         }
         Int member_count = owner_model.members.len();
-        if (self.lowerer.typeck.ordered_call_args(node_id) is .some(ordered)) {
+        if (self.lowerer.typeck.ordered_call_args(node_id) is .some(_)) {
             self.lower_default_nominal_ordered_fields(
                 node_id,
-                named.def_id,
+                owner_def,
                 member_count,
                 destination,
-                substitutions$.ref(),
-                ordered.values
+                substitutions$.ref()
             );
             return;
         }
         Int index! = 0;
         while (index < member_count) {
-            guard self.lowerer.model.def(named.def_id) is .some(current_owner) else { return; }
+            guard self.lowerer.model.def(owner_def) is .some(current_owner) else { return; }
             qid.DefId member_def = current_owner.members.get(index);
             if (self.lowerer.store.defs.get(member_def).kind == .field_def) {
                 guard self.lower_default_nominal_field(
@@ -1877,8 +1937,7 @@ public extend body_context.BodyLowerer {
         qid.DefId owner_def,
         Int member_count,
         jil.Place destination,
-        monomorph.SubstitutionMap& substitutions,
-        sem.NodeId[]& values
+        monomorph.SubstitutionMap& substitutions
     ) {
         Int field_index! = 0;
         Int member_index! = 0;
@@ -1890,7 +1949,7 @@ public extend body_context.BodyLowerer {
                     destination,
                     member_def,
                     substitutions,
-                    values,
+                    node_id,
                     field_index
                 )) {
                     self.mark_unsupported(node_id);
@@ -1906,13 +1965,14 @@ public extend body_context.BodyLowerer {
         jil.Place destination,
         qid.DefId field_def,
         monomorph.SubstitutionMap& substitutions,
-        sem.NodeId[]& values,
+        sem.NodeId call_id,
         Int field_index
     ) {
-        if (field_index >= values.length) { return false; }
+        if (field_index >= self.lowerer.typeck.ordered_call_arg_count(call_id)) { return false; }
+        sem.NodeId value = self.lowerer.typeck.ordered_call_arg_at(call_id, field_index);
         guard self.field_expected_type(field_def, substitutions) is .some(field_type) else { return false; }
         jil.Place field_place = self.project_field(destination, field_def, field_type);
-        self.lower_into_place_as_type(values[field_index], field_place, field_type);
+        self.lower_into_place_as_type(value, field_place, field_type);
         return true;
     }
 
