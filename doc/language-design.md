@@ -522,6 +522,18 @@ struct Pair {
 named 模式的 target 必须唯一且完整，不能与位置模式混用。字段 binding 不支持 `self` source，
 也不改变字段 `TypeId`、layout 或 ABI。
 
+`@region` 的普通参数是固定单 slot；尾部 `?` 参数的 shape 由实际字段类型推断。
+`@region(r, v?: r)` 表示省略 `v` binding 时，用 `r` 填充 `shape(v)` 的全部 slots；只有一个
+固定参数时可以简写为 `@region(r, v?)`。若有多个固定参数且未写 `?: source`，推断参数仍必须
+显式绑定。
+
+reference 使用专用 `reference(value)` Shape，不退化成普通 product。外层 borrow 是第一个
+逻辑位置，第二个逻辑位置保持完整 pointee Shape。reference 字段必须绑定外层 borrow；例如
+`Pair` 的 Shape 为 `(a, b)` 时，可以只写 `@life(r)`，由 `r` 填充 pointee，也可以完整写作
+`@life(r, (a, b))`，但不能扁平化或部分绑定。函数 contract 中，reference 参数根名表示外层
+borrow，`input.a` 表示 pointee 的公开 region；`(T t)& input` 中的 `input.t` 表示完整
+`shape(T)`。
+
 函数没有显式 `@life` 且返回 Shape 非空时，readonly `self` / `Self&! self` reference receiver
 的 Shape 非空则优先使用 receiver，等价于 `@life(return: self)`；即使还有其他非空参数 root，
 也不产生歧义。没有该特例时，只有恰好一个用户可见参数 root 的 Shape 非空且与返回 Shape

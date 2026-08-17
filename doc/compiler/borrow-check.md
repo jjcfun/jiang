@@ -105,14 +105,16 @@ loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事
 lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
 
 `LifetimeShape` 是按具体 `TypeId` 缓存并 intern 的派生属性，描述值可公开携带的 lifetime slot
-结构。当前节点包括 empty、slot、product、repeated element、tagged alternative、symbolic 和
-recursive。查询状态显式区分 computing/complete；递归 nominal 在 computing 回边上使用 interned
-recursive 节点，不重新扫描字段。generic 和 associated type 未解析时保留 symbolic 节点。
+结构。当前节点包括 empty、slot、reference、product、repeated element、tagged alternative、
+symbolic 和 recursive。查询状态显式区分 computing/complete；递归 nominal 在 computing 回边上
+使用 interned recursive 节点，不重新扫描字段。generic 和 associated type 未解析时保留
+symbolic 节点。
 需要旧式 empty/non-empty/unknown 结论的消费者统一从 shape 派生，不维护第二套递归类型扫描。
 具体值是否实际携带 borrow 仍由 Loan 和 path dataflow 决定。
 
-reference 提供一个 slot；raw pointer 不提供 slot，owner pointer 保留 pointee shape。tuple/struct
-使用 product，array/slice value 使用 repeated element，optional/error union/union 使用有序
+`reference(value)` 的规范化 slot 顺序是外层 ref 在前、value shape 在后；`T&` 与 `T&!` 使用
+相同 shape。raw pointer 不提供 slot，owner pointer 保留 pointee shape。tuple/struct 使用 product，
+array/slice value 使用 repeated element，optional/error union/union 使用有序
 alternative。slice handle 由自身 slot 与 repeated element 组成；Task 使用 pending empty/completed
 result alternative。RawFn 为空 shape，Fn 的 slot 表示 capture environment lifetime。
 

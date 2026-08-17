@@ -615,6 +615,15 @@ source 也必须由同一 annotation 声明，但可以写在 target 之前或�
 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；named 模式不能与位置模式
 混用，也不能使用 `self` source。
 
+`@region(anchor, value?: anchor)` 中的 `value` shape 由绑定字段的实际类型推断。字段省略
+`value` binding 时，`anchor` 会填充该 shape 的全部 slots；显式绑定时仍必须提供完整 shape。
+
+reference 的完整 Shape 是 `reference(shape(T))`，外层 borrow 与 pointee Shape 是两个逻辑
+位置。若 `Pair` 的 Shape 是 `(a, b)`，则 reference 字段可以只写 `@life(r)`，用 `r` 填充
+pointee 的两个 slots；也可以写 `@life(r, (a, b))` 精确绑定，但不能写成扁平的
+`@life(r, a, b)` 或部分 binding。函数契约中，`input` 表示外层 borrow，`input.a` 表示
+pointee 的公开 region；`(T t)& input` 还可用 `input.t` 表示完整 `shape(T)`。
+
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
 ```jiang
@@ -629,9 +638,10 @@ callable contract 只能引用 result/参数的声明名；需要参与 contract
 契约名本身不参与类型身份；解析后的来源关系参与 callable 的语义兼容性。因此，返回其他参数
 借用的函数或 lambda 不能传给上述 `callback`。
 
-聚合返回值必须整体映射，例如 `@life(return: (left, right))`；不能拆成
-`return.left`、`return.right` 多条 target。聚合参数的单个 region 使用公开名称选择，
-例如 `value.second`。tuple/Fn 不支持 `[0]` 一类位置式 lifetime path。
+聚合返回值可以整体映射，例如 `@life(return: (left, right))`，也可以把互不重叠的公开
+regions 分别映射为 `return.left: left`、`return.right: right`；whole return 与其子投影不能
+同时作为 target。聚合参数的单个 region 使用公开名称选择，例如 `value.second`。tuple/Fn
+不支持 `[0]` 一类位置式 lifetime path。
 
 `Fn<R, Args...>` 和 `RawFn<R, Args...>` 默认使用空 lifetime 契约：`R` 不能借用 callback
 参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明
