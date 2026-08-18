@@ -1,6 +1,7 @@
 // 声明签名、where predicate 和 trait conformance 检查。
 
 import sem = "../../sema/model.jiang";
+import store_api = "../../store.jiang";
 import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
@@ -41,6 +42,113 @@ struct ResolvedCallableLifetimePath: Copyable {
 struct ResolvedLifetimeSlotPath: Copyable {
     Int slot_index;
     types.LifetimePath path;
+}
+
+Bool type_ref_list_uses_parameter(
+    store_api.CompilerStore& store,
+    sem.NodeId[]& refs,
+    qid.DefId param_def
+) {
+    Int index! = 0;
+    while (index < refs.length) {
+        if (type_ref_uses_parameter(store, refs[index], param_def)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool effect_set_uses_parameter(
+    store_api.CompilerStore& store,
+    sem.EffectSet effects,
+    qid.DefId param_def
+) {
+    if (effects.domain is .some(domain)) {
+        if (type_ref_uses_parameter(store, domain, param_def)) { return true; }
+    }
+    guard effects.context is .some(context) else { return false; }
+    return type_ref_uses_parameter(store, context, param_def);
+}
+
+Bool function_type_ref_uses_parameter(
+    store_api.CompilerStore& store,
+    sem.FunctionTypeRef function_type,
+    qid.DefId param_def
+) {
+    if (type_ref_list_uses_parameter(store, function_type.params, param_def)) { return true; }
+    if (type_ref_uses_parameter(store, function_type.result, param_def)) { return true; }
+    return effect_set_uses_parameter(store, function_type.effects, param_def);
+}
+
+Bool type_ref_uses_parameter(
+    store_api.CompilerStore& store,
+    sem.NodeId type_ref,
+    qid.DefId param_def
+) {
+    sem.Node node = store.model.node(type_ref);
+    if (node.data is .named_type_ref(named)) {
+        if (named.def_id == param_def) { return true; }
+        return type_ref_list_uses_parameter(store, named.args, param_def);
+    }
+    if (node.data is .layered_type_ref(layered)) {
+        return type_ref_uses_parameter(store, layered.element, param_def);
+    }
+    if (node.data is .array_type_ref(array_type)) {
+        return type_ref_uses_parameter(store, array_type.element, param_def);
+    }
+    if (node.data is .errorable_type_ref(errorable)) {
+        if (type_ref_uses_parameter(store, errorable.value_type, param_def)) { return true; }
+        guard errorable.error_type is .some(error_type) else { return false; }
+        return type_ref_uses_parameter(store, error_type, param_def);
+    }
+    if (node.data is .function_type_ref(function_type)) {
+        return function_type_ref_uses_parameter(store, function_type, param_def);
+    }
+    if (node.data is .effect_type_ref(effect_type)) {
+        if (type_ref_uses_parameter(store, effect_type.base, param_def)) { return true; }
+        return effect_set_uses_parameter(store, effect_type.effects, param_def);
+    }
+    if (node.data is .tuple_type_ref(tuple_type)) {
+        return type_ref_list_uses_parameter(store, tuple_type.items, param_def);
+    }
+    return false;
+}
+
+Bool signature_uses_parameter(
+    store_api.CompilerStore& store,
+    sem.FunctionSignature signature,
+    qid.DefId param_def
+) {
+    if (type_ref_list_uses_parameter(store, signature.params, param_def)) { return true; }
+    if (type_ref_uses_parameter(store, signature.result, param_def)) { return true; }
+    return effect_set_uses_parameter(store, signature.effects, param_def);
+}
+
+Bool member_uses_parameter(
+    store_api.CompilerStore& store,
+    qid.DefId member_def,
+    qid.DefId param_def
+) {
+    sem.Decl decl = store.model.def_ref(member_def).decl;
+    if (decl.type_ref is .some(type_ref)) {
+        if (type_ref_uses_parameter(store, type_ref, param_def)) { return true; }
+    }
+    guard decl.function_signature is .some(signature) else { return false; }
+    return signature_uses_parameter(store, signature, param_def);
+}
+
+Bool nominal_members_use_parameter(
+    store_api.CompilerStore& store,
+    qid.DefId owner_def,
+    qid.DefId param_def
+) {
+    Int count = store.model.def_member_count(owner_def);
+    Int index! = 0;
+    while (index < count) {
+        qid.DefId member_def = store.model.def_member_at(owner_def, index);
+        index = index + 1;
+        if (member_uses_parameter(store, member_def, param_def)) { return true; }
+    }
+    return false;
 }
 
 @region(a)
@@ -813,7 +921,7 @@ public struct DeclCheck: Movable {
         }
     }
 
-    Bool callable_life_targets_overlap(self, sem.Def& model_def) {
+    Bool callable_life_targets_overlap(Self&! self, sem.Def& model_def) {
         Int index! = 0;
         while (index < model_def.life_clauses.len()) {
             sem.LifeClause clause = model_def.life_clauses.get(index);
@@ -825,7 +933,7 @@ public struct DeclCheck: Movable {
             while (previous < index) {
                 sem.LifeClause candidate = model_def.life_clauses.get(previous);
                 if (candidate.target is .some(other)
-                    && self.lifetime_names_overlap(target, other)) {
+                    && self.lifetime_names_overlap(model_def, target, other)) {
                     return true;
                 }
                 previous = previous + 1;
@@ -836,12 +944,21 @@ public struct DeclCheck: Movable {
     }
 
     Bool lifetime_names_overlap(
-        self,
+        Self&! self,
+        sem.Def& model_def,
         sem.LifetimeName left,
         sem.LifetimeName right
     ) {
         if (left.kind != right.kind || left.symbol != right.symbol) { return false; }
-        if (left.projection_path == null || right.projection_path == null) { return true; }
+        if (left.projection_path == null && right.projection_path == null) {
+            return true;
+        }
+        if (left.projection_path == null || right.projection_path == null) {
+            guard self.lifetime_root_type(model_def, left) is .some(root_type) else {
+                return true;
+            }
+            return !self.lifetime_root_is_reference(root_type);
+        }
         sem.LifetimePathId left_path! = left.projection_path$.some();
         sem.LifetimePathId right_path! = right.projection_path$.some();
         Int left_depth = self.lifetime_path_depth(left_path);
@@ -852,6 +969,13 @@ public struct DeclCheck: Movable {
             right_path = self.lifetime_path_ancestor(right_path, right_depth - left_depth);
         }
         return self.lifetime_paths_equal(left_path, right_path);
+    }
+
+    Bool lifetime_root_is_reference(self, qid.TypeId type_id) {
+        if (self.type_is_reference(type_id)) { return true; }
+        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(type_id);
+        guard info.data is .optional(optional) else { return false; }
+        return self.type_is_reference(optional.element);
     }
 
     Int lifetime_path_depth(self, sem.LifetimePathId path_id) {
@@ -976,6 +1100,7 @@ public struct DeclCheck: Movable {
     ) {
         sem.LifetimeExpression expression =
             self.type_ops.state.ctx.store.model.lifetime_expression(expression_id);
+        if (expression.data is .empty) { return self.type_ops.empty_lifetime_shape(); }
         if (expression.data is .name(name)) {
             if (!self.check_canonical_lifetime_name(model_def, name)) { return null; }
             return self.semantic_lifetime_name_shape(model_def, name);
@@ -1104,8 +1229,18 @@ public struct DeclCheck: Movable {
                 return generic_shape;
             }
         }
-        if (self.public_region_projection(model_def, name) != null) {
-            return self.type_ops.slot_lifetime_shape();
+        if (self.public_region_projection(model_def, name) is .some(region)) {
+            guard self.lifetime_root_type(model_def, name) is .some(root_type) else {
+                return null;
+            }
+            qid.TypeId nominal_type = self.lifetime_projection_base_type(root_type);
+            guard self.public_region_owner_for_type(nominal_type) is .some(owner_def) else {
+                return null;
+            }
+            guard self.region_name_index(owner_def, region) is .some(region_index) else {
+                return null;
+            }
+            return self.nominal_region_parameter_shape(nominal_type, region_index);
         }
         if (name.projection_path == null
             && self.lifetime_root_type(model_def, name) is .some(root_type)
@@ -1255,7 +1390,8 @@ public struct DeclCheck: Movable {
             return;
         }
         self.check_duplicate_region_params(def_id);
-        self.check_inferred_region_params(def_id);
+        self.check_region_parameter_sources(def_id);
+        self.check_region_parameter_name_conflicts(def_id);
         self.check_region_constraint_names(def_id);
     }
 
@@ -1283,29 +1419,37 @@ public struct DeclCheck: Movable {
         }
     }
 
-    Void check_inferred_region_params(Self&! self, qid.DefId def_id) {
-        Bool inferred_seen! = false;
+    Void check_region_parameter_sources(Self&! self, qid.DefId def_id) {
+        Bool shaped_seen! = false;
         Int count = self.type_ops.state.ctx.store.model.def_region_param_count(def_id);
         Int index! = 0;
         while (index < count) {
             sem.RegionParam param =
                 self.type_ops.state.ctx.store.model.def_region_param_at(def_id, index);
-            if (param.inferred) {
-                inferred_seen = true;
-                if (param.inference_source is .some(source)
-                    && !self.valid_region_inference_source(def_id, source, index)) {
+            if (param.shape_source is .some(source)) {
+                shaped_seen = true;
+                if (!self.valid_region_shape_source(def_id, source)) {
                     self.type_ops.add_def_error(
                         def_id,
-                        "an inferred region source must be an earlier explicit region parameter",
-                        "invalid_inferred_region_source"
+                        "a region shape source must name a type generic parameter",
+                        "invalid_region_shape_source"
                     );
                     return;
                 }
-            } else if (inferred_seen) {
+                if (param.default_source is .some(default_source)
+                    && !self.valid_region_default_source(def_id, default_source, index)) {
+                    self.type_ops.add_def_error(
+                        def_id,
+                        "a region default source must name an earlier fixed region",
+                        "invalid_region_default_source"
+                    );
+                    return;
+                }
+            } else if (shaped_seen) {
                 self.type_ops.add_def_error(
                     def_id,
-                    "inferred region parameters must follow all explicit region parameters",
-                    "inferred_region_parameter_order"
+                    "shape-valued region parameters must follow all fixed regions",
+                    "region_shape_parameter_order"
                 );
                 return;
             }
@@ -1313,17 +1457,85 @@ public struct DeclCheck: Movable {
         }
     }
 
-    Bool valid_region_inference_source(
+    Bool valid_region_shape_source(
+        self,
+        qid.DefId def_id,
+        qid.SymbolId source
+    ) {
+        return self.type_generic_param_named(def_id, source) != null;
+    }
+
+    qid.DefId? type_generic_param_named(
+        self,
+        qid.DefId def_id,
+        qid.SymbolId source
+    ) {
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_generic_param_count(def_id)) {
+            qid.DefId param_def =
+                self.type_ops.state.ctx.store.model.def_generic_param_at(def_id, index);
+            def.DefRecord record = self.type_ops.state.ctx.store.defs.get(param_def);
+            if (record.name.symbol == source && record.domain == .type_name) { return param_def; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool valid_region_default_source(
         self,
         qid.DefId def_id,
         qid.SymbolId source,
-        Int inferred_index
+        Int shaped_index
     ) {
         Int index! = 0;
-        while (index < inferred_index) {
+        while (index < shaped_index) {
             sem.RegionParam candidate =
                 self.type_ops.state.ctx.store.model.def_region_param_at(def_id, index);
-            if (candidate.name == source) { return !candidate.inferred; }
+            if (candidate.name == source) { return candidate.shape_source == null; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Void check_region_parameter_name_conflicts(Self&! self, qid.DefId def_id) {
+        Int region_index! = 0;
+        while (region_index < self.type_ops.state.ctx.store.model.def_region_param_count(def_id)) {
+            qid.SymbolId name =
+                self.type_ops.state.ctx.store.model.def_region_param_at(def_id, region_index).name;
+            if (self.generic_parameter_named(def_id, name) || self.field_named(def_id, name)) {
+                self.type_ops.add_def_error(
+                    def_id,
+                    "a region name cannot conflict with a generic parameter or field",
+                    "region_name_conflict"
+                );
+                return;
+            }
+            region_index = region_index + 1;
+        }
+    }
+
+    Bool generic_parameter_named(self, qid.DefId def_id, qid.SymbolId name) {
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_generic_param_count(def_id)) {
+            qid.DefId param_def =
+                self.type_ops.state.ctx.store.model.def_generic_param_at(def_id, index);
+            if (self.type_ops.state.ctx.store.defs.get(param_def).name.symbol == name) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool field_named(self, qid.DefId def_id, qid.SymbolId name) {
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
+            qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
+            def.DefRecord record = self.type_ops.state.ctx.store.defs.get(member_def);
+            if ((record.kind == .field_def || record.kind == .union_variant_def)
+                && record.name.symbol == name) {
+                return true;
+            }
             index = index + 1;
         }
         return false;
@@ -1377,6 +1589,7 @@ public struct DeclCheck: Movable {
     Void check_nominal_region_bindings(Self&! self, qid.DefId owner_def) {
         def.DefKind kind = self.type_ops.state.ctx.store.defs.get(owner_def).kind;
         if (kind != .struct_def && kind != .union_def) { return; }
+        self.check_nominal_type_parameter_usage(owner_def);
         Bool has_schema =
             self.type_ops.state.ctx.store.model.def_region_annotation_count(owner_def) > 0;
         list.ArrayList<qid.SymbolId> used_regions! = list.ArrayList<qid.SymbolId>();
@@ -1396,6 +1609,32 @@ public struct DeclCheck: Movable {
         }
         if (!has_schema) { return; }
         self.check_dangling_regions(owner_def, used_regions$.ref());
+    }
+
+    Void check_nominal_type_parameter_usage(Self&! self, qid.DefId owner_def) {
+        list.ArrayList<qid.DefId> unused_params! = list.ArrayList<qid.DefId>();
+        {
+            store_api.CompilerStore& store = self.type_ops.state.ctx.store$.ref();
+            Int count = store.model.def_generic_param_count(owner_def);
+            Int index! = 0;
+            while (index < count) {
+                qid.DefId param_def = store.model.def_generic_param_at(owner_def, index);
+                index = index + 1;
+                if (store.defs.get(param_def).domain != .type_name) { continue; }
+                if (nominal_members_use_parameter(store, owner_def, param_def)) { continue; }
+                unused_params.add(param_def);
+            }
+        }
+        Int index! = 0;
+        while (index < unused_params.len()) {
+            qid.DefId param_def = unused_params.get(index);
+            index = index + 1;
+            self.type_ops.add_def_error(
+                param_def,
+                "a nominal type parameter must be used by the declaration",
+                "unused_nominal_type_parameter"
+            );
+        }
     }
 
     Void check_field_region_binding(
@@ -1501,7 +1740,7 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        if (self.check_inferred_region_field_binding(
+        if (self.check_shape_region_field_binding(
             owner_def,
             field_def,
             used_regions
@@ -1531,7 +1770,7 @@ public struct DeclCheck: Movable {
         self.check_single_slot_field_binding(owner_def, field_def, used_regions);
     }
 
-    Bool check_inferred_region_field_binding(
+    Bool check_shape_region_field_binding(
         Self&! self,
         qid.DefId owner_def,
         qid.DefId field_def,
@@ -1551,7 +1790,7 @@ public struct DeclCheck: Movable {
         }
         sem.RegionParam param =
             self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, index);
-        if (!param.inferred) { return false; }
+        if (param.shape_source == null) { return false; }
         return self.check_field_life_source(
             owner_def,
             field_def,
@@ -2224,6 +2463,7 @@ public struct DeclCheck: Movable {
                 owner_def,
                 field_def,
                 region_owner_def,
+                field_type,
                 clause,
                 bound_targets$.mut_ref(),
                 used_regions
@@ -2232,7 +2472,7 @@ public struct DeclCheck: Movable {
             }
         }
         if (bound_targets.len()
-            != self.type_ops.state.ctx.store.model.def_region_param_count(region_owner_def)) {
+            != self.non_empty_region_parameter_count(field_type, region_owner_def)) {
             self.type_ops.add_def_error(
                 field_def,
                 "field @life must bind every public target region exactly once",
@@ -2250,32 +2490,19 @@ public struct DeclCheck: Movable {
         list.ArrayList<qid.SymbolId>&! used_regions
     ) {
         Int clause_count = self.type_ops.state.ctx.store.model.def_life_clause_count(field_def);
-        Int required = self.required_region_parameter_count(region_owner_def);
         Int region_count =
             self.type_ops.state.ctx.store.model.def_region_param_count(region_owner_def);
-        if (clause_count < required || clause_count > region_count) {
-            self.type_ops.add_def_error(
-                field_def,
-                "field @life source vector does not match the field lifetime shape",
-                "field_life_shape_mismatch"
-            );
-            return;
-        }
-        lifetime_shape_query.LifetimeShapeQuery query! =
-            lifetime_shape_query.LifetimeShapeQuery(
-                self.type_ops.state.ctx.store$.ref(),
-                self.type_ops.state.ctx.query$.mut_ref()
-            );
-        Int index! = 0;
-        while (index < clause_count) {
-            sem.LifeClause clause =
-                self.type_ops.state.ctx.store.model.def_life_clause_at(field_def, index);
-            lifetime_shape.LifetimeShapeId target_shape =
+        Int region_index! = 0;
+        while (region_index < region_count) {
+            lifetime_shape.LifetimeShapeId target_shape! =
                 self.type_ops.slot_lifetime_shape();
             sem.RegionParam param =
-                self.type_ops.state.ctx.store.model.def_region_param_at(region_owner_def, index);
-            if (param.inferred) {
-                guard query.nominal_region_parameter_shape(field_type, index)
+                self.type_ops.state.ctx.store.model.def_region_param_at(
+                    region_owner_def,
+                    region_index
+                );
+            if (param.shape_source != null) {
+                guard self.nominal_region_parameter_shape(field_type, region_index)
                     is .some(inferred_shape) else {
                     self.type_ops.add_def_error(
                         field_def,
@@ -2286,6 +2513,24 @@ public struct DeclCheck: Movable {
                 }
                 target_shape = self.semantic_lifetime_position_shape(inferred_shape);
             }
+            if (region_index >= clause_count) {
+                Bool empty = target_shape.index == self.type_ops.empty_lifetime_shape().index;
+                if (empty || self.default_region_source_index(region_owner_def, region_index) >= 0) {
+                    region_index = region_index + 1;
+                    continue;
+                }
+                self.type_ops.add_def_error(
+                    field_def,
+                    "field @life source vector does not match the field lifetime shape",
+                    "field_life_shape_mismatch"
+                );
+                return;
+            }
+            sem.LifeClause clause =
+                self.type_ops.state.ctx.store.model.def_life_clause_at(
+                    field_def,
+                    region_index
+                );
             if (!self.check_field_life_clause_source(
                 owner_def,
                 field_def,
@@ -2295,8 +2540,28 @@ public struct DeclCheck: Movable {
             )) {
                 return;
             }
-            index = index + 1;
+            region_index = region_index + 1;
         }
+        if (clause_count > region_count) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life source vector does not match the field lifetime shape",
+                "field_life_shape_mismatch"
+            );
+        }
+    }
+
+    lifetime_shape.LifetimeShapeId? nominal_region_parameter_shape(
+        Self&! self,
+        qid.TypeId field_type,
+        Int index
+    ) {
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(
+                self.type_ops.state.ctx.store$.ref(),
+                self.type_ops.state.ctx.query$.mut_ref()
+            );
+        return query.nominal_region_parameter_shape(field_type, index);
     }
 
     Int required_region_parameter_count(self, qid.DefId owner_def) {
@@ -2306,7 +2571,7 @@ public struct DeclCheck: Movable {
         while (index < count) {
             sem.RegionParam param =
                 self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, index);
-            if (!param.inferred) { explicit_count = explicit_count + 1; }
+            if (param.shape_source == null) { explicit_count = explicit_count + 1; }
             index = index + 1;
         }
         Int required! = explicit_count;
@@ -2314,11 +2579,40 @@ public struct DeclCheck: Movable {
         while (index < count) {
             sem.RegionParam param =
                 self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, index);
-            Bool has_default = param.inference_source != null || explicit_count == 1;
+            Bool has_default = param.default_source != null;
             if (!has_default) { required = index + 1; }
             index = index + 1;
         }
         return required;
+    }
+
+    Int non_empty_region_parameter_count(
+        Self&! self,
+        qid.TypeId field_type,
+        qid.DefId owner_def
+    ) {
+        Int count! = 0;
+        Int index! = 0;
+        Int length = self.type_ops.state.ctx.store.model.def_region_param_count(owner_def);
+        while (index < length) {
+            sem.RegionParam param =
+                self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, index);
+            if (param.shape_source == null) {
+                count = count + 1;
+                index = index + 1;
+                continue;
+            }
+            guard self.nominal_region_parameter_shape(field_type, index)
+                is .some(shape) else {
+                return length;
+            }
+            if (self.semantic_lifetime_position_shape(shape).index
+                != self.type_ops.empty_lifetime_shape().index) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
     }
 
     Void check_slice_field_binding(
@@ -2365,6 +2659,7 @@ public struct DeclCheck: Movable {
                 owner_def,
                 field_def,
                 region_owner_def,
+                null,
                 clause,
                 bound_targets$.mut_ref(),
                 used_regions
@@ -2419,6 +2714,7 @@ public struct DeclCheck: Movable {
         qid.DefId owner_def,
         qid.DefId field_def,
         qid.DefId region_owner_def,
+        qid.TypeId? field_type,
         sem.LifeClause clause,
         list.ArrayList<qid.SymbolId>&! bound_targets,
         list.ArrayList<qid.SymbolId>&! used_regions
@@ -2439,7 +2735,7 @@ public struct DeclCheck: Movable {
             );
             return false;
         }
-        if (!self.region_name_declared(region_owner_def, target)) {
+        guard self.region_name_index(region_owner_def, target) is .some(target_index) else {
             self.type_ops.add_def_error(
                 field_def,
                 "unknown public region name in field @life target",
@@ -2456,11 +2752,29 @@ public struct DeclCheck: Movable {
             return false;
         }
         bound_targets.add(target);
+        lifetime_shape.LifetimeShapeId target_shape! = self.type_ops.slot_lifetime_shape();
+        sem.RegionParam param =
+            self.type_ops.state.ctx.store.model.def_region_param_at(
+                region_owner_def,
+                target_index
+            );
+        if (field_type is .some(type_id) && param.shape_source != null) {
+            guard self.nominal_region_parameter_shape(type_id, target_index)
+                is .some(inferred_shape) else {
+                self.type_ops.add_def_error(
+                    field_def,
+                    "cannot resolve inferred region parameter shape",
+                    "unresolved_inferred_region_shape"
+                );
+                return false;
+            }
+            target_shape = self.semantic_lifetime_position_shape(inferred_shape);
+        }
         return self.check_field_life_clause_source(
             owner_def,
             field_def,
             clause,
-            self.type_ops.slot_lifetime_shape(),
+            target_shape,
             used_regions
         );
     }
@@ -2487,7 +2801,7 @@ public struct DeclCheck: Movable {
             clause.source,
             used_regions
         )) {
-            source_shape = self.type_ops.slot_lifetime_shape();
+            source_shape = self.field_lifetime_name_shape(owner_def, clause.source);
         }
         guard source_shape is .some(resolved_source_shape) else { return false; }
         if (target_shape.index == resolved_source_shape.index) { return true; }
@@ -2508,6 +2822,7 @@ public struct DeclCheck: Movable {
     ) {
         sem.LifetimeExpression expression =
             self.type_ops.state.ctx.store.model.lifetime_expression(expression_id);
+        if (expression.data is .empty) { return self.type_ops.empty_lifetime_shape(); }
         if (expression.data is .name(name)) {
             if (!self.check_field_life_source(
                 owner_def,
@@ -2517,7 +2832,7 @@ public struct DeclCheck: Movable {
             )) {
                 return null;
             }
-            return self.type_ops.slot_lifetime_shape();
+            return self.field_lifetime_name_shape(owner_def, name);
         }
         if (expression.data is .meet(meet)) {
             guard self.field_lifetime_expression_shape(
@@ -2556,6 +2871,41 @@ public struct DeclCheck: Movable {
             return null;
         }
         return self.type_ops.product_lifetime_shape(shapes$.ref());
+    }
+
+    lifetime_shape.LifetimeShapeId field_lifetime_name_shape(
+        Self&! self,
+        qid.DefId owner_def,
+        sem.LifetimeName name
+    ) {
+        guard self.region_binding_source_symbol(name) is .some(symbol) else {
+            return self.type_ops.slot_lifetime_shape();
+        }
+        guard self.region_name_index(owner_def, symbol) is .some(index) else {
+            return self.type_ops.slot_lifetime_shape();
+        }
+        return self.declared_region_parameter_shape(owner_def, index);
+    }
+
+    lifetime_shape.LifetimeShapeId declared_region_parameter_shape(
+        Self&! self,
+        qid.DefId owner_def,
+        Int index
+    ) {
+        sem.RegionParam param =
+            self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, index);
+        guard param.shape_source is .some(source) else {
+            return self.type_ops.slot_lifetime_shape();
+        }
+        guard self.type_generic_param_named(owner_def, source) is .some(param_def) else {
+            return self.type_ops.empty_lifetime_shape();
+        }
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(
+                self.type_ops.state.ctx.store$.ref(),
+                self.type_ops.state.ctx.query$.mut_ref()
+            );
+        return query.generic_parameter_shape(param_def);
     }
 
     Bool append_field_lifetime_product_shapes(
@@ -3346,6 +3696,7 @@ public struct DeclCheck: Movable {
     ) {
         if (self.public_region_owner_for_type(type_id) is .some(owner_def)) {
             Int region_index! = 0;
+            Int region_offset! = slot_offset;
             while (region_index
                 < self.type_ops.state.ctx.store.model.def_region_param_count(owner_def)) {
                 sem.RegionParam region =
@@ -3358,10 +3709,12 @@ public struct DeclCheck: Movable {
                     region.name,
                     root,
                     root.projection_path,
-                    slot_offset + region_index,
+                    region_offset,
                     visiting,
                     paths
                 );
+                region_offset = region_offset
+                    + self.nominal_region_binding_position_count(type_id, region_index);
                 region_index = region_index + 1;
             }
             return;
@@ -3649,14 +4002,19 @@ public struct DeclCheck: Movable {
         Int binding_index! = 0;
         while (binding_index < count) {
             if (self.field_is_logical_raw_storage(field_def)) {
-                self.add_resolved_lifetime_path(root, field_path, slot_index, paths);
+                self.add_resolved_lifetime_path(
+                    root,
+                    field_path,
+                    slot_index + binding_index,
+                    paths
+                );
             } else {
                 self.append_type_binding_position_path(
                     field_type,
                     binding_index,
                     root,
                     field_path,
-                    slot_index,
+                    slot_index + binding_index,
                     visiting,
                     paths
                 );
@@ -3877,20 +4235,31 @@ public struct DeclCheck: Movable {
         list.ArrayList<ResolvedLifetimeSlotPath>&! paths
     ) {
         Int index! = 0;
+        Int binding_offset! = 0;
         while (index < self.type_ops.state.ctx.store.model.def_life_clause_count(field_def)) {
             sem.LifeClause clause =
                 self.type_ops.state.ctx.store.model.def_life_clause_at(field_def, index);
-            if (self.field_clause_source_contains_region(clause, region)) {
+            list.ArrayList<Int> offsets! = list.ArrayList<Int>();
+            Int binding_count = self.append_field_clause_region_offsets(
+                clause,
+                region,
+                binding_offset,
+                offsets$.mut_ref()
+            );
+            Int offset_index! = 0;
+            while (offset_index < offsets.len()) {
                 self.append_type_binding_position_path(
                     field_type,
-                    index,
+                    offsets.get(offset_index),
                     root,
                     field_path,
                     slot_index,
                     visiting,
                     paths
                 );
+                offset_index = offset_index + 1;
             }
+            binding_offset = binding_offset + binding_count;
             index = index + 1;
         }
     }
@@ -3920,16 +4289,10 @@ public struct DeclCheck: Movable {
         list.ArrayList<ResolvedLifetimeSlotPath>&! paths
     ) {
         if (self.public_region_owner_for_type(type_id) is .some(owner_def)) {
-            if (binding_index < 0
-                || binding_index
-                    >= self.type_ops.state.ctx.store.model.def_region_param_count(owner_def)) {
-                return;
-            }
-            sem.RegionParam region =
-                self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, binding_index);
-            self.append_public_region_paths(
+            self.append_nominal_binding_position_path(
                 type_id,
-                region.name,
+                owner_def,
+                binding_index,
                 root,
                 prefix,
                 slot_index,
@@ -4015,6 +4378,94 @@ public struct DeclCheck: Movable {
         if (binding_index == 0
             && self.type_lifetime_binding_position_count_in_context(type_id, visiting) == 1) {
             self.add_resolved_lifetime_path(root, prefix, slot_index, paths);
+        }
+    }
+
+    Void append_nominal_binding_position_path(
+        Self&! self,
+        qid.TypeId type_id,
+        qid.DefId owner_def,
+        Int binding_index,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId? prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>&! visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>&! paths
+    ) {
+        Int offset! = 0;
+        Int region_index! = 0;
+        while (region_index
+            < self.type_ops.state.ctx.store.model.def_region_param_count(owner_def)) {
+            Int count = self.nominal_region_binding_position_count(type_id, region_index);
+            if (binding_index >= offset && binding_index < offset + count) {
+                sem.RegionParam region =
+                    self.type_ops.state.ctx.store.model.def_region_param_at(
+                        owner_def,
+                        region_index
+                    );
+                self.append_selected_public_region_path(
+                    type_id,
+                    region.name,
+                    binding_index - offset,
+                    root,
+                    prefix,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+                return;
+            }
+            offset = offset + count;
+            region_index = region_index + 1;
+        }
+    }
+
+    Int nominal_region_binding_position_count(
+        Self&! self,
+        qid.TypeId type_id,
+        Int region_index
+    ) {
+        guard self.nominal_region_parameter_shape(type_id, region_index)
+            is .some(shape) else {
+            return 0;
+        }
+        return self.lifetime_shape_binding_position_count(shape);
+    }
+
+    Void append_selected_public_region_path(
+        Self&! self,
+        qid.TypeId type_id,
+        qid.SymbolId region,
+        Int position,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId? prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>&! visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>&! paths
+    ) {
+        list.ArrayList<ResolvedLifetimeSlotPath> candidates! =
+            list.ArrayList<ResolvedLifetimeSlotPath>();
+        self.append_public_region_paths(
+            type_id,
+            region,
+            root,
+            prefix,
+            0,
+            visiting,
+            candidates$.mut_ref()
+        );
+        Int index! = 0;
+        while (index < candidates.len()) {
+            ResolvedLifetimeSlotPath candidate = candidates.get(index);
+            if (candidate.slot_index == position) {
+                self.add_resolved_lifetime_path(
+                    candidate.path,
+                    candidate.path.projection_path,
+                    slot_index,
+                    paths
+                );
+            }
+            index = index + 1;
         }
     }
 
@@ -4173,20 +4624,26 @@ public struct DeclCheck: Movable {
                 self.type_ops.state.ctx.store.model.def_life_clause_at(field_def, clause_index);
             clause_index = clause_index + 1;
             guard clause.target is .some(target) else { continue; }
-            if (!self.field_clause_source_contains_region(clause, region)) { continue; }
             guard self.region_binding_source_symbol(target) is .some(target_region) else {
                 continue;
             }
             if (!self.region_name_declared(target_owner_def, target_region)) { continue; }
-            self.append_public_region_paths(
-                field_type,
-                target_region,
-                root,
-                field_path,
-                slot_index,
-                visiting,
-                paths
-            );
+            list.ArrayList<Int> offsets! = list.ArrayList<Int>();
+            self.append_field_clause_region_offsets(clause, region, 0, offsets$.mut_ref());
+            Int offset_index! = 0;
+            while (offset_index < offsets.len()) {
+                self.append_selected_public_region_path(
+                    field_type,
+                    target_region,
+                    offsets.get(offset_index),
+                    root,
+                    field_path,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+                offset_index = offset_index + 1;
+            }
         }
     }
 
@@ -4218,24 +4675,27 @@ public struct DeclCheck: Movable {
             }
             sem.LifeClause clause =
                 self.type_ops.state.ctx.store.model.def_life_clause_at(field_def, source_index);
-            if (!self.field_clause_source_contains_region(clause, region)) {
-                index = index + 1;
-                continue;
-            }
+            list.ArrayList<Int> offsets! = list.ArrayList<Int>();
+            self.append_field_clause_region_offsets(clause, region, 0, offsets$.mut_ref());
             sem.RegionParam target_region =
                 self.type_ops.state.ctx.store.model.def_region_param_at(
                     target_owner_def,
                     index
                 );
-            self.append_public_region_paths(
-                field_type,
-                target_region.name,
-                root,
-                field_path,
-                slot_index,
-                visiting,
-                paths
-            );
+            Int offset_index! = 0;
+            while (offset_index < offsets.len()) {
+                self.append_selected_public_region_path(
+                    field_type,
+                    target_region.name,
+                    offsets.get(offset_index),
+                    root,
+                    field_path,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+                offset_index = offset_index + 1;
+            }
             index = index + 1;
         }
     }
@@ -4245,12 +4705,11 @@ public struct DeclCheck: Movable {
         if (region_index < 0 || region_index >= count) { return -1; }
         sem.RegionParam param =
             self.type_ops.state.ctx.store.model.def_region_param_at(owner_def, region_index);
-        if (!param.inferred) { return -1; }
-        if (param.inference_source is .some(source)) {
+        if (param.shape_source == null) { return -1; }
+        if (param.default_source is .some(source)) {
             if (self.region_name_index(owner_def, source) is .some(index)) { return index; }
             return -1;
         }
-        if (self.required_region_parameter_count(owner_def) == 1) { return 0; }
         return -1;
     }
 
@@ -4533,7 +4992,7 @@ public struct DeclCheck: Movable {
     }
 
     lifetime_shape.LifetimeShapeId default_function_position_shape(
-        self,
+        Self&! self,
         qid.TypeId type_id,
         lifetime_shape.LifetimeShapeId raw_shape
     ) {
@@ -5165,6 +5624,10 @@ public struct DeclCheck: Movable {
             return self.type_ops.check_function_result_type_ref(signature.result);
         }
         if (name.kind == .self_lifetime) {
+            if (model_def.decl.function_signature is .some(signature)
+                && signature.has_receiver) {
+                return self.type_ops.receiver_type_for_function(model_def.def_id);
+            }
             return self.lifetime_self_type(model_def.def_id);
         }
         guard name.symbol is .some(symbol) else { return null; }
@@ -5493,13 +5956,17 @@ public struct DeclCheck: Movable {
         }
         guard tuple.contract_names is .some(names) else { return null; }
         if (names.length != 1 || names[0] != symbol) { return null; }
-        return self.type_ops.check_non_task_container_type_ref(tuple.items[0]);
+        sem.NodeId item = tuple.items[0];
+        return self.type_ops.check_non_task_container_type_ref(item);
     }
 
     sem.TupleTypeRef? reference_occurrence_tuple(Self&! self, sem.NodeId type_ref) {
         sem.Node node = self.type_ops.state.ctx.store.model.node(type_ref);
         guard node.data is .layered_type_ref(layered) else { return null; }
         if (layered.kind == .mutable_type) {
+            return self.reference_occurrence_tuple(layered.element);
+        }
+        if (layered.kind == .optional_type) {
             return self.reference_occurrence_tuple(layered.element);
         }
         if (layered.kind != .reference) { return null; }
@@ -5948,8 +6415,8 @@ public struct DeclCheck: Movable {
         if (!self.is_value_recursive_nominal_kind(kind)) {
             return;
         }
-        if (self.value_recursion_states.get(def_id) is .some(state)) {
-            if (state$.get() == 1) {
+        if (self.value_recursion_state(def_id) is .some(state)) {
+            if (state == 1) {
                 self.type_ops.add_def_error(def_id, "recursive by-value type", "recursive_value_type");
             }
             return;
@@ -5957,6 +6424,11 @@ public struct DeclCheck: Movable {
         self.value_recursion_states.set(def_id, 1);
         self.check_nominal_member_value_recursion(def_id, kind);
         self.value_recursion_states.set(def_id, 2);
+    }
+
+    Int? value_recursion_state(self, qid.DefId def_id) {
+        guard self.value_recursion_states.get(def_id) is .some(state) else { return null; }
+        return state$.get();
     }
 
     Void check_nominal_member_value_recursion(Self&! self, qid.DefId def_id, def.DefKind owner_kind) {
@@ -6649,8 +7121,9 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        guard self.type_ops.state.ctx.store.model.def(impl_assoc) is .some(impl_model) else { return; }
-        if (self.type_ops.state.ctx.store.defs.get(impl_assoc).kind != .associated_type_def || !impl_model.decl.is_const) {
+        if (!self.type_ops.state.ctx.store.model.has_def(impl_assoc)) { return; }
+        if (self.type_ops.state.ctx.store.defs.get(impl_assoc).kind != .associated_type_def
+            || !self.type_ops.state.ctx.store.model.def_is_const(impl_assoc)) {
             self.type_ops.add_def_error(
                 impl_assoc,
                 "associated const implementation must be an associated const",
@@ -6658,7 +7131,7 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        if (impl_model.body == null) {
+        if (!self.type_ops.state.ctx.store.model.has_body(impl_assoc)) {
             self.type_ops.add_def_error(
                 impl_assoc,
                 "associated const implementation requires a value",
@@ -6900,14 +7373,15 @@ public struct DeclCheck: Movable {
         if (!self.callables_share_overload_name(left_def, right_def)) {
             return;
         }
-        guard self.type_ops.state.ctx.store.model.def(left_def) is .some(left_model) else { return; }
-        guard self.type_ops.state.ctx.store.model.def(right_def) is .some(right_model) else { return; }
-        guard left_model.decl.function_signature is .some(left_signature) else { return; }
-        guard right_model.decl.function_signature is .some(right_signature) else { return; }
-        if (left_signature.has_receiver != right_signature.has_receiver) {
+        if (!self.type_ops.state.ctx.store.model.has_function_signature(left_def)
+            || !self.type_ops.state.ctx.store.model.has_function_signature(right_def)) {
             return;
         }
-        if (!self.call_argument_counts_and_types_overlap(left_signature, right_signature)) {
+        if (self.type_ops.state.ctx.store.model.function_signature_has_receiver(left_def)
+            != self.type_ops.state.ctx.store.model.function_signature_has_receiver(right_def)) {
+            return;
+        }
+        if (!self.call_argument_counts_and_types_overlap(left_def, right_def)) {
             return;
         }
         self.type_ops.add_def_error(
@@ -6943,13 +7417,15 @@ public struct DeclCheck: Movable {
         return kind == .init_def;
     }
 
-    Bool call_argument_counts_and_types_overlap(Self&! self, sem.FunctionSignature left, sem.FunctionSignature right) {
-        Int left_min = self.min_positional_call_arg_count(left);
-        Int right_min = self.min_positional_call_arg_count(right);
+    Bool call_argument_counts_and_types_overlap(Self&! self, qid.DefId left_def, qid.DefId right_def) {
+        Int left_min = self.min_positional_call_arg_count(left_def);
+        Int right_min = self.min_positional_call_arg_count(right_def);
         Int min_args! = self.max_int(left_min, right_min);
-        Int max_args = self.min_int(left.params.length, right.params.length);
+        Int left_count = self.type_ops.state.ctx.store.model.function_signature_param_count(left_def);
+        Int right_count = self.type_ops.state.ctx.store.model.function_signature_param_count(right_def);
+        Int max_args = self.min_int(left_count, right_count);
         while (min_args <= max_args) {
-            if (self.call_prefix_types_overlap(left, right, min_args)) {
+            if (self.call_prefix_types_overlap(left_def, right_def, min_args)) {
                 return true;
             }
             min_args = min_args + 1;
@@ -6957,11 +7433,15 @@ public struct DeclCheck: Movable {
         return false;
     }
 
-    Bool call_prefix_types_overlap(Self&! self, sem.FunctionSignature left, sem.FunctionSignature right, Int count) {
+    Bool call_prefix_types_overlap(Self&! self, qid.DefId left_def, qid.DefId right_def, Int count) {
         Int index! = 0;
         while (index < count) {
-            qid.TypeId left_type = self.type_ops.check_type_ref(left.params[index]);
-            qid.TypeId right_type = self.type_ops.check_type_ref(right.params[index]);
+            sem.NodeId left_param =
+                self.type_ops.state.ctx.store.model.function_signature_param_at(left_def, index);
+            sem.NodeId right_param =
+                self.type_ops.state.ctx.store.model.function_signature_param_at(right_def, index);
+            qid.TypeId left_type = self.type_ops.check_type_ref(left_param);
+            qid.TypeId right_type = self.type_ops.check_type_ref(right_param);
             if (self.type_ops.is_invalid_type(left_type) || self.type_ops.is_invalid_type(right_type)) {
                 return false;
             }
@@ -6987,11 +7467,12 @@ public struct DeclCheck: Movable {
         return right;
     }
 
-    Int min_positional_call_arg_count(self, sem.FunctionSignature signature) {
+    Int min_positional_call_arg_count(self, qid.DefId def_id) {
         Int count! = 0;
         Int index! = 0;
-        while (index < signature.params.length) {
-            if (!self.param_has_default(signature, index)) {
+        Int param_count = self.type_ops.state.ctx.store.model.function_signature_param_count(def_id);
+        while (index < param_count) {
+            if (!self.param_has_default(def_id, index)) {
                 count = index + 1;
             }
             index = index + 1;
@@ -6999,10 +7480,13 @@ public struct DeclCheck: Movable {
         return count;
     }
 
-    Bool param_has_default(self, sem.FunctionSignature signature, Int param_index) {
+    Bool param_has_default(self, qid.DefId def_id, Int param_index) {
         Int index! = 0;
-        while (index < signature.param_defaults.length) {
-            if (signature.param_defaults[index].param_index == param_index) {
+        Int default_count = self.type_ops.state.ctx.store.model.function_signature_param_default_count(def_id);
+        while (index < default_count) {
+            sem.ParamDefault value =
+                self.type_ops.state.ctx.store.model.function_signature_param_default_at(def_id, index);
+            if (value.param_index == param_index) {
                 return true;
             }
             index = index + 1;

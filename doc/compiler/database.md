@@ -44,16 +44,21 @@ function/body 仍由当前 JIL Store 拥有。
 `QueryCache<K, V>` 是不知道业务的同步 memo 原语。`K` 和 `V` 都是 `Copyable`。
 
 ```text
-entries: WyHashMap<K, V?>
+entries:    WyHashMap<K, V>
+evaluating: WyHashMap<K, Bool>
 ```
 
-一张表表示三种状态：
+完成值和求值中状态分别存储，`QueryCacheState<V>` 只是访问结果：
 
-| entries | `QueryCacheState<V>` | 含义 |
+| cache 内容 | `QueryCacheState<V>` | 含义 |
 | --- | --- | --- |
-| 没有 key | `missing` | `state` 写入 `key -> null`，当前调用方负责计算 |
-| `key -> null` | `evaluating` | 该 key 正在求值，由 wrapper 解释重入 |
-| `key -> value` | `ready(value)` | 结果已发布 |
+| entries 没有 key，evaluating 没有 key 或为 false | `missing` | `state` 把 key 标记为 evaluating，当前调用方负责计算 |
+| evaluating 中 key 为 true | `evaluating` | 该 key 正在求值，由 wrapper 解释重入 |
+| entries 包含 `key -> value` | `ready(value)` | 结果已发布 |
+
+ready 热路径只查询 entries；只有 miss 才查询 evaluating。entries 不借用 `null` 表示内部
+状态，因此 `V` 本身为 Optional 时仍能完整表示 `ready(null)`。完成求值时把 evaluating
+标记改为 false，不让正常查询热路径反复制造 hash-map tombstone。
 
 正常状态转换是：
 

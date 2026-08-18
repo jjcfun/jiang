@@ -132,9 +132,9 @@ Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
 struct / union 的 `@region(a, b: a)` 中，每个 item 声明一个 public region；
 `target: source` 同时声明 target 并表示 outlives 约束，每个 target 只能出现一次。单-slot
-region 使用普通名字；`value?` 声明 shape 由字段类型推断的 region，必须位于固定 region 之后。
-`value?: anchor` 还允许省略字段 binding，并用 `anchor` 填充推断 shape 的全部 slots；只有一个
-固定 region 时，`value?` 默认使用该唯一 region。
+region 使用普通名字；`value: T` 声明 shape 来自同一 nominal 的类型泛型参数 `T`，并且必须
+位于固定 region 之后。`value: T = anchor` 还允许省略字段 binding，并用较早声明的固定 region
+`anchor` 填充 `shape(T)` 的全部 slots。`?` 推断语法不再使用。
 字段 binding 写作 `@life(a)`，多-slot
 字段 binding 可以按位置写作 `@life(a, b)`，或按 type occurrence 的具名位置写作
 `@life(left: a, right: b)`；两种模式不能混用，target 必须唯一且完整。callable

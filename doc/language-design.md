@@ -522,12 +522,17 @@ struct Pair {
 named 模式的 target 必须唯一且完整，不能与位置模式混用。字段 binding 不支持 `self` source，
 也不改变字段 `TypeId`、layout 或 ABI。
 
-`@region` 的普通参数是固定单 slot；尾部 `?` 参数的 shape 由实际字段类型推断。
-`@region(r, v?: r)` 表示省略 `v` binding 时，用 `r` 填充 `shape(v)` 的全部 slots；只有一个
-固定参数时可以简写为 `@region(r, v?)`。若有多个固定参数且未写 `?: source`，推断参数仍必须
-显式绑定。
+`@region` 的普通参数是固定单 slot；`value: T` 显式声明
+`shape(value) = shape(T)`，其中 `T` 必须是同一 nominal 的类型泛型参数。region schema
+不再从字段布局反向推导。`@region(r, value: T = r)` 还声明字段省略 `value` binding 时，
+用 `r` 填充 `shape(T)` 的全部 slots；没有 `= r` 时必须显式提供完整 binding，实际 shape
+为空时除外。shape-valued region 必须位于固定 region 之后。
 
-reference 使用专用 `reference(value)` Shape，不退化成普通 product。外层 borrow 是第一个
+region slot 不得与同一 nominal 的字段、泛型参数或其他 region slot 重名；函数、内部类型和
+extension 成员不参与该冲突检查。
+
+reference 使用专用 `reference(value)` Shape，不退化成普通 product，其 schema 在语义上等价于
+`@region(r, value: T = r)`。外层 borrow 是第一个
 逻辑位置，第二个逻辑位置保持完整 pointee Shape。reference 字段必须绑定外层 borrow；例如
 `Pair` 的 Shape 为 `(a, b)` 时，可以只写 `@life(r)`，由 `r` 填充 pointee，也可以完整写作
 `@life(r, (a, b))`，但不能扁平化或部分绑定。函数 contract 中，reference 参数根名表示外层

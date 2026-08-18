@@ -12,6 +12,7 @@ import comptime_value = "../../sema/comptime/value.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
 import types = "../../sema/type.jiang";
 import list = "../../support/list.jiang";
+import map = "../../support/map.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
 import jil = "../model.jiang";
@@ -33,6 +34,73 @@ import suspend = "./suspend.jiang";
 import dispatch = "./dispatch.jiang";
 import builder = "./builder.jiang";
 public import intrinsic = "./intrinsic.jiang";
+
+public Void push_task_region_start(
+    map.WyHashMap<Int, jil.TaskStoragePlan>&! task_storage_plans,
+    BodyBuilder&! body_builder,
+    jil.Place task_place,
+    jil.LocalId task_local,
+    jil.TaskStoragePlan storage,
+    jil.FunctionRef? child_resume,
+    token.Span span
+) {
+    task_storage_plans.set(task_local.to_index(), storage);
+    body_builder.push_statement(jil.Statement (
+        span: span,
+        kind: jil.task_region_start_statement_kind(jil.TaskRegionStartStatement (
+            task: task_place,
+            task_local: task_local,
+            storage: storage,
+            child_resume: child_resume
+        ))
+    ));
+}
+
+public extend body_context.BodyBuilder {
+    public Void append_initialized_task_statements(
+        Self&! self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        jil.Place frame_place,
+        jil.FunctionRef resume_function,
+        jil.FunctionRef completion_function,
+        token.Span span
+    ) {
+        coroutine_task_abi.append_initialized_task_statements(
+            self.storage,
+            layout,
+            task_place,
+            frame_place,
+            resume_function,
+            completion_function,
+            span,
+            self.statements$.mut_ref()
+        );
+    }
+
+    public Void append_task_lifetime_initializers(
+        Self&! self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        jil.FunctionRef cleanup,
+        token.Span span
+    ) {
+        coroutine_task_abi.append_lifetime_initializers(
+            self.storage, layout, task_place, cleanup, true, span, self.statements$.mut_ref()
+        );
+    }
+
+    public Void append_inactive_task_lifetime_initializers(
+        Self&! self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        token.Span span
+    ) {
+        coroutine_task_abi.append_inactive_lifetime_initializers(
+            self.storage, layout, task_place, span, self.statements$.mut_ref()
+        );
+    }
+}
 
 public extend body_context.BodyLowerer {
     public Void lower_async_call_task(Self&! self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
@@ -79,9 +147,17 @@ public extend body_context.BodyLowerer {
             self.mark_unsupported(node_id);
             return;
         }
-        self.push_task_region_start(destination, task_local, storage, resume_function, span);
+        push_task_region_start(
+            self.task_storage_plans$.mut_ref(),
+            self.builder,
+            destination,
+            task_local,
+            storage,
+            resume_function,
+            span
+        );
         jil.Place frame_place = self.initialize_task_frame_storage(
-            layout$.ref(), task_local, storage, span
+            layout.frame_type_id, task_local, storage, span
         );
         self.initialize_structured_task_state(destination, layout$.ref(), task_local, storage, span);
         self.lower_async_call_args_into_frame(call, layout$.ref(), destination, frame_place);
@@ -137,7 +213,15 @@ public extend body_context.BodyLowerer {
                 reclaim: .parent
             );
         }
-        self.push_task_region_start(task_place, task_local, storage, null, span);
+        push_task_region_start(
+            self.task_storage_plans$.mut_ref(),
+            self.builder,
+            task_place,
+            task_local,
+            storage,
+            null,
+            span
+        );
         self.initialize_structured_task_state(task_place, layout, task_local, storage, span);
         jil.Place frame_pointer = coroutine_task_abi.task_field_place(
             self.lowerer.storage, task_place, layout.task_abi.frame_field
@@ -201,7 +285,7 @@ public extend body_context.BodyLowerer {
         );
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place initialize_external_task_continuation_storage(
         Self&! self,
         jil.CoroutineFrameLayout& layout,
@@ -383,6 +467,7 @@ public extend body_context.BodyLowerer {
         self.builder.start_block(next_block);
     }
 
+    @life(return: self.d)
     public jil.FunctionRef? async_call_completion_function_ref(
         Self&! self,
         sem.NodeId node_id,
@@ -402,6 +487,7 @@ public extend body_context.BodyLowerer {
         );
     }
 
+    @life(return: self.d)
     public jil.FunctionRef? async_call_resume_function_ref(
         Self&! self,
         sem.NodeId node_id,
@@ -412,14 +498,13 @@ public extend body_context.BodyLowerer {
             return null;
         }
         FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
-        return jil.FunctionRef (
-            target: .source(target_def),
-            type_args: self.lowerer.storage.type_arg_array(function_args.type_args),
-            const_args: self.lowerer.storage.const_arg_array(function_args.const_args),
-            coroutine_resume: true,
-            coroutine_completion: false,
-            type_id: layout.task_abi.resume_function_type_id,
-            span: self.lowerer.model_span(node_id)
+        return self.lowerer.storage.source_coroutine_function_ref(
+            target_def,
+            function_args.type_args,
+            function_args.const_args,
+            layout.task_abi.resume_function_type_id,
+            true,
+            self.lowerer.model_span(node_id)
         );
     }
 
@@ -459,7 +544,7 @@ public extend body_context.BodyLowerer {
         jil.Place consumed_task = support.stable_place(
             self.lowerer.storage, task_place$.ref()
         );
-        self.builder.statements.add(jil.Statement (
+        self.builder.push_statement(jil.Statement (
             span: span,
             kind: jil.task_consume_statement_kind(jil.TaskConsumeStatement (
                 task: consumed_task,
@@ -497,7 +582,7 @@ public extend body_context.BodyLowerer {
 
     // await may resume in a later invocation. Preserve the resolved Task address instead of
     // re-evaluating projections whose index temporaries live in the previous stack invocation.
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place stable_task_place(
         Self&! self,
         jil.Place task_place,
@@ -516,7 +601,7 @@ public extend body_context.BodyLowerer {
         return self.project_deref(self.place_for_local(pointer), true);
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place stable_owned_task_root(
         Self&! self,
         jil.Place owner,
@@ -540,7 +625,7 @@ public extend body_context.BodyLowerer {
         return self.place_for_local(pointer);
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place? task_owner_pointer_place(self, jil.Place task_place) {
         Int count = task_place.projection.length;
         if (count == 0) { return null; }
@@ -662,7 +747,7 @@ public extend body_context.BodyLowerer {
         jil.Place consumed_task = support.stable_place(
             self.lowerer.storage, task_place$.ref()
         );
-        self.builder.statements.add(jil.Statement (
+        self.builder.push_statement(jil.Statement (
             span: span,
             kind: jil.task_consume_statement_kind(jil.TaskConsumeStatement (
                 task: consumed_task,
@@ -732,7 +817,7 @@ public extend body_context.BodyLowerer {
                 storage: storage
             ))
         );
-        self.builder.statements.add(release);
+        self.builder.push_statement(release);
         self.builder.push_assign(
             coroutine_task_abi.task_field_place(
                 self.lowerer.storage, task_place, task_state.state
@@ -776,27 +861,27 @@ public extend body_context.BodyLowerer {
         return self.task_owner_pointer_place(destination) != null;
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place initialize_task_frame_storage(
         Self&! self,
-        jil.CoroutineFrameLayout& layout,
+        qid.TypeId frame_type_id,
         jil.LocalId task_local,
         jil.TaskStoragePlan storage,
         token.Span span
     ) {
         if (storage.frame != .heap) {
             jil.LocalId frame_local = self.add_coroutine_capture_temp(
-                layout.frame_type_id, span, task_local, .task_frame
+                frame_type_id, span, task_local, .task_frame
             );
             return self.place_for_local(frame_local);
         }
-        qid.TypeId pointer_type = self.raw_pointer_type(layout.frame_type_id, span);
+        qid.TypeId pointer_type = self.raw_pointer_type(frame_type_id, span);
         jil.LocalId pointer_local = self.add_coroutine_capture_temp(
             pointer_type, span, task_local, .auxiliary
         );
         self.builder.push_assign(
             self.place_for_local(pointer_local),
-            jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: layout.frame_type_id)),
+            jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: frame_type_id)),
             span
         );
         return self.project_deref(self.place_for_local(pointer_local), true);
@@ -820,26 +905,6 @@ public extend body_context.BodyLowerer {
             return .concurrent;
         }
         return .local_serial;
-    }
-
-    public Void push_task_region_start(
-        Self&! self,
-        jil.Place task_place,
-        jil.LocalId task_local,
-        jil.TaskStoragePlan storage,
-        jil.FunctionRef? child_resume,
-        token.Span span
-    ) {
-        self.set_task_storage_plan(task_local, storage);
-        self.builder.statements.add(jil.Statement (
-            span: span,
-            kind: jil.task_region_start_statement_kind(jil.TaskRegionStartStatement (
-                task: task_place,
-                task_local: task_local,
-                storage: storage,
-                child_resume: child_resume
-            ))
-        ));
     }
 
     public Void set_task_storage_plan(
@@ -951,7 +1016,7 @@ public extend body_context.BodyLowerer {
         return false;
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place initialize_local_task_state(
         self,
         jil.Place task_place,
@@ -1233,20 +1298,10 @@ public extend body_context.BodyLowerer {
             jil.FunctionRef cleanup = self.task_cleanup_function(
                 self.task_state_layout_for_task(task_place), span
             );
-            coroutine_task_abi.append_lifetime_initializers(
-                self.lowerer.storage,
-                layout,
-                task_place,
-                cleanup,
-                true,
-                span,
-                self.builder.statements$.mut_ref()
-            );
+            self.builder.append_task_lifetime_initializers(layout, task_place, cleanup, span);
             return;
         }
-        coroutine_task_abi.append_inactive_lifetime_initializers(
-            self.lowerer.storage, layout, task_place, span, self.builder.statements$.mut_ref()
-        );
+        self.builder.append_inactive_task_lifetime_initializers(layout, task_place, span);
     }
 
     public Void lower_await_task_ready(
@@ -1543,7 +1598,7 @@ public extend body_context.BodyLowerer {
         )), span);
         self.builder.start_block(wait_block);
         jil.Operand expected = self.operand_for_place(self.place_for_local(tagged_word));
-        self.builder.statements.add(jil.Statement (
+        self.builder.push_statement(jil.Statement (
             span: span,
             kind: jil.task_wait_statement_kind(jil.TaskWaitStatement (
                 state: state_place,
@@ -1936,7 +1991,7 @@ public extend body_context.BodyLowerer {
     }
 
     public Void push_atomic_store(Self&! self, jil.Place destination, jil.Operand value, token.Span span) {
-        self.builder.statements.add(jil.Statement (
+        self.builder.push_statement(jil.Statement (
             span: span,
             kind: jil.atomic_store_statement_kind(jil.AtomicStoreStatement (
                 destination: destination,
@@ -1963,7 +2018,7 @@ public extend body_context.BodyLowerer {
                     call.args[index], self.stable_place(param_location$.ref()), param_type
                 );
                 jil.Place environment = self.stable_place(param_location$.ref());
-                self.builder.statements.add(jil.Statement (
+                self.builder.push_statement(jil.Statement (
                     span: self.lowerer.model_span(call.args[index]),
                     kind: jil.capture_bind_statement_kind(jil.CaptureBindStatement (
                         destination: task_place,
@@ -1975,7 +2030,7 @@ public extend body_context.BodyLowerer {
         }
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place? async_call_frame_field_place(
         self,
         jil.CoroutineFrameLayout& layout,
@@ -1993,7 +2048,7 @@ public extend body_context.BodyLowerer {
         return null;
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place project_frame_field(
         self,
         jil.Place frame_place,
@@ -2009,7 +2064,7 @@ public extend body_context.BodyLowerer {
         );
     }
 
-    @life(return: self.a)
+    @life(return: self.d)
     public jil.Place project_frame_field(
         self,
         jil.Place frame_place,
