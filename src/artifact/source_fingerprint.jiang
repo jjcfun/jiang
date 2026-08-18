@@ -12,6 +12,7 @@ import interner = "../resolve/interner.jiang";
 import store = "../resolve/store.jiang";
 import blake3 = "../support/blake3.jiang";
 import list = "../support/list.jiang";
+import map = "../support/map.jiang";
 import memory = "../support/memory.jiang";
 import source = "../source.jiang";
 import ji = "./ji_file.jiang";
@@ -2399,32 +2400,102 @@ Void write_bytes_with_length(SourceSectionWriter&! writer, UInt8[]& bytes) {
 }
 
 list.ArrayList<Int> sorted_declaration_indexes(source_artifact.ModuleInterface& module_interface) {
+    list.ArrayList<qkey.StableSymbolId> groups! = declaration_root_groups(module_interface);
     list.ArrayList<Int> indexes! = index_list(module_interface.declarations.len());
-    Int index! = 0;
-    while (index < indexes.len()) {
-        Int min_index! = index;
-        Int scan! = index + 1;
-        while (scan < indexes.len()) {
-            if (declaration_index_less(module_interface, indexes.get(scan), indexes.get(min_index))) {
-                min_index = scan;
-            }
-            scan = scan + 1;
-        }
-        swap_indexes(indexes$.mut_ref(), index, min_index);
-        index = index + 1;
-    }
+    list.ArrayList<Int> scratch! = index_list(indexes.len());
+    Int count = indexes.len();
+    sort_declaration_indexes(indexes$.mut_ref(), scratch$.mut_ref(), groups.slice(), 0, count);
     return indexes;
 }
 
+// Interface 声明按顶层 owner 分组排序。稳定索引只在构建排序视图时创建，不能在
+// 比较器中反复线性扫描 declarations；后者会使大型模块退化为近似 O(n³)。
+list.ArrayList<qkey.StableSymbolId> declaration_root_groups(
+    source_artifact.ModuleInterface& module_interface
+) {
+    map.WyHashMap<qkey.StableSymbolId, Int> positions! =
+        map.WyHashMap<qkey.StableSymbolId, Int>();
+    positions.reserve(module_interface.declarations.len());
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        positions.set(module_interface.declarations.get(index).stable_id, index);
+        index = index + 1;
+    }
+
+    list.ArrayList<qkey.StableSymbolId> groups! =
+        list.ArrayList<qkey.StableSymbolId>(module_interface.declarations.len());
+    index = 0;
+    while (index < module_interface.declarations.len()) {
+        groups.add(declaration_root_group(module_interface, positions$.ref(), index));
+        index = index + 1;
+    }
+    return groups;
+}
+
+Void sort_declaration_indexes(
+    list.ArrayList<Int>&! indexes,
+    list.ArrayList<Int>&! scratch,
+    qkey.StableSymbolId[]& groups,
+    Int begin,
+    Int end
+) {
+    if (end - begin <= 1) { return; }
+    Int middle = begin + (end - begin) / 2;
+    sort_declaration_indexes(indexes, scratch, groups, begin, middle);
+    sort_declaration_indexes(indexes, scratch, groups, middle, end);
+    merge_declaration_indexes(indexes, scratch, groups, begin, middle, end);
+}
+
+Void merge_declaration_indexes(
+    list.ArrayList<Int>&! indexes,
+    list.ArrayList<Int>&! scratch,
+    qkey.StableSymbolId[]& groups,
+    Int begin,
+    Int middle,
+    Int end
+) {
+    Int left! = begin;
+    Int right! = middle;
+    Int write! = begin;
+    while (left < middle && right < end) {
+        if (declaration_index_less(groups, indexes.get(right), indexes.get(left))) {
+            scratch.set(write, indexes.get(right));
+            right = right + 1;
+        } else {
+            scratch.set(write, indexes.get(left));
+            left = left + 1;
+        }
+        write = write + 1;
+    }
+    copy_declaration_index_tail(indexes, scratch, left, middle, write);
+    write = write + (middle - left);
+    copy_declaration_index_tail(indexes, scratch, right, end, write);
+    copy_declaration_index_tail(scratch, indexes, begin, end, begin);
+}
+
+Void copy_declaration_index_tail(
+    list.ArrayList<Int>& source,
+    list.ArrayList<Int>&! target,
+    Int begin,
+    Int end,
+    Int target_begin
+) {
+    Int source_index! = begin;
+    Int target_index! = target_begin;
+    while (source_index < end) {
+        target.set(target_index, source.get(source_index));
+        source_index = source_index + 1;
+        target_index = target_index + 1;
+    }
+}
+
 Bool declaration_index_less(
-    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId[]& groups,
     Int lhs_index,
     Int rhs_index
 ) {
-    source_artifact.InterfaceDeclSummary lhs = module_interface.declarations.get(lhs_index);
-    source_artifact.InterfaceDeclSummary rhs = module_interface.declarations.get(rhs_index);
-    qkey.StableSymbolId lhs_group = declaration_root_group(module_interface, lhs);
-    qkey.StableSymbolId rhs_group = declaration_root_group(module_interface, rhs);
+    qkey.StableSymbolId lhs_group = groups[lhs_index];
+    qkey.StableSymbolId rhs_group = groups[rhs_index];
     if (stable_id_less(lhs_group, rhs_group)) { return true; }
     if (stable_id_less(rhs_group, lhs_group)) { return false; }
     // 同一顶层 owner 内的顺序属于 ABI，字段、tag 和 trait vtable 都依赖它。
@@ -2433,35 +2504,25 @@ Bool declaration_index_less(
 
 qkey.StableSymbolId declaration_root_group(
     source_artifact.ModuleInterface& module_interface,
-    source_artifact.InterfaceDeclSummary declaration
+    map.WyHashMap<qkey.StableSymbolId, Int>& positions,
+    Int declaration_index
 ) {
+    source_artifact.InterfaceDeclSummary declaration =
+        module_interface.declarations.get(declaration_index);
     qkey.StableSymbolId root! = declaration.stable_id;
     qkey.StableSymbolId? owner! = declaration.owner;
     Int remaining! = module_interface.declarations.len();
     while (owner is .some(owner_id) && remaining > 0) {
-        guard declaration_index(module_interface, owner_id) is .some(owner_index) else {
+        guard positions.get(owner_id) is .some(owner_index) else {
             return root;
         }
         source_artifact.InterfaceDeclSummary owner_declaration =
-            module_interface.declarations.get(owner_index);
+            module_interface.declarations.get(owner_index$.get());
         root = owner_id;
         owner = owner_declaration.owner;
         remaining = remaining - 1;
     }
     return root;
-}
-
-Int? declaration_index(
-    source_artifact.ModuleInterface& module_interface,
-    qkey.StableSymbolId stable_id
-) {
-    Int index! = 0;
-    while (index < module_interface.declarations.len()) {
-        source_artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
-        if (declaration.stable_id == stable_id) { return index; }
-        index = index + 1;
-    }
-    return null;
 }
 
 list.ArrayList<Int> sorted_import_indexes(
