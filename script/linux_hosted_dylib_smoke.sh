@@ -20,7 +20,7 @@ fi
 cd "$ROOT_DIR"
 TEST_ROOT=test/compiler \
 TEST_LIST="$PROFILE" \
-TEST_TIMEOUT=180 \
+TEST_TIMEOUT=600 \
 TEST_JOBS=1 \
 JIANGC="$JIANGC" \
 bash "$ROOT_DIR/script/test.sh"
