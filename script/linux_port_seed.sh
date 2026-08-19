@@ -137,13 +137,6 @@ require_seed_llvm() {
     echo "Linux port seed requires LLVM $EXPECTED_LLVM_VERSION, got $LLVM_VERSION" >&2
     exit 2
   fi
-  local source_revision
-  source_revision="$(git -C "$ROOT_DIR" ls-tree HEAD vendor/llvm-project | awk '{print $3}')"
-  if [ "$source_revision" != "$EXPECTED_LLVM_REVISION" ]; then
-    echo "Linux port seed requires LLVM gitlink $EXPECTED_LLVM_REVISION" >&2
-    echo "repository records: $source_revision" >&2
-    exit 2
-  fi
 }
 
 append_link_manifest() {

@@ -60,8 +60,9 @@ bash ./script/install_llvm.sh --user
 bash ./script/install_llvm.sh --local --from-source
 ```
 
-源码模式优先使用 `vendor/llvm-project` submodule；release 包没有 submodule 时，从 Jiang LLVM fork
-浅克隆 `llvmorg-22.1.8`。`JIANG_LLVM_FORCE_BUILD=1` 仍表示强制源码重建。LLVM 库默认以静态库形式
+源码模式从 Jiang LLVM fork 浅克隆锁定的 `llvmorg-22.1.8`，源码位于
+`build/llvm-source/22.1.8`（可用 `JIANG_LLVM_SOURCE_DIR` 覆盖）。`JIANG_LLVM_FORCE_BUILD=1`
+仍表示强制源码重建。LLVM 库默认以静态库形式
 链接进 `jiangc`，release 用户不需要安装 LLVM runtime。
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。

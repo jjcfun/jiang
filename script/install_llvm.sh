@@ -9,7 +9,7 @@ JIANG_LLVM_SOURCE_REVISION="${JIANG_LLVM_SOURCE_REVISION:-ca7933e47d3a3451d81e72
 JIANG_LLVM_SDK_REVISION="${JIANG_LLVM_SDK_REVISION:-1}"
 JIANG_LLVM_REPO="${JIANG_LLVM_REPO:-https://github.com/jjcfun/llvm-project.git}"
 JIANG_LLVM_REF="${JIANG_LLVM_REF:-llvmorg-22.1.8}"
-JIANG_LLVM_SOURCE_DIR="${JIANG_LLVM_SOURCE_DIR:-$ROOT_DIR/vendor/llvm-project}"
+JIANG_LLVM_SOURCE_DIR="${JIANG_LLVM_SOURCE_DIR:-$ROOT_DIR/build/llvm-source/$JIANG_LLVM_RELEASE_VERSION}"
 JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-}"
 JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
 JIANG_LLVM_DOWNLOAD_DIR="${JIANG_LLVM_DOWNLOAD_DIR:-$ROOT_DIR/build/downloads}"
@@ -149,16 +149,15 @@ ensure_llvm_source() {
     return
   fi
 
-  if [ ! -f "$ROOT_DIR/.gitmodules" ]; then
-    mkdir -p "$(dirname "$JIANG_LLVM_SOURCE_DIR")"
-    git clone --depth 1 --branch "$JIANG_LLVM_REF" "$JIANG_LLVM_REPO" "$JIANG_LLVM_SOURCE_DIR"
-    return
-  fi
-
-  git -C "$ROOT_DIR" submodule update --init --depth 1 vendor/llvm-project
+  mkdir -p "$(dirname "$JIANG_LLVM_SOURCE_DIR")"
+  git clone --depth 1 --branch "$JIANG_LLVM_REF" "$JIANG_LLVM_REPO" "$JIANG_LLVM_SOURCE_DIR"
 
   if [ ! -f "$JIANG_LLVM_SOURCE_DIR/llvm/CMakeLists.txt" ]; then
-    echo "missing LLVM source after submodule init: $JIANG_LLVM_SOURCE_DIR" >&2
+    echo "missing LLVM source after clone: $JIANG_LLVM_SOURCE_DIR" >&2
+    exit 2
+  fi
+  if [ "$(git -C "$JIANG_LLVM_SOURCE_DIR" rev-parse HEAD)" != "$JIANG_LLVM_SOURCE_REVISION" ]; then
+    echo "unexpected LLVM source revision in $JIANG_LLVM_SOURCE_DIR" >&2
     exit 2
   fi
 }
