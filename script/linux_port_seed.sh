@@ -82,7 +82,6 @@ emit_object() {
   mkdir -p "$SEED_DIR"
   cd "$ROOT_DIR"
   "$BOOTSTRAP_BIN" \
-    --mode release \
     --target "$TARGET" \
     --emit-obj \
     -o "$SEED_OBJECT" \
@@ -95,7 +94,7 @@ emit_object() {
     printf 'target=%s\n' "$TARGET"
     printf 'bootstrap_version=%s\n' "$BOOTSTRAP_RELEASE_VERSION"
     printf 'bootstrap_sha256=%s\n' "$(sha256_digest "$BOOTSTRAP_BIN")"
-    printf 'emit_command=jiangc --mode release --target %s --emit-obj src/jiangc.jiang\n' "$TARGET"
+    printf 'emit_command=jiangc --target %s --emit-obj src/jiangc.jiang\n' "$TARGET"
     printf 'object_sha256=%s\n' "$(sha256_digest "$SEED_OBJECT")"
   } >"$SEED_MANIFEST"
   sha256_file "$SEED_OBJECT"
@@ -199,7 +198,6 @@ bootstrap_seed() {
   BOOTSTRAP_BIN="$SEED_BIN" \
   BOOTSTRAP_RELEASE_VERSION="$BOOTSTRAP_RELEASE_VERSION" \
   BOOTSTRAP_DEPTH=stable \
-  BOOTSTRAP_CHECK_MODE=audit \
   VERIFY=none \
     bash "$ROOT_DIR/script/build_next.sh"
   "$BUILD_DIR/bin/jiangc.next" --version
