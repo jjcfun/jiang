@@ -199,6 +199,7 @@ bootstrap_seed() {
   BOOTSTRAP_BIN="$SEED_BIN" \
   BOOTSTRAP_RELEASE_VERSION="$BOOTSTRAP_RELEASE_VERSION" \
   BOOTSTRAP_DEPTH=stable \
+  BOOTSTRAP_CHECK_MODE=audit \
   VERIFY=none \
     bash "$ROOT_DIR/script/build_next.sh"
   "$BUILD_DIR/bin/jiangc.next" --version
