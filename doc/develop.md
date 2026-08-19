@@ -67,23 +67,19 @@ release 分支保留自己的线性提交历史；bootstrap 分支只提供编�
 ### 0.5.2 严格检查过渡模式
 
 0.5.2 的 mutable receiver/place 写能力规则始终执行同一套分析。过渡编译器默认以 strict
-模式编译普通源码；只有 bootstrap 自举可以显式使用 `--bootstrap-check-mode audit`。audit
-只降级 `src/`、`std/` 中的可变性诊断与 borrow-check 诊断，测试或用户源码中的违规仍然
-失败；syntax、resolve 和其他 type-check 错误也始终失败。
+模式编译普通源码；release 自举始终使用严格检查。`--bootstrap-check-mode audit` 只在
+bootstrap worktree 中用于产出过渡编译器，不能作为 release 验证证据。
 
-`BOOTSTRAP_DEPTH=stable` 默认用 audit 构建 self-host candidate。audit warning 不阻止候选
-编译器生成；任何未降级的 fatal diagnostic 仍使构建失败，而且失败的 candidate 不会替换已有
-编译器。
-迁移完成后使用以下门槛切回 strict：
+`BOOTSTRAP_DEPTH=stable` 以严格检查构建 self-host candidate；任意借用或 lifetime 诊断
+都会阻止候选生成。使用以下门槛验证：
 
 ```bash
 BOOTSTRAP_DEPTH=stable \
-BOOTSTRAP_CHECK_MODE=strict \
 VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-audit candidate 不是 release compiler，也不提供已经通过借用安全验证的承诺。
+release candidate 只有在严格自举成功后才具备发布验证资格。
 
 ## Linux 首次 hosted port seed
 
