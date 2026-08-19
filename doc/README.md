@@ -24,19 +24,21 @@
 - [compiler/](compiler/)：各阶段的详细设计，包括 AST、resolve、Semantic Model、type check、JIL、
   borrow check、backend、incremental 和测试覆盖。
 
-## 0.5.1 自举链
+## 0.5.2 自举链
 
-0.5.1 release 使用以下可复现 transition chain：
+0.5.2 release 使用以下可复现 transition chain：
 
 ```text
-0.5.0 stable
-  -> bootstrap/0.5.1 next
-  -> release/0.5.1 next
-  -> release/0.5.1 stable
+0.5.1 stable
+  -> bootstrap/0.5.2 next
+  -> bootstrap/0.5.2-2 next
+  -> release/0.5.2 next
+  -> release/0.5.2 stable
 ```
 
-0.5.1 release 源码包含 0.5.0 无法解析的迁移语法；历史复现链和 Linux seed 流程见
-[编译器开发流程](develop.md)。发布后的常规开发使用 0.5.1 stable。
+0.5.2 引入严格所有权检查及引用 lifetime shape 规则，0.5.1 无法直接自举该源码。过渡编译器
+只负责生成下一阶段，不是 release。完整命令与 audit/strict 验证边界见
+[编译器开发流程](develop.md)。
 
 ## 0.5.0 自举链
 

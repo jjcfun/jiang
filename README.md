@@ -66,13 +66,13 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前源码默认使用已发布的 Jiang 0.5.1 stable 编译器作为 bootstrap 输入。默认路径：
+当前 0.5.2 release 源码使用 `bootstrap/0.5.2-2` 产出的过渡编译器作为 bootstrap 输入。默认路径：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc
+../bootstrap-0.5.2-2/build/bin/jiangc.next
 ```
 
-安装 0.5.1 后可直接运行：
+先构建 `bootstrap/0.5.2-2` 后可直接运行：
 
 ```bash
 bash ./script/build_next.sh
@@ -81,7 +81,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc -> build/bin/jiangc.next
+../bootstrap-0.5.2-2/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
 并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -101,8 +101,8 @@ build/bin/jiangc.next
 BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 ```
 
-破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。Jiang 0.5.1 的可复现历史
-自举链使用 `0.5.1-bootstrap` 过渡 tag；普通开发不需要保留对应 worktree。
+破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。Jiang 0.5.2 使用两阶段过渡
+编译器；完整链路和验证边界也在该文档中说明。
 
 Jiang 0.5.1 的正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
 glibc、pthread、dl 和 C++ runtime；安装包内的 `ABI.txt` 根据最终 ELF symbol version requirements

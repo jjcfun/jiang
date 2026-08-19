@@ -30,13 +30,13 @@ layout 不要求在任何阶段之前批量完成。
 
 ```text
 LayoutStore
-  keys: HashTable<LayoutKey, LayoutId>
+  type_layouts: WyHashMap<TypeId, LayoutId>
   layouts: ArrayTable<LayoutId, TypeLayout>
   storage: Arena
 ```
 
-`LayoutKey` 表达 concrete type 的语义身份。nominal generic type 必须包含
-`InstanceKey { def_id, type_args }`，所以 `Box<Int>` 和 `Box<Bool>` 会得到不同 layout。
+`TypeId` 表达 concrete type 的语义身份。nominal generic instance 的 `TypeId` 已包含其 type
+arguments，所以 `Box<Int>` 和 `Box<Bool>` 会得到不同 layout。
 
 `TypeLayout` 保存：
 

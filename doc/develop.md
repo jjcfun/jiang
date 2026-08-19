@@ -5,10 +5,10 @@
 
 ## 常规开发
 
-当前源码默认使用已安装的 Jiang 0.5.1 stable：
+当前 0.5.2 release 源码默认使用第二阶段过渡编译器：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc
+../bootstrap-0.5.2-2/build/bin/jiangc.next
 ```
 
 构建当前源码：
@@ -61,7 +61,7 @@ previous stable
   -> release/<version> stable
 ```
 
-release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历史和可复现自举顺序一致。
+release 分支保留自己的线性提交历史；bootstrap 分支只提供编译下一阶段所需的过渡编译器。
 各阶段必须使用独立 build 目录，不混用编译产物。
 
 ### 0.5.2 严格检查过渡模式

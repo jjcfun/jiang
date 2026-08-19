@@ -83,7 +83,7 @@ monomorph          -> generic template section
   package/public interface fingerprint 和 dirty/candidate；
 - 正向边为 `source -> dependency`；
 - 反向边为 `dependency -> importer`；
-- identity 到 node 的 HashTable 只用于查找，不决定分析顺序。
+- identity 到 node 的 hash 索引只用于查找，不决定分析顺序。
 
 构图从 root 递归进行。source metadata 未变时沿用 `.ji` header 的 source hash；metadata 改变时才
 读取源码重新计算 hash。旧 import summary 缺失、损坏、context 不匹配或 source hash 变化时，从
@@ -115,7 +115,7 @@ monomorph unit:
 闭包从 source unit 的 function/global roots 出发，覆盖 lowering 生成的 shim、析构函数和
 coroutine 变体。同一实例可以进入多个调用方的 monomorph unit，并由 weak/linkonce 定义合并；
 这样复用任一调用方 source object 时，它所需的泛型符号都由同 source identity 的 `.mono.o`
-覆盖。unit 和实例 fingerprint 均稳定排序，不依赖 `ModuleId`、`DefId` 或 HashTable 遍历顺序。
+覆盖。unit 和实例 fingerprint 均稳定排序，不依赖 `ModuleId`、`DefId` 或 hash map 遍历顺序。
 
 source unit fingerprint 覆盖 source body、interface、layout、target、compiler 与 backend profile。
 monomorph unit fingerprint 覆盖排序后的 concrete instance key、generic body/layout 与相同 codegen
