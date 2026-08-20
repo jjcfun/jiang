@@ -194,15 +194,17 @@ if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then
 fi
 
 if [ "$VERIFY" != "none" ]; then
-  printf '\n== next verify: smoke with %s ==\n' "$VERIFY_BIN"
-  slow_smoke=""
   if [ "$VERIFY" = "full" ]; then
-    slow_smoke=1
+    printf '\n== next verify: compiler tests with %s ==\n' "$VERIFY_BIN"
+    TEST_ROOT=test/compiler \
+    JIANGC="$VERIFY_BIN" \
+    bash "$ROOT_DIR/script/test.sh"
+  else
+    printf '\n== next verify: smoke with %s ==\n' "$VERIFY_BIN"
+    BUILD_DIR="$BUILD_DIR" \
+    JIANGC="$VERIFY_BIN" \
+    bash "$ROOT_DIR/script/smoke.sh"
   fi
-  BUILD_DIR="$BUILD_DIR" \
-  JIANGC="$VERIFY_BIN" \
-  JIANG_SLOW_SMOKE="$slow_smoke" \
-  bash "$ROOT_DIR/script/smoke.sh"
 
   printf '\n== next verify: backend cli smoke ==\n'
   BUILD_DIR="$BUILD_DIR" \

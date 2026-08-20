@@ -5,7 +5,6 @@ trap 'case $- in *e*) echo "backend CLI smoke failed at line $LINENO" >&2 ;; esa
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_backend_cli"
-SMOKE_SOURCE_DIR="${TMPDIR:-/tmp}/jiang-backend-cli-smoke"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 EXPECTED_COMPILER_VERSION="${EXPECTED_COMPILER_VERSION:-$PACKAGE_VERSION}"
 HOST_OS="$(uname -s)"
@@ -25,7 +24,7 @@ assert_file_matches() {
   return 1
 }
 
-mkdir -p "$SMOKE_BUILD_DIR" "$SMOKE_SOURCE_DIR"
+mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
 
 COMPILER_UNDER_TEST="${JIANGC:-}"
@@ -52,8 +51,7 @@ fi
 COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
 
 clang_bin="$LLVM_CLANG"
-compiler_bin="$SMOKE_BUILD_DIR/jiangc"
-llvm_link_args=()
+compiler_bin="$COMPILER_UNDER_TEST"
 host_clang_link_args=()
 sample="$SMOKE_BUILD_DIR/minimal.jiang"
 sample_ll="$SMOKE_BUILD_DIR/minimal.ll"
@@ -69,7 +67,7 @@ package_release_bin="$SMOKE_BUILD_DIR/package_release"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
 field_ll="$SMOKE_BUILD_DIR/field_projection.ll"
 field_bin="$SMOKE_BUILD_DIR/field_projection"
-system_fs_sample="$SMOKE_SOURCE_DIR/system_fs_target.jiang"
+system_fs_sample="$ROOT_DIR/test/compiler/fixture/system_fs_target.jiang"
 system_fs_linux_ll="$SMOKE_BUILD_DIR/system_fs_linux.ll"
 system_fs_linux_no_libc_ll="$SMOKE_BUILD_DIR/system_fs_linux_no_libc.ll"
 alloc_sample="$SMOKE_BUILD_DIR/no_libc_alloc.jiang"
@@ -97,7 +95,7 @@ wasm_target_obj="$SMOKE_BUILD_DIR/minimal_wasm.o"
 wasi_target_ll="$SMOKE_BUILD_DIR/minimal_wasi.ll"
 wasi_target_obj="$SMOKE_BUILD_DIR/minimal_wasi.o"
 wasi_target_bin="$SMOKE_BUILD_DIR/minimal_wasi.wasm"
-wasi_provider_sample="$SMOKE_BUILD_DIR/wasi_provider.jiang"
+wasi_provider_sample="$ROOT_DIR/test/compiler/fixture/wasi_provider.jiang"
 wasi_provider_bin="$SMOKE_BUILD_DIR/wasi_provider.wasm"
 wasi_provider_stdout="$SMOKE_BUILD_DIR/wasi_provider.stdout"
 wasi_provider_stderr="$SMOKE_BUILD_DIR/wasi_provider.stderr"
@@ -115,7 +113,6 @@ esac
 
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
-printf 'import std;\nInt main() { if (std.fs.exists("/tmp")) { 0 } else { 1 } }\n' >"$system_fs_sample"
 cat >"$alloc_sample" <<'EOF'
 Int main() {
     unsafe {
@@ -126,62 +123,9 @@ Int main() {
     0
 }
 EOF
-cat >"$wasi_provider_sample" <<'EOF'
-import std;
+printf '== backend cli smoke: test %s (%s) ==\n' "$compiler_bin" "$COMPILER_VERSION"
 
-Int main() {
-    std.process.ProgramArguments args = std.process.arguments();
-    if (args.length != 3) { return 14; }
-    if (!text_equal(args.argument(1)[..], "a")) { return 13; }
-    if (!text_equal(args.argument(2)[..], "b")) { return 12; }
-    if (!std.fs.write_all("/sandbox/wasi-file.txt", "fs-ok"[..])) { return 15; }
-    guard std.fs.read_all("/sandbox/wasi-file.txt") is .some(text) else { return 16; }
-    if (text.length != 5) { return 17; }
-    if (text[0] != UInt8(102)) { return 18; }
-    if (text[1] != UInt8(115)) { return 19; }
-    if (text[2] != UInt8(45)) { return 20; }
-    if (text[3] != UInt8(111)) { return 21; }
-    if (text[4] != UInt8(107)) { return 22; }
-    guard std.process.env("JIANG_WASI_ENV") is .some(value) else { return 23; }
-    if (value.length != 6) { return 24; }
-    if (value[0] != UInt8(119)) { return 25; }
-    if (value[1] != UInt8(97)) { return 26; }
-    if (value[2] != UInt8(115)) { return 27; }
-    if (value[3] != UInt8(105)) { return 28; }
-    if (value[4] != UInt8(111)) { return 29; }
-    if (value[5] != UInt8(107)) { return 30; }
-    if (!std.io.stdout().write_all("stdout-ok"[..])) { return 31; }
-    if (!std.io.stderr().write_all("stderr-ok"[..])) { return 32; }
-    return 0;
-}
-
-Bool text_equal(UInt8[]& lhs, UInt8[]& rhs) {
-    if (lhs.length != rhs.length) { return false; }
-    Int index! = 0;
-    while (index < lhs.length) {
-        if (lhs[index] != rhs[index]) { return false; }
-        index = index + 1;
-    }
-    return true;
-}
-EOF
-
-for arg in \
-  $("$LLVM_CONFIG" --link-static --ldflags) \
-  $("$LLVM_CONFIG" --link-static --libs all) \
-  $("$LLVM_CONFIG" --link-static --system-libs) \
-  $(jiang_macos_sdkroot_link_args) \
-  $(jiang_llvm_cxx_runtime_link_args)
-do
-  llvm_link_args+=(--link-arg "$arg")
-done
-
-printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
-"$COMPILER_UNDER_TEST" --linker "$clang_bin" "${llvm_link_args[@]}" -o "$compiler_bin" src/jiangc.jiang
-
-# 开发分支中 compiler-under-test 和刚构建出的 compiler_bin 可能共享同一个
-# package 版本号，但 source artifact 格式已经变化。运行新 compiler 前清掉
-# 默认缓存，避免它误读前一阶段写出的 `.ji`。
+# smoke 必须从当前源码重新生成目标产物，不能复用上一次运行留下的 source artifact。
 rm -rf "$BUILD_DIR/cache"
 
 "$compiler_bin" --emit-llvm -o "$sample_ll" "$sample"
