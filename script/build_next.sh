@@ -9,6 +9,7 @@ JIANGC_BIN="${JIANGC_BIN:-$BUILD_BIN_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 BOOTSTRAP_CHECK_MODE="${BOOTSTRAP_CHECK_MODE:-strict}"
+COMPILER_BUILD_MODE="${COMPILER_BUILD_MODE:-debug}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
@@ -94,6 +95,14 @@ case "$BOOTSTRAP_CHECK_MODE" in
     exit 2
     ;;
 esac
+
+case "$COMPILER_BUILD_MODE" in
+  debug|release) ;;
+  *)
+    echo "invalid COMPILER_BUILD_MODE=$COMPILER_BUILD_MODE; expected debug or release" >&2
+    exit 2
+    ;;
+esac
 if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ] && [ "$BOOTSTRAP_DEPTH" != "stable" ]; then
   echo "bootstrap audit requires BOOTSTRAP_DEPTH=stable for strict release self-host" >&2
   exit 2
@@ -144,16 +153,18 @@ emit_next_from_bootstrap() {
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ]; then
     "$BOOTSTRAP_BIN" --bootstrap-check-mode audit \
+      --mode "$COMPILER_BUILD_MODE" \
       --linker "$CLANG_BIN" \
       "${LLVM_LINK_ARGS[@]}" \
       -o "$output_bin" \
       src/jiangc.jiang
   else
     "$BOOTSTRAP_BIN" \
-    --linker "$CLANG_BIN" \
-    "${LLVM_LINK_ARGS[@]}" \
-    -o "$output_bin" \
-    src/jiangc.jiang
+      --mode "$COMPILER_BUILD_MODE" \
+      --linker "$CLANG_BIN" \
+      "${LLVM_LINK_ARGS[@]}" \
+      -o "$output_bin" \
+      src/jiangc.jiang
   fi
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
@@ -166,6 +177,7 @@ emit_compiler_with_compiler() {
   test -x "$source_bin"
   printf '== build next: compile executable with %s ==\n' "$source_bin"
   "$source_bin" \
+    --mode "$COMPILER_BUILD_MODE" \
     --artifact-cache-dir "$NEXT_ARTIFACT_CACHE_DIR" \
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
@@ -179,6 +191,7 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
+printf '== compiler build mode: %s ==\n' "$COMPILER_BUILD_MODE"
 printf '== bootstrap cache: %s ==\n' "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
 printf '== current cache: %s ==\n' "$NEXT_ARTIFACT_CACHE_DIR"
 clear_bootstrap_artifact_cache

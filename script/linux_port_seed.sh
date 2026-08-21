@@ -9,11 +9,20 @@ SEED_BIN="${SEED_BIN:-$BUILD_DIR/bin/jiangc.linux-port-seed}"
 SEED_MANIFEST="${SEED_MANIFEST:-$SEED_DIR/jiangc-x86_64-linux-gnu.manifest}"
 ABI_PROBE_BIN="${ABI_PROBE_BIN:-$SEED_DIR/linux-hosted-abi-probe}"
 BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.1}"
+COMPILER_BUILD_MODE="${COMPILER_BUILD_MODE:-debug}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc}"
 EXPECTED_LLVM_VERSION="${EXPECTED_LLVM_VERSION:-22.1.8}"
 EXPECTED_LLVM_REVISION="${EXPECTED_LLVM_REVISION:-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1}"
 TARGET="x86_64-unknown-linux-gnu"
+
+case "$COMPILER_BUILD_MODE" in
+  debug|release) ;;
+  *)
+    echo "invalid COMPILER_BUILD_MODE=$COMPILER_BUILD_MODE; expected debug or release" >&2
+    exit 2
+    ;;
+esac
 
 usage() {
   echo "usage: bash ./script/linux_port_seed.sh emit-object|link|bootstrap" >&2
@@ -82,6 +91,7 @@ emit_object() {
   mkdir -p "$SEED_DIR"
   cd "$ROOT_DIR"
   "$BOOTSTRAP_BIN" \
+    --mode "$COMPILER_BUILD_MODE" \
     --target "$TARGET" \
     --emit-obj \
     -o "$SEED_OBJECT" \
@@ -94,7 +104,9 @@ emit_object() {
     printf 'target=%s\n' "$TARGET"
     printf 'bootstrap_version=%s\n' "$BOOTSTRAP_RELEASE_VERSION"
     printf 'bootstrap_sha256=%s\n' "$(sha256_digest "$BOOTSTRAP_BIN")"
-    printf 'emit_command=jiangc --target %s --emit-obj src/jiangc.jiang\n' "$TARGET"
+    printf 'compiler_build_mode=%s\n' "$COMPILER_BUILD_MODE"
+    printf 'emit_command=jiangc --mode %s --target %s --emit-obj src/jiangc.jiang\n' \
+      "$COMPILER_BUILD_MODE" "$TARGET"
     printf 'object_sha256=%s\n' "$(sha256_digest "$SEED_OBJECT")"
   } >"$SEED_MANIFEST"
   sha256_file "$SEED_OBJECT"
@@ -128,6 +140,7 @@ require_seed_inputs() {
   require_manifest_value source_revision "$(source_revision)"
   require_manifest_value target "$TARGET"
   require_manifest_value bootstrap_version "$BOOTSTRAP_RELEASE_VERSION"
+  require_manifest_value compiler_build_mode "$COMPILER_BUILD_MODE"
   require_manifest_value object_sha256 "$(sha256_digest "$SEED_OBJECT")"
 }
 
