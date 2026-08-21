@@ -24,6 +24,7 @@ import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
 import map = "../support/map.jiang";
 import string = "../support/string.jiang";
+import table = "../support/table.jiang";
 import token = "../syntax/token.jiang";
 import loan = "./loan.jiang";
 import location = "./location.jiang";
@@ -173,6 +174,8 @@ struct BorrowDataflowState: Movable {
 
 struct LoanLivenessData: Movable {
     public UInt64*! live_after;
+    public UInt64*! overlap_bits;
+    public Bool*! overlap_ready;
     public Int*! block_points;
     public Int*! path_bits;
     public Int*! tracked_paths;
@@ -195,12 +198,24 @@ struct LoanLivenessData: Movable {
             self.tracked_path_count = tracked_path_count;
             self.word_count = (tracked_path_count + 63) / 64;
             self.live_after = UInt64$.alloc(point_count * self.word_count);
+            self.overlap_bits = UInt64$.alloc(path_count * self.word_count);
+            self.overlap_ready = Bool$.alloc(path_count);
             self.block_points = Int$.alloc(block_count);
             self.path_bits = Int$.alloc(path_count);
             self.tracked_paths = Int$.alloc(tracked_path_count);
             Int index! = 0;
             while (index < point_count * self.word_count) {
                 self.live_after[index] = UInt64(0);
+                index = index + 1;
+            }
+            index = 0;
+            while (index < path_count * self.word_count) {
+                self.overlap_bits[index] = UInt64(0);
+                index = index + 1;
+            }
+            index = 0;
+            while (index < path_count) {
+                self.overlap_ready[index] = false;
                 index = index + 1;
             }
             index = 0;
@@ -216,6 +231,10 @@ struct LoanLivenessData: Movable {
             if (self.point_count > 0 && self.word_count > 0) {
                 self.live_after$.dealloc();
             }
+            if (self.path_count > 0 && self.word_count > 0) {
+                self.overlap_bits$.dealloc();
+            }
+            if (self.path_count > 0) { self.overlap_ready$.dealloc(); }
             if (self.block_count > 0) { self.block_points$.dealloc(); }
             if (self.path_count > 0) { self.path_bits$.dealloc(); }
             if (self.tracked_path_count > 0) { self.tracked_paths$.dealloc(); }
@@ -282,6 +301,7 @@ struct FunctionBorrowChecker: Movable {
     public jil.CoroutineFrameLayout? coroutine_frame;
     public Int loan_start_index;
     public move_path.MovePathTree paths!;
+    table.SideTable<move_path.MovePathId, qid.TypeId> path_types!;
     public BorrowDataflowState dataflow!;
     public LoanLivenessData loan_liveness!;
     public location.Location current_location!;
@@ -309,6 +329,7 @@ struct FunctionBorrowChecker: Movable {
         self.coroutine_frame = function.coroutine_frame;
         jil.Body body! = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
+        self.path_types = table.SideTable<move_path.MovePathId, qid.TypeId>();
         self.dataflow = BorrowDataflowState(self.paths.len());
         self.loan_liveness = LoanLivenessData(0, 0, 0, 0);
         self.current_location = location.Location(function.id, body.entry, .terminator, -1);
@@ -338,6 +359,7 @@ struct FunctionBorrowChecker: Movable {
             self.prebuild_local_lifetime_paths();
             self.prebuild_call_lifetime_paths();
             self.paths.freeze();
+            self.build_move_path_types();
             self.build_loan_liveness();
             self.dataflow = BorrowDataflowState(self.paths.len());
             Int entry_index = self.body.entry.to_index();
@@ -1239,6 +1261,33 @@ struct FunctionBorrowChecker: Movable {
         }
     }
 
+    Void initialize_liveness_overlap_bits_for_path(
+        Self&! self,
+        move_path.MovePathId path
+    ) {
+        unsafe {
+            Int path_index = path.to_index();
+            if (self.loan_liveness.overlap_ready[path_index]) { return; }
+            move_path.MovePath current = self.paths.get(path);
+            move_path.MovePathId root = self.paths.root_for_local(current.local_id);
+            list.ArrayList<move_path.MovePathId> pending! =
+                list.ArrayList<move_path.MovePathId>();
+            pending.add(root);
+            while (!pending.empty()) {
+                move_path.MovePathId target = pending.pop();
+                Int tracked_index = self.loan_liveness.path_bits[target.to_index()];
+                if (tracked_index >= 0 && self.loan_target_matches_path(target, path)) {
+                    Int word = path_index * self.loan_liveness.word_count + tracked_index / 64;
+                    self.loan_liveness.overlap_bits[word] =
+                        self.loan_liveness.overlap_bits[word]
+                        | (UInt64(1) << UInt64(tracked_index % 64));
+                }
+                self.paths.append_children(target, pending$.mut_ref());
+            }
+            self.loan_liveness.overlap_ready[path_index] = true;
+        }
+    }
+
     Int loan_liveness_point_count(self) {
         Int count! = 0;
         Int block_index! = 0;
@@ -1332,20 +1381,8 @@ struct FunctionBorrowChecker: Movable {
         UInt64*! uses,
         UInt64*! kills
     ) {
-        Int tracked_index! = 0;
-        while (tracked_index < self.loan_liveness.tracked_path_count) {
-            Int target_index = unsafe {
-                self.loan_liveness.tracked_paths[tracked_index]
-            };
-            move_path.MovePathId target = move_path.MovePathId(target_index);
-            if (self.statement_uses_loan_target(statement, target)) {
-                self.set_liveness_bit(uses, point, target_index);
-            }
-            if (self.statement_kills_loan_target(statement, target)) {
-                self.set_liveness_bit(kills, point, target_index);
-            }
-            tracked_index = tracked_index + 1;
-        }
+        self.record_statement_liveness_uses(statement, point, uses);
+        self.record_statement_liveness_kills(statement, point, kills);
     }
 
     Void record_terminator_liveness_facts(
@@ -1354,17 +1391,7 @@ struct FunctionBorrowChecker: Movable {
         Int point,
         UInt64*! uses
     ) {
-        Int tracked_index! = 0;
-        while (tracked_index < self.loan_liveness.tracked_path_count) {
-            Int target_index = unsafe {
-                self.loan_liveness.tracked_paths[tracked_index]
-            };
-            move_path.MovePathId target = move_path.MovePathId(target_index);
-            if (self.terminator_uses_loan_target(terminator, target)) {
-                self.set_liveness_bit(uses, point, target_index);
-            }
-            tracked_index = tracked_index + 1;
-        }
+        self.record_terminator_liveness_uses(terminator, point, uses);
     }
 
     Void record_edge_liveness_facts(
@@ -1392,18 +1419,478 @@ struct FunctionBorrowChecker: Movable {
         Int edge = unsafe {
             edge_points[block.id.to_index()] + successor_index
         };
-        Int tracked_index! = 0;
-        while (tracked_index < self.loan_liveness.tracked_path_count) {
-            Int target_index = unsafe {
-                self.loan_liveness.tracked_paths[tracked_index]
-            };
-            move_path.MovePathId target = move_path.MovePathId(target_index);
-            if (self.terminator_kills_loan_target_on_edge(
-                block.terminator, successor_index, target
-            )) {
-                self.set_liveness_bit(edge_kills, edge, target_index);
+        self.record_terminator_liveness_edge_kills(
+            block.terminator, successor_index, edge, edge_kills
+        );
+    }
+
+    Void record_path_liveness_bits(
+        Self&! self,
+        UInt64*! rows,
+        Int row,
+        move_path.MovePathId path
+    ) {
+        if (!self.valid_move_path(path)) { return; }
+        self.initialize_liveness_overlap_bits_for_path(path);
+        unsafe {
+            Int target_word = row * self.loan_liveness.word_count;
+            Int source_word = path.to_index() * self.loan_liveness.word_count;
+            Int word! = 0;
+            while (word < self.loan_liveness.word_count) {
+                rows[target_word + word] = rows[target_word + word]
+                    | self.loan_liveness.overlap_bits[source_word + word];
+                word = word + 1;
             }
-            tracked_index = tracked_index + 1;
+        }
+    }
+
+    Void record_place_liveness_bits(
+        Self&! self,
+        UInt64*! rows,
+        Int row,
+        jil.Place place
+    ) {
+        self.record_path_liveness_bits(
+            rows, row, self.paths.existing_path_for_place(place)
+        );
+    }
+
+    Void record_write_place_liveness_use(
+        Self&! self,
+        UInt64*! uses,
+        Int point,
+        jil.Place place
+    ) {
+        if (!self.destination_has_deref_projection(place)
+            && !self.place_is_indirect_memory(place)) {
+            return;
+        }
+        self.record_place_liveness_bits(uses, point, place);
+    }
+
+    Void record_operand_liveness_use(
+        Self&! self,
+        UInt64*! uses,
+        Int point,
+        jil.Operand operand
+    ) {
+        if (self.operand_place(operand) is .some(place)) {
+            self.record_place_liveness_bits(uses, point, place);
+        }
+    }
+
+    Void record_optional_operand_liveness_use(
+        Self&! self,
+        UInt64*! uses,
+        Int point,
+        jil.Operand? operand
+    ) {
+        if (operand is .some(value)) {
+            self.record_operand_liveness_use(uses, point, value);
+        }
+    }
+
+    Void record_operand_array_liveness_uses(
+        Self&! self,
+        UInt64*! uses,
+        Int point,
+        jil.Operand[]& operands
+    ) {
+        Int index! = 0;
+        while (index < operands.length) {
+            self.record_operand_liveness_use(uses, point, operands[index]);
+            index = index + 1;
+        }
+    }
+
+    Void record_place_array_liveness_uses(
+        Self&! self,
+        UInt64*! uses,
+        Int point,
+        jil.Place[]& places
+    ) {
+        Int index! = 0;
+        while (index < places.length) {
+            self.record_place_liveness_bits(uses, point, places[index]);
+            index = index + 1;
+        }
+    }
+
+    Void record_statement_liveness_uses(
+        Self&! self,
+        jil.Statement statement,
+        Int point,
+        UInt64*! uses
+    ) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            self.record_rvalue_liveness_uses(assign_stmt.value, point, uses);
+            self.record_write_place_liveness_use(uses, point, assign_stmt.destination);
+            return;
+        }
+        if (statement.kind is .atomic_store_stmt(atomic_store)) {
+            self.record_write_place_liveness_use(uses, point, atomic_store.destination);
+            self.record_operand_liveness_use(uses, point, atomic_store.value);
+            return;
+        }
+        if (statement.kind is .executor_leave_stmt(executor_leave)) {
+            self.record_path_liveness_bits(
+                uses, point, self.paths.root_for_local(executor_leave.executor)
+            );
+            self.record_path_liveness_bits(
+                uses, point, self.paths.root_for_local(executor_leave.previous_context)
+            );
+            return;
+        }
+        if (statement.kind is .task_suspend_stmt(suspend)) {
+            self.record_place_liveness_bits(uses, point, suspend.task);
+            return;
+        }
+        if (statement.kind is .task_complete_stmt(complete)) {
+            self.record_place_liveness_bits(uses, point, complete.task);
+            return;
+        }
+        if (statement.kind is .forget_stmt(forget_stmt)) {
+            self.record_place_liveness_bits(uses, point, forget_stmt.place);
+            return;
+        }
+        if (statement.kind is .set_discriminant_stmt(discriminant)) {
+            self.record_write_place_liveness_use(uses, point, discriminant.destination);
+            return;
+        }
+        if (statement.kind is .exclusive_stmt(exclusive_stmt)) {
+            self.record_place_liveness_bits(uses, point, exclusive_stmt.place);
+            return;
+        }
+        if (statement.kind is .capture_bind_stmt(bind)) {
+            self.record_place_liveness_bits(uses, point, bind.destination);
+            self.record_place_liveness_bits(uses, point, bind.environment);
+            return;
+        }
+        if (statement.kind is .task_consume_stmt(consume)) {
+            self.record_place_liveness_bits(uses, point, consume.task);
+            return;
+        }
+        if (statement.kind is .task_release_stmt(release)) {
+            self.record_task_release_liveness_uses(release, point, uses);
+            return;
+        }
+        if (statement.kind is .task_owner_release_stmt(release)) {
+            self.record_place_liveness_bits(uses, point, release.pointer);
+            return;
+        }
+        if (statement.kind is .task_region_start_stmt(start)) {
+            self.record_place_liveness_bits(uses, point, start.task);
+            return;
+        }
+        if (statement.kind is .task_wait_stmt(wait)) {
+            self.record_place_liveness_bits(uses, point, wait.state);
+            self.record_operand_liveness_use(uses, point, wait.expected);
+            return;
+        }
+        if (statement.kind is .storage_dead_stmt(storage_dead)) {
+            self.record_storage_dead_liveness_use(storage_dead.local_id, point, uses);
+        }
+    }
+
+    Void record_storage_dead_liveness_use(
+        Self&! self,
+        jil.LocalId local_id,
+        Int point,
+        UInt64*! uses
+    ) {
+        move_path.MovePathId root = self.paths.root_for_local(local_id);
+        Int index! = 0;
+        while (index < self.loan_liveness.tracked_path_count) {
+            move_path.MovePathId target = unsafe {
+                move_path.MovePathId(self.loan_liveness.tracked_paths[index])
+            };
+            if (self.path_matches_or_contains(root, target)
+                && self.loan_target_has_task_owner_ancestor(target, root)) {
+                self.set_liveness_bit(uses, point, target.to_index());
+            }
+            index = index + 1;
+        }
+    }
+
+    Void record_statement_liveness_kills(
+        Self&! self,
+        jil.Statement statement,
+        Int point,
+        UInt64*! kills
+    ) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            self.record_place_liveness_bits(kills, point, assign_stmt.destination);
+            return;
+        }
+        if (statement.kind is .atomic_store_stmt(atomic_store)) {
+            self.record_place_liveness_bits(kills, point, atomic_store.destination);
+            return;
+        }
+        if (statement.kind is .set_discriminant_stmt(discriminant)) {
+            self.record_place_liveness_bits(kills, point, discriminant.destination);
+            return;
+        }
+        if (statement.kind is .storage_live_stmt(storage_live)) {
+            self.record_path_liveness_bits(
+                kills, point, self.paths.root_for_local(storage_live.local_id)
+            );
+            return;
+        }
+        if (statement.kind is .storage_dead_stmt(storage_dead)) {
+            self.record_path_liveness_bits(
+                kills, point, self.paths.root_for_local(storage_dead.local_id)
+            );
+        }
+    }
+
+    Void record_terminator_liveness_uses(
+        Self&! self,
+        jil.Terminator terminator,
+        Int point,
+        UInt64*! uses
+    ) {
+        if (terminator.kind is .goto_term(goto_term)) {
+            if (goto_term.initialized_place is .some(place)) {
+                self.record_write_place_liveness_use(uses, point, place);
+            }
+            return;
+        }
+        if (terminator.kind is .branch_term(branch)) {
+            self.record_operand_liveness_use(uses, point, branch.condition);
+            return;
+        }
+        if (terminator.kind is .switch_term(switch_term)) {
+            self.record_operand_liveness_use(uses, point, switch_term.discriminator);
+            return;
+        }
+        if (terminator.kind is .call_term(call_term)) {
+            self.record_call_liveness_uses(call_term, point, uses);
+            return;
+        }
+        if (terminator.kind is .drop_term(drop_term)) {
+            self.record_place_liveness_bits(uses, point, drop_term.place);
+            return;
+        }
+        if (terminator.kind is .assert_term(assert_term)) {
+            self.record_operand_liveness_use(uses, point, assert_term.condition);
+            return;
+        }
+        if (terminator.kind is .throw_term(throw_term)) {
+            self.record_operand_liveness_use(uses, point, throw_term.error_value);
+            return;
+        }
+        if (terminator.kind is .return_term(return_term) && !return_term.implicit_unit) {
+            self.record_path_liveness_bits(
+                uses, point, self.paths.root_for_local(self.body.return_local)
+            );
+        }
+    }
+
+    Void record_terminator_liveness_edge_kills(
+        Self&! self,
+        jil.Terminator terminator,
+        Int successor_index,
+        Int edge,
+        UInt64*! edge_kills
+    ) {
+        if (successor_index != 0) { return; }
+        if (terminator.kind is .goto_term(goto_term)) {
+            if (goto_term.initialized_place is .some(place)) {
+                self.record_place_liveness_bits(edge_kills, edge, place);
+            }
+            return;
+        }
+        guard terminator.kind is .call_term(call_term) else { return; }
+        self.record_place_liveness_bits(edge_kills, edge, call_term.destination);
+        if (call_term.deferred_initialization) { return; }
+        if (call_term.initialized_place is .some(place)) {
+            self.record_place_liveness_bits(edge_kills, edge, place);
+        }
+    }
+
+    Void record_call_liveness_uses(
+        Self&! self,
+        jil.CallTerminator call_term,
+        Int point,
+        UInt64*! uses
+    ) {
+        self.record_call_callee_liveness_uses(call_term.callee, point, uses);
+        self.record_write_place_liveness_use(uses, point, call_term.destination);
+        if (call_term.initialized_place is .some(place)) {
+            self.record_write_place_liveness_use(uses, point, place);
+        }
+        self.record_operand_array_liveness_uses(uses, point, call_term.args);
+        self.record_place_array_liveness_uses(
+            uses, point, call_term.exclusive_places
+        );
+    }
+
+    Void record_call_callee_liveness_uses(
+        Self&! self,
+        jil.CallCallee callee,
+        Int point,
+        UInt64*! uses
+    ) {
+        if (callee is .indirect_operand(operand)) {
+            self.record_operand_liveness_use(uses, point, operand);
+            return;
+        }
+        if (callee is .domain_enqueue(enqueue)) {
+            self.record_optional_operand_liveness_use(uses, point, enqueue.task);
+            self.record_operand_liveness_use(uses, point, enqueue.resume);
+            return;
+        }
+        if (callee is .dynamic_domain_enqueue(enqueue)) {
+            self.record_operand_liveness_use(uses, point, enqueue.executor);
+            self.record_optional_operand_liveness_use(uses, point, enqueue.task);
+            self.record_operand_liveness_use(uses, point, enqueue.resume);
+        }
+    }
+
+    Void record_task_release_liveness_uses(
+        Self&! self,
+        jil.TaskReleaseStatement release,
+        Int point,
+        UInt64*! uses
+    ) {
+        if (release.task is .some(task)) {
+            self.record_place_liveness_bits(uses, point, task);
+        }
+        self.record_place_liveness_bits(uses, point, release.task_pointer);
+        self.record_place_liveness_bits(uses, point, release.frame);
+        self.record_place_liveness_bits(uses, point, release.state);
+        self.record_place_liveness_bits(uses, point, release.result);
+    }
+
+    Void record_rvalue_liveness_uses(
+        Self&! self,
+        jil.Rvalue value,
+        Int point,
+        UInt64*! uses
+    ) {
+        if (value is .use_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+            return;
+        }
+        if (value is .unary_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+            return;
+        }
+        if (value is .binary_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.lhs);
+            self.record_operand_liveness_use(uses, point, item.rhs);
+            return;
+        }
+        if (value is .cast_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+            return;
+        }
+        if (value is .inline_asm_value(item)) {
+            self.record_inline_asm_liveness_uses(item, point, uses);
+            return;
+        }
+        if (value is .borrow_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            return;
+        }
+        if (value is .address_of_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            return;
+        }
+        if (value is .coroutine_address_value(item)) {
+            self.record_write_place_liveness_use(uses, point, item.place);
+            return;
+        }
+        if (value is .executor_enter_value(item)) {
+            self.record_path_liveness_bits(
+                uses, point, self.paths.root_for_local(item.executor)
+            );
+            self.record_path_liveness_bits(
+                uses, point, self.paths.root_for_local(item.context)
+            );
+            return;
+        }
+        if (value is .atomic_load_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            return;
+        }
+        if (value is .atomic_exchange_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            self.record_operand_liveness_use(uses, point, item.desired);
+            return;
+        }
+        if (value is .atomic_compare_exchange_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            self.record_operand_liveness_use(uses, point, item.expected);
+            self.record_operand_liveness_use(uses, point, item.desired);
+            return;
+        }
+        if (value is .alloc_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+            return;
+        }
+        if (value is .coroutine_frame_alloc_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.executor);
+            return;
+        }
+        if (value is .alloc_array_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.count);
+            return;
+        }
+        if (value is .free_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.pointer);
+            return;
+        }
+        if (value is .coroutine_frame_free_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.pointer);
+            self.record_operand_liveness_use(uses, point, item.executor);
+            return;
+        }
+        if (value is .slice_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.base);
+            self.record_optional_operand_liveness_use(uses, point, item.start);
+            self.record_optional_operand_liveness_use(uses, point, item.end);
+            return;
+        }
+        if (value is .len_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            return;
+        }
+        if (value is .discriminant_value(item)) {
+            self.record_place_liveness_bits(uses, point, item.place);
+            return;
+        }
+        if (value is .aggregate_value(item)) {
+            self.record_optional_operand_liveness_use(uses, point, item.tag);
+            self.record_operand_array_liveness_uses(uses, point, item.fields);
+            return;
+        }
+        if (value is .closure_value(item)) {
+            self.record_operand_array_liveness_uses(uses, point, item.captures);
+            self.record_operand_liveness_use(uses, point, item.vtable);
+            return;
+        }
+        if (value is .optional_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+            return;
+        }
+        if (value is .error_union_value(item)) {
+            self.record_operand_liveness_use(uses, point, item.value);
+        }
+    }
+
+    Void record_inline_asm_liveness_uses(
+        Self&! self,
+        jil.InlineAsmRvalue value,
+        Int point,
+        UInt64*! uses
+    ) {
+        Int index! = 0;
+        while (index < value.operands.length) {
+            if (value.operands[index] is .input(input)) {
+                self.record_operand_liveness_use(uses, point, input.value);
+            }
+            index = index + 1;
         }
     }
 
@@ -2950,13 +3437,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Int move_path_depth(self, move_path.MovePathId path_id) {
-        Int depth! = 0;
-        move_path.MovePath current! = self.paths.get(path_id);
-        while (current.has_parent) {
-            depth = depth + 1;
-            current = self.paths.get(current.parent);
-        }
-        return depth;
+        return self.paths.get(path_id).depth;
     }
 
     Bool same_depth_move_paths_may_alias(
@@ -2967,11 +3448,24 @@ struct FunctionBorrowChecker: Movable {
         if (!self.valid_move_path(lhs_id) || !self.valid_move_path(rhs_id)) {
             return false;
         }
-        if (lhs_id == rhs_id) { return true; }
-        move_path.MovePath lhs = self.paths.get(lhs_id);
-        move_path.MovePath rhs = self.paths.get(rhs_id);
-        if (!lhs.has_parent || !rhs.has_parent) { return false; }
-        if (!self.same_depth_move_paths_may_alias(lhs.parent, rhs.parent)) { return false; }
+        move_path.MovePathId lhs! = lhs_id;
+        move_path.MovePathId rhs! = rhs_id;
+        while (lhs != rhs) {
+            move_path.MovePath lhs_path = self.paths.get(lhs);
+            move_path.MovePath rhs_path = self.paths.get(rhs);
+            if (!lhs_path.has_parent || !rhs_path.has_parent) { return false; }
+            if (!self.projections_may_alias(lhs_path, rhs_path)) { return false; }
+            lhs = lhs_path.parent;
+            rhs = rhs_path.parent;
+        }
+        return true;
+    }
+
+    Bool projections_may_alias(
+        Self&! self,
+        move_path.MovePath lhs,
+        move_path.MovePath rhs
+    ) {
         if (move_path.place_elem_equal(lhs.projection, rhs.projection)) { return true; }
         qid.TypeId parent_type = self.move_path_type(lhs.parent);
         if (self.valid_type_id(parent_type)
@@ -3723,10 +4217,25 @@ struct FunctionBorrowChecker: Movable {
     }
 
     qid.TypeId move_path_type(Self&! self, move_path.MovePathId path_id) {
+        if (self.path_types.has(path_id)) { return self.path_types.get(path_id); }
         move_path.MovePath path = self.paths.get(path_id);
-        if (!path.has_parent) { return self.local_type(path.local_id); }
-        qid.TypeId parent_type = self.move_path_type(path.parent);
-        return self.projected_type(parent_type, path.projection);
+        qid.TypeId type_id! = self.local_type(path.local_id);
+        if (path.has_parent) {
+            type_id = self.projected_type(
+                self.move_path_type(path.parent), path.projection
+            );
+        }
+        self.path_types.set(path_id, type_id);
+        return type_id;
+    }
+
+    Void build_move_path_types(Self&! self) {
+        Int index! = 0;
+        while (index < self.paths.len()) {
+            move_path.MovePathId id = move_path.MovePathId.from_index(index);
+            self.move_path_type(id);
+            index = index + 1;
+        }
     }
 
     Bool is_return_local_path(self, move_path.MovePathId path_id) {
@@ -4054,124 +4563,6 @@ struct FunctionBorrowChecker: Movable {
         return self.memory_path_contains(place_path, current.source);
     }
 
-    Bool call_uses_loan_target(
-        Self&! self,
-        jil.CallTerminator call_term,
-        move_path.MovePathId target_path
-    ) {
-        if (self.call_callee_uses_loan_target(call_term.callee, target_path)) { return true; }
-        if (self.place_write_uses_loan_target(call_term.destination, target_path)) {
-            return true;
-        }
-        if (call_term.initialized_place is .some(initialized_place)) {
-            if (self.place_write_uses_loan_target(initialized_place, target_path)) {
-                return true;
-            }
-        }
-        Int index! = 0;
-        while (index < call_term.args.length) {
-            if (self.operand_uses_loan_target(call_term.args[index], target_path)) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return self.places_use_loan_target(
-            call_term.exclusive_places, target_path
-        );
-    }
-
-    Bool call_callee_uses_loan_target(
-        Self&! self,
-        jil.CallCallee callee,
-        move_path.MovePathId target_path
-    ) {
-        if (callee is .indirect_operand(operand)) {
-            return self.operand_uses_loan_target(operand, target_path);
-        }
-        if (callee is .domain_enqueue(enqueue)) {
-            if (self.optional_operand_uses_loan_target(enqueue.task, target_path)) { return true; }
-            return self.operand_uses_loan_target(enqueue.resume, target_path);
-        }
-        if (callee is .dynamic_domain_enqueue(enqueue)) {
-            if (self.operand_uses_loan_target(enqueue.executor, target_path)) { return true; }
-            if (self.optional_operand_uses_loan_target(enqueue.task, target_path)) { return true; }
-            return self.operand_uses_loan_target(enqueue.resume, target_path);
-        }
-        return false;
-    }
-
-    Bool statement_uses_loan_target(
-        Self&! self,
-        jil.Statement statement,
-        move_path.MovePathId target_path
-    ) {
-        if (statement.kind is .assign_stmt(assign_stmt)) {
-            if (self.rvalue_uses_loan_target(assign_stmt.value, target_path)) {
-                return true;
-            }
-            return self.place_write_uses_loan_target(
-                assign_stmt.destination, target_path
-            );
-        }
-        if (statement.kind is .atomic_store_stmt(atomic_store)) {
-            if (self.place_write_uses_loan_target(
-                atomic_store.destination, target_path
-            )) {
-                return true;
-            }
-            return self.operand_uses_loan_target(atomic_store.value, target_path);
-        }
-        if (statement.kind is .executor_leave_stmt(executor_leave)) {
-            return self.local_uses_loan_target(executor_leave.executor, target_path)
-                || self.local_uses_loan_target(
-                    executor_leave.previous_context, target_path
-                );
-        }
-        if (statement.kind is .task_suspend_stmt(suspend)) {
-            return self.place_uses_loan_target(suspend.task, target_path);
-        }
-        if (statement.kind is .task_complete_stmt(complete)) {
-            return self.place_uses_loan_target(complete.task, target_path);
-        }
-        if (statement.kind is .forget_stmt(forget_stmt)) {
-            return self.place_uses_loan_target(forget_stmt.place, target_path);
-        }
-        if (statement.kind is .set_discriminant_stmt(discriminant)) {
-            return self.place_write_uses_loan_target(
-                discriminant.destination, target_path
-            );
-        }
-        if (statement.kind is .exclusive_stmt(exclusive_stmt)) {
-            return self.place_uses_loan_target(exclusive_stmt.place, target_path);
-        }
-        if (statement.kind is .capture_bind_stmt(bind)) {
-            return self.place_uses_loan_target(bind.destination, target_path)
-                || self.place_uses_loan_target(bind.environment, target_path);
-        }
-        if (statement.kind is .task_consume_stmt(consume)) {
-            return self.place_uses_loan_target(consume.task, target_path);
-        }
-        if (statement.kind is .task_release_stmt(release)) {
-            return self.task_release_uses_loan_target(release, target_path);
-        }
-        if (statement.kind is .task_owner_release_stmt(release)) {
-            return self.place_uses_loan_target(release.pointer, target_path);
-        }
-        if (statement.kind is .task_region_start_stmt(start)) {
-            return self.place_uses_loan_target(start.task, target_path);
-        }
-        if (statement.kind is .task_wait_stmt(wait)) {
-            if (self.place_uses_loan_target(wait.state, target_path)) { return true; }
-            return self.operand_uses_loan_target(wait.expected, target_path);
-        }
-        if (statement.kind is .storage_dead_stmt(storage_dead)) {
-            move_path.MovePathId root = self.paths.root_for_local(storage_dead.local_id);
-            if (!self.path_matches_or_contains(root, target_path)) { return false; }
-            return self.loan_target_has_task_owner_ancestor(target_path, root);
-        }
-        return false;
-    }
-
     Bool statement_kills_loan_target(
         Self&! self,
         jil.Statement statement,
@@ -4195,279 +4586,6 @@ struct FunctionBorrowChecker: Movable {
             return self.path_matches_or_contains(root, target_path);
         }
         return false;
-    }
-
-    Bool terminator_uses_loan_target(
-        Self&! self,
-        jil.Terminator terminator,
-        move_path.MovePathId target_path
-    ) {
-        if (terminator.kind is .goto_term(goto_term)) {
-            if (goto_term.initialized_place is .some(initialized_place)) {
-                return self.place_write_uses_loan_target(
-                    initialized_place, target_path
-                );
-            }
-            return false;
-        }
-        if (terminator.kind is .branch_term(branch)) {
-            return self.operand_uses_loan_target(branch.condition, target_path);
-        }
-        if (terminator.kind is .switch_term(switch_term)) {
-            return self.operand_uses_loan_target(switch_term.discriminator, target_path);
-        }
-        if (terminator.kind is .call_term(call_term)) {
-            return self.call_uses_loan_target(call_term, target_path);
-        }
-        if (terminator.kind is .drop_term(drop_term)) {
-            return self.place_uses_loan_target(drop_term.place, target_path);
-        }
-        if (terminator.kind is .assert_term(assert_term)) {
-            return self.operand_uses_loan_target(assert_term.condition, target_path);
-        }
-        if (terminator.kind is .throw_term(throw_term)) {
-            return self.operand_uses_loan_target(throw_term.error_value, target_path);
-        }
-        if (terminator.kind is .return_term(return_term)) {
-            if (return_term.implicit_unit) { return false; }
-            move_path.MovePathId return_path =
-                self.paths.root_for_local(self.body.return_local);
-            return self.loan_target_matches_path(target_path, return_path);
-        }
-        return false;
-    }
-
-    Bool terminator_kills_loan_target_on_edge(
-        Self&! self,
-        jil.Terminator terminator,
-        Int successor_index,
-        move_path.MovePathId target_path
-    ) {
-        if (successor_index != 0) { return false; }
-        if (terminator.kind is .goto_term(goto_term)) {
-            if (goto_term.initialized_place is .some(initialized_place)) {
-                return self.place_kills_loan_target(initialized_place, target_path);
-            }
-            return false;
-        }
-        if (terminator.kind is .call_term(call_term)) {
-            if (self.place_kills_loan_target(call_term.destination, target_path)) {
-                return true;
-            }
-            if (call_term.deferred_initialization) { return false; }
-            if (call_term.initialized_place is .some(initialized_place)) {
-                return self.place_kills_loan_target(initialized_place, target_path);
-            }
-        }
-        return false;
-    }
-
-    Bool rvalue_uses_loan_target(
-        Self&! self,
-        jil.Rvalue value,
-        move_path.MovePathId target_path
-    ) {
-        if (value is .use_value(use_value)) {
-            return self.operand_uses_loan_target(use_value.value, target_path);
-        }
-        if (value is .unary_value(unary_value)) {
-            return self.operand_uses_loan_target(unary_value.value, target_path);
-        }
-        if (value is .binary_value(binary_value)) {
-            if (self.operand_uses_loan_target(binary_value.lhs, target_path)) { return true; }
-            return self.operand_uses_loan_target(binary_value.rhs, target_path);
-        }
-        if (value is .cast_value(cast_value)) {
-            return self.operand_uses_loan_target(cast_value.value, target_path);
-        }
-        if (value is .inline_asm_value(inline_asm)) {
-            return self.inline_asm_uses_loan_target(inline_asm, target_path);
-        }
-        if (value is .borrow_value(borrow_value)) {
-            return self.place_uses_loan_target(borrow_value.place, target_path);
-        }
-        if (value is .address_of_value(address_of_value)) {
-            return self.place_uses_loan_target(address_of_value.place, target_path);
-        }
-        if (value is .coroutine_address_value(coroutine_address)) {
-            return self.place_write_uses_loan_target(
-                coroutine_address.place, target_path
-            );
-        }
-        if (value is .executor_enter_value(executor_enter)) {
-            return self.local_uses_loan_target(executor_enter.executor, target_path)
-                || self.local_uses_loan_target(executor_enter.context, target_path);
-        }
-        if (value is .atomic_load_value(atomic_load)) {
-            return self.place_uses_loan_target(atomic_load.place, target_path);
-        }
-        if (value is .atomic_exchange_value(exchange)) {
-            if (self.place_uses_loan_target(exchange.place, target_path)) { return true; }
-            return self.operand_uses_loan_target(exchange.desired, target_path);
-        }
-        if (value is .atomic_compare_exchange_value(compare_exchange)) {
-            if (self.place_uses_loan_target(compare_exchange.place, target_path)) { return true; }
-            if (self.operand_uses_loan_target(compare_exchange.expected, target_path)) { return true; }
-            return self.operand_uses_loan_target(compare_exchange.desired, target_path);
-        }
-        if (value is .alloc_value(alloc_value)) {
-            return self.operand_uses_loan_target(alloc_value.value, target_path);
-        }
-        if (value is .coroutine_frame_alloc_value(frame_alloc)) {
-            return self.operand_uses_loan_target(frame_alloc.executor, target_path);
-        }
-        if (value is .alloc_array_value(alloc_array)) {
-            return self.operand_uses_loan_target(alloc_array.count, target_path);
-        }
-        if (value is .free_value(free_value)) {
-            return self.operand_uses_loan_target(free_value.pointer, target_path);
-        }
-        if (value is .coroutine_frame_free_value(frame_free)) {
-            if (self.operand_uses_loan_target(frame_free.pointer, target_path)) { return true; }
-            return self.operand_uses_loan_target(frame_free.executor, target_path);
-        }
-        if (value is .slice_value(slice_value)) {
-            if (self.place_uses_loan_target(slice_value.base, target_path)) { return true; }
-            if (self.optional_operand_uses_loan_target(slice_value.start, target_path)) { return true; }
-            return self.optional_operand_uses_loan_target(slice_value.end, target_path);
-        }
-        if (value is .len_value(len_value)) {
-            return self.place_uses_loan_target(len_value.place, target_path);
-        }
-        if (value is .discriminant_value(discriminant_value)) {
-            return self.place_uses_loan_target(discriminant_value.place, target_path);
-        }
-        if (value is .aggregate_value(aggregate_value)) {
-            if (self.optional_operand_uses_loan_target(aggregate_value.tag, target_path)) { return true; }
-            return self.operands_use_loan_target(aggregate_value.fields, target_path);
-        }
-        if (value is .closure_value(closure_value)) {
-            if (self.operands_use_loan_target(closure_value.captures, target_path)) { return true; }
-            return self.operand_uses_loan_target(closure_value.vtable, target_path);
-        }
-        if (value is .optional_value(optional_value)) {
-            return self.operand_uses_loan_target(optional_value.value, target_path);
-        }
-        if (value is .error_union_value(error_union_value)) {
-            return self.operand_uses_loan_target(error_union_value.value, target_path);
-        }
-        return false;
-    }
-
-    Bool inline_asm_uses_loan_target(
-        Self&! self,
-        jil.InlineAsmRvalue value,
-        move_path.MovePathId target_path
-    ) {
-        Int index! = 0;
-        while (index < value.operands.length) {
-            if (value.operands[index] is .input(input)) {
-                if (self.operand_uses_loan_target(input.value, target_path)) {
-                    return true;
-                }
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool operands_use_loan_target(
-        Self&! self,
-        jil.Operand[]& operands,
-        move_path.MovePathId target_path
-    ) {
-        Int index! = 0;
-        while (index < operands.length) {
-            if (self.operand_uses_loan_target(operands[index], target_path)) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool places_use_loan_target(
-        Self&! self,
-        jil.Place[]& places,
-        move_path.MovePathId target_path
-    ) {
-        Int index! = 0;
-        while (index < places.length) {
-            if (self.place_uses_loan_target(places[index], target_path)) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool optional_operand_uses_loan_target(
-        Self&! self,
-        jil.Operand? operand,
-        move_path.MovePathId target_path
-    ) {
-        if (operand is .some(value)) {
-            return self.operand_uses_loan_target(value, target_path);
-        }
-        return false;
-    }
-
-    Bool task_release_uses_loan_target(
-        Self&! self,
-        jil.TaskReleaseStatement release,
-        move_path.MovePathId target_path
-    ) {
-        if (release.task is .some(task)) {
-            if (self.place_uses_loan_target(task, target_path)) { return true; }
-        }
-        if (self.place_uses_loan_target(release.task_pointer, target_path)) {
-            return true;
-        }
-        if (self.place_uses_loan_target(release.frame, target_path)) { return true; }
-        if (self.place_uses_loan_target(release.state, target_path)) { return true; }
-        return self.place_uses_loan_target(release.result, target_path);
-    }
-
-    Bool local_uses_loan_target(
-        Self&! self,
-        jil.LocalId local_id,
-        move_path.MovePathId target_path
-    ) {
-        Int local_index = local_id.to_index();
-        if (!self.valid_local_index(local_index)) { return false; }
-        move_path.MovePathId root = self.paths.root_for_local(local_id);
-        return self.loan_target_matches_path(target_path, root);
-    }
-
-    Bool operand_uses_loan_target(
-        Self&! self,
-        jil.Operand operand,
-        move_path.MovePathId target_path
-    ) {
-        guard self.operand_place(operand) is .some(place) else { return false; }
-        return self.place_uses_loan_target(place, target_path);
-    }
-
-    Bool place_uses_loan_target(
-        Self&! self,
-        jil.Place place,
-        move_path.MovePathId target_path
-    ) {
-        move_path.MovePathId path = self.paths.existing_path_for_place(place);
-        if (!self.valid_move_path(path)) { return false; }
-        return self.loan_target_matches_path(target_path, path);
-    }
-
-    Bool place_write_uses_loan_target(
-        Self&! self,
-        jil.Place place,
-        move_path.MovePathId target_path
-    ) {
-        if (!self.destination_has_deref_projection(place)
-            && !self.place_is_indirect_memory(place)) {
-            return false;
-        }
-        return self.place_uses_loan_target(place, target_path);
     }
 
     Bool place_kills_loan_target(
@@ -6288,15 +6406,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Bool is_descendant_of(self, move_path.MovePathId child, move_path.MovePathId parent) {
-        if (child == parent) { return false; }
-        move_path.MovePath current! = self.paths.get(child);
-        while (current.has_parent) {
-            if (current.parent == parent) {
-                return true;
-            }
-            current = self.paths.get(current.parent);
-        }
-        return false;
+        return self.paths.is_descendant(child, parent);
     }
 
     Void clear_path_and_descendants(Self&! self, move_path.MovePathId path) {
