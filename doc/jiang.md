@@ -2651,16 +2651,6 @@ jiangc --artifact-cache-dir path/to/cache --clean-artifact-cache
 `--artifact-stats`，编译器会在标准错误输出接口与对象的命中、缺失、失效、生成、复用、
 最终链接和无修改快速命中数量。
 
-debug executable 可以用 `--jobs N` 限制同时执行 object emission 的 worker 数量：
-
-```bash
-jiangc --jobs 4 path/to/pkg -o pkg
-```
-
-默认使用当前进程可用的逻辑 CPU 数，平台无法查询时回退到 `1`。
-该选项不改变输出和缓存身份；release、shared library、`--emit-llvm` 以及 `--emit-obj`
-仍使用串行 backend 路径。
-
 当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前识别：
 
 - `[package].name`

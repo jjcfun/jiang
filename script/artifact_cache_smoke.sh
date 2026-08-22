@@ -825,52 +825,27 @@ check_concurrent_publish() {
   require_stat_eq "$WORK_DIR/concurrent-hot.log" artifact_emitted_units 0
 }
 
-check_parallel_backend_emission() {
+check_backend_emission() {
   local input="$ROOT_DIR/test/lang/package/run/source_dependency_app"
-  local serial_cache="$WORK_DIR/backend-jobs-1-cache"
-  local parallel_cache="$WORK_DIR/backend-jobs-4-cache"
+  local cache="$WORK_DIR/backend-emission-cache"
   local failed_cache="$WORK_DIR/backend-failed-unit-cache"
   local repeat_cache="$WORK_DIR/backend-failed-unit-repeat-cache"
-  local serial_output="$WORK_DIR/backend-jobs-1"
-  local parallel_output="$WORK_DIR/backend-jobs-4"
+  local output="$WORK_DIR/backend-emission"
   local failed_output="$WORK_DIR/backend-failed-unit"
 
-  "$JIANGC" --jobs 1 --artifact-cache-dir "$serial_cache" --artifact-stats \
-    -o "$serial_output" "$input" >"$WORK_DIR/backend-jobs-1.log" 2>&1
-  "$JIANGC" --jobs 4 --artifact-cache-dir "$parallel_cache" --artifact-stats \
-    -o "$parallel_output" "$input" >"$WORK_DIR/backend-jobs-4.log" 2>&1
-  expect_exit "$serial_output" 52
-  expect_exit "$parallel_output" 52
-  require_stat_ge "$WORK_DIR/backend-jobs-1.log" artifact_emitted_units 2
-  require_stat_ge "$WORK_DIR/backend-jobs-4.log" artifact_emitted_units 2
-  artifact_stat_snapshot "$WORK_DIR/backend-jobs-1.log" \
-    "$WORK_DIR/backend-jobs-1.stats"
-  artifact_stat_snapshot "$WORK_DIR/backend-jobs-4.log" \
-    "$WORK_DIR/backend-jobs-4.stats"
-  cmp "$WORK_DIR/backend-jobs-1.stats" "$WORK_DIR/backend-jobs-4.stats"
-  compare_object_caches "$serial_cache" "$parallel_cache"
-  normalized_symbols "$serial_output" "$WORK_DIR/backend-jobs-1.symbols"
-  normalized_symbols "$parallel_output" "$WORK_DIR/backend-jobs-4.symbols"
-  cmp "$WORK_DIR/backend-jobs-1.symbols" "$WORK_DIR/backend-jobs-4.symbols"
+  "$JIANGC" --artifact-cache-dir "$cache" --artifact-stats \
+    -o "$output" "$input" >"$WORK_DIR/backend-emission.log" 2>&1
+  expect_exit "$output" 52
+  require_stat_ge "$WORK_DIR/backend-emission.log" artifact_emitted_units 2
 
-  "$JIANGC" --jobs 1 --artifact-cache-dir "$serial_cache" --artifact-stats \
-    -o "$serial_output" "$input" >"$WORK_DIR/backend-jobs-1-hot.log" 2>&1
-  "$JIANGC" --jobs 4 --artifact-cache-dir "$parallel_cache" --artifact-stats \
-    -o "$parallel_output" "$input" >"$WORK_DIR/backend-jobs-4-hot.log" 2>&1
-  require_stat_eq "$WORK_DIR/backend-jobs-1-hot.log" artifact_no_op_hits 1
-  require_stat_eq "$WORK_DIR/backend-jobs-4-hot.log" artifact_no_op_hits 1
-  require_stat_eq "$WORK_DIR/backend-jobs-1-hot.log" artifact_emitted_units 0
-  require_stat_eq "$WORK_DIR/backend-jobs-4-hot.log" artifact_emitted_units 0
-  artifact_stat_snapshot "$WORK_DIR/backend-jobs-1-hot.log" \
-    "$WORK_DIR/backend-jobs-1-hot.stats"
-  artifact_stat_snapshot "$WORK_DIR/backend-jobs-4-hot.log" \
-    "$WORK_DIR/backend-jobs-4-hot.stats"
-  cmp "$WORK_DIR/backend-jobs-1-hot.stats" "$WORK_DIR/backend-jobs-4-hot.stats"
-  require_no_temporary_files "$serial_cache"
-  require_no_temporary_files "$parallel_cache"
+  "$JIANGC" --artifact-cache-dir "$cache" --artifact-stats \
+    -o "$output" "$input" >"$WORK_DIR/backend-emission-hot.log" 2>&1
+  require_stat_eq "$WORK_DIR/backend-emission-hot.log" artifact_no_op_hits 1
+  require_stat_eq "$WORK_DIR/backend-emission-hot.log" artifact_emitted_units 0
+  require_no_temporary_files "$cache"
 
   if env JIANG_INTERNAL_BACKEND_FAIL_UNIT=0 \
-    "$JIANGC" --jobs 4 --artifact-cache-dir "$failed_cache" --artifact-stats \
+    "$JIANGC" --artifact-cache-dir "$failed_cache" --artifact-stats \
       -o "$failed_output" "$input" >"$WORK_DIR/backend-failed-unit.log" 2>&1
   then
     fail "forced backend unit failure unexpectedly succeeded"
@@ -886,7 +861,7 @@ check_parallel_backend_emission() {
   require_no_temporary_files "$failed_cache"
 
   if env JIANG_INTERNAL_BACKEND_FAIL_UNIT=0 \
-    "$JIANGC" --jobs 4 --artifact-cache-dir "$repeat_cache" --artifact-stats \
+    "$JIANGC" --artifact-cache-dir "$repeat_cache" --artifact-stats \
       -o "$failed_output.repeat" "$input" >"$WORK_DIR/backend-failed-unit-repeat.log" 2>&1
   then
     fail "repeated forced backend unit failure unexpectedly succeeded"
@@ -897,7 +872,7 @@ check_parallel_backend_emission() {
     "$WORK_DIR/backend-failed-unit-repeat.diagnostic"
   require_no_temporary_files "$repeat_cache"
 
-  "$JIANGC" --jobs 4 --artifact-cache-dir "$failed_cache" --artifact-stats \
+  "$JIANGC" --artifact-cache-dir "$failed_cache" --artifact-stats \
     -o "$failed_output" "$input" >"$WORK_DIR/backend-failed-unit-retry.log" 2>&1
   require_stat_eq "$WORK_DIR/backend-failed-unit-retry.log" artifact_emitted_units 1
   require_stat_ge "$WORK_DIR/backend-failed-unit-retry.log" artifact_object_hit 1
@@ -1024,7 +999,7 @@ run_check release_units "release whole-package state" check_release_whole_packag
 run_check global_only "global-only dependency" check_global_only_dependency
 run_check public_alias "public alias dependency" check_public_alias_dependency
 run_check trait_interface "trait interface" check_trait_interface
-run_check backend_parallel "parallel backend emission" check_parallel_backend_emission
+run_check backend_emission "serial backend emission" check_backend_emission
 run_check concurrent "concurrent publication" check_concurrent_publish
 run_check clean "explicit cache clean" check_explicit_cache_clean
 run_check partial "failed link preserves work products" check_failed_link_preserves_work_products

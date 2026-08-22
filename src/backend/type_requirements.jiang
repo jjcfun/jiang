@@ -1,0 +1,528 @@
+// Backend 所需类型闭包。
+//
+// 这里统一遍历最终 JIL 中会被 ABI、LLVM lowering、global initializer 和 coroutine
+// lowering 消费的类型。Layout 准备只接受这份闭包，不能再由各 backend helper 各自猜测。
+
+import jil = "../jil.jiang";
+import qid = "../id.jiang";
+import store_api = "../store.jiang";
+import types = "../sema/type.jiang";
+import list = "../support/list.jiang";
+
+public list.ArrayList<qid.TypeId> collect(
+    store_api.CompilerStore& store,
+    jil.Store& jil_store
+) {
+    Collector collector! = Collector(store);
+    collector.collect_jil_store(jil_store);
+    return collector.finish();
+}
+
+public Void append_type_closure(
+    store_api.CompilerStore& store,
+    qid.TypeId type_id,
+    list.ArrayList<Bool>&! seen,
+    list.ArrayList<qid.TypeId>&! items
+) {
+    Int index = type_id.to_index();
+    while (seen.len() <= index) { seen.add(false); }
+    if (seen.get(index)) { return; }
+    seen.set(index, true);
+    items.add(type_id);
+    append_type_data_closure(store, store.types.get(type_id).data, seen, items);
+}
+
+Void append_type_data_closure(
+    store_api.CompilerStore& store,
+    types.TypeData data,
+    list.ArrayList<Bool>&! seen,
+    list.ArrayList<qid.TypeId>&! items
+) {
+    if (data is .named(named)) {
+        append_type_slice_closure(store, named.type_args, seen, items);
+    } else if (data is .optional(optional)) {
+        append_type_closure(store, optional.element, seen, items);
+    } else if (data is .error_union(error_union)) {
+        append_type_closure(store, error_union.value, seen, items);
+        append_type_closure(store, error_union.error, seen, items);
+    } else if (data is .handle_type(handle)) {
+        append_type_closure(store, handle.element, seen, items);
+    } else if (data is .slice_value_type(slice)) {
+        append_type_closure(store, slice.element, seen, items);
+    } else if (data is .array_type(array)) {
+        append_type_closure(store, array.element, seen, items);
+    } else {
+        append_tail_type_data_closure(store, data, seen, items);
+    }
+}
+
+Void append_tail_type_data_closure(
+    store_api.CompilerStore& store,
+    types.TypeData data,
+    list.ArrayList<Bool>&! seen,
+    list.ArrayList<qid.TypeId>&! items
+) {
+    if (data is .tuple_type(tuple)) {
+        append_type_slice_closure(store, tuple.items, seen, items);
+    } else if (data is .closure_environment_type(environment)) {
+        append_type_slice_closure(store, environment.capture_types, seen, items);
+    } else if (data is .task_state_type(task_state)) {
+        append_type_closure(store, task_state.result, seen, items);
+        append_type_slice_closure(store, task_state.field_types, seen, items);
+    } else if (data is .function_type(function)) {
+        append_type_slice_closure(store, function.params, seen, items);
+        append_type_closure(store, function.result, seen, items);
+        if (function.effects.domain is .some(domain)) {
+            append_type_closure(store, domain.domain_type, seen, items);
+        }
+    } else if (data is .task_type(task)) {
+        append_type_closure(store, task.result, seen, items);
+        append_type_closure(store, task.state_type, seen, items);
+        if (task.domain is .some(domain)) {
+            append_type_closure(store, domain.domain_type, seen, items);
+        }
+    }
+}
+
+Void append_type_slice_closure(
+    store_api.CompilerStore& store,
+    qid.TypeId[]& type_ids,
+    list.ArrayList<Bool>&! seen,
+    list.ArrayList<qid.TypeId>&! items
+) {
+    Int index! = 0;
+    while (index < type_ids.length) {
+        append_type_closure(store, type_ids[index], seen, items);
+        index = index + 1;
+    }
+}
+
+@region(a)
+struct Collector: Movable {
+    @life(a)
+    store_api.CompilerStore& store;
+    list.ArrayList<Bool> seen!;
+    list.ArrayList<qid.TypeId> items!;
+
+    init(self, store_api.CompilerStore& store) {
+        self.store = store;
+        self.seen = list.ArrayList<Bool>(store.types.types.len());
+        self.items = list.ArrayList<qid.TypeId>();
+        Int index! = 0;
+        while (index < store.types.types.len()) {
+            self.seen.add(false);
+            index = index + 1;
+        }
+    }
+
+    list.ArrayList<qid.TypeId> finish(Self self!) {
+        return self.items.take();
+    }
+
+    Void collect_jil_store(Self&! self, jil.Store& jil_store) {
+        Int index! = 0;
+        while (index < jil_store.program.functions.len()) {
+            self.collect_function(jil_store.program.functions.ref_at(index));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < jil_store.program.globals.len()) {
+            self.collect_global(jil_store.program.globals.ref_at(index));
+            index = index + 1;
+        }
+    }
+
+    Void collect_function(Self&! self, jil.Function& function) {
+        self.add_type_slice(function.type_args);
+        self.add_effects(function.effects);
+        if (jil.function_generated_origin(function.origin) is .some(origin)) {
+            self.add_optional_type(origin.identity_type);
+        }
+        if (function.coroutine_frame is .some(frame)) {
+            self.collect_coroutine_frame(frame);
+        }
+        Int index! = 0;
+        while (index < function.body.locals.length) {
+            self.add(function.body.locals[index].type_id);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < function.body.blocks.length) {
+            self.collect_block(function.body.blocks[index]);
+            index = index + 1;
+        }
+    }
+
+    Void collect_coroutine_frame(Self&! self, jil.CoroutineFrameLayout frame) {
+        self.add(frame.frame_type_id);
+        self.collect_task_abi(frame.task_abi);
+        Int index! = 0;
+        while (index < frame.fields.length) {
+            self.add(frame.fields[index].type_id);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < frame.task_regions.length) {
+            if (frame.task_regions[index].child_resume is .some(function_ref)) {
+                self.collect_function_ref(function_ref);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void collect_task_abi(Self&! self, jil.TaskAbiLayout value) {
+        self.add(value.task_type_id);
+        self.add(value.task_state_type_id);
+        self.add(value.task_state_pointer_type_id);
+        self.add(value.result_type_id);
+        self.add(value.frame_pointer_type_id);
+        self.add(value.resume_return_type_id);
+        self.add(value.resume_function_type_id);
+        self.add(value.blocking_ack_pointer_type_id);
+        self.add(value.bool_type_id);
+        self.add(value.waiter_layout.type_id);
+        self.add(value.waiter_layout.pointer_type_id);
+        self.add(value.suspend_layout.type_id);
+        self.add(value.suspend_layout.pointer_type_id);
+    }
+
+    Void collect_global(Self&! self, jil.Global& global) {
+        self.add(global.type_id);
+        if (global.origin is .generated(origin)) {
+            self.add_optional_type(origin.identity_type);
+        }
+        if (global.initializer is .some(initializer)) {
+            self.collect_static_value(initializer);
+        }
+    }
+
+    Void collect_static_value(Self&! self, jil.StaticValue value) {
+        if (value is .scalar(constant)) {
+            self.add(constant.type_id);
+            return;
+        }
+        if (value is .function(function_ref)) {
+            self.collect_function_ref(function_ref);
+            return;
+        }
+        if (value is .global_address(global_ref)) {
+            self.add(global_ref.type_id);
+            return;
+        }
+        guard value is .aggregate(fields) else { return; }
+        Int index! = 0;
+        while (index < fields.length) {
+            self.add(fields[index].type_id);
+            self.collect_static_value(fields[index].value);
+            index = index + 1;
+        }
+    }
+
+    Void collect_block(Self&! self, jil.Block block) {
+        Int index! = 0;
+        while (index < block.statements.length) {
+            self.collect_statement(block.statements[index]);
+            index = index + 1;
+        }
+        self.collect_terminator(block.terminator);
+    }
+
+    Void collect_statement(Self&! self, jil.Statement statement) {
+        if (statement.kind is .assign_stmt(assign)) {
+            self.collect_place(assign.destination);
+            self.collect_rvalue(assign.value);
+            return;
+        }
+        if (statement.kind is .atomic_store_stmt(store)) {
+            self.collect_place(store.destination);
+            self.collect_operand(store.value);
+            return;
+        }
+        if (statement.kind is .task_wait_stmt(wait)) {
+            self.collect_place(wait.state);
+            self.collect_operand(wait.expected);
+            return;
+        }
+        if (statement.kind is .task_region_start_stmt(start)) {
+            self.collect_place(start.task);
+            if (start.child_resume is .some(function_ref)) {
+                self.collect_function_ref(function_ref);
+            }
+            return;
+        }
+        self.collect_tail_statement(statement.kind);
+    }
+
+    Void collect_tail_statement(Self&! self, jil.StatementKind statement) {
+        if (statement is .task_release_stmt(release)) {
+            self.collect_optional_place(release.task);
+            self.collect_place(release.task_pointer);
+            self.collect_place(release.frame);
+            self.collect_place(release.state);
+            self.collect_place(release.result);
+            self.collect_function_ref(release.result_drop);
+        } else if (statement is .task_owner_release_stmt(release)) {
+            self.collect_place(release.pointer);
+        } else if (statement is .task_suspend_stmt(suspend)) {
+            self.collect_place(suspend.task);
+        } else if (statement is .task_complete_stmt(complete)) {
+            self.collect_place(complete.task);
+        } else if (statement is .task_consume_stmt(consume)) {
+            self.collect_place(consume.task);
+        } else if (statement is .capture_bind_stmt(bind)) {
+            self.collect_place(bind.destination);
+            self.collect_place(bind.environment);
+        } else if (statement is .exclusive_stmt(exclusive)) {
+            self.collect_place(exclusive.place);
+        } else if (statement is .forget_stmt(forget)) {
+            self.collect_place(forget.place);
+        } else if (statement is .set_discriminant_stmt(set_discriminant)) {
+            self.collect_place(set_discriminant.destination);
+        }
+    }
+
+    Void collect_terminator(Self&! self, jil.Terminator terminator) {
+        if (terminator.kind is .call_term(call)) {
+            self.collect_call(call);
+            return;
+        }
+        if (terminator.kind is .branch_term(branch)) {
+            self.collect_operand(branch.condition);
+            return;
+        }
+        if (terminator.kind is .switch_term(switch_term)) {
+            self.collect_operand(switch_term.discriminator);
+            Int index! = 0;
+            while (index < switch_term.cases.length) {
+                self.add(switch_term.cases[index].value.type_id);
+                index = index + 1;
+            }
+            return;
+        }
+        self.collect_tail_terminator(terminator.kind);
+    }
+
+    Void collect_tail_terminator(Self&! self, jil.TerminatorKind terminator) {
+        if (terminator is .goto_term(goto_term)) {
+            self.collect_optional_place(goto_term.initialized_place);
+        } else if (terminator is .drop_term(drop)) {
+            self.collect_place(drop.place);
+        } else if (terminator is .assert_term(assert_term)) {
+            self.collect_operand(assert_term.condition);
+            self.collect_optional_operand(assert_term.message);
+        } else if (terminator is .throw_term(throw_term)) {
+            self.collect_operand(throw_term.error_value);
+        }
+    }
+
+    Void collect_call(Self&! self, jil.CallTerminator call) {
+        self.collect_callee(call.callee);
+        self.collect_operands(call.args);
+        self.collect_place(call.destination);
+        self.collect_optional_place(call.initialized_place);
+        self.collect_optional_place(call.lifetime_destination);
+        if (call.suspend_child is .some(function_ref)) {
+            self.collect_function_ref(function_ref);
+        }
+        if (call.lifetime_args is .some(args)) { self.collect_operands(args); }
+        Int index! = 0;
+        while (index < call.exclusive_places.length) {
+            self.collect_place(call.exclusive_places[index]);
+            index = index + 1;
+        }
+        self.add_effects(call.current_effects);
+    }
+
+    Void collect_callee(Self&! self, jil.CallCallee callee) {
+        if (callee is .direct_function(function_ref)) {
+            self.collect_function_ref(function_ref);
+            return;
+        }
+        if (callee is .indirect_operand(operand)) {
+            self.collect_operand(operand);
+            return;
+        }
+        if (callee is .domain_enqueue(enqueue)) {
+            self.collect_optional_operand(enqueue.task);
+            self.collect_operand(enqueue.resume);
+            return;
+        }
+        guard callee is .dynamic_domain_enqueue(enqueue) else { return; }
+        self.collect_operand(enqueue.executor);
+        self.collect_optional_operand(enqueue.task);
+        self.collect_operand(enqueue.resume);
+    }
+
+    Void collect_rvalue(Self&! self, jil.Rvalue value) {
+        if (value is .use_value(item)) {
+            self.collect_operand(item.value);
+        } else if (value is .unary_value(item)) {
+            self.collect_operand(item.value);
+        } else if (value is .binary_value(item)) {
+            self.collect_operand(item.lhs);
+            self.collect_operand(item.rhs);
+        } else if (value is .cast_value(item)) {
+            self.add(item.target_type);
+            self.collect_operand(item.value);
+        } else if (value is .inline_asm_value(item)) {
+            self.collect_inline_asm(item);
+        } else {
+            self.collect_extended_rvalue(value);
+        }
+    }
+
+    Void collect_extended_rvalue(Self&! self, jil.Rvalue value) {
+        if (value is .borrow_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .address_of_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .coroutine_address_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .atomic_load_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .atomic_exchange_value(item)) {
+            self.collect_place(item.place);
+            self.collect_operand(item.desired);
+        } else if (value is .atomic_compare_exchange_value(item)) {
+            self.collect_place(item.place);
+            self.collect_operand(item.expected);
+            self.collect_operand(item.desired);
+        } else {
+            self.collect_allocation_rvalue(value);
+        }
+    }
+
+    Void collect_allocation_rvalue(Self&! self, jil.Rvalue value) {
+        if (value is .alloc_box_value(item)) {
+            self.add(item.value_type);
+        } else if (value is .coroutine_frame_alloc_value(item)) {
+            self.add(item.value_type);
+            self.collect_operand(item.executor);
+        } else if (value is .alloc_value(item)) {
+            self.add(item.value_type);
+            self.collect_operand(item.value);
+        } else if (value is .alloc_array_value(item)) {
+            self.add(item.element_type);
+            self.collect_operand(item.count);
+        } else if (value is .free_value(item)) {
+            self.collect_operand(item.pointer);
+        } else if (value is .coroutine_frame_free_value(item)) {
+            self.collect_operand(item.pointer);
+            self.collect_operand(item.executor);
+        } else {
+            self.collect_tail_rvalue(value);
+        }
+    }
+
+    Void collect_tail_rvalue(Self&! self, jil.Rvalue value) {
+        if (value is .slice_value(item)) {
+            self.collect_place(item.base);
+            self.collect_optional_operand(item.start);
+            self.collect_optional_operand(item.end);
+        } else if (value is .len_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .discriminant_value(item)) {
+            self.collect_place(item.place);
+        } else if (value is .aggregate_value(item)) {
+            self.add(item.type_id);
+            self.collect_optional_operand(item.tag);
+            self.collect_operands(item.fields);
+        } else if (value is .closure_value(item)) {
+            self.add(item.closure_type);
+            self.add(item.environment_type);
+            self.collect_optional_place(item.stack_environment);
+            self.collect_operands(item.captures);
+            self.collect_operand(item.vtable);
+        } else if (value is .optional_value(item)) {
+            self.collect_operand(item.value);
+        } else if (value is .error_union_value(item)) {
+            self.collect_operand(item.value);
+        }
+    }
+
+    Void collect_inline_asm(Self&! self, jil.InlineAsmRvalue value) {
+        self.add(value.result_type);
+        Int index! = 0;
+        while (index < value.operands.length) {
+            if (value.operands[index] is .input(input)) {
+                self.collect_operand(input.value);
+            } else if (value.operands[index] is .output(output)) {
+                self.add(output.type_id);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void collect_operands(Self&! self, jil.Operand[]& operands) {
+        Int index! = 0;
+        while (index < operands.length) {
+            self.collect_operand(operands[index]);
+            index = index + 1;
+        }
+    }
+
+    Void collect_optional_operand(Self&! self, jil.Operand? operand) {
+        if (operand is .some(value)) { self.collect_operand(value); }
+    }
+
+    Void collect_operand(Self&! self, jil.Operand operand) {
+        if (operand is .copy_operand(copy)) {
+            self.collect_place(copy.place);
+        } else if (operand is .move_operand(move)) {
+            self.collect_place(move.place);
+        } else if (operand is .out_operand(out)) {
+            self.collect_place(out.place);
+        } else if (operand is .function_operand(function_ref)) {
+            self.collect_function_ref(function_ref);
+        } else if (operand is .global_operand(global_ref)) {
+            self.add(global_ref.type_id);
+        } else if (operand is .global_address_operand(global_ref)) {
+            self.add(global_ref.type_id);
+        } else if (operand is .const_operand(constant)) {
+            self.add(constant.type_id);
+        }
+    }
+
+    Void collect_function_ref(Self&! self, jil.FunctionRef function_ref) {
+        self.add(function_ref.type_id);
+        self.add_type_slice(function_ref.type_args);
+    }
+
+    Void collect_optional_place(Self&! self, jil.Place? place) {
+        if (place is .some(value)) { self.collect_place(value); }
+    }
+
+    Void collect_place(Self&! self, jil.Place place) {
+        if (place.base is .global(global_ref)) { self.add(global_ref.type_id); }
+        Int index! = 0;
+        while (index < place.projection.length) {
+            jil.PlaceElem projection = place.projection[index];
+            if (projection is .field_projection(field)) {
+                self.add(field.field_type);
+            } else if (projection is .frame_field_projection(field)) {
+                self.add(field.field_type);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void add_optional_type(Self&! self, qid.TypeId? type_id) {
+        if (type_id is .some(value)) { self.add(value); }
+    }
+
+    Void add_type_slice(Self&! self, qid.TypeId[]& type_ids) {
+        Int index! = 0;
+        while (index < type_ids.length) {
+            self.add(type_ids[index]);
+            index = index + 1;
+        }
+    }
+
+    Void add_effects(Self&! self, types.EffectSet effects) {
+        if (effects.domain is .some(domain)) { self.add(domain.domain_type); }
+    }
+
+    Void add(Self&! self, qid.TypeId type_id) {
+        append_type_closure(self.store, type_id, self.seen$.mut_ref(), self.items$.mut_ref());
+    }
+}

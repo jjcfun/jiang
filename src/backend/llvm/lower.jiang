@@ -27,18 +27,8 @@ import llvm_type = "./type.jiang";
 import llvm_value = "./value.jiang";
 import std;
 
-Bool text_starts_with(UInt8[]& text, UInt8[]& prefix) {
-    if (text.length < prefix.length) { return false; }
-    Int index! = 0;
-    while (index < prefix.length) {
-        if (text[index] != prefix[index]) { return false; }
-        index = index + 1;
-    }
-    return true;
-}
-
-// 已完成 JIL lowering 的独立 LLVM object。它拥有自己的 LLVM Context 和 Module，
-// worker 只执行 LLVM pass 与 object emission，不再访问 CompilerStore。
+// 独立 LLVM object 拥有自己的 LLVM Context 和 Module。它在当前 CGU 完成 pass
+// 和 object emission 后立即释放，不跨 CGU 保留 CompilerStore 或 JIL 状态。
 public struct ObjectUnit: Movable {
     ffi.Context llvm_context!;
     ffi.Module module!;
@@ -149,6 +139,7 @@ public Bool emit_object_unit_file(
     jil.Store& store,
     codegen_unit.CodegenUnit& unit,
     jil_analysis.attributes.Store& attribute_facts,
+    list.ArrayList<jil.FunctionId>& shared_runtime_functions,
     UInt8[]& output_path,
     Int opt_level,
     UInt8[]& pass_pipeline,
@@ -162,7 +153,14 @@ public Bool emit_object_unit_file(
         link_libc,
         target_triple
     );
-    Bool ok = lowerer.emit_object_unit_file(store, unit, output_path, opt_level, pass_pipeline);
+    Bool ok = lowerer.emit_object_unit_file(
+        store,
+        unit,
+        shared_runtime_functions,
+        output_path,
+        opt_level,
+        pass_pipeline
+    );
     diagnostic.DiagnosticStore diagnostics = lowerer.finish_diagnostics();
     ctx.store.diagnostics.append(diagnostics);
     return ok;
@@ -173,6 +171,7 @@ public ObjectUnit^? prepare_object_unit(
     jil.Store& store,
     codegen_unit.CodegenUnit& unit,
     jil_analysis.attributes.Store& attribute_facts,
+    list.ArrayList<jil.FunctionId>& shared_runtime_functions,
     UInt8[]& output_path,
     Int opt_level,
     UInt8[]& pass_pipeline,
@@ -186,7 +185,7 @@ public ObjectUnit^? prepare_object_unit(
         link_libc,
         target_triple
     );
-    Bool ok = lowerer.lower_unit(store, unit);
+    Bool ok = lowerer.lower_unit(store, unit, shared_runtime_functions);
     Bool has_errors = lowerer.output.diagnostics.has_errors();
     if (!ok || has_errors) {
         lowerer.dispose();
@@ -352,11 +351,12 @@ struct LlvmLowerer: Movable {
     Bool emit_object_unit_file(Self&! self,
         jil.Store& store,
         codegen_unit.CodegenUnit& unit,
+        list.ArrayList<jil.FunctionId>& shared_runtime_functions,
         UInt8[]& output_path,
         Int opt_level,
         UInt8[]& pass_pipeline
     ) {
-        Bool ok! = self.lower_unit(store, unit);
+        Bool ok! = self.lower_unit(store, unit, shared_runtime_functions);
         if (ok) {
             ok = ffi.module_emit_object(
                 self.module$.ref(),
@@ -401,9 +401,16 @@ struct LlvmLowerer: Movable {
         return text;
     }
 
-    Bool lower_unit(Self&! self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
+    Bool lower_unit(
+        Self&! self,
+        jil.Store& store,
+        codegen_unit.CodegenUnit& unit,
+        list.ArrayList<jil.FunctionId>& shared_runtime_functions
+    ) {
         // 独立 object 只拥有当前 unit 的 body，其他函数由引用 lowering 按需声明。
-        if (!self.declare_unit_functions(store, unit) || !self.declare_store_globals_for_unit(store, unit)) {
+        if (!self.declare_unit_functions(store, unit, shared_runtime_functions)
+            || !self.declare_store_globals_for_unit(store, unit)
+        ) {
             return false;
         }
         Int index! = 0;
@@ -595,33 +602,15 @@ struct LlvmLowerer: Movable {
     ) {
         Bool ok! = true;
         Int index! = 0;
-        while (ok && index < store.program.globals.len()) {
-            jil.Global& global = store.program.globals.ref_at(index);
-            Bool owns_definition = self.source_unit_owns_global(store, unit, global);
-            ok = ffi.value_valid(self.declare_global(global, owns_definition));
+        while (ok && index < unit.globals.len()) {
+            jil.Global& global = store.program.globals.ref_at(unit.globals.get(index).to_index());
             index = index + 1;
+            ok = ffi.value_valid(self.declare_global(global, true));
         }
         if (!ok) {
             self.add_codegen_error("failed to declare LLVM global", "llvm_global_declare_failed");
         }
         return ok;
-    }
-
-    Bool source_unit_owns_global(
-        self,
-        jil.Store& store,
-        codegen_unit.CodegenUnit& unit,
-        jil.Global& global
-    ) {
-        if (global.is_external || unit.key.kind != .source_unit) {
-            return false;
-        }
-        if (symbol.global_module_id(self.ctx, global) is .some(module_id)) {
-            qid.PackageId package_id = self.ctx.store.resolve.module_ref(module_id).package_id;
-            return package_id.to_index() == unit.key.package_index
-                && module_id.to_index() == unit.key.module_index;
-        }
-        return self.unit_contains_language_entry(store, unit);
     }
 
     ffi.Value declare_global(Self&! self, jil.Global& global, Bool owns_definition) {
@@ -690,7 +679,12 @@ struct LlvmLowerer: Movable {
         return ok;
     }
 
-    Bool declare_unit_functions(Self&! self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
+    Bool declare_unit_functions(
+        Self&! self,
+        jil.Store& store,
+        codegen_unit.CodegenUnit& unit,
+        list.ArrayList<jil.FunctionId>& shared_runtime_functions
+    ) {
         Int index! = 0;
         while (index < unit.functions.len()) {
             jil.Function& function = store.program.functions.ref_at(unit.functions.get(index).to_index());
@@ -706,16 +700,19 @@ struct LlvmLowerer: Movable {
             self.add_unit_monomorph_linkage(unit, function, llvm_function);
             index = index + 1;
         }
-        return self.declare_shared_runtime_functions(store);
+        return self.declare_shared_runtime_functions(store, shared_runtime_functions);
     }
 
-    Bool declare_shared_runtime_functions(Self&! self, jil.Store& store) {
+    Bool declare_shared_runtime_functions(
+        Self&! self,
+        jil.Store& store,
+        list.ArrayList<jil.FunctionId>& shared_runtime_functions
+    ) {
         Int index! = 0;
-        while (index < store.program.functions.len()) {
-            jil.Function& function = store.program.functions.ref_at(index);
+        while (index < shared_runtime_functions.len()) {
+            jil.FunctionId function_id = shared_runtime_functions.get(index);
+            jil.Function& function = store.program.functions.ref_at(function_id.to_index());
             index = index + 1;
-            std.String name = self.function_symbol_name(function);
-            if (!text_starts_with(name.bytes(), "__jiang_runtime_")) { continue; }
             if (ffi.value_valid(self.function_value(function))) { continue; }
             if (!ffi.value_valid(self.declare_function(function))) {
                 self.add_function_codegen_error(
