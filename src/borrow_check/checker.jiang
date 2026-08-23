@@ -82,59 +82,128 @@ public struct PackageBorrowChecker: Movable {
 
     public Void check_store(Self&! self, jil.Store& store) {
         unsafe {
+            Int template_count = store.program.template_count();
             Int function_count = store.program.functions.len();
-            Int*! states = Int$.alloc(function_count);
+            Int*! template_states = Int$.alloc(template_count);
+            Int*! function_states = Int$.alloc(function_count);
             Int index! = 0;
-            while (index < function_count) {
-                states[index] = 0;
+            while (index < template_count) {
+                template_states[index] = 0;
                 index = index + 1;
             }
             index = 0;
             while (index < function_count) {
-                self.check_function_at(store, index, states);
+                function_states[index] = 0;
                 index = index + 1;
             }
-            states$.dealloc();
+            index = 0;
+            while (index < template_count) {
+                self.check_template_at(
+                    store, index, template_states, function_states
+                );
+                index = index + 1;
+            }
+            index = 0;
+            while (index < function_count) {
+                self.check_generated_function_at(
+                    store, index, template_states, function_states
+                );
+                index = index + 1;
+            }
+            template_states$.dealloc();
+            function_states$.dealloc();
         }
     }
 
-    Void check_function_at(Self&! self, jil.Store& store, Int index, Int*! states) {
+    Void check_template_at(
+        Self&! self,
+        jil.Store& store,
+        Int index,
+        Int*! template_states,
+        Int*! function_states
+    ) {
         unsafe {
-            if (states[index] == 2) { return; }
-            if (states[index] == 1) { return; }
-            states[index] = 1;
-            jil.Function function! = store.program.functions.get(index);
-            if (store.program.borrow_check_function(function.id) is .some(source)) {
-                function = source;
-            }
-            self.check_direct_dependencies(store, function, states);
+            if (template_states[index] == 2) { return; }
+            if (template_states[index] == 1) { return; }
+            template_states[index] = 1;
+            jil.Function function = store.program.template(jil.TemplateId(index));
+            self.check_direct_dependencies(
+                store, function, template_states, function_states
+            );
             if (!store.program.is_borrow_check_exempt(function.id)) {
                 self.check_function(function);
             }
-            states[index] = 2;
+            template_states[index] = 2;
         }
     }
 
-    Void check_direct_dependencies(Self&! self, jil.Store& store, jil.Function function, Int*! states) {
+    Void check_generated_function_at(
+        Self&! self,
+        jil.Store& store,
+        Int index,
+        Int*! template_states,
+        Int*! function_states
+    ) {
+        unsafe {
+            if (function_states[index] == 2) { return; }
+            if (function_states[index] == 1) { return; }
+            function_states[index] = 1;
+            jil.Function function = store.program.functions.get(index);
+            if (function.origin is .source(_)) {
+                function_states[index] = 2;
+                return;
+            }
+            self.check_direct_dependencies(
+                store, function, template_states, function_states
+            );
+            if (!store.program.is_borrow_check_exempt(function.id)) {
+                self.check_function(function);
+            }
+            function_states[index] = 2;
+        }
+    }
+
+    Void check_direct_dependencies(
+        Self&! self,
+        jil.Store& store,
+        jil.Function function,
+        Int*! template_states,
+        Int*! function_states
+    ) {
         Int block_index! = 0;
         while (block_index < function.body.blocks.length) {
             jil.Terminator terminator = function.body.blocks[block_index].terminator;
-            self.check_terminator_dependency(store, terminator, states);
+            self.check_terminator_dependency(
+                store, terminator, template_states, function_states
+            );
             block_index = block_index + 1;
         }
     }
 
-    Void check_terminator_dependency(Self&! self, jil.Store& store, jil.Terminator terminator, Int*! states) {
+    Void check_terminator_dependency(
+        Self&! self,
+        jil.Store& store,
+        jil.Terminator terminator,
+        Int*! template_states,
+        Int*! function_states
+    ) {
         guard terminator.kind is .call_term(call_term) else { return; }
         guard call_term.callee is .direct_function(function_ref) else { return; }
-        guard self.function_id_for_ref(store, function_ref) is .some(function_id) else { return; }
+        if (function_ref.target is .source(function_def)) {
+            guard store.program.template_id_for_def(function_def)
+                is .some(template_id) else { return; }
+            self.check_template_at(
+                store, template_id.to_index(), template_states, function_states
+            );
+            return;
+        }
+        guard function_ref.target is .generated(generated) else { return; }
+        jil.FunctionId function_id = generated.id;
         Int index = function_id.to_index();
         if (index < 0 || index >= store.program.functions.len()) { return; }
-        self.check_function_at(store, index, states);
-    }
-
-    jil.FunctionId? function_id_for_ref(self, jil.Store& store, jil.FunctionRef function_ref) {
-        return store.program.function_id_for_ref(function_ref);
+        self.check_generated_function_at(
+            store, index, template_states, function_states
+        );
     }
 
     Void check_function(Self&! self, jil.Function function) {
@@ -2854,6 +2923,11 @@ struct FunctionBorrowChecker: Movable {
                 destination,
                 cast_value.value
             );
+            if (self.record_owner_cast_lifetime_loans(
+                destination, cast_value.value
+            )) {
+                return;
+            }
             self.record_operand_loan(destination, cast_value.value);
             return;
         }
@@ -3284,6 +3358,43 @@ struct FunctionBorrowChecker: Movable {
         );
     }
 
+    Bool record_owner_cast_lifetime_loans(
+        Self&! self,
+        jil.Place destination,
+        jil.Operand operand
+    ) {
+        qid.TypeId destination_type = self.place_type(destination);
+        types.TypeInfo destination_info = self.store.types.get(destination_type);
+        guard destination_info.data is .handle_type(destination_handle) else {
+            return false;
+        }
+        if (!types.is_owner_pointer_handle(destination_handle)) { return false; }
+        guard self.operand_place(operand) is .some(source) else { return false; }
+        if (!self.borrowed_handle_type(self.place_type(source))) { return false; }
+        move_path.MovePathId source_path = self.paths.path_for_place(source);
+        move_path.MovePathId destination_path = self.paths.path_for_place(destination);
+        Int original_len = self.dataflow.active_loans.len();
+        Int index! = 0;
+        while (index < original_len) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            index = index + 1;
+            if (!self.loan_target_matches_path(fact.target, source_path)) { continue; }
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (fact.target == source_path && current.kind != .region_value) { continue; }
+            move_path.MovePathId copied_target = self.copied_loan_target(
+                source_path, fact.target, destination_path
+            );
+            self.add_loan_from_paths_with_domain_kind(
+                current.kind,
+                current.source,
+                copied_target,
+                current.domain_type,
+                current.carried
+            );
+        }
+        return true;
+    }
+
     Void record_operand_loan_to_path(Self&! self,
         move_path.MovePathId destination_path,
         qid.TypeId destination_type,
@@ -3340,7 +3451,7 @@ struct FunctionBorrowChecker: Movable {
                 continue;
             }
             self.add_loan_from_paths(
-                .reference_view,
+                .region_value,
                 sources.get(index),
                 destinations.get(index)
             );
@@ -3698,6 +3809,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Bool reference_loan_kinds_conflict(self, loan.LoanKind lhs, loan.LoanKind rhs) {
+        if (lhs == .region_value || rhs == .region_value) { return false; }
         if (lhs == .raw_pointer_view || rhs == .raw_pointer_view) { return false; }
         return lhs == .mutable_reference_view || rhs == .mutable_reference_view;
     }
@@ -4667,6 +4779,7 @@ struct FunctionBorrowChecker: Movable {
         move_path.MovePathId place_path,
         loan.Loan current
     ) {
+        if (current.kind == .region_value) { return false; }
         return self.memory_path_contains(place_path, current.source);
     }
 
@@ -5377,7 +5490,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Bool function_param_lifetime_covers(
-        self,
+        Self&! self,
         Int source_index,
         move_path.MovePathId source,
         move_path.MovePathId target,
@@ -5392,30 +5505,53 @@ struct FunctionBorrowChecker: Movable {
         guard self.param_root_path_by_index(target_index) is .some(target_root) else {
             return false;
         }
-        types.LifetimePath source_path = types.LifetimePath (
-            root_kind: .parameter,
-            root_index: source_index,
-            position_index: 0,
-            projection_path: self.move_path_lifetime_projection(source_root, source)
-        );
-        types.LifetimePath target_path = types.LifetimePath (
-            root_kind: .parameter,
-            root_index: target_index,
-            position_index: 0,
-            projection_path: self.move_path_lifetime_projection(target_root, target)
-        );
         guard self.function_lifetime_contract() is .some(contract) else { return false; }
         Int count = self.store.types.lifetime_contract_flow_count(contract);
         Int index! = 0;
         while (index < count) {
             types.LifetimeFlow flow = self.store.types.lifetime_contract_flow_at(contract, index);
-            if (types.lifetime_path_equal(flow.source, source_path)
-                && types.lifetime_path_equal(flow.target, target_path)) {
+            if (self.parameter_lifetime_flow_covers(
+                flow,
+                source_index,
+                target_index,
+                source_root,
+                target_root,
+                source,
+                target
+            )) {
                 return true;
             }
             index = index + 1;
         }
         return false;
+    }
+
+    Bool parameter_lifetime_flow_covers(
+        Self&! self,
+        types.LifetimeFlow flow,
+        Int source_index,
+        Int target_index,
+        move_path.MovePathId source_root,
+        move_path.MovePathId target_root,
+        move_path.MovePathId source,
+        move_path.MovePathId target
+    ) {
+        if (flow.source.root_kind != .parameter
+            || flow.source.root_index != source_index) {
+            return false;
+        }
+        if (flow.target.root_kind != .parameter
+            || flow.target.root_index != target_index) {
+            return false;
+        }
+        move_path.MovePathId expected_source = self.project_lifetime_move_path(
+            source_root, flow.source.projection_path
+        );
+        move_path.MovePathId expected_target = self.project_lifetime_move_path(
+            target_root, flow.target.projection_path
+        );
+        return self.move_path_matches_lifetime_path(expected_source, source)
+            && self.move_path_matches_lifetime_path(expected_target, target);
     }
 
     Bool source_dies_before_target_from_successors(
@@ -5741,8 +5877,10 @@ struct FunctionBorrowChecker: Movable {
             move_path.MovePathId copied_source = self.copied_loan_source(
                 fact.target, source_path, current.source
             );
+            loan.LoanKind copied_kind! = .reference_view;
+            if (current.kind == .region_value) { copied_kind = .region_value; }
             self.add_loan_from_paths_with_domain_kind(
-                .reference_view,
+                copied_kind,
                 copied_source,
                 copied_target,
                 current.domain_type,
@@ -5843,8 +5981,12 @@ struct FunctionBorrowChecker: Movable {
         while (index < destinations.len()) {
             move_path.MovePathId loan_source! = source;
             if (pairwise) { loan_source = sources.get(index); }
+            loan.LoanKind kind! = .region_value;
+            if (index == 0 && self.optional_borrowed_handle_type(type_id)) {
+                kind = .reference_view;
+            }
             self.add_loan_from_paths_with_domain_kind(
-                .reference_view,
+                kind,
                 loan_source,
                 destinations.get(index),
                 domain_type,
@@ -6145,6 +6287,7 @@ struct FunctionBorrowChecker: Movable {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             loan.Loan current = self.results.loans.get(fact.loan_id);
             index = index + 1;
+            if (current.kind == .region_value) { continue; }
             if (current.kind == .raw_pointer_view || current.kind == .reference_view) { continue; }
             if (!write && current.kind == .frozen_reference_view) { continue; }
             if (self.current_statement_kills_loan_target(fact.target)) { continue; }
@@ -6217,6 +6360,7 @@ struct FunctionBorrowChecker: Movable {
 
     Bool loan_source_is_dead(self, loan_facts.ActiveLoanFact fact) {
         loan.Loan current = self.results.loans.get(fact.loan_id);
+        if (current.kind == .region_value) { return false; }
         if (self.loan_source_is_live(current)) {
             return false;
         }

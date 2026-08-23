@@ -572,9 +572,13 @@ Int& apply(
     Int& value,
     Int& fallback
 );
+
+@life(return.result: return.value)
+Fn<T result, T value>^ make_identity<T>();
 ```
 
-callable contract 只能引用 result/参数的声明名；需要参与 contract 的位置必须命名。
+Fn 作为函数参数或返回值时使用同一套命名位置规则；根分别是参数名和 `return`。callable contract
+只能引用 result/参数的声明名；需要参与 contract 的位置必须命名。
 不支持 `callback[0]` 之类的位置路径。closure environment、receiver adapter 和 continuation
 等 ABI 隐藏参数不能出现在公开 contract 中。
 
