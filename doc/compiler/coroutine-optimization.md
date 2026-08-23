@@ -171,8 +171,8 @@ fallback 也不能创建 Task control state 或独立 resume token。
 
 当前 lowering 已识别非泛型 self-recursive 和 mutual-recursive 回边：无环边仍嵌入 child frame，
 回边通过 heap async-context start shim，并在同一 Task Job 上 handoff。20,000 层非尾递归测试用于
-证明 native stack 不随 coroutine 深度增长。泛型递归还依赖 monomorph instance discovery 的递归
-去重；在该前置问题修复前，不能声称 generic recursive async 已完成。
+证明 native stack 不随 coroutine 深度增长。泛型递归实例由 JIL emission worklist 去重，不能在
+instance query 内递归求值 callee。
 
 ### Scoped Task
 

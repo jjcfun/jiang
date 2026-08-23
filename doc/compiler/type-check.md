@@ -1,7 +1,8 @@
 # Type Check 设计
 
-type check 消费 resolved Semantic Model，输出 `TypeCheckStore` 和规范化后的 typed Semantic Model。它负责类型引用解析、function
-signature、expression/pattern type、member selection、generic arg 检查、trait bound 基础规则
+type check 消费 resolved Semantic Model，输出 `TypeCheckStore` 和规范化后的 typed Semantic Model。
+它负责类型引用解析、function signature、expression/pattern type、member selection、
+generic arg 检查、trait bound 基础规则
 和 lazy type query cycle guard。
 
 ## 输入
@@ -52,8 +53,9 @@ alias cycle、associated type default cycle、trait bound dependency 都应围�
 
 ## 泛型和 Trait
 
-type check 只负责证明泛型和 trait 约束在源程序层面成立。它不复制 Semantic Model，也不生成 concrete
-函数体。需要 codegen 的 concrete instances 由 monomorph 阶段收集。
+type check 只负责证明泛型和 trait 约束在源程序层面成立。它不复制 Semantic Model，
+也不生成 concrete 函数体。JIL 先生成泛型 template，再从真实可达入口按需实例化
+concrete body。
 
 基础规则：
 
@@ -66,7 +68,7 @@ type check 只负责证明泛型和 trait 约束在源程序层面成立。它�
   稳定诊断。
 - nominal trait list / trait parent list 必须指向 trait def。
 - associated type trait bounds 必须指向 trait def。
-- where constraints 和 projected equality 写入类型事实，供 member lookup 和 monomorph 使用。
+- where constraints 和 projected equality 写入类型事实，供 member lookup 和 JIL 实例化使用。
 
 ## 不变量
 

@@ -5,7 +5,12 @@
 
 import diagnostic = "../diagnostic.jiang";
 import diagnostic_helper = "../diagnostic/helper.jiang";
+import store_api = "../store.jiang";
+import qid = "../id.jiang";
+import types = "../sema/type.jiang";
 import jil = "./model.jiang";
+import jil_references = "./references.jiang";
+import type_requirements = "./type_requirements.jiang";
 import std;
 
 public enum Stage {
@@ -20,12 +25,282 @@ public Bool verify(
     Stage stage
 ) {
     if (store.program.has_errors()) { return false; }
-    if (!verify_globals(store) || !verify_functions(store, stage)) {
+    if (!verify_globals(store)
+        || !verify_templates(store, stage)
+        || !verify_functions(store, stage)) {
         add_failure(diagnostics, stage);
         store.program.mark_error();
         return false;
     }
     return true;
+}
+
+public Bool verify_concrete(
+    store_api.CompilerStore&! compiler_store,
+    jil.Store&! store
+) {
+    if (store.program.has_errors()) { return false; }
+    Int function_index! = 0;
+    while (function_index < store.program.functions.len()) {
+        jil.Function function = store.program.functions.get(function_index);
+        jil_references.References references =
+            jil_references.collect_function_refs(function);
+        if (!references.trait_vtables.empty()) {
+            diagnostic_helper.add_package_error(
+                compiler_store.diagnostics$.mut_ref(),
+                "concrete JIL contains an unresolved trait vtable demand",
+                "jil_concrete_trait_vtable"
+            );
+            store.program.mark_error();
+            return false;
+        }
+        Int block_index! = 0;
+        while (block_index < function.body.blocks.length) {
+            jil.Block block = function.body.blocks[block_index];
+            if (block.terminator.kind is .call_term(call)
+                && (call.deferred_async_direct || call.deferred_async_task != null)) {
+                std.StringBuilder message! = std.StringBuilder();
+                message.append("concrete JIL contains deferred async operation in FunctionId ");
+                message.append(function.id.to_index());
+                message.append(" block ");
+                message.append(block.id.to_index());
+                append_deferred_async_failure(
+                    compiler_store$.ref(), store$.ref(), function, call, message$.mut_ref()
+                );
+                diagnostic_helper.add_package_error(
+                    compiler_store.diagnostics$.mut_ref(),
+                    message.into_string().bytes(),
+                    "jil_concrete_deferred_async"
+                );
+                store.program.mark_error();
+                return false;
+            }
+            block_index = block_index + 1;
+        }
+        function_index = function_index + 1;
+    }
+    guard type_requirements.concrete_failure(
+        compiler_store$.ref(), store$.ref()
+    ) is .some(failure) else { return true; }
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("concrete JIL contains an unbound generic parameter");
+    if (failure.type_id is .some(type_id)) {
+        message.append(" in TypeId ");
+        message.append(type_id.to_index());
+        append_type_name(compiler_store$.ref(), message$.mut_ref(), type_id);
+        if (failure.root_type != null) {
+            qid.TypeId root_type = failure.root_type$.some();
+            if (root_type != type_id) {
+                message.append(" reached from TypeId ");
+                message.append(root_type.to_index());
+                append_type_name(compiler_store$.ref(), message$.mut_ref(), root_type);
+                append_direct_tuple_field(
+                    compiler_store$.ref(),
+                    message$.mut_ref(),
+                    root_type,
+                    type_id
+                );
+            }
+        }
+    } else if (failure.const_param is .some(param_def)) {
+        message.append(" at const DefId ");
+        message.append(param_def.to_index());
+    }
+    if (failure.callee_def is .some(callee_def)) {
+        message.append(" through callee DefId ");
+        message.append(callee_def.to_index());
+        if (compiler_store.defs.has(callee_def)) {
+            message.append(" (");
+            message.append(compiler_store.symbols.text(
+                compiler_store.defs.get(callee_def).name.symbol
+            ));
+            message.append(")");
+        }
+    }
+    append_concrete_failure_owner(
+        compiler_store$.ref(), store$.ref(), message$.mut_ref(), failure
+    );
+    diagnostic_helper.add_package_error(
+        compiler_store.diagnostics$.mut_ref(),
+        message.into_string().bytes(),
+        "jil_concrete_verifier_failed"
+    );
+    store.program.mark_error();
+    return false;
+}
+
+Void append_deferred_async_failure(
+    store_api.CompilerStore& compiler_store,
+    jil.Store& store,
+    jil.Function function,
+    jil.CallTerminator call,
+    std.StringBuilder&! message
+) {
+    qid.DefId owner = jil.function_provenance_def(function.origin);
+    message.append(" for DefId ");
+    message.append(owner.to_index());
+    if (compiler_store.defs.has(owner)) {
+        message.append(" (");
+        message.append(compiler_store.symbols.text(
+            compiler_store.defs.get(owner).name.symbol
+        ));
+        message.append(")");
+    }
+    if (call.deferred_async_task != null) {
+        message.append(" task");
+    } else {
+        message.append(" direct");
+    }
+    guard call.callee is .direct_function(function_ref) else { return; }
+    guard function_ref.target is .source(callee_def) else { return; }
+    message.append(" callee DefId ");
+    message.append(callee_def.to_index());
+    guard store.program.function_id_for_ref(function_ref)
+        is .some(callee_id) else {
+        message.append(" without instance");
+        return;
+    }
+    message.append(" FunctionId ");
+    message.append(callee_id.to_index());
+    if (store.program.function(callee_id).coroutine_frame == null) {
+        message.append(" without frame");
+    }
+}
+
+Void append_direct_tuple_field(
+    store_api.CompilerStore& store,
+    std.StringBuilder&! message,
+    qid.TypeId root_type,
+    qid.TypeId target_type
+) {
+    types.TypeData data = store.types.get(root_type).data;
+    guard data is .tuple_type(tuple) else { return; }
+    Int index! = 0;
+    while (index < tuple.items.length) {
+        if (tuple.items[index] == target_type) {
+            message.append(" at tuple field ");
+            message.append(index);
+            return;
+        }
+        index = index + 1;
+    }
+}
+
+Void append_concrete_failure_owner(
+    store_api.CompilerStore& compiler_store,
+    jil.Store& store,
+    std.StringBuilder&! message,
+    type_requirements.ConcreteFailure failure
+) {
+    if (failure.function_id is .some(function_id)) {
+        jil.Function function = store.program.function(function_id);
+        qid.DefId provenance = jil.function_provenance_def(function.origin);
+        message.append(" in FunctionId ");
+        message.append(function_id.to_index());
+        message.append(" for DefId ");
+        message.append(provenance.to_index());
+        message.append(" with ");
+        message.append(function.args.length);
+        message.append(" generic args");
+        Int arg_index! = 0;
+        while (arg_index < function.args.length) {
+            if (function.args[arg_index] is .type_arg(type_arg)) {
+                message.append(" TypeId ");
+                message.append(type_arg.value.to_index());
+            } else if (function.args[arg_index] is .const_arg(const_arg)) {
+                message.append(" const");
+                if (const_arg.param_def is .some(param_def)) {
+                    message.append(" for DefId ");
+                    message.append(param_def.to_index());
+                }
+                if (const_arg.value.data is .const_param_value(value_def)) {
+                    message.append(" from const DefId ");
+                    message.append(value_def.to_index());
+                }
+            }
+            arg_index = arg_index + 1;
+        }
+        if (jil.function_generated_origin(function.origin) is .some(origin)) {
+            message.append(" generated kind ");
+            message.append(Int(origin.kind));
+        }
+        if (failure.type_id is .some(type_id)) {
+            append_matching_local(message, function, type_id);
+        }
+        if (!compiler_store.defs.has(provenance)) { return; }
+        message.append(" (");
+        message.append(compiler_store.symbols.text(
+            compiler_store.defs.get(provenance).name.symbol
+        ));
+        message.append(")");
+        if (compiler_store.source_map.def_span(provenance) is .some(location)
+            && location.source_id is .some(source_id)) {
+            message.append(" at ");
+            message.append(compiler_store.sources.get(source_id).key.value);
+            message.append(":");
+            message.append(location.span.start);
+        }
+        return;
+    }
+    if (failure.global_id is .some(global_id)) {
+        message.append(" in GlobalId ");
+        message.append(global_id.to_index());
+    }
+}
+
+Void append_matching_local(
+    std.StringBuilder&! message,
+    jil.Function function,
+    qid.TypeId type_id
+) {
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        if (function.body.locals[index].type_id == type_id) {
+            message.append(" at LocalId ");
+            message.append(index);
+            return;
+        }
+        index = index + 1;
+    }
+}
+
+Void append_type_name(
+    store_api.CompilerStore& store,
+    std.StringBuilder&! message,
+    qid.TypeId type_id
+) {
+    types.TypeData data = store.types.get(type_id).data;
+    if (data is .named(named)) {
+        message.append(" (");
+        message.append(store.symbols.text(store.defs.get(named.def_id).name.symbol));
+        message.append(" DefId ");
+        message.append(named.def_id.to_index());
+        message.append(")");
+    } else if (data is .closure_environment_type(environment)) {
+        message.append(" (closure environment for DefId ");
+        message.append(environment.lambda_def.to_index());
+        message.append(")");
+    } else if (data is .optional(_)) {
+        message.append(" (optional)");
+    } else if (data is .error_union(_)) {
+        message.append(" (error union)");
+    } else if (data is .handle_type(_)) {
+        message.append(" (handle)");
+    } else if (data is .slice_value_type(_)) {
+        message.append(" (slice)");
+    } else if (data is .tuple_type(_)) {
+        message.append(" (tuple)");
+    } else if (data is .array_type(_)) {
+        message.append(" (array)");
+    } else if (data is .function_type(_)) {
+        message.append(" (function)");
+    } else if (data is .task_state_type(_)) {
+        message.append(" (task state)");
+    } else if (data is .task_type(_)) {
+        message.append(" (task)");
+    } else if (data is .trait_companion(_)) {
+        message.append(" (trait companion)");
+    }
 }
 
 Bool verify_globals(jil.Store& store) {
@@ -37,18 +312,40 @@ Bool verify_globals(jil.Store& store) {
     return true;
 }
 
-Bool verify_functions(jil.Store& store, Stage stage) {
+Bool verify_templates(jil.Store& store, Stage stage) {
+    if (stage != .lower_output) { return true; }
     Int index! = 0;
-    while (index < store.program.functions.len()) {
-        jil.Function function = store.program.functions.get(index);
-        if (function.id.to_index() != index) { return false; }
-        if (!verify_function(store, function, stage)) { return false; }
+    while (index < store.program.template_count()) {
+        if (!verify_function(
+            store,
+            store.program.template(jil.TemplateId.from_index(index)),
+            stage,
+            true
+        )) {
+            return false;
+        }
         index = index + 1;
     }
     return true;
 }
 
-Bool verify_function(jil.Store& store, jil.Function function, Stage stage) {
+Bool verify_functions(jil.Store& store, Stage stage) {
+    Int index! = 0;
+    while (index < store.program.functions.len()) {
+        jil.Function function = store.program.functions.get(index);
+        if (function.id.to_index() != index) { return false; }
+        if (!verify_function(store, function, stage, false)) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_function(
+    jil.Store& store,
+    jil.Function function,
+    Stage stage,
+    Bool allow_deferred
+) {
     if (function.is_external && function.body.blocks.length == 0) { return true; }
     if (function.body.id.to_index() != function.id.to_index()) { return false; }
     if (!verify_drop_stage(store, function, stage)) { return false; }
@@ -56,7 +353,9 @@ Bool verify_function(jil.Store& store, jil.Function function, Stage stage) {
     Bool allow_cancel = function.is_coroutine
         && !function.is_coroutine_resume
         && !function.is_coroutine_completion;
-    if (!verify_blocks(function.body, stage, allow_cancel)) { return false; }
+    if (!verify_blocks(function.body, stage, allow_cancel, allow_deferred)) {
+        return false;
+    }
     return true;
 }
 
@@ -75,13 +374,20 @@ Bool verify_locals(jil.Body body) {
     return true;
 }
 
-Bool verify_blocks(jil.Body body, Stage stage, Bool allow_cancel) {
+Bool verify_blocks(
+    jil.Body body,
+    Stage stage,
+    Bool allow_cancel,
+    Bool allow_deferred
+) {
     if (!block_valid(body, body.entry)) { return false; }
     Int index! = 0;
     while (index < body.blocks.length) {
         jil.Block block = body.blocks[index];
         if (block.id.to_index() != index) { return false; }
-        if (!verify_block(body, block, stage, allow_cancel)) { return false; }
+        if (!verify_block(body, block, stage, allow_cancel, allow_deferred)) {
+            return false;
+        }
         index = index + 1;
     }
     return true;
@@ -91,7 +397,8 @@ Bool verify_block(
     jil.Body body,
     jil.Block block,
     Stage stage,
-    Bool allow_cancel
+    Bool allow_cancel,
+    Bool allow_deferred
 ) {
     Int index! = 0;
     while (index < block.statements.length) {
@@ -99,7 +406,9 @@ Bool verify_block(
         index = index + 1;
     }
     if (!verify_successors(body, block.terminator)) { return false; }
-    return verify_terminator(body, block.terminator, stage, allow_cancel);
+    return verify_terminator(
+        body, block.terminator, stage, allow_cancel, allow_deferred
+    );
 }
 
 Bool verify_successors(jil.Body body, jil.Terminator terminator) {
@@ -198,7 +507,8 @@ Bool verify_terminator(
     jil.Body body,
     jil.Terminator terminator,
     Stage stage,
-    Bool allow_cancel
+    Bool allow_cancel,
+    Bool allow_deferred
 ) {
     if (terminator.kind is .goto_term(goto_term)) {
         return verify_optional_place(body, goto_term.initialized_place);
@@ -210,7 +520,7 @@ Bool verify_terminator(
         return verify_operand(body, switch_term.discriminator);
     }
     if (terminator.kind is .call_term(call_term)) {
-        return verify_call(body, call_term);
+        return verify_call(body, call_term, allow_deferred);
     }
     if (terminator.kind is .drop_term(drop_term)) {
         return verify_place(body, drop_term.place);
@@ -233,13 +543,25 @@ Bool verify_terminator(
     return true;
 }
 
-Bool verify_call(jil.Body body, jil.CallTerminator call_term) {
+Bool verify_call(
+    jil.Body body,
+    jil.CallTerminator call_term,
+    Bool allow_deferred
+) {
+    if (!allow_deferred && (call_term.deferred_async_direct
+        || call_term.deferred_async_task != null)) {
+        return false;
+    }
     if (!verify_callee(body, call_term.callee)) { return false; }
     if (!verify_operands(body, call_term.args)) { return false; }
     if (!verify_place(body, call_term.destination)) { return false; }
     if (!verify_optional_place(body, call_term.initialized_place)) { return false; }
     if (!verify_optional_operands(body, call_term.lifetime_args)) { return false; }
     if (!verify_optional_place(body, call_term.lifetime_destination)) { return false; }
+    if (call_term.deferred_async_task is .some(task)) {
+        if (!local_valid(body, task.task_local)) { return false; }
+        if (!verify_operands(body, task.captures)) { return false; }
+    }
     return verify_places(body, call_term.exclusive_places);
 }
 
@@ -364,8 +686,7 @@ Bool verify_rvalue(jil.Body body, jil.Rvalue value) {
         }
         if (closure.environment_storage == .heap && closure.stack_environment != null) { return false; }
         return verify_optional_place(body, closure.stack_environment)
-            && verify_operands(body, closure.captures)
-            && verify_operand(body, closure.vtable);
+            && verify_operands(body, closure.captures);
     }
     if (value is .optional_value(optional)) {
         return verify_operand(body, optional.value);

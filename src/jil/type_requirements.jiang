@@ -18,6 +18,124 @@ public list.ArrayList<qid.TypeId> collect(
     return collector.finish();
 }
 
+public struct ConcreteFailure: Copyable {
+    public qid.TypeId? type_id;
+    public qid.TypeId? root_type;
+    public qid.DefId? const_param;
+    public qid.DefId? callee_def;
+    public jil.FunctionId? function_id;
+    public jil.GlobalId? global_id;
+}
+
+public Bool concrete(
+    store_api.CompilerStore& store,
+    jil.Store& jil_store
+) {
+    return concrete_failure(store, jil_store) == null;
+}
+
+public ConcreteFailure? concrete_failure(
+    store_api.CompilerStore& store,
+    jil.Store& jil_store
+) {
+    Collector collector! = Collector(store);
+    collector.collect_jil_store(jil_store);
+    if (collector.symbolic_const is .some(param_def)) {
+        return ConcreteFailure(
+            type_id: null,
+            root_type: null,
+            const_param: param_def,
+            callee_def: null,
+            function_id: collector.symbolic_const_function,
+            global_id: collector.symbolic_const_global
+        );
+    }
+    Int index! = 0;
+    while (index < collector.items.len()) {
+        qid.TypeId type_id = collector.items.get(index);
+        if (!concrete_type(store, type_id)) {
+            return ConcreteFailure(
+                type_id: type_id,
+                root_type: collector.type_roots.get(index),
+                const_param: null,
+                callee_def: collector.type_callees.get(index),
+                function_id: collector.type_functions.get(index),
+                global_id: collector.type_globals.get(index)
+            );
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool concrete_type(store_api.CompilerStore& store, qid.TypeId type_id) {
+    types.TypeData data = store.types.get(type_id).data;
+    if (data is .invalid) { return false; }
+    if (data is .named(named)) {
+        if (store.defs.get(named.def_id).kind == .generic_param_def) { return false; }
+        if (store.defs.get(named.def_id).kind == .associated_type_def) { return false; }
+        return concrete_generic_args(store, named.args);
+    }
+    if (data is .array_type(array)) {
+        if (array.count_param != null) { return false; }
+        return concrete_sentinel(array.sentinel);
+    }
+    if (data is .slice_value_type(slice)) {
+        return concrete_sentinel(slice.sentinel);
+    }
+    if (data is .handle_type(handle)) {
+        return concrete_sentinel(handle.sentinel);
+    }
+    if (data is .closure_environment_type(environment)) {
+        return concrete_generic_args(store, environment.args);
+    }
+    if (data is .function_type(function)) {
+        return concrete_effects(store, function.effects);
+    }
+    if (data is .task_type(task) && task.domain is .some(domain)) {
+        return !symbolic_def(store, domain.binding);
+    }
+    return true;
+}
+
+Bool concrete_generic_args(
+    store_api.CompilerStore& store,
+    types.GenericArg[]& args
+) {
+    Int index! = 0;
+    while (index < args.length) {
+        if (args[index] is .const_arg(value)) {
+            if (value.value.data is .const_param_value(_)) { return false; }
+            if (value.binding_def is .some(binding) && symbolic_def(store, binding)) {
+                return false;
+            }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool concrete_sentinel(types.Sentinel? sentinel) {
+    if (sentinel is .some(value)) {
+        return !(value.value.data is .const_param_value(_));
+    }
+    return true;
+}
+
+Bool concrete_effects(
+    store_api.CompilerStore& store,
+    types.EffectSet effects
+) {
+    if (effects.domain is .some(domain)) {
+        return !symbolic_def(store, domain.binding);
+    }
+    return true;
+}
+
+Bool symbolic_def(store_api.CompilerStore& store, qid.DefId def_id) {
+    return store.defs.get(def_id).kind == .generic_param_def;
+}
+
 public Void append_type_closure(
     store_api.CompilerStore& store,
     qid.TypeId type_id,
@@ -103,11 +221,31 @@ struct Collector: Movable {
     store_api.CompilerStore& store;
     list.ArrayList<Bool> seen!;
     list.ArrayList<qid.TypeId> items!;
+    list.ArrayList<qid.TypeId> type_roots!;
+    list.ArrayList<qid.DefId?> type_callees!;
+    list.ArrayList<jil.FunctionId?> type_functions!;
+    list.ArrayList<jil.GlobalId?> type_globals!;
+    jil.FunctionId? current_function!;
+    jil.GlobalId? current_global!;
+    qid.DefId? current_callee!;
+    qid.DefId? symbolic_const!;
+    jil.FunctionId? symbolic_const_function!;
+    jil.GlobalId? symbolic_const_global!;
 
     init(self, store_api.CompilerStore& store) {
         self.store = store;
         self.seen = list.ArrayList<Bool>(store.types.types.len());
         self.items = list.ArrayList<qid.TypeId>();
+        self.type_roots = list.ArrayList<qid.TypeId>();
+        self.type_callees = list.ArrayList<qid.DefId?>();
+        self.type_functions = list.ArrayList<jil.FunctionId?>();
+        self.type_globals = list.ArrayList<jil.GlobalId?>();
+        self.current_function = null;
+        self.current_global = null;
+        self.current_callee = null;
+        self.symbolic_const = null;
+        self.symbolic_const_function = null;
+        self.symbolic_const_global = null;
         Int index! = 0;
         while (index < store.types.types.len()) {
             self.seen.add(false);
@@ -133,8 +271,11 @@ struct Collector: Movable {
     }
 
     Void collect_function(Self&! self, jil.Function& function) {
-        self.add_type_slice(function.type_args);
+        self.current_function = function.id;
+        self.current_global = null;
+        self.add_generic_arg_types(function.args);
         self.add_effects(function.effects);
+        self.add_optional_type(function.coroutine_capture_env_type);
         if (jil.function_generated_origin(function.origin) is .some(origin)) {
             self.add_optional_type(origin.identity_type);
         }
@@ -151,6 +292,7 @@ struct Collector: Movable {
             self.collect_block(function.body.blocks[index]);
             index = index + 1;
         }
+        self.current_function = null;
     }
 
     Void collect_coroutine_frame(Self&! self, jil.CoroutineFrameLayout frame) {
@@ -187,6 +329,8 @@ struct Collector: Movable {
     }
 
     Void collect_global(Self&! self, jil.Global& global) {
+        self.current_function = null;
+        self.current_global = global.id;
         self.add(global.type_id);
         if (global.origin is .generated(origin)) {
             self.add_optional_type(origin.identity_type);
@@ -194,11 +338,13 @@ struct Collector: Movable {
         if (global.initializer is .some(initializer)) {
             self.collect_static_value(initializer);
         }
+        self.current_global = null;
     }
 
     Void collect_static_value(Self&! self, jil.StaticValue value) {
         if (value is .scalar(constant)) {
             self.add(constant.type_id);
+            self.add_const(constant);
             return;
         }
         if (value is .function(function_ref)) {
@@ -295,6 +441,7 @@ struct Collector: Movable {
             Int index! = 0;
             while (index < switch_term.cases.length) {
                 self.add(switch_term.cases[index].value.type_id);
+                self.add_const(switch_term.cases[index].value);
                 index = index + 1;
             }
             return;
@@ -325,6 +472,10 @@ struct Collector: Movable {
             self.collect_function_ref(function_ref);
         }
         if (call.lifetime_args is .some(args)) { self.collect_operands(args); }
+        if (call.deferred_async_task is .some(task)) {
+            self.add_optional_type(task.environment_type);
+            self.collect_operands(task.captures);
+        }
         Int index! = 0;
         while (index < call.exclusive_places.length) {
             self.collect_place(call.exclusive_places[index]);
@@ -427,12 +578,15 @@ struct Collector: Movable {
             self.add(item.type_id);
             self.collect_optional_operand(item.tag);
             self.collect_operands(item.fields);
+        } else if (value is .layout_value(item)) {
+            self.add(item.type_id);
         } else if (value is .closure_value(item)) {
+            self.add_generic_arg_types(item.args);
             self.add(item.closure_type);
             self.add(item.environment_type);
+            self.add(item.vtable_type);
             self.collect_optional_place(item.stack_environment);
             self.collect_operands(item.captures);
-            self.collect_operand(item.vtable);
         } else if (value is .optional_value(item)) {
             self.collect_operand(item.value);
         } else if (value is .error_union_value(item)) {
@@ -478,14 +632,20 @@ struct Collector: Movable {
             self.add(global_ref.type_id);
         } else if (operand is .global_address_operand(global_ref)) {
             self.add(global_ref.type_id);
+        } else if (operand is .trait_vtable_operand(vtable)) {
+            self.add(vtable.key.subject_type);
+            self.add(vtable.type_id);
         } else if (operand is .const_operand(constant)) {
             self.add(constant.type_id);
+            self.add_const(constant);
         }
     }
 
     Void collect_function_ref(Self&! self, jil.FunctionRef function_ref) {
+        self.current_callee = jil.function_target_provenance_def(function_ref.target);
         self.add(function_ref.type_id);
-        self.add_type_slice(function_ref.type_args);
+        self.add_generic_arg_types(function_ref.args);
+        self.current_callee = null;
     }
 
     Void collect_optional_place(Self&! self, jil.Place? place) {
@@ -518,11 +678,54 @@ struct Collector: Movable {
         }
     }
 
+    Void add_generic_arg_types(Self&! self, types.GenericArg[]& args) {
+        Int index! = 0;
+        while (index < args.length) {
+            if (args[index] is .type_arg(value)) {
+                self.add(value.value);
+            } else if (args[index] is .const_arg(value)) {
+                self.add(value.value.type_id);
+                if (value.value.data is .const_param_value(param_def)) {
+                    self.record_symbolic_const(param_def);
+                }
+                if (value.binding_def is .some(binding)
+                    && symbolic_def(self.store, binding)) {
+                    self.record_symbolic_const(binding);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
     Void add_effects(Self&! self, types.EffectSet effects) {
-        if (effects.domain is .some(domain)) { self.add(domain.domain_type); }
+        if (effects.domain is .some(domain)) {
+            self.add(domain.domain_type);
+            if (symbolic_def(self.store, domain.binding)) {
+                self.record_symbolic_const(domain.binding);
+            }
+        }
+    }
+
+    Void add_const(Self&! self, jil.Const value) {
+        if (value.value is .const_param(param)) {
+            self.record_symbolic_const(param.def_id);
+        }
+    }
+
+    Void record_symbolic_const(Self&! self, qid.DefId param_def) {
+        if (self.symbolic_const != null) { return; }
+        self.symbolic_const = param_def;
+        self.symbolic_const_function = self.current_function;
+        self.symbolic_const_global = self.current_global;
     }
 
     Void add(Self&! self, qid.TypeId type_id) {
         append_type_closure(self.store, type_id, self.seen$.mut_ref(), self.items$.mut_ref());
+        while (self.type_functions.len() < self.items.len()) {
+            self.type_roots.add(type_id);
+            self.type_callees.add(self.current_callee);
+            self.type_functions.add(self.current_function);
+            self.type_globals.add(self.current_global);
+        }
     }
 }

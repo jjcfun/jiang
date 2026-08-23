@@ -39,8 +39,8 @@ build_module_graph(root_unit)
 ```
 
 `ModuleGraph.package_id` 只记录入口 root package。`ModuleGraph.modules` 可以包含多个
-package 的 module；后续 Semantic Model/type check/monomorph/JIL/layout/borrow/backend 都消费同一张
-root import closure。
+package 的 module；后续 Semantic Model、type check、JIL、layout、borrow check 和 backend
+都消费同一张 root import closure。
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
 

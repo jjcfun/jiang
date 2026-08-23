@@ -204,6 +204,9 @@ public ffi.Value lower_rvalue(
     if (value is .discriminant_value(discriminant_value)) {
         return lower_discriminant(state, output, body, discriminant_value, local_slots);
     }
+    if (value is .layout_value(layout_value)) {
+        return lower_layout_value(state, layout_value, result_type);
+    }
     if (value is .aggregate_value(aggregate_value)) {
         return lower_aggregate(state, output, body, aggregate_value, local_slots);
     }
@@ -214,6 +217,20 @@ public ffi.Value lower_rvalue(
         return lower_error_union(state, output, body, error_union_value, local_slots, result_type);
     }
     return ffi.Value();
+}
+
+ffi.Value lower_layout_value(
+    llvm_state.LowerState& state,
+    jil.LayoutValueRvalue value,
+    qid.TypeId result_type
+) {
+    Int result! = state.ctx.query.layout.target().aggregate_align;
+    if (value.kind == .size) {
+        result = llvm_type.layout_size(state, value.type_id);
+    } else if (value.kind == .align) {
+        result = llvm_type.layout_align(state, value.type_id);
+    }
+    return ffi.const_int(llvm_type.lower_type(state, result_type), UInt64(result));
 }
 
 public ffi.Value lower_domain_executor(
@@ -483,10 +500,8 @@ public Bool lower_aggregate_into_place(
     if (value.fields.length == 0) {
         return true;
     }
-    if (value.payload_field_index < 0) {
-        return false;
-    }
-    qid.TypeId payload_type = llvm_type.constant_index_type(state, value.type_id, value.payload_field_index);
+    guard union_payload_field_index(state, value) is .some(payload_field_index) else { return false; }
+    qid.TypeId payload_type = llvm_type.constant_index_type(state, value.type_id, payload_field_index);
     if (!llvm_type.type_has_abi_value(state, payload_type)) {
         return true;
     }
@@ -497,6 +512,7 @@ public Bool lower_aggregate_into_place(
             body,
             value,
             destination_pointer,
+            payload_field_index,
             payload_type,
             local_slots
         );
@@ -509,7 +525,7 @@ public Bool lower_aggregate_into_place(
             local_slots,
             value.type_id,
             destination_pointer,
-            value.payload_field_index,
+            payload_field_index,
             payload_type
         )
     ) {
@@ -519,7 +535,15 @@ public Bool lower_aggregate_into_place(
     if (!ffi.value_valid(payload)) {
         return false;
     }
-    return store_layout_field(state, value.type_id, destination_pointer, value.payload_field_index, payload);
+    return store_layout_field(state, value.type_id, destination_pointer, payload_field_index, payload);
+}
+
+Int? union_payload_field_index(
+    llvm_state.LowerState& state,
+    jil.AggregateRvalue value
+) {
+    guard value.def_id is .some(variant_def) else { return null; }
+    return llvm_type.layout_field_index_for_def(state, value.type_id, variant_def);
 }
 
 public Bool lower_closure_into_place(
@@ -543,7 +567,17 @@ public Bool lower_closure_into_place(
     if (!ffi.value_valid(environment)) {
         return false;
     }
-    ffi.Value vtable = lower_operand(state, output, body, value.vtable, local_slots);
+    Bool heap_environment = value.environment_storage == .heap;
+    guard state.store.program.closure_vtable_global(
+        value.lambda_def, value.args, heap_environment
+    ) is .some(vtable_global) else { return false; }
+    jil.Operand vtable_operand = jil.global_address_operand_value(jil.GlobalRef(
+        id: vtable_global,
+        type_id: value.vtable_type
+    ));
+    ffi.Value vtable = lower_operand(
+        state, output, body, vtable_operand, local_slots
+    );
     if (!ffi.value_valid(vtable)) {
         return false;
     }
@@ -671,6 +705,7 @@ Bool lower_union_payload_fields_into_pointer(
     jil.Body& body,
     jil.AggregateRvalue value,
     ffi.Value destination_pointer,
+    Int payload_field_index,
     qid.TypeId payload_type,
     list.ArrayList<ffi.Value>& local_slots
 ) {
@@ -678,7 +713,7 @@ Bool lower_union_payload_fields_into_pointer(
         state,
         value.type_id,
         destination_pointer,
-        value.payload_field_index
+        payload_field_index
     );
     if (!ffi.value_valid(payload_pointer)) {
         return false;
@@ -1864,15 +1899,15 @@ ffi.Value lower_union_variant_aggregate(
     if (value.fields.length != 1) {
         return ffi.Value();
     }
-    if (value.payload_field_index < 0) {
+    guard union_payload_field_index(state, value) is .some(payload_field_index) else {
         return ffi.Value();
     }
-    qid.TypeId payload_type = llvm_type.constant_index_type(state, value.type_id, value.payload_field_index);
+    qid.TypeId payload_type = llvm_type.constant_index_type(state, value.type_id, payload_field_index);
     if (!llvm_type.type_has_abi_value(state, payload_type)) {
         return aggregate;
     }
     ffi.Value payload = lower_operand(state, output, body, value.fields[0], local_slots);
-    return insert_layout_field(state, value.type_id, aggregate, value.payload_field_index, payload);
+    return insert_layout_field(state, value.type_id, aggregate, payload_field_index, payload);
 }
 
 ffi.Value lower_optional(
@@ -2123,6 +2158,9 @@ ffi.Value lower_binary(
     jil.BinaryRvalue value,
     list.ArrayList<ffi.Value>& local_slots
 ) {
+    if (value.op == .structural_eq || value.op == .structural_ne) {
+        return lower_structural_binary(state, output, body, value, local_slots);
+    }
     qid.TypeId lhs_type = operand_type(state, body, value.lhs);
     qid.TypeId rhs_type = operand_type(state, body, value.rhs);
     qid.TypeId compare_type = binary_compare_type(state, lhs_type, rhs_type);
@@ -2147,6 +2185,99 @@ ffi.Value lower_binary(
         return lower_int_compare(state, predicate, lhs, rhs);
     }
     return ffi.Value();
+}
+
+ffi.Value lower_structural_binary(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    jil.BinaryRvalue value,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    guard operand_place(value.lhs) is .some(lhs) else { return ffi.Value(); }
+    guard operand_place(value.rhs) is .some(rhs) else { return ffi.Value(); }
+    qid.TypeId type_id = llvm_place.place_type(state, body, lhs);
+    ffi.Value lhs_pointer = llvm_place.lower_place_pointer(
+        state, output, body, lhs, local_slots
+    );
+    ffi.Value rhs_pointer = llvm_place.lower_place_pointer(
+        state, output, body, rhs, local_slots
+    );
+    ffi.Value equal = lower_structural_equal_at(
+        state, output, type_id, lhs_pointer, rhs_pointer
+    );
+    if (value.op == .structural_ne) { return invert_bool(state, equal); }
+    return equal;
+}
+
+ffi.Value lower_structural_equal_at(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    qid.TypeId type_id,
+    ffi.Value lhs_pointer,
+    ffi.Value rhs_pointer
+) {
+    layout.TypeLayout type_layout = llvm_type.layout_for_type(state, type_id);
+    if (type_layout.kind == .zero_sized) { return bool_value(state, true); }
+    if (type_layout.fields.length == 0) {
+        return lower_structural_scalar(state, type_id, lhs_pointer, rhs_pointer);
+    }
+    ffi.Value result! = bool_value(state, true);
+    Int index! = 0;
+    while (index < type_layout.fields.length) {
+        layout.FieldLayout field = type_layout.fields[index];
+        if (llvm_type.type_has_abi_value(state, field.field_type)) {
+            ffi.Value field_equal = lower_structural_field(
+                state, output, type_id, field, index, lhs_pointer, rhs_pointer
+            );
+            result = ffi.builder_build_binary(
+                state.builder$.ref(), .int_and, result, field_equal
+            );
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+ffi.Value lower_structural_field(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    qid.TypeId owner_type,
+    layout.FieldLayout field,
+    Int field_index,
+    ffi.Value lhs_pointer,
+    ffi.Value rhs_pointer
+) {
+    ffi.Value lhs_field = llvm_place.lower_layout_field_pointer(
+        state, output, lhs_pointer, owner_type, field_index
+    );
+    ffi.Value rhs_field = llvm_place.lower_layout_field_pointer(
+        state, output, rhs_pointer, owner_type, field_index
+    );
+    return lower_structural_equal_at(
+        state, output, field.field_type, lhs_field, rhs_field
+    );
+}
+
+ffi.Value lower_structural_scalar(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id,
+    ffi.Value lhs_pointer,
+    ffi.Value rhs_pointer
+) {
+    ffi.Type value_type = llvm_type.lower_type(state, type_id);
+    ffi.Value lhs = ffi.builder_build_load(state.builder$.ref(), value_type, lhs_pointer);
+    ffi.Value rhs = ffi.builder_build_load(state.builder$.ref(), value_type, rhs_pointer);
+    if (type_is_float(state, type_id)) {
+        return ffi.builder_build_fcmp(state.builder$.ref(), Int32(1), lhs, rhs);
+    }
+    return ffi.builder_build_icmp(state.builder$.ref(), Int32(32), lhs, rhs);
+}
+
+ffi.Value invert_bool(llvm_state.LowerState& state, ffi.Value value) {
+    return ffi.builder_build_binary(
+        state.builder$.ref(), .int_xor, value, bool_value(state, true)
+    );
 }
 
 ffi.Value lower_float_binary(llvm_state.LowerState& state, jil.BinaryOp op, ffi.Value lhs, ffi.Value rhs) {
@@ -2485,6 +2616,7 @@ public ffi.Value ensure_function_for_ref(
 jil.FunctionId? function_for_ref(llvm_state.LowerState& state, jil.FunctionRef value) {
     jil.FunctionId? candidate = state.store.program.function_id_for_ref(value);
     if (candidate is .some(function_id)) {
+        if (value.coroutine_start || value.coroutine_sync) { return function_id; }
         jil.Function& function = state.store.program.functions.ref_at(function_id.to_index());
         if (function_ref_matches(state, value, function)) { return function_id; }
     }

@@ -26,7 +26,7 @@ CompilerContext
     JIL Store identity allocator
 
 阶段 local owner
-  AstUnit / MonomorphStore / JIL Store / ObjectUnit / ...
+  AstUnit / JIL Store / ObjectUnit / ...
 
 持久层
   .ji / .o / .mono.o / .jbuild
@@ -36,8 +36,8 @@ CompilerContext
 `LayoutId`，真正的 `Layout` 仍由 `LayoutStore` 拥有；JIL body query 缓存 `FunctionId`，
 function/body 仍由当前 JIL Store 拥有。
 
-`MonomorphStore^`、`jil.Store^` 和 `BorrowCheckStore^` 等 Movable 结果直接沿 pipeline 传递，
-不通过 ID owner、callback 或第二张 cache 间接持有。
+`jil.Store^` 等 Movable 结果直接沿 pipeline 传递，不通过 ID owner、callback 或第二张 cache
+间接持有。JIL query 只缓存当前 Store 中的 `TemplateId` / `FunctionId`。
 
 ## 2. QueryCache
 

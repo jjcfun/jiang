@@ -8,7 +8,6 @@ import layout = "../../layout.jiang";
 import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
-import comptime_value = "../../sema/comptime/value.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
 import types = "../../sema/type.jiang";
 import list = "../../support/list.jiang";
@@ -103,90 +102,134 @@ public extend body_context.BodyBuilder {
 }
 
 public extend body_context.BodyLowerer {
+    public Void lower_deferred_async_task(
+        Self&! self,
+        qid.DefId target_def,
+        types.GenericArg[]& function_args,
+        jil.Operand[]& args,
+        qid.TypeId? environment_type,
+        jil.Operand[]& captures,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        jil.Place destination,
+        jil.AsyncStartKind? async_start,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.function_type_for_ref(
+            target_def, function_args
+        );
+        jil.BlockId next_block = self.builder.reserve_block(span);
+        self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator(
+            callee: jil.direct_function_callee(jil.FunctionRef(
+                target: .source(target_def),
+                args: self.lowerer.storage.generic_arg_array(function_args),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: function_type
+            )),
+            args: self.lowerer.storage.operand_slice(args),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            async_start: async_start,
+            deferred_async_task: jil.DeferredAsyncTask(
+                task_local: task_local,
+                storage: storage,
+                environment_type: environment_type,
+                captures: self.lowerer.storage.operand_slice(captures)
+            ),
+            destination: destination,
+            target: next_block,
+            initialized_place: destination,
+            exclusive_places: self.lowerer.storage.empty_places(),
+            cleanup: null
+        )), span);
+        self.builder.start_block(next_block);
+    }
+
     public Void lower_async_call_task(Self&! self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
         token.Span span = self.lowerer.model_span(node_id);
-        guard self.async_call_frame_layout(node_id, call) is .some(layout) else {
-            self.mark_unsupported(node_id);
-            return;
-        }
         guard self.async_call_target_def(call) is .some(target_def) else {
             self.mark_unsupported(node_id);
             return;
         }
         FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
-        guard self.async_call_target_function(
-            target_def, function_args.type_args, function_args.const_args
-        ) is .some(function) else {
-            self.mark_unsupported(node_id);
-            return;
-        }
-        if (function.is_external) {
-            self.lower_external_async_task(
-                node_id,
-                call,
-                target_def,
-                function_args.type_args,
-                function_args.const_args,
-                layout$.ref(),
-                destination,
-                span
+        if (!self.lowerer.is_external_function_decl(target_def)) {
+            self.lower_symbolic_async_call_task(
+                node_id, call, target_def, function_args.args, destination, span
             );
             return;
         }
+        self.lowerer.lower_external_function_with_args(
+            target_def, function_args.args
+        );
+        guard self.lowerer.program.function_id_for_instance(
+            target_def, function_args.args
+        ) is .some(function_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.lowerer.program.function(function_id).coroutine_frame
+            is .some(layout) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.lower_external_async_task(
+            node_id,
+            call,
+            target_def,
+            function_args.args,
+            layout$.ref(),
+            destination,
+            span
+        );
+    }
+
+    public Void lower_symbolic_async_call_task(
+        Self&! self,
+        sem.NodeId node_id,
+        sem.ImplicitCall call,
+        qid.DefId target_def,
+        types.GenericArg[]& function_args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.function_type_for_ref(
+            target_def, function_args
+        );
+        types.EffectSet effects! = types.EffectSet();
+        if (self.lowerer.store.types.function_type_head(function_type)
+            is .some(function_info)) {
+            effects = function_info.effects;
+        }
         jil.LocalId task_local = self.ensure_task_place_identity(destination, span);
         jil.TaskStoragePlan storage! = self.task_local_storage(
-            .local, self.task_sync_mode(layout$.ref())
+            .local, self.task_sync_mode_for_effects(effects)
         );
         if (self.task_destination_is_owned(destination)) {
             storage = self.escaping_task_storage();
         }
-        guard self.async_call_resume_function_ref(
-                node_id, call, layout$.ref()
-            ) is .some(resume_function)
-        else {
-            self.mark_unsupported(node_id);
-            return;
+        self.set_task_storage_plan(task_local, storage);
+        list.ArrayList<jil.Operand> args! =
+            list.ArrayList<jil.Operand>(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_call_arg_operand(
+                call.args[index], function_type, index
+            ));
+            index = index + 1;
         }
-        push_task_region_start(
-            self.task_storage_plans$.mut_ref(),
-            self.builder,
-            destination,
+        list.ArrayList<jil.Operand> captures! = list.ArrayList<jil.Operand>();
+        self.lower_deferred_async_task(
+            target_def,
+            function_args,
+            args.slice(),
+            null,
+            captures.slice(),
             task_local,
             storage,
-            resume_function,
-            span
-        );
-        jil.Place frame_place = self.initialize_task_frame_storage(
-            layout.frame_type_id, task_local, storage, span
-        );
-        self.initialize_structured_task_state(destination, layout$.ref(), task_local, storage, span);
-        self.lower_async_call_args_into_frame(call, layout$.ref(), destination, frame_place);
-        guard self.async_call_completion_function_ref(
-                node_id, call, layout$.ref(), storage.sync
-            ) is .some(completion_function)
-        else {
-            self.mark_unsupported(node_id);
-            return;
-        }
-        coroutine_task_abi.append_initialized_task_statements(
-            self.lowerer.storage,
-            layout$.ref(),
             destination,
-            frame_place,
-            resume_function,
-            completion_function,
-            span,
-            self.builder.statements$.mut_ref()
-        );
-        self.push_task_lifetime_initializers(destination, layout$.ref(), storage, span);
-        self.push_structured_task_frame_domain(
-            layout$.ref(), frame_place, storage, span
-        );
-        self.push_task_execution_domain_initializers(
-            layout$.ref(), destination, frame_place, span
-        );
-        self.lower_task_resume_call(
-            destination, resume_function, self.async_start_kind(node_id), span
+            self.async_start_kind(node_id),
+            span
         );
     }
 
@@ -195,8 +238,7 @@ public extend body_context.BodyLowerer {
         sem.NodeId node_id,
         sem.ImplicitCall call,
         qid.DefId target_def,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args,
+        types.GenericArg[]& function_args,
         jil.CoroutineFrameLayout& layout,
         jil.Place task_place,
         token.Span span
@@ -277,8 +319,7 @@ public extend body_context.BodyLowerer {
         jil.Operand[]& abi_args = self.lowerer.storage.operand_array(args$.ref());
         self.lower_external_async_start_call(
             target_def,
-            type_args,
-            const_args,
+            function_args,
             abi_args,
             self.async_start_kind(node_id),
             span
@@ -435,20 +476,18 @@ public extend body_context.BodyLowerer {
     public Void lower_external_async_start_call(
         Self&! self,
         qid.DefId target_def,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args,
+        types.GenericArg[]& function_args,
         jil.Operand[]& args,
         jil.AsyncStartKind? async_start,
         token.Span span
     ) {
-        qid.TypeId source_type = self.function_type_for_ref(target_def, type_args, const_args);
+        qid.TypeId source_type = self.function_type_for_ref(target_def, function_args);
         jil.LocalId unit_result = self.add_temp(self.lowerer.store.types.unit_type(), span);
         jil.BlockId next_block = self.builder.reserve_block(span);
         self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
             callee: jil.direct_function_callee(jil.FunctionRef (
                 target: .source(target_def),
-                type_args: self.lowerer.storage.type_arg_array(type_args),
-                const_args: self.lowerer.storage.const_arg_array(const_args),
+                args: self.lowerer.storage.generic_arg_array(function_args),
                 coroutine_resume: false,
                 coroutine_completion: false,
                 type_id: self.lowerer.external_async_abi_function_type(source_type, span)
@@ -478,31 +517,9 @@ public extend body_context.BodyLowerer {
         FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
         return self.task_completion_function_ref(
             target_def,
-            function_args.type_args,
-            function_args.const_args,
+            function_args.args,
             layout,
             sync,
-            self.lowerer.model_span(node_id)
-        );
-    }
-
-    @life(return: self.d)
-    public jil.FunctionRef? async_call_resume_function_ref(
-        Self&! self,
-        sem.NodeId node_id,
-        sem.ImplicitCall call,
-        jil.CoroutineFrameLayout& layout
-    ) {
-        guard self.async_call_target_def(call) is .some(target_def) else {
-            return null;
-        }
-        FunctionRefArgs function_args = self.function_call_args(node_id, call.base, target_def);
-        return self.lowerer.storage.source_coroutine_function_ref(
-            target_def,
-            function_args.type_args,
-            function_args.const_args,
-            layout.task_abi.resume_function_type_id,
-            true,
             self.lowerer.model_span(node_id)
         );
     }
@@ -887,15 +904,24 @@ public extend body_context.BodyLowerer {
     }
 
     public jil.TaskSyncMode task_sync_mode(self, jil.CoroutineFrameLayout& child) {
+        return self.task_sync_mode_for_effects(child.effects);
+    }
+
+    public jil.TaskSyncMode task_sync_mode_for_effects(
+        self,
+        types.EffectSet child
+    ) {
         if (!self.current_effects.has_async) {
             return .concurrent;
         }
         guard self.current_effects.domain is .some(current_domain) else {
             return .concurrent;
         }
-        if (child.effects.domain is .some(_)) {
-            if (child.domain_kind != 0) { return .concurrent; }
-            if (!types.effect_domain_equal(self.current_effects.domain, child.effects.domain)) {
+        if (child.domain is .some(domain)) {
+            if (self.lowerer.domain_kind_for_type(domain.domain_type) != 0) {
+                return .concurrent;
+            }
+            if (!types.effect_domain_equal(self.current_effects.domain, child.domain)) {
                 return .concurrent;
             }
             return .local_serial;
@@ -990,9 +1016,7 @@ public extend body_context.BodyLowerer {
             return false;
         }
         if (lhs is .field_projection(left)) {
-            if (rhs is .field_projection(right)) {
-                return left.field_def == right.field_def && left.field_index == right.field_index;
-            }
+            if (rhs is .field_projection(right)) { return left.field_def == right.field_def; }
             return false;
         }
         if (lhs is .frame_field_projection(left)) {
@@ -1158,8 +1182,7 @@ public extend body_context.BodyLowerer {
         );
         return jil.FunctionRef (
             target: .generated(self.lowerer.program.generated_function_target(drop_id)),
-            type_args: self.lowerer.storage.empty_type_args(),
-            const_args: self.lowerer.storage.empty_const_args(),
+            args: self.lowerer.storage.empty_generic_args(),
             coroutine_resume: false,
             coroutine_completion: false,
             type_id: self.closure_drop_env_type(span)
@@ -1174,8 +1197,7 @@ public extend body_context.BodyLowerer {
         jil.FunctionId cleanup_id = self.ensure_task_cleanup_shim(task_state, span);
         return jil.FunctionRef (
             target: .generated(self.lowerer.program.generated_function_target(cleanup_id)),
-            type_args: self.lowerer.storage.empty_type_args(),
-            const_args: self.lowerer.storage.empty_const_args(),
+            args: self.lowerer.storage.empty_generic_args(),
             coroutine_resume: false,
             coroutine_completion: false,
             type_id: self.closure_drop_env_type(span)
@@ -1473,8 +1495,9 @@ public extend body_context.BodyLowerer {
             jil.use_rvalue(jil.UseRvalue (
                 value: jil.function_operand_value(jil.FunctionRef (
                     target: .source(self.def_id),
-                    type_args: self.lowerer.storage.type_arg_array(self.function_type_args),
-                    const_args: self.lowerer.storage.const_arg_array(self.function_const_args),
+                    args: self.lowerer.storage.generic_arg_array(
+                        self.function_args.slice()
+                    ),
                     coroutine_resume: true,
                     coroutine_completion: false,
                     type_id: self.jil_place_type(
@@ -1997,35 +2020,6 @@ public extend body_context.BodyLowerer {
         ));
     }
 
-    public Void lower_async_call_args_into_frame(
-        Self&! self,
-        sem.ImplicitCall call,
-        jil.CoroutineFrameLayout& layout,
-        jil.Place task_place,
-        jil.Place frame_place
-    ) {
-        Int index! = 0;
-        while (index < call.args.length) {
-            jil.LocalId param_local = jil.LocalId.from_index(index + 1);
-            if (self.async_call_frame_field_place(layout, frame_place, param_local) is .some(param_place)) {
-                qid.TypeId param_type = self.jil_place_type(param_place);
-                support.StablePlaceLocation param_location = self.stable_place_location(param_place);
-                self.lower_into_place_as_type(
-                    call.args[index], self.stable_place(param_location$.ref()), param_type
-                );
-                jil.Place environment = self.stable_place(param_location$.ref());
-                self.builder.push_statement(jil.Statement (
-                    span: self.lowerer.model_span(call.args[index]),
-                    kind: jil.capture_bind_statement_kind(jil.CaptureBindStatement (
-                        destination: task_place,
-                        environment: environment
-                    ))
-                ));
-            }
-            index = index + 1;
-        }
-    }
-
     @life(return: self.d)
     public jil.Place? async_call_frame_field_place(
         self,
@@ -2083,27 +2077,6 @@ public extend body_context.BodyLowerer {
         );
     }
 
-    public jil.CoroutineFrameLayout? async_call_frame_layout(
-        Self&! self,
-        sem.NodeId node_id,
-        sem.ImplicitCall call
-    ) {
-        guard self.async_call_target_def(call) is .some(target_def) else {
-            return null;
-        }
-        FunctionRefArgs function_args! = self.function_call_args(node_id, call.base, target_def);
-        self.ensure_async_call_target(
-            target_def, function_args.type_args, function_args.const_args
-        );
-        function_args = self.function_call_args(node_id, call.base, target_def);
-        guard self.async_call_target_function(
-            target_def, function_args.type_args, function_args.const_args
-        ) is .some(function) else {
-            return null;
-        }
-        return function.coroutine_frame;
-    }
-
     public qid.DefId? async_call_target_def(self, sem.ImplicitCall call) {
         if (self.lowerer.typeck.member_selection(call.base) is .some(selected_def)) {
             return selected_def;
@@ -2114,53 +2087,6 @@ public extend body_context.BodyLowerer {
             return def_id;
         }
         return null;
-    }
-
-    public Void ensure_async_call_target(
-        Self&! self,
-        qid.DefId target_def,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args
-    ) {
-        if (self.lowerer.function_is_lowering(
-            self.body_query, target_def, type_args, const_args
-        )) {
-            return;
-        }
-        if (type_args.length > 0 || const_args.length > 0) {
-            self.lowerer.ensure_function_instance_with_const_args(
-                self.body_query, self.layouts, target_def, type_args, const_args
-            );
-            return;
-        }
-        if (!self.lowerer.model.has_def(target_def)) {
-            self.lowerer.ensure_external_function(target_def);
-            return;
-        }
-        if (self.lowerer.model.has_body(target_def)) {
-            self.lowerer.lower_function(self.body_query, self.layouts, target_def);
-            return;
-        }
-        self.lowerer.ensure_external_function(target_def);
-    }
-
-    @life(return: (self, self, self))
-    public jil.Function? async_call_target_function(
-        self,
-        qid.DefId target_def,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args
-    ) {
-        if (type_args.length > 0 || const_args.length > 0) {
-            guard self.lowerer.program.function_id_for_instance(target_def, type_args, const_args) is .some(id) else {
-                return null;
-            }
-            return self.lowerer.program.function(id);
-        }
-        guard self.lowerer.program.function_id_for_def(target_def) is .some(id) else {
-            return null;
-        }
-        return self.lowerer.program.function(id);
     }
 
 }

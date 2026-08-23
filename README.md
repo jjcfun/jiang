@@ -210,7 +210,7 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 - [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)
 - 阶段设计：[AST](doc/compiler/ast.md)、[Resolve](doc/compiler/resolve.md)、[Semantic Model](doc/compiler/semantic-model.md)、
-  [Type Check](doc/compiler/type-check.md)、[Monomorph](doc/compiler/monomorph.md)、
+  [Type Check](doc/compiler/type-check.md)、[JIL Monomorphization](doc/compiler/monomorph.md)、
   [JIL](doc/compiler/jil.md)、[Layout](doc/compiler/layout.md)、
   [Borrow Check](doc/compiler/borrow-check.md)、[Backend](doc/compiler/backend.md)、
   [Startup](doc/compiler/startup.md)、[Targets](doc/compiler/targets.md)

@@ -1,8 +1,8 @@
 # JIL 设计
 
 JIL 是 type check 之后的可执行语义 IR，用来承接后续 borrow check、drop 插入、优化和 backend。
-JIL 的输入是 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore`、`ModuleGraph`
-和按需查询的 `LayoutStore`；它不回读 AST，不重新 resolve，也不重新 type check。
+JIL 的输入是 Semantic Model、`TypeCheckStore` 和 `ModuleGraph`；它不回读 AST，不重新 resolve，
+也不重新 type check。Layout 只在实例化、drop、ABI 或 backend 的真实使用点按需查询。
 
 ## 边界
 
@@ -10,11 +10,14 @@ JIL 的输入是 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore`�
 - JIL body 由 locals、basic blocks、statements 和 terminators 组成。
 - Semantic Model block 是表达式/语句容器；JIL basic block 是 CFG 节点。
 - JIL place 表达语义位置，例如 local、field、index、deref。
-- JIL field projection 保存 field `DefId`、field `TypeId` 和 layout field index，不保存 field offset。
-- 泛型模板函数不直接生成 JIL body；只有 `MonomorphStore` 中的 concrete function instance
-  会生成 JIL body。
-- JIL lowering 不自己计算 layout，但可以按需查询 `LayoutStore` 来固定 field index、type info
-  和 aggregate representation。layout 不需要在 JIL lowering 前批量完成。
+- JIL nominal field projection 只保存 field `DefId` 和 field `TypeId`。tuple、closure environment 和
+  coroutine frame 等编译器生成结构保存逻辑 index；LLVM element index 不进入 JIL。
+- 每个源码函数先生成一份 template JIL body。template 可以包含泛型 `TypeId`、const parameter
+  和 `DefId + GenericArgs` 形式的函数引用。
+- concrete JIL 由 `instance_jil(InstanceKey)` 按需从 template 实例化；template 与 concrete 使用
+  同一套 JIL 数据结构，不增加另一层 IR。
+- JIL lowering 不为 nominal field 或 union payload 固化 layout index。drop、ABI 和 backend 在
+  concrete owner type 的真实使用点按需查询 `LayoutStore`；layout 不需要在 JIL lowering 前批量完成。
 - Semantic Model `for in` 在 JIL 中统一降成 index-loop CFG；range、array、slice 只影响 index 来源。
 
 JIL 生成完成后，borrow check、drop elaboration 和 backend 会继续把 JIL 与 layout 查询结果
@@ -42,8 +45,9 @@ elaboration 改写 JIL。
 
 ```text
 Semantic Model/type facts -> initial JIL
+  -> concrete instance JIL
   -> optional structural verifier (--verify-jil)
-  -> borrow check
+  -> concrete borrow check
   -> drop elaboration
   -> optional drop-output verifier (--verify-jil)
   -> direct self-call candidate selection
@@ -94,6 +98,8 @@ src/jil/model.jiang       数据模型入口
 src/jil/model/            ID、Place、Value、CFG、Program、Store
 src/jil/lower.jiang       Semantic Model -> JIL lowering 入口
 src/jil/lower/            package 入口、body lowering、阶段内模型与共享 support
+src/jil/instantiate.jiang template JIL -> concrete instance JIL
+src/jil/references.jiang  concrete body 的直接函数引用收集
 src/jil/analysis.jiang    dataflow analysis 入口
 src/jil/analysis/         provenance 与参数属性证明
 src/jil/optimize.jiang    优化编排入口
@@ -120,7 +126,8 @@ trait object、aggregate、task、suspend 和 intrinsic 按职责拆分。
 
 ```text
 jil.Store
-  functions: jil.Function table
+  templates: DefId -> jil.Function
+  functions: concrete jil.Function table
 
 jil.Body
   locals: ArrayList<jil.LocalDecl>
@@ -195,8 +202,13 @@ control flow 由 terminator 表达：
 
 ## 泛型实例
 
-JIL lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
-`InstanceKey` lower。lowering 中的 type substitution 只用于当前 concrete body。
+`template_jil(DefId)` 对每个源码函数只 lower 一次。`FunctionRef` 只保存一份权威泛型身份：
+`DefId + GenericArgs`；类型参数和 const 参数不再拆成两套平行数组。
+
+`instance_jil(InstanceKey)` 只替换当前函数体中的 type/const parameter，并解析 type check 已选择的
+静态 trait 分派。它不会在查询内部递归实例化 callee；concrete body 中收集到的
+函数引用由 emission
+worklist 继续请求目标实例。borrow check 和 drop elaboration 只消费 concrete instance。
 
 ## Async continuation ABI
 

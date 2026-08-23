@@ -1,0 +1,263 @@
+// concrete JIL function 直接引用的函数集合。
+
+import jil = "./model.jiang";
+import list = "../support/list.jiang";
+import types = "../sema/type.jiang";
+import qid = "../id.jiang";
+
+public struct ClosureReference: Copyable {
+    public qid.DefId lambda_def;
+    public qid.TypeId closure_type;
+    public qid.TypeId environment_type;
+    public qid.TypeId vtable_type;
+    public jil.ClosureEnvironmentStorage environment_storage;
+}
+
+public struct FunctionReference: Movable {
+    public qid.DefId def_id;
+    public list.ArrayList<types.GenericArg> args!;
+    public qid.TypeId? unresolved_dispatch;
+    public Bool coroutine_start;
+    public Bool coroutine_sync;
+    public ClosureReference? closure;
+
+    public init(self, jil.FunctionRef source) {
+        self.def_id = qid.DefId.from_index(0);
+        if (source.target is .source(def_id)) { self.def_id = def_id; }
+        self.args = list.ArrayList<types.GenericArg>();
+        Int arg_index! = 0;
+        while (arg_index < source.args.length) {
+            self.args.add(source.args[arg_index]);
+            arg_index = arg_index + 1;
+        }
+        self.unresolved_dispatch = source.dispatch_type;
+        self.coroutine_start = source.coroutine_start;
+        self.coroutine_sync = source.coroutine_sync;
+        self.closure = null;
+    }
+
+    public init(
+        self,
+        qid.DefId def_id,
+        types.GenericArg[]& source_args,
+        ClosureReference closure
+    ) {
+        self.def_id = def_id;
+        self.args = list.ArrayList<types.GenericArg>(source_args.length);
+        Int index! = 0;
+        while (index < source_args.length) {
+            self.args.add(source_args[index]);
+            index = index + 1;
+        }
+        self.unresolved_dispatch = null;
+        self.coroutine_start = false;
+        self.coroutine_sync = false;
+        self.closure = closure;
+    }
+}
+
+public struct References: Movable {
+    public list.ArrayList<FunctionReference> functions!;
+    public list.ArrayList<jil.TraitVTableRef> trait_vtables!;
+
+    public init(self) {
+        self.functions = list.ArrayList<FunctionReference>();
+        self.trait_vtables = list.ArrayList<jil.TraitVTableRef>();
+    }
+}
+
+public References collect_function_refs(jil.Function function) {
+    References result! = References();
+    Int index! = 0;
+    while (index < function.body.blocks.length) {
+        collect_block(function.body.blocks[index], result$.mut_ref());
+        index = index + 1;
+    }
+    return result;
+}
+
+public list.ArrayList<FunctionReference> collect_global_refs(jil.Global global) {
+    References result! = References();
+    if (global.initializer is .some(initializer)) {
+        collect_static_value(initializer, result$.mut_ref());
+    }
+    return result.functions.take();
+}
+
+Void collect_static_value(
+    jil.StaticValue value,
+    References&! result
+) {
+    if (value is .function(function_ref)) {
+        add_reference(function_ref, result);
+        return;
+    }
+    guard value is .aggregate(fields) else { return; }
+    Int index! = 0;
+    while (index < fields.length) {
+        collect_static_value(fields[index].value, result);
+        index = index + 1;
+    }
+}
+
+Void collect_block(jil.Block block, References&! result) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        collect_statement(block.statements[index], result);
+        index = index + 1;
+    }
+    collect_terminator(block.terminator, result);
+}
+
+Void collect_statement(jil.Statement statement, References&! result) {
+    if (statement.kind is .assign_stmt(value)) {
+        collect_rvalue(value.value, result);
+    } else if (statement.kind is .atomic_store_stmt(value)) {
+        collect_operand(value.value, result);
+    } else if (statement.kind is .task_wait_stmt(value)) {
+        collect_operand(value.expected, result);
+    } else if (statement.kind is .task_region_start_stmt(value)) {
+        collect_optional_function_ref(value.child_resume, result);
+    } else if (statement.kind is .task_release_stmt(value)) {
+        add_reference(value.result_drop, result);
+    }
+}
+
+Void collect_terminator(jil.Terminator terminator, References&! result) {
+    if (terminator.kind is .call_term(value)) {
+        collect_callee(value.callee, result);
+        collect_operands(value.args, result);
+        if (value.lifetime_args is .some(args)) { collect_operands(args, result); }
+        collect_optional_function_ref(value.suspend_child, result);
+        if (value.deferred_async_task is .some(task)) {
+            collect_operands(task.captures, result);
+        }
+    } else if (terminator.kind is .branch_term(value)) {
+        collect_operand(value.condition, result);
+    } else if (terminator.kind is .switch_term(value)) {
+        collect_operand(value.discriminator, result);
+    } else if (terminator.kind is .assert_term(value)) {
+        collect_operand(value.condition, result);
+        if (value.message is .some(message)) { collect_operand(message, result); }
+    } else if (terminator.kind is .throw_term(value)) {
+        collect_operand(value.error_value, result);
+    }
+}
+
+Void collect_callee(jil.CallCallee callee, References&! result) {
+    if (callee is .direct_function(value)) {
+        add_reference(value, result);
+    } else if (callee is .indirect_operand(value)) {
+        collect_operand(value, result);
+    } else if (callee is .domain_enqueue(value)) {
+        if (value.task is .some(task)) { collect_operand(task, result); }
+        collect_operand(value.resume, result);
+    } else if (callee is .dynamic_domain_enqueue(value)) {
+        collect_operand(value.executor, result);
+        if (value.task is .some(task)) { collect_operand(task, result); }
+        collect_operand(value.resume, result);
+    }
+}
+
+Void collect_rvalue(jil.Rvalue value, References&! result) {
+    if (value is .use_value(item)) {
+        collect_operand(item.value, result);
+    } else if (value is .unary_value(item)) {
+        collect_operand(item.value, result);
+    } else if (value is .binary_value(item)) {
+        collect_operand(item.lhs, result);
+        collect_operand(item.rhs, result);
+    } else if (value is .cast_value(item)) {
+        collect_operand(item.value, result);
+    } else if (value is .inline_asm_value(item)) {
+        collect_inline_asm(item, result);
+    } else {
+        collect_extended_rvalue(value, result);
+    }
+}
+
+Void collect_extended_rvalue(jil.Rvalue value, References&! result) {
+    if (value is .atomic_exchange_value(item)) {
+        collect_operand(item.desired, result);
+    } else if (value is .atomic_compare_exchange_value(item)) {
+        collect_operand(item.expected, result);
+        collect_operand(item.desired, result);
+    } else if (value is .coroutine_frame_alloc_value(item)) {
+        collect_operand(item.executor, result);
+    } else if (value is .alloc_value(item)) {
+        collect_operand(item.value, result);
+    } else if (value is .alloc_array_value(item)) {
+        collect_operand(item.count, result);
+    } else if (value is .free_value(item)) {
+        collect_operand(item.pointer, result);
+    } else if (value is .coroutine_frame_free_value(item)) {
+        collect_operand(item.pointer, result);
+        collect_operand(item.executor, result);
+    } else {
+        collect_tail_rvalue(value, result);
+    }
+}
+
+Void collect_tail_rvalue(jil.Rvalue value, References&! result) {
+    if (value is .slice_value(item)) {
+        if (item.start is .some(start)) { collect_operand(start, result); }
+        if (item.end is .some(end)) { collect_operand(end, result); }
+    } else if (value is .aggregate_value(item)) {
+        if (item.tag is .some(tag)) { collect_operand(tag, result); }
+        collect_operands(item.fields, result);
+    } else if (value is .closure_value(item)) {
+        result.functions.add(FunctionReference(
+            item.lambda_def,
+            item.args,
+            ClosureReference(
+                lambda_def: item.lambda_def,
+                closure_type: item.closure_type,
+                environment_type: item.environment_type,
+                vtable_type: item.vtable_type,
+                environment_storage: item.environment_storage
+            )
+        ));
+        collect_operands(item.captures, result);
+    } else if (value is .optional_value(item)) {
+        collect_operand(item.value, result);
+    } else if (value is .error_union_value(item)) {
+        collect_operand(item.value, result);
+    }
+}
+
+Void collect_inline_asm(
+    jil.InlineAsmRvalue value,
+    References&! result
+) {
+    Int index! = 0;
+    while (index < value.operands.length) {
+        if (value.operands[index] is .input(input)) {
+            collect_operand(input.value, result);
+        }
+        index = index + 1;
+    }
+}
+
+Void collect_operands(jil.Operand[]& values, References&! result) {
+    Int index! = 0;
+    while (index < values.length) {
+        collect_operand(values[index], result);
+        index = index + 1;
+    }
+}
+
+Void collect_operand(jil.Operand value, References&! result) {
+    if (value is .function_operand(function_ref)) { add_reference(function_ref, result); }
+    if (value is .trait_vtable_operand(vtable)) { result.trait_vtables.add(vtable); }
+}
+
+Void collect_optional_function_ref(
+    jil.FunctionRef? value,
+    References&! result
+) {
+    if (value is .some(function_ref)) { add_reference(function_ref, result); }
+}
+
+Void add_reference(jil.FunctionRef value, References&! result) {
+    if (value.target is .source(_)) { result.functions.add(FunctionReference(value)); }
+}

@@ -6411,7 +6411,7 @@ public struct BodyCheck: Movable {
         qid.TypeId function_type,
         qid.TypeId? expected_result
     ) {
-        if (!self.all_call_generic_args_are_types(call.type_args)) {
+        if (self.call_has_const_generic_args(selected_def, call.type_args)) {
             self.type_ops.check_generic_instance_args_into(node_id, selected_def, call.type_args, type_args);
             return;
         }
@@ -6425,6 +6425,23 @@ public struct BodyCheck: Movable {
             );
         }
         self.type_ops.check_type_arg_arity(node_id, selected_def, type_args.len());
+    }
+
+    Bool call_has_const_generic_args(
+        self,
+        qid.DefId function_def,
+        sem.NodeId[]& arg_refs
+    ) {
+        if (!self.all_call_generic_args_are_types(arg_refs)) { return true; }
+        guard self.type_ops.state.ctx.store.model.def(function_def)
+            is .some(function_model) else { return false; }
+        Int index! = 0;
+        while (index < arg_refs.length && index < function_model.generic_params.len()) {
+            qid.DefId param_def = function_model.generic_params.get(index);
+            if (!self.generic_param_is_type(param_def)) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     Void record_call_generic_instance(Self&! self,
@@ -6498,12 +6515,12 @@ public struct BodyCheck: Movable {
         qid.TypeId base_type,
         qid.DefId member_def
     ) {
-        if (self.append_default_trait_self_arg(args, base_type, member_def)) { return; }
+        if (self.append_trait_self_arg(args, base_type, member_def)) { return; }
         if (!self.append_receiver_generic_args(args, base_type, member_def)) { return; }
         self.type_ops.append_extension_binding_args_for_member(args, base_type, member_def);
     }
 
-    Bool append_default_trait_self_arg(
+    Bool append_trait_self_arg(
         Self&! self,
         list.ArrayList<types.GenericArg>&! args,
         qid.TypeId base_type,
@@ -6511,8 +6528,6 @@ public struct BodyCheck: Movable {
     ) {
         guard self.type_ops.state.ctx.store.defs.get(member_def).owner_def is .some(owner_def) else { return false; }
         if (self.type_ops.state.ctx.store.defs.get(owner_def).kind != .trait_def) { return false; }
-        guard self.type_ops.state.ctx.store.model.def(member_def) is .some(member_model) else { return false; }
-        if (member_model.body == null) { return false; }
         qid.TypeId self_type = self.type_ops.read_value_type(base_type);
         args.add(types.generic_type_param_arg(owner_def, self_type));
         return true;
@@ -6687,23 +6702,21 @@ public struct BodyCheck: Movable {
             }
             cursor = self.type_ops.state.ctx.store.resolve.next_binding_cursor(cursor);
         }
-        if (matches == 0 && self.trait_call_overload_member(call) is .some(trait_member)) {
-            cursor = self.type_ops.state.ctx.store.resolve.first_binding_cursor(
-                self.type_ops.state.ctx.store.defs.get(trait_member).decl_namespace_id,
-                initial.name.symbol,
-                initial.domain
-            );
-            while (cursor.valid()) {
-                namespace.BindingEntry binding = self.type_ops.state.ctx.store.resolve.binding_at(cursor);
-                Int score = self.call_candidate_score(call, binding.def_id, type_args);
+        list.ArrayList<qid.DefId> trait_candidates =
+            self.trait_call_overload_defs(call, initial.name.symbol);
+        if (matches == 0 && trait_candidates.len() > 1) {
+            Int index! = 0;
+            while (index < trait_candidates.len()) {
+                qid.DefId candidate = trait_candidates.get(index);
+                Int score = self.call_candidate_score(call, candidate, type_args);
                 if (score > best_score) {
-                    selected = binding.def_id;
+                    selected = candidate;
                     matches = 1;
                     best_score = score;
                 } else if (score >= 0 && score == best_score) {
                     matches = matches + 1;
                 }
-                cursor = self.type_ops.state.ctx.store.resolve.next_binding_cursor(cursor);
+                index = index + 1;
             }
         }
         if (matches == 1) {
@@ -6713,7 +6726,42 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "function call is ambiguous", "ambiguous_call_overload");
             return null;
         }
+        if (trait_candidates.len() > 1) {
+            self.type_ops.add_node_error(
+                node_id,
+                "no matching function overload",
+                "no_matching_call_overload"
+            );
+            return null;
+        }
         return initial_def;
+    }
+
+    list.ArrayList<qid.DefId> trait_call_overload_defs(
+        Self&! self,
+        sem.Call call,
+        qid.SymbolId symbol
+    ) {
+        list.ArrayList<qid.DefId> result! = list.ArrayList<qid.DefId>();
+        guard self.trait_call_overload_member(call) is .some(trait_member) else {
+            return result;
+        }
+        guard self.type_ops.state.ctx.store.defs.get(trait_member).owner_def
+            is .some(trait_def) else {
+            return result;
+        }
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_member_count(trait_def)) {
+            qid.DefId candidate =
+                self.type_ops.state.ctx.store.model.def_member_at(trait_def, index);
+            def.DefRecord record = self.type_ops.state.ctx.store.defs.get(candidate);
+            if (self.overloadable_call_kind(record.kind)
+                && record.name.symbol == symbol) {
+                result.add(candidate);
+            }
+            index = index + 1;
+        }
+        return result;
     }
 
     qid.DefId? trait_call_overload_member(Self&! self, sem.Call call) {
@@ -9267,10 +9315,14 @@ public struct BodyCheck: Movable {
                 return self.type_ops.state.ctx.store.types.bool_type();
             }
             self.type_ops.expect_compatible_binary_operands(node_id, left, right);
-            if (self.mark_trait_equality_if_needed(node_id, left)) {
+            qid.TypeId equality_left = self.equality_value_type(left);
+            qid.TypeId equality_right = self.equality_value_type(right);
+            if (self.mark_trait_equality_if_needed(node_id, equality_left)) {
                 return self.type_ops.state.ctx.store.types.bool_type();
             }
-            self.mark_aggregate_equality_if_needed(node_id, left, right);
+            self.mark_aggregate_equality_if_needed(
+                node_id, equality_left, equality_right
+            );
             return self.type_ops.state.ctx.store.types.bool_type();
         }
         if (binary.op == .less || binary.op == .less_equal
@@ -9331,10 +9383,130 @@ public struct BodyCheck: Movable {
         return literal.value is .null_value;
     }
 
-    Void mark_aggregate_equality_if_needed(Self&! self, sem.NodeId node_id, qid.TypeId left, qid.TypeId right) {
-        if (self.type_has_aggregate_equality(left) || self.type_has_aggregate_equality(right)) {
-            self.type_ops.state.ctx.store.typeck.mark_expr_lowering(node_id, .aggregate_equality);
+    qid.TypeId equality_value_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle) && handle.kind == .reference) {
+            return handle.element;
         }
+        return type_id;
+    }
+
+    Void mark_aggregate_equality_if_needed(Self&! self, sem.NodeId node_id, qid.TypeId left, qid.TypeId right) {
+        qid.TypeId aggregate_type! = right;
+        if (self.type_has_aggregate_equality(left)) { aggregate_type = left; }
+        if (!self.type_has_aggregate_equality(aggregate_type)) { return; }
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        if (!self.aggregate_equality_type_valid(
+            aggregate_type, node_id.owner_def, visiting$.mut_ref()
+        )) {
+            self.type_ops.add_node_error(
+                node_id,
+                "aggregate equality requires every stored generic type to satisfy Equatable",
+                "aggregate_equality_requires_equatable"
+            );
+        }
+        self.type_ops.state.ctx.store.typeck.mark_expr_lowering(node_id, .aggregate_equality);
+    }
+
+    Bool aggregate_equality_type_valid(
+        Self&! self,
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        list.ArrayList<qid.DefId>&! visiting
+    ) {
+        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(type_id);
+        if (info.data is .optional(optional)) {
+            return self.aggregate_equality_type_valid(optional.element, use_owner, visiting);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.aggregate_equality_type_valid(error_union.value, use_owner, visiting)
+                && self.aggregate_equality_type_valid(error_union.error, use_owner, visiting);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.aggregate_equality_type_valid(array_type.element, use_owner, visiting);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.aggregate_equality_tuple_valid(tuple_type, use_owner, visiting);
+        }
+        guard info.data is .named(named) else { return true; }
+        def.DefKind kind = self.type_ops.state.ctx.store.defs.get(named.def_id).kind;
+        if (kind == .generic_param_def) {
+            guard self.type_ops.state.ctx.store.resolve.core_traits.equatable_trait
+                is .some(equatable_def) else { return false; }
+            return self.type_satisfies_trait(type_id, equatable_def, use_owner);
+        }
+        if (kind == .enum_def) { return true; }
+        if (kind != .struct_def && kind != .union_def) { return true; }
+        return self.aggregate_equality_nominal_valid(named, use_owner, visiting);
+    }
+
+    Bool aggregate_equality_tuple_valid(
+        Self&! self,
+        types.TupleType tuple_type,
+        qid.DefId use_owner,
+        list.ArrayList<qid.DefId>&! visiting
+    ) {
+        Int index! = 0;
+        while (index < tuple_type.items.length) {
+            if (!self.aggregate_equality_type_valid(
+                tuple_type.items[index], use_owner, visiting
+            )) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool aggregate_equality_nominal_valid(
+        Self&! self,
+        types.NamedType named,
+        qid.DefId use_owner,
+        list.ArrayList<qid.DefId>&! visiting
+    ) {
+        if (self.aggregate_equality_visiting_contains(visiting, named.def_id)) {
+            return true;
+        }
+        visiting.add(named.def_id);
+        generic_bindings.GenericBindings caller! = generic_bindings.GenericBindings();
+        generic_bindings.GenericBindings bindings! = generic_bindings.bindings_for_instance(
+            self.type_ops.state.ctx.store.defs$.ref(),
+            self.type_ops.state.ctx.store.model$.ref(),
+            self.type_ops.state.ctx.store.types$.ref(),
+            named.def_id,
+            named.args,
+            caller$.ref()
+        );
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_member_count(named.def_id)) {
+            qid.DefId member_def =
+                self.type_ops.state.ctx.store.model.def_member_at(named.def_id, index);
+            index = index + 1;
+            def.DefKind kind = self.type_ops.state.ctx.store.defs.get(member_def).kind;
+            if (kind != .field_def && kind != .union_variant_def) { continue; }
+            qid.TypeId member_type = generic_bindings.substitute_type(
+                self.type_ops.state.ctx.store.types$.ref(),
+                self.type_ops.type_for_def(member_def),
+                bindings$.ref()
+            );
+            if (!self.aggregate_equality_type_valid(member_type, use_owner, visiting)) {
+                visiting.pop();
+                return false;
+            }
+        }
+        visiting.pop();
+        return true;
+    }
+
+    Bool aggregate_equality_visiting_contains(
+        self,
+        list.ArrayList<qid.DefId>& visiting,
+        qid.DefId def_id
+    ) {
+        Int index! = 0;
+        while (index < visiting.len()) {
+            if (visiting.get(index) == def_id) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     Bool mark_trait_equality_if_needed(Self&! self, sem.NodeId node_id, qid.TypeId type_id) {

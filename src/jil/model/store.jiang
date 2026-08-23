@@ -14,7 +14,6 @@ import arena = "../../support/arena.jiang";
 import list = "../../support/list.jiang";
 import map = "../../support/map.jiang";
 import memory = "../../support/memory.jiang";
-import table = "../../support/table.jiang";
 import std;
 
 // arena-backed JIL 数据发布后保持不可变；Storage 只提供固化能力，
@@ -43,13 +42,15 @@ public struct DropElaborationState: Movable {
     }
 }
 
-@region(a, b, c, d)
+@region(a, b, c)
 public struct Program: Movable {
     public Bool ok!;
     public Int query_identity!;
-    @life((a, b, c))
+    @life((a, b))
     public list.ArrayList<Function> functions!;
-    @life(d)
+    @life((a, b))
+    list.ArrayList<Function> templates!;
+    @life(c)
     public list.ArrayList<Global> globals!;
     list.ArrayList<std.String> generated_names!;
     public qid.DefId? main_domain_def!;
@@ -57,39 +58,50 @@ public struct Program: Movable {
 
     // 非泛型函数仍可直接用 DefId 查找。
     map.WyHashMap<qid.DefId, FunctionId> function_for_def!;
+    map.WyHashMap<qid.DefId, TemplateId> template_for_def!;
     map.WyHashMap<qid.DefId, GlobalId> global_for_def!;
     map.WyHashMap<qid.DefId, DomainExecutorDescriptor> domain_executor_descriptors!;
 
     // 泛型函数 concrete JIL 需要同时区分 DefId 和 type args。
     // 不能写进 function_for_def，否则 id<Int> 和 id<Bool> 会互相覆盖。
-    @life((a, b))
+    @life(a)
     map.WyHashMap<FunctionKey, FunctionId> function_for_instance!;
-    @life((a, b))
+    @life(a)
+    map.WyHashMap<FunctionKey, FunctionId> async_start_for_instance!;
+    @life(a)
+    map.WyHashMap<FunctionKey, FunctionId> async_sync_for_instance!;
+    @life(a)
     map.WyHashMap<FunctionKey, Int> function_instance_identities!;
     Int next_function_instance_identity!;
-    @life((), (a, b, c))
+    map.WyHashMap<Int, GlobalId> closure_vtable_globals!;
+    @life((), (a, b))
     map.WyHashMap<Int, Function> borrow_check_overrides!;
     map.WyHashMap<Int, Bool> borrow_check_exempt_functions!;
-    table.MultiTable<Int, qid.ModuleId> monomorph_owners!;
+    map.WyHashMap<Int, Bool> shared_codegen_functions!;
 
     public init(self, Bool ok) {
         self.ok = ok;
         self.query_identity = -1;
         self.functions = list.ArrayList<Function>();
+        self.templates = list.ArrayList<Function>();
         self.globals = list.ArrayList<Global>();
         self.generated_names = list.ArrayList<std.String>();
         self.main_domain_def = null;
         self.pending_generated_function_count = 0;
         self.function_for_def = map.WyHashMap<qid.DefId, FunctionId>();
+        self.template_for_def = map.WyHashMap<qid.DefId, TemplateId>();
         self.global_for_def = map.WyHashMap<qid.DefId, GlobalId>();
         self.domain_executor_descriptors =
             map.WyHashMap<qid.DefId, DomainExecutorDescriptor>();
         self.function_for_instance = map.WyHashMap<FunctionKey, FunctionId>();
+        self.async_start_for_instance = map.WyHashMap<FunctionKey, FunctionId>();
+        self.async_sync_for_instance = map.WyHashMap<FunctionKey, FunctionId>();
         self.function_instance_identities = map.WyHashMap<FunctionKey, Int>();
         self.next_function_instance_identity = 0;
+        self.closure_vtable_globals = map.WyHashMap<Int, GlobalId>();
         self.borrow_check_overrides = map.WyHashMap<Int, Function>();
         self.borrow_check_exempt_functions = map.WyHashMap<Int, Bool>();
-        self.monomorph_owners = table.MultiTable<Int, qid.ModuleId>();
+        self.shared_codegen_functions = map.WyHashMap<Int, Bool>();
     }
 }
 
@@ -138,17 +150,38 @@ public extend Program {
         FunctionId id = function.id;
         self.functions.add(function);
         guard function.origin is .source(def_id) else { return id; }
-        if (function.type_args.length == 0 && function.const_args.length == 0) {
+        if (function.args.length == 0) {
             if (!function.is_runtime_entry) {
                 self.function_for_def.set(def_id, id);
             }
         } else {
             self.function_for_instance.set(
-                FunctionKey(def_id, function.type_args, function.const_args),
+                FunctionKey(def_id, function.args),
                 id
             );
         }
         return id;
+    }
+
+    public TemplateId add_template(Self&! self, qid.DefId def_id, Function function) {
+        TemplateId id = TemplateId.from_index(self.templates.len());
+        self.templates.add(function);
+        self.template_for_def.set(def_id, id);
+        return id;
+    }
+
+    @life(return: (self.a, self.b))
+    public Function template(self, TemplateId id) {
+        return self.templates.get(id.to_index());
+    }
+
+    public TemplateId? template_id_for_def(self, qid.DefId def_id) {
+        guard self.template_for_def.get(def_id) is .some(template_id) else { return null; }
+        return template_id$.get();
+    }
+
+    public Int template_count(self) {
+        return self.templates.len();
     }
 
     public FunctionId add_generated_function(Self&! self, Function function) {
@@ -161,21 +194,17 @@ public extend Program {
         Self&! self,
         Storage& storage,
         GeneratedFunctionOrigin origin,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args,
+        types.GenericArg[]& args,
         token.Span span
     ) {
         FunctionId id = FunctionId.from_index(self.functions.len());
-        qid.TypeId[]& stored_type_args = storage.type_arg_array(type_args);
-        comptime_value.ComptimeValue[]& stored_const_args =
-            storage.const_arg_array(const_args);
+        types.GenericArg[]& stored_args = storage.generic_arg_array(args);
         LocalDecl[]& locals = storage.empty_locals();
         Block[]& blocks = storage.empty_blocks();
         self.functions.add(Function(
             id: id,
             origin: .generated(origin),
-            type_args: stored_type_args,
-            const_args: stored_const_args,
+            args: stored_args,
             signature_id: null,
             effects: types.EffectSet(),
             is_coroutine: false,
@@ -217,18 +246,82 @@ public extend Program {
         return self.pending_generated_function_count != 0;
     }
 
+    public FunctionId? first_pending_generated_function(self) {
+        Int index! = 0;
+        while (index < self.functions.len()) {
+            Function& function = self.functions.ref_at(index);
+            if (function.origin is .generated(_)
+                && function.body.blocks.length == 0
+                && function.inline_always) {
+                return function.id;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
     public FunctionId? function_id_for_ref(
         self,
         FunctionRef value
     ) {
         if (value.target is .generated(generated)) { return generated.id; }
         guard value.target is .source(function_def) else { return null; }
-        if (value.type_args.length == 0 && value.const_args.length == 0) {
+        if (value.coroutine_start) {
+            return self.async_start_function(function_def, value.args);
+        }
+        if (value.coroutine_sync) {
+            return self.async_sync_function(function_def, value.args);
+        }
+        if (value.args.length == 0) {
             return self.function_id_for_def(function_def);
         }
-        return self.function_id_for_instance(
-            function_def, value.type_args, value.const_args
+        return self.function_id_for_instance(function_def, value.args);
+    }
+
+    public Void set_async_start_function(
+        Self&! self,
+        Storage& storage,
+        qid.DefId function_def,
+        types.GenericArg[]& args,
+        FunctionId function_id
+    ) {
+        types.GenericArg[]& stored_args = storage.generic_arg_array(args);
+        self.async_start_for_instance.set(
+            FunctionKey(function_def, stored_args), function_id
         );
+    }
+
+    public FunctionId? async_start_function(
+        self,
+        qid.DefId function_def,
+        types.GenericArg[]& args
+    ) {
+        guard self.async_start_for_instance.get(FunctionKey(function_def, args))
+            is .some(function_id) else { return null; }
+        return function_id$.get();
+    }
+
+    public Void set_async_sync_function(
+        Self&! self,
+        Storage& storage,
+        qid.DefId function_def,
+        types.GenericArg[]& args,
+        FunctionId function_id
+    ) {
+        types.GenericArg[]& stored_args = storage.generic_arg_array(args);
+        self.async_sync_for_instance.set(
+            FunctionKey(function_def, stored_args), function_id
+        );
+    }
+
+    public FunctionId? async_sync_function(
+        self,
+        qid.DefId function_def,
+        types.GenericArg[]& args
+    ) {
+        guard self.async_sync_for_instance.get(FunctionKey(function_def, args))
+            is .some(function_id) else { return null; }
+        return function_id$.get();
     }
 
     public GeneratedFunctionTarget generated_function_target(self, FunctionId id) {
@@ -245,56 +338,29 @@ public extend Program {
         );
     }
 
-    public Void add_monomorph_owner(Self&! self, FunctionId function_id, qid.ModuleId owner) {
-        Int key = function_id.to_index();
-        table.MultiTableCursor cursor! = self.monomorph_owners.first(key);
-        while (cursor.valid()) {
-            if (self.monomorph_owners.get(cursor) == owner) { return; }
-            cursor = self.monomorph_owners.next(cursor);
-        }
-        self.monomorph_owners.add(key, owner);
+    public Void mark_shared_codegen_function(Self&! self, FunctionId function_id) {
+        self.shared_codegen_functions.set(function_id.to_index(), true);
     }
 
-    public Void add_monomorph_owners(
+    public Void copy_shared_codegen_status(
         Self&! self,
-        FunctionId function_id,
-        list.ArrayList<qid.ModuleId>& owners
+        FunctionId source,
+        FunctionId target
     ) {
-        Int index! = 0;
-        while (index < owners.len()) {
-            self.add_monomorph_owner(function_id, owners.get(index));
-            index = index + 1;
+        if (self.function_is_shared_codegen(source)) {
+            self.mark_shared_codegen_function(target);
         }
     }
 
-    public Void copy_monomorph_owners(Self&! self, FunctionId source, FunctionId target) {
-        table.MultiTableCursor cursor! =
-            self.monomorph_owners.first(source.to_index());
-        while (cursor.valid()) {
-            self.add_monomorph_owner(target, self.monomorph_owners.get(cursor));
-            cursor = self.monomorph_owners.next(cursor);
-        }
-    }
-
-    public list.ArrayList<qid.ModuleId> function_monomorph_owners(
-        self,
-        FunctionId function_id
-    ) {
-        list.ArrayList<qid.ModuleId> result! = list.ArrayList<qid.ModuleId>();
-        table.MultiTableCursor cursor! =
-            self.monomorph_owners.first(function_id.to_index());
-        while (cursor.valid()) {
-            result.add(self.monomorph_owners.get(cursor));
-            cursor = self.monomorph_owners.next(cursor);
-        }
-        return result;
+    public Bool function_is_shared_codegen(self, FunctionId function_id) {
+        return self.shared_codegen_functions.has(function_id.to_index());
     }
 
     public Void set_borrow_check_override(Self&! self, Function function) {
         self.borrow_check_overrides.set(function.id.to_index(), function);
     }
 
-    @life(return: (self.a, self.b, self.c))
+    @life(return: (self.a, self.b))
     public Function? borrow_check_function(self, FunctionId function_id) {
         guard self.borrow_check_overrides.get(function_id.to_index()) is .some(function) else {
             return null;
@@ -310,7 +376,7 @@ public extend Program {
         return self.borrow_check_exempt_functions.has(function_id.to_index());
     }
 
-    @life(return: (self.a, self.b, self.c))
+    @life(return: (self.a, self.b))
     public Function function(self, FunctionId id) {
         return self.functions.get(id.to_index());
     }
@@ -372,10 +438,10 @@ public extend Program {
 
     public FunctionId? function_id_for_instance(self,
         qid.DefId def_id,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args
+        types.GenericArg[]& args
     ) {
-        FunctionKey key = FunctionKey(def_id, type_args, const_args);
+        if (args.length == 0) { return self.function_id_for_def(def_id); }
+        FunctionKey key = FunctionKey(def_id, args);
         guard self.function_for_instance.get(key) is .some(function_id) else { return null; }
         return function_id$.get();
     }
@@ -383,10 +449,9 @@ public extend Program {
     public Int? existing_function_instance_identity(
         self,
         qid.DefId def_id,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args
+        types.GenericArg[]& args
     ) {
-        FunctionKey key = FunctionKey(def_id, type_args, const_args);
+        FunctionKey key = FunctionKey(def_id, args);
         guard self.function_instance_identities.get(key) is .some(identity) else { return null; }
         return identity$.get();
     }
@@ -395,22 +460,53 @@ public extend Program {
         Self&! self,
         Storage& storage,
         qid.DefId def_id,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args
+        types.GenericArg[]& args
     ) {
-        FunctionKey lookup = FunctionKey(def_id, type_args, const_args);
+        FunctionKey lookup = FunctionKey(def_id, args);
         if (self.function_instance_identities.get(lookup) is .some(identity)) {
             return identity$.get();
         }
-        qid.TypeId[]& stored_type_args = storage.type_arg_array(type_args);
-        comptime_value.ComptimeValue[]& stored_const_args =
-            storage.const_arg_array(const_args);
-        FunctionKey stored = FunctionKey(def_id, stored_type_args, stored_const_args);
+        types.GenericArg[]& stored_args = storage.generic_arg_array(args);
+        FunctionKey stored = FunctionKey(def_id, stored_args);
         Int identity = self.next_function_instance_identity;
         self.next_function_instance_identity = identity + 1;
         self.function_instance_identities.set(stored, identity);
         return identity;
     }
+
+    public Void set_closure_vtable_global(
+        Self&! self,
+        qid.DefId lambda_def,
+        types.GenericArg[]& args,
+        Bool heap_environment,
+        GlobalId global_id
+    ) {
+        guard self.existing_function_instance_identity(lambda_def, args)
+            is .some(identity) else { return; }
+        self.closure_vtable_globals.set(
+            closure_vtable_key(identity, heap_environment), global_id
+        );
+    }
+
+    public GlobalId? closure_vtable_global(
+        self,
+        qid.DefId lambda_def,
+        types.GenericArg[]& args,
+        Bool heap_environment
+    ) {
+        guard self.existing_function_instance_identity(lambda_def, args)
+            is .some(identity) else { return null; }
+        guard self.closure_vtable_globals.get(
+            closure_vtable_key(identity, heap_environment)
+        ) is .some(global_id) else { return null; }
+        return global_id$.get();
+    }
+}
+
+Int closure_vtable_key(Int function_identity, Bool heap_environment) {
+    Int key = function_identity * 2;
+    if (heap_environment) { return key + 1; }
+    return key;
 }
 
 public extend Storage {
@@ -418,16 +514,14 @@ public extend Storage {
     public FunctionRef source_coroutine_function_ref(
         self,
         qid.DefId target_def,
-        qid.TypeId[]& type_args,
-        comptime_value.ComptimeValue[]& const_args,
+        types.GenericArg[]& args,
         qid.TypeId function_type,
         Bool resume,
         token.Span span
     ) {
         return FunctionRef(
             target: .source(target_def),
-            type_args: self.type_arg_array(type_args),
-            const_args: self.const_arg_array(const_args),
+            args: self.generic_arg_array(args),
             coroutine_resume: resume,
             coroutine_completion: !resume,
             type_id: function_type
@@ -440,6 +534,52 @@ public extend Storage {
 
     public qid.TypeId[]& type_arg_array(self, qid.TypeId[]& type_args) {
         return store_type_arg_array(self.arena$.ref(), type_args);
+    }
+
+    @life(return: self)
+    public types.GenericArg[]& generic_arg_array(self, types.GenericArg[]& args) {
+        unsafe {
+            Int count = args.length;
+            Int capacity! = count;
+            if (capacity == 0) { capacity = 1; }
+            types.GenericArg*! values = self.arena.alloc_array<types.GenericArg>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                values[index] = args[index];
+                index = index + 1;
+            }
+            return values[0..count];
+        }
+    }
+
+    @life(return: self)
+    public types.GenericArg[]& empty_generic_args(self) {
+        unsafe {
+            types.GenericArg*! values = self.arena.alloc_array<types.GenericArg>(1);
+            return values[0..0];
+        }
+    }
+
+    @life(return: self)
+    public types.GenericArg[]& generic_args_from_values(
+        self,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>(
+            type_args.length + const_args.length
+        );
+        Int index! = 0;
+        while (index < type_args.length) {
+            args.add(types.generic_type_arg(type_args[index]));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < const_args.length) {
+            args.add(types.generic_const_arg(const_args[index]));
+            index = index + 1;
+        }
+        return self.generic_arg_array(args.slice());
     }
 
     @life(return: self)

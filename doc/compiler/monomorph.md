@@ -1,35 +1,36 @@
-# Monomorph 设计
+# JIL 单态化设计
 
-monomorph 运行在 type check 之后、concrete JIL lowering 之前。它不是 type check 的一部分，
-也不负责证明泛型约束正确；它只从 Semantic Model reachable tree 和 `TypeCheckStore` 中收集需要生成的
-concrete instances。
+单态化运行在 template JIL 之后。每个源码函数只 lower 一份允许包含泛型参数的 template；
+真正可达的 concrete function 由 `instance_jil(InstanceKey)` 按需生成。
 
-## 职责
+```text
+type check
+  -> template_jil(DefId)
+  -> instance_jil(DefId + GenericArgs)
+  -> borrow check / drop elaboration / backend
+```
 
-- 从 root reachable function 开始收集需要生成的 concrete function instances。
-- 收集 concrete nominal type instances，供 layout 和 backend 查询。
-- 为 JIL lowering 提供 `MonomorphStore`。
-- 提供 generic member type substitution 查询。
+## 身份与所有权
 
-## 核心数据
+- `FunctionRef` 使用 `DefId + GenericArgs` 表示源码函数引用。
+- `TemplateJilQuery` 缓存当前 JIL Store 中的 `TemplateId`。
+- `InstanceJilQuery` 缓存当前 JIL Store 中的 concrete `FunctionId`。
+- template 和 instance 共用同一套 JIL 数据结构，由各自的 owner 表区分。
+- 不存在独立的全局实例 store，也不保存第二份 reachable instance 集合。
 
-- `InstanceKey = DefId + TypeArgList`。
-- `MonomorphStore` 保存 concrete function instance 和 nominal type instance。
-- `SubstitutionMap` 描述一个 generic owner 在某个 concrete instance 下的 type parameter 替换。
+## 求值
 
-`SubstitutionMap` 不放在 `TypeCheckStore` 中。它是 monomorph/JIL lowering 针对单个 concrete
-instance 的临时上下文，生命周期短于 type check 全局结果。
+初始 root 产生 concrete function。扫描 concrete body 中的 `FunctionRef` 后，把尚未生成的
+`DefId + GenericArgs` 加入 worklist。单个 instance query 只替换自己的 type/const parameter，
+不递归求值 callee；递归调用由 worklist 收口。
 
-## 边界
-
-- generic template function 不直接生成 JIL body。
-- monomorph 不复制 Semantic Model，不修改 `TypeCheckStore`。
-- monomorph 不负责 concrete type layout；layout 使用 `InstanceKey` 查询 concrete nominal type。
-- 实例化过程需要 active stack，避免递归实例无限生成。
-- 递归实例化诊断接入 JIL lowering 或 monomorph 入口。
+Layout 不由单态化预收集。instance、drop、ABI 或 backend 在真实使用点用 concrete `TypeId`
+查询 `LayoutQuery`。
 
 ## 不变量
 
-- 所有 concrete JIL function 都应来自 `MonomorphStore` 或非泛型 reachable function。
-- generic nominal type 的 field type 替换通过 `concrete_member_type` 查询。
-- monomorph 不能重新做 name resolution 或 trait bound checking。
+- template lowering 不读取 concrete instance 或 concrete Layout。
+- instance 输出不得包含未绑定泛型参数。
+- borrow check、drop elaboration 和 backend 只消费 concrete function。
+- 单态化不重新 resolve、type check 或验证 trait bound。
+- 未可达的泛型函数、vtable 和 Layout 不生成结果。

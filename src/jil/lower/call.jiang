@@ -9,7 +9,7 @@ import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
 import source = "../../source.jiang";
-import monomorph = "../../sema/monomorph.jiang";
+import generic_bindings = "../../sema/generic/bindings.jiang";
 import comptime_value = "../../sema/comptime/value.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
 import types = "../../sema/type.jiang";
@@ -409,11 +409,11 @@ public extend body_context.BodyLowerer {
                 direct_args.add(self.lower_to_operand(value));
                 direct_index = direct_index + 1;
             }
+            list.ArrayList<types.GenericArg> function_args! =
+                self.owned_generic_args(self.function_args.slice());
             self.lower_async_direct_call(
-                node_id,
                 function_def,
-                self.function_type_args,
-                self.function_const_args,
+                function_args.slice(),
                 self.lowerer.storage.operand_array(direct_args$.ref()),
                 destination,
                 direct_span
@@ -530,8 +530,7 @@ public extend body_context.BodyLowerer {
         qid.TypeId context_type = self.lowerer.coroutine_context_pointer_type(span);
         jil.Operand resume = jil.function_operand_value(jil.FunctionRef (
             target: .source(self.def_id),
-            type_args: self.lowerer.storage.type_arg_array(self.function_type_args),
-            const_args: self.lowerer.storage.const_arg_array(self.function_const_args),
+            args: self.lowerer.storage.generic_arg_array(self.function_args.slice()),
             coroutine_resume: true,
             coroutine_completion: false,
             type_id: self.lowerer.coroutine_continuation_type(context_type, span)
@@ -614,7 +613,8 @@ public extend body_context.BodyLowerer {
             task_handoff: true,
             destination: self.place_for_local(unit_result),
             target: next_block,
-            initialized_place: null,
+            initialized_place: lifetime_destination,
+            deferred_initialization: true,
             return_lifetime_flows: lifetime_flows,
             lifetime_args: lifetime_args,
             lifetime_destination: lifetime_destination,
@@ -622,6 +622,7 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), span);
         self.builder.start_block(next_block);
+        self.complete_deferred_async_initialization(lifetime_destination, span);
         self.compare_exchange_passive_cancel_target(3, 0, span);
     }
 
@@ -895,21 +896,9 @@ public extend body_context.BodyLowerer {
     ) {
         qid.DefId target_def = self.direct_call_target(node_id, init_def);
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>();
-        FunctionRefArgs function_args = self.function_call_args(node_id, call.callee, target_def);
-        qid.TypeId function_type = self.function_type_for_ref(
-            target_def, function_args.type_args, function_args.const_args
+        qid.TypeId function_type = self.function_type_for_call_target(
+            node_id, call.callee, target_def, null
         );
-        if (function_args.type_args.length > 0 || function_args.const_args.length > 0) {
-            self.lowerer.ensure_function_instance_with_const_args(
-                self.body_query,
-                self.layouts,
-                target_def,
-                function_args.type_args,
-                function_args.const_args
-            );
-        } else {
-            self.lowerer.ensure_external_function(target_def);
-        }
         args.add(self.borrow_destination_operand(destination, self.lowerer.model_span(node_id)));
         self.add_constructor_call_operands(node_id, call, args$.mut_ref(), function_type);
         jil.LocalId unit_local = self.add_temp(
@@ -1165,23 +1154,63 @@ public extend body_context.BodyLowerer {
         }
         token.Span span = self.lowerer.model_span(node_id);
         qid.DefId function_def = lambda.function_def;
-        self.ensure_lambda_function_instance(function_def);
-        sem.Node refreshed_closure_node = self.lowerer.model.node(closure_id);
-        guard refreshed_closure_node.data is .lambda_expr(refreshed_lambda) else {
-            self.mark_unsupported(node_id);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.lambda_env_operand(closure_id, lambda, span));
+        list.ArrayList<types.GenericArg> function_args! =
+            self.owned_generic_args(self.function_args.slice());
+        if (!self.current_effects.has_async) {
+            self.lower_symbolic_async_sync_call(
+                function_def,
+                function_args.slice(),
+                self.lowerer.storage.operand_array(args$.ref()),
+                destination,
+                span
+            );
             return;
         }
-        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
-        args.add(self.lambda_env_operand(closure_id, refreshed_lambda, span));
         self.lower_async_direct_call(
-            node_id,
             function_def,
-            self.lowerer.storage.empty_type_args(),
-            self.lowerer.storage.empty_const_args(),
+            function_args.slice(),
             self.lowerer.storage.operand_array(args$.ref()),
             destination,
             span
         );
+    }
+
+    public Void lower_symbolic_async_sync_call(
+        Self&! self,
+        qid.DefId target_def,
+        types.GenericArg[]& function_args,
+        jil.Operand[]& args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.function_type_for_ref(
+            target_def, function_args
+        );
+        jil.BlockId next_block = self.builder.reserve_block(span);
+        self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.direct_function_callee(jil.FunctionRef (
+                target: .source(target_def),
+                args: self.lowerer.storage.generic_arg_array(function_args),
+                coroutine_sync: true,
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: function_type
+            )),
+            args: self.lowerer.storage.operand_slice(args),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: destination,
+            target: next_block,
+            initialized_place: null,
+            return_lifetime_flows: self.type_return_lifetime_flows(function_type, 0),
+            lifetime_args: args,
+            lifetime_destination: destination,
+            exclusive_places: self.lowerer.storage.empty_places(),
+            cleanup: null
+        )), span);
+        self.builder.start_block(next_block);
     }
 
     public Void lower_raw_fn_to_fn(Self&! self, sem.NodeId node_id, sem.Call call, jil.Place destination) {
@@ -1273,8 +1302,7 @@ public extend body_context.BodyLowerer {
             type_id: code_type,
             value: jil.function_static_value(jil.FunctionRef (
                 target: .generated(self.lowerer.program.generated_function_target(shim_id)),
-                type_args: self.lowerer.storage.empty_type_args(),
-                const_args: self.lowerer.storage.empty_const_args(),
+                args: self.lowerer.storage.empty_generic_args(),
                 coroutine_resume: false,
             coroutine_completion: false,
                 type_id: code_type
@@ -1387,8 +1415,7 @@ public extend body_context.BodyLowerer {
         self.lowerer.program.add_generated_function(jil.Function(
             id: function_id,
             origin: .generated(origin),
-            type_args: self.lowerer.storage.empty_type_args(),
-            const_args: self.lowerer.storage.empty_const_args(),
+            args: self.lowerer.storage.empty_generic_args(),
             signature_id: null,
             effects: types.EffectSet(),
             is_coroutine: false,
@@ -1403,7 +1430,7 @@ public extend body_context.BodyLowerer {
             span: span,
             body: body
         ));
-        self.register_current_monomorph_owners(function_id);
+        self.mark_current_shared_codegen_function(function_id);
         self.lowerer.program.mark_borrow_check_exempt(function_id);
         return function_id;
     }
@@ -1466,8 +1493,7 @@ public extend body_context.BodyLowerer {
         self.lowerer.program.add_generated_function(jil.Function (
             id: function_id,
             origin: .generated(origin),
-            type_args: self.lowerer.storage.empty_type_args(),
-            const_args: self.lowerer.storage.empty_const_args(),
+            args: self.lowerer.storage.empty_generic_args(),
             signature_id: null,
             effects: types.EffectSet(),
             is_coroutine: false,
@@ -1489,7 +1515,7 @@ public extend body_context.BodyLowerer {
                 return_local: jil.LocalId.from_index(0)
             )
         ));
-        self.register_current_monomorph_owners(function_id);
+        self.mark_current_shared_codegen_function(function_id);
         self.lowerer.program.mark_borrow_check_exempt(function_id);
         return function_id;
     }
@@ -1949,7 +1975,9 @@ public extend body_context.BodyLowerer {
             return;
         }
         qid.DefId owner_def = named.def_id;
-        monomorph.SubstitutionMap substitutions = self.nominal_substitution(owner_def, named.type_args);
+        generic_bindings.GenericBindings substitutions = self.nominal_substitution(
+            owner_def, named.args
+        );
         guard self.lowerer.model.def(owner_def) is .some(owner_model) else {
             self.mark_unsupported(node_id);
             return;
@@ -1986,7 +2014,7 @@ public extend body_context.BodyLowerer {
         qid.DefId owner_def,
         Int member_count,
         jil.Place destination,
-        monomorph.SubstitutionMap& substitutions
+        generic_bindings.GenericBindings& substitutions
     ) {
         Int field_index! = 0;
         Int member_index! = 0;
@@ -2013,7 +2041,7 @@ public extend body_context.BodyLowerer {
     public Bool lower_default_nominal_ordered_field(Self&! self,
         jil.Place destination,
         qid.DefId field_def,
-        monomorph.SubstitutionMap& substitutions,
+        generic_bindings.GenericBindings& substitutions,
         sem.NodeId call_id,
         Int field_index
     ) {
@@ -2029,7 +2057,7 @@ public extend body_context.BodyLowerer {
         sem.NodeId call_id,
         jil.Place destination,
         qid.DefId field_def,
-        monomorph.SubstitutionMap& substitutions
+        generic_bindings.GenericBindings& substitutions
     ) {
         guard self.default_constructor_field_value(call_id, field_def) is .some(value) else {
             return false;
@@ -2069,8 +2097,7 @@ public extend body_context.BodyLowerer {
         qid.DefId function_def,
         jil.Place destination
     ) {
-        qid.DefId selected_def = self.direct_call_target(node_id, function_def);
-        qid.DefId target_def = self.static_dispatch_target_for_call(call, selected_def);
+        qid.DefId target_def = self.direct_call_target(node_id, function_def);
         def.DefKind target_kind = self.lowerer.store.defs.get(target_def).kind;
         if (self.is_assert_call(target_def, target_kind)) {
             self.lower_builtin_assert(node_id, call);
@@ -2097,37 +2124,23 @@ public extend body_context.BodyLowerer {
             return;
         }
         qid.TypeId? call_receiver_type = self.function_call_receiver_type(
-            call.callee, selected_def
+            call.callee, target_def
         );
-        FunctionRefArgs function_args = self.function_call_args_for_receiver(
-            node_id, call.callee, selected_def, call_receiver_type
+        qid.TypeId function_type = self.function_type_for_call_target(
+            node_id, call.callee, target_def, call_receiver_type
         );
-        qid.TypeId function_type = self.function_type_for_ref(
-            target_def, function_args.type_args, function_args.const_args
-        );
-        if (function_args.type_args.length > 0 || function_args.const_args.length > 0) {
-            self.lowerer.ensure_function_instance_with_const_args(
-                self.body_query,
-                self.layouts,
-                target_def,
-                function_args.type_args,
-                function_args.const_args
-            );
-        } else {
-            self.lowerer.ensure_external_function(target_def);
-        }
         if (self.function_type_is_async(function_type)) {
             list.ArrayList<jil.Operand> args! = self.lower_call_operands(
                 node_id, call, target_def, function_type
             );
             FunctionRefArgs async_callee_args = self.function_call_args_for_receiver(
-                node_id, call.callee, selected_def, call_receiver_type
+                node_id, call.callee, target_def, call_receiver_type
             );
+            list.ArrayList<types.GenericArg> async_function_args! =
+                self.owned_generic_args(async_callee_args.args);
             self.lower_async_direct_call(
-                node_id,
                 target_def,
-                async_callee_args.type_args,
-                async_callee_args.const_args,
+                async_function_args.slice(),
                 self.lowerer.storage.operand_array(args$.ref()),
                 destination,
                 self.lowerer.model_span(node_id)
@@ -2141,7 +2154,7 @@ public extend body_context.BodyLowerer {
         );
         jil.BlockId next_block = self.builder.reserve_block(self.lowerer.model_span(node_id));
         FunctionRefArgs callee_args = self.function_call_args_for_receiver(
-            node_id, call.callee, selected_def, call_receiver_type
+            node_id, call.callee, target_def, call_receiver_type
         );
         jil.Place[]& exclusive_places = self.freeze_exclusive_places(exclusive_locations$.ref());
         self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
@@ -2161,6 +2174,19 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), self.lowerer.model_span(node_id));
         self.builder.start_block(next_block);
+    }
+
+    qid.TypeId function_type_for_call_target(
+        Self&! self,
+        sem.NodeId node_id,
+        sem.NodeId callee_id,
+        qid.DefId target_def,
+        qid.TypeId? receiver_type
+    ) {
+        FunctionRefArgs args = self.function_call_args_for_receiver(
+            node_id, callee_id, target_def, receiver_type
+        );
+        return self.function_type_for_ref(target_def, args.args);
     }
 
     public Void lower_atomic_builtin_call(

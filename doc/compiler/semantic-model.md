@@ -1,13 +1,14 @@
 # Semantic Model 设计
 
-Semantic Model 是 resolve 之后的高级语义树。它已经完成名字解析，但仍未类型化。Semantic Model 以 `DefId`
-为 owner 组织：每个有语义所有权的 definition 对应一个 `sem.Def`，`sem.NodeId` 只在所属
+Semantic Model 是 resolve 之后的高级语义树。它已经完成名字解析，但仍未类型化。
+Semantic Model 以 `DefId` 为 owner 组织：每个有语义所有权的 definition 对应一个
+`sem.Def`，`sem.NodeId` 只在所属
 `sem.Def` 内有效。
 
 ## 职责
 
 - 保存 resolved source-level 语义结构。
-- 作为 type check、monomorph、JIL lowering 和后续工具的主要输入。
+- 作为 type check、template JIL lowering 和后续工具的主要输入。
 - 把 AST 的语法细节整理成更稳定的语义节点。
 - 保留 source map 需要的定位信息，但不把 span 写进类型或布局事实。
 
@@ -41,4 +42,5 @@ Semantic Model 是 resolve 之后的高级语义树。它已经完成名字解�
 - type check 不回读 AST，只消费 Semantic Model。
 - JIL lowering 不重新 resolve，也不重新 type check。
 - Semantic Model 是 session-local 语义表；每轮 `CompilerContext.begin_compilation` 都会重建 `sem_store.Store`。
-- 长期增量只保存稳定 fingerprint 和 public generic Semantic Model template，不保存当前轮的 `sem.NodeId` / `sem.Def`。
+- 长期增量只保存稳定 fingerprint 和 public generic Semantic Model template，
+  不保存当前轮的 `sem.NodeId` / `sem.Def`。

@@ -1,13 +1,13 @@
 # Layout 设计
 
-layout 是按需查询或批量物化的 concrete type layout 层。它的数据来源不是 JIL body。
-layout 消费 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore` 和 `TargetLayout`，
-输出 `LayoutStore`。JIL lowering 可以触发 layout 查询，但不能自己计算 layout。
+layout 是按需物化的 concrete type layout 层。它的数据来源不是 JIL body。
+layout 消费 Semantic Model、`TypeCheckStore`、`TypeStore` 和 `TargetLayout`，输出 `LayoutStore`。
+JIL、drop 和 backend 可以触发 layout 查询，但不能自己计算 layout。
 
 ## 边界
 
 - layout 不回读 AST，不重新 resolve，不重新 type check。
-- layout 不修改 Semantic Model、`TypeCheckStore`、`TypeStore`、`MonomorphStore` 或 JIL。
+- layout 不修改 Semantic Model、`TypeCheckStore`、`TypeStore` 或 JIL。
 - layout 不遍历 JIL 来决定类型布局。
 - layout key 表达 concrete type 语义身份，nominal generic type 必须带 type args。
 - layout 负责 size、align、stride 和 field offset。
@@ -18,7 +18,7 @@ layout 消费 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore` 和
 ## 顺序
 
 ```text
-Semantic Model + TypeCheckStore + MonomorphStore + TargetLayout
+Semantic Model + TypeCheckStore + TypeStore + TargetLayout
   -> layout query
   -> LayoutStore
 ```

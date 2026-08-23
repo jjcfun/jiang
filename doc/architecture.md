@@ -15,9 +15,9 @@ driver/cli -> pipeline.compile
                        provider dylib      public syntax       early comptime
                          prepare           expansion           source select
 
-        Semantic Model -> type facts + const values -> monomorph instances -> JIL -> checked JIL -> backend output
-                 \                    \              \             \          \
-                  --------------------- layout facts --------------------------
+        Semantic Model -> type facts + const values -> template JIL -> concrete JIL -> checked JIL -> backend output
+                 \                    \                 \              \          \
+                  --------------------- layout facts -----------------------------
 ```
 
 流程中的几个块对应：
@@ -31,8 +31,8 @@ driver/cli -> pipeline.compile
 - `Semantic Model`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
   source selection 在 resolve/Semantic Model lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
-- `monomorph instances`：type check 之后收集的 concrete generic instance 集合。
-- `JIL`：Semantic Model lowering 生成的 CFG。
+- `template JIL`：每个源码函数 lowering 一次、允许包含泛型参数的 CFG。
+- `concrete JIL`：从真实入口和调用引用出发，按 `InstanceKey` 渐进实例化的 CFG。
 - `checked JIL`：borrow check 后经过 drop elaboration 的 JIL。
 - `backend output`：LLVM IR、object file 或 executable。
 - `layout facts`：由 Semantic Model、type facts 和 target layout 按需查询得到，供 JIL、borrow/drop 和
@@ -54,7 +54,7 @@ trait、builtin named type 的 namespace 外壳、body-less builtin trait implem
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 
 `layout` 是 store 层事实，不从 JIL body 生成。它消费 Semantic Model、`TypeCheckStore`、
-`MonomorphStore` 和 target layout。JIL lowering、borrow check、drop elaboration
+`TypeStore` 和 target layout。JIL instance、borrow check、drop elaboration
 和 backend 都可以按需查询 layout；各阶段不能绕过 `LayoutStore` 自己推导 field offset、size
 或 ABI 表达。
 
@@ -105,13 +105,9 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 禁止：执行运行时副作用、生成 JIL/backend 节点、把 `ComptimeValue` 泄漏到 backend。
   - 备注：`comptime if` 的 top-level item 选择目前嵌在 resolve/name resolver 和 Semantic Model lowering
     中，通过 `CompileSelector` 判断条件；`ComptimeStore` 本身只保存 const value。
-- `monomorph`
-  - 生产：concrete generic instance 集合。
-  - 消费：type facts、Semantic Model generic template。
-  - 禁止：生成目标代码、修改 type facts。
 - `jil`
-  - 生产：CFG、local、place、rvalue、terminator。
-  - 消费：Semantic Model、type facts、builtin operation lowering kind、monomorph、layout query。
+  - 生产：template CFG，以及按需实例化的 concrete CFG、local、place、rvalue、terminator。
+  - 消费：Semantic Model、type facts、builtin operation lowering kind、layout query。
   - 禁止：重新 resolve/type check、按源码文本重新判断 builtin operation、写 backend symbol。
   - 备注：`Trait.Any` 动态调用、`Trait.VTable` slot 和 `Trait.Receiver` 构造在 JIL lowering
     中消费 type check 已选出的 companion facts，不在 JIL 里重新做 trait lookup。
@@ -220,8 +216,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
   type check / JIL / layout 的 compiler-known facts 承接。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
-- `MonomorphStore` 和 `jil.Store` 是单次 pipeline 中的阶段产物；pipeline 的
-  `BorrowCheckStore` 结果发布到 `CompilerStore.borrowck`，作为 borrow facts 的唯一
+- `jil.Store` 是单次 pipeline 中的阶段产物；pipeline 的 `BorrowCheckStore` 结果发布到
+  `CompilerStore.borrowck`，作为 borrow facts 的唯一
   owner。backend 直接消费 drop elaboration 后的同一个 `jil.Store`，不维护一份
   等价 JIL。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
@@ -272,8 +268,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   详见 [Semantic Model 设计](compiler/semantic-model.md)。
 - `sema` 还负责类型检查、trait、generic、overload 和类型转换；
   详见 [Type Check 设计](compiler/type-check.md)。
-- `monomorph` 运行在 type check 之后，负责收集 concrete generic instances；
-  详见 [Monomorph 设计](compiler/monomorph.md)。
+- JIL 单态化在 template lowering 之后按可达引用生成 concrete instance；
+  详见 [JIL 单态化设计](compiler/monomorph.md)。
 - `jil` 包含 JIL 数据定义、Semantic Model -> JIL lowering 和 drop elaboration；JIL lowering 可以查询
   layout 做布局相关的 representation 决策，但 layout 仍由 `layout` 模块统一计算；
   详见 [JIL 设计](compiler/jil.md)。
@@ -312,7 +308,7 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   和 `IncrementalSymbolStore` 都挂在 `CompilerStore`。
 - `SourceArtifactCache` 和 `ObjectArtifactCache` 挂在 `CompilerStore`，用于
   artifact 复用统计和 object 复用。
-- `MonomorphStore`、`jil.Store` 和 `ModuleGraph` 是单次 pipeline 调用中的阶段产物；
+- `jil.Store` 和 `ModuleGraph` 是单次 pipeline 调用中的阶段产物；
   pipeline borrow result 在完成后移入 `CompilerStore.borrowck`。
 - `ModuleResolver` 是本次 `compile_package` active AST 的唯一 owner；module 完成 Semantic Model
   lowering 后立即释放对应 AST。
@@ -359,7 +355,7 @@ src/
   core.jiang    compiler-known core 源码入口
   core/         builtin trait/type 外壳、intrinsic 声明
   resolve/      symbol store、keyword store、import/module/name resolver
-  sema/         type store、trait、generic、overload、type check、comptime、monomorph
+  sema/         type store、trait、generic、overload、type check、comptime
     model.jiang Semantic Model 稳定入口
     model/      Semantic Model store
     comptime/   source selection、const value evaluator/interpreter、ComptimeStore
@@ -371,6 +367,7 @@ src/
     model/      ID、Place、Value、CFG、Program 和 Store
     lower.jiang Semantic Model -> JIL lowering 入口
     lower/      package lowering 和共享 support
+    instantiate.jiang template JIL -> concrete JIL 实例化
     analysis.jiang  JIL dataflow analysis 入口
     analysis/   provenance、escape 和参数属性证明
     optimize.jiang JIL 优化编排入口

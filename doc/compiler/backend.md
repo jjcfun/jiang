@@ -7,9 +7,11 @@ LLVM-specific lowering 不写进 JIL 或 layout。
 
 - JIL function bodies。
 - `LayoutStore` 中的 concrete type layout。
-- monomorph `MonomorphStore`。
 - target 配置。
 - root package import closure 中所有 reachable concrete functions。
+
+backend 只消费 `instance_jil(InstanceKey)` 产生的 concrete function；不能接收 template body，
+也不能自行重新实例化泛型。
 
 ## LLVM 关系
 

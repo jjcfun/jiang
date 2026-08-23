@@ -9,16 +9,18 @@ import diagnostic = "../../diagnostic.jiang";
 import sem_store = "../../sema/model/store.jiang";
 import module_graph = "../../resolve/module_graph.jiang";
 import store = "../../resolve/store.jiang";
-import monomorph = "../../sema/monomorph.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
 import qid = "../../id.jiang";
 import list = "../../support/list.jiang";
+import map = "../../support/map.jiang";
 import system_target = "../../system/target.jiang";
 import jil = "../model.jiang";
+import std;
 import coroutine_confinement = "../coroutine/confinement.jiang";
 import coroutine_rtc = "../coroutine/run_to_completion.jiang";
 import lower_context = "./context.jiang";
 public import lower_coroutine = "./coroutine.jiang";
+public import lower_derived = "./derived.jiang";
 public import lower_function = "./function.jiang";
 public import lower_entry = "./entry.jiang";
 public import lower_local = "./local.jiang";
@@ -29,12 +31,11 @@ public import lower_domain_executor = "./domain_executor.jiang";
 @life()
 public jil.Store^ lower_package(
     context.CompilerContext&! ctx,
-    monomorph.MonomorphStore& instances,
     module_graph.ModuleGraph& graph
 ) {
     sem_store.Store& model = ctx.store.model$.ref();
     typeck_store.TypeCheckStore& typeck = ctx.store.typeck$.ref();
-    return lower_package(ctx, model, typeck, instances, graph);
+    return lower_package(ctx, model, typeck, graph);
 }
 
 @life()
@@ -42,7 +43,6 @@ public jil.Store^ lower_package(
     context.CompilerContext&! ctx,
     sem_store.Store& model,
     typeck_store.TypeCheckStore& typeck,
-    monomorph.MonomorphStore& instances,
     module_graph.ModuleGraph& graph
 ) {
     jil.Store^ output! = new jil.Store(model.ok && typeck.ok);
@@ -59,12 +59,13 @@ public jil.Store^ lower_package(
     diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
     lower_package_into(
         ctx.store$.ref(),
-        ctx.query.jil_body$.ref(),
+        ctx.query.template_jil$.ref(),
+        ctx.query.trait_vtable$.ref(),
+        ctx.query.instance_jil$.ref(),
         ctx.query.layout$.mut_ref(),
         ctx.output,
         model,
         typeck,
-        instances,
         graph,
         closure_env_symbol,
         output$.mut_ref(),
@@ -87,12 +88,13 @@ public jil.Store^ lower_package(
 
 Void lower_package_into(
     compiler_store.CompilerStore& store,
-    database.JilBodyQuery& body_query,
+    database.TemplateJilQuery& template_query,
+    database.TraitVTableQuery& trait_vtable_query,
+    database.InstanceJilQuery& instance_query,
     database.LayoutQuery&! layouts,
     system_target.BuildOutputKind output_kind,
     sem_store.Store& model,
     typeck_store.TypeCheckStore& typeck,
-    monomorph.MonomorphStore& instances,
     module_graph.ModuleGraph& graph,
     qid.SymbolId closure_env_symbol,
     jil.Store&! output,
@@ -103,36 +105,49 @@ Void lower_package_into(
         output_kind,
         model,
         typeck,
-        instances,
         graph,
+        template_query,
+        trait_vtable_query,
         closure_env_symbol,
         output.storage$.ref(),
         output.program$.mut_ref(),
         output.drop_elaboration$.mut_ref(),
         diagnostics
     );
-    lowerer.lower_package(body_query, layouts);
+    lowerer.lower_package(instance_query, layouts);
 }
 
 public extend lower_context.Context {
     public Void lower_package(
         Self&! self,
-        database.JilBodyQuery& body_query,
+        database.InstanceJilQuery& instance_query,
         database.LayoutQuery&! layouts
     ) {
-        // JIL 调度从 module graph + Semantic Model ownership tree 派生：graph 给出本次
-        // 编译的 root/import closure，module Def.members 给出当前
-        // module 的顶层声明集合。泛型模板本身不生成 JIL；后面按
-        // MonomorphStore 为每个 concrete type args 生成独立函数体。
+        // 先为 source function 建立可含泛型参数的 template JIL。具体实例由
+        // runtime roots 和 concrete JIL 中的函数引用驱动，不再维护全量实例集合。
         Int module_index! = 0;
         while (module_index < self.graph.module_count()) {
             store.ModuleRecord& module = self.store.resolve.module_ref(self.graph.module_at(module_index));
-            self.lower_def_tree(body_query, layouts, module.def_id);
+            self.lower_def_tree(instance_query, layouts, module.def_id);
             module_index = module_index + 1;
         }
-        self.lower_instances(body_query, layouts);
-        self.ensure_custom_deinit_instances(body_query, layouts);
-        self.lower_runtime_entry(body_query, layouts);
+        self.lower_runtime_entry(instance_query, layouts);
+        map.WyHashMap<Int, Bool> active_finalization! =
+            map.WyHashMap<Int, Bool>();
+        Int referenced_global_cursor! = 0;
+        Int referenced_function_cursor! = 0;
+        Int finalization_cursor! = 0;
+        list.ArrayList<jil.FunctionId> pending_finalization! =
+            list.ArrayList<jil.FunctionId>();
+        self.close_referenced_instances(
+            instance_query,
+            layouts,
+            active_finalization$.mut_ref(),
+            referenced_global_cursor$.mut_ref(),
+            referenced_function_cursor$.mut_ref(),
+            finalization_cursor$.mut_ref(),
+            pending_finalization$.mut_ref()
+        );
         list.ArrayList<coroutine_confinement.Summary> confinement! =
             coroutine_confinement.analyze(self.program);
         self.apply_coroutine_confinement(confinement$.ref());
@@ -140,13 +155,72 @@ public extend lower_context.Context {
         self.prepare_coroutine_plans();
         self.prepare_coroutine_source_layouts();
         self.lower_coroutine_resume_functions();
+        self.close_referenced_instances(
+            instance_query,
+            layouts,
+            active_finalization$.mut_ref(),
+            referenced_global_cursor$.mut_ref(),
+            referenced_function_cursor$.mut_ref(),
+            finalization_cursor$.mut_ref(),
+            pending_finalization$.mut_ref()
+        );
         if (self.program.has_pending_generated_functions()) {
             self.program.mark_error();
+            std.String message! = std.String(
+                "JIL lowering left generated functions unfinished"
+            );
+            if (self.program.first_pending_generated_function()
+                is .some(function_id)) {
+                std.StringBuilder builder! = std.StringBuilder();
+                builder.append("JIL lowering left generated FunctionId unfinished: ");
+                builder.append(function_id.to_index());
+                jil.Function pending = self.program.function(function_id);
+                if (pending.origin is .generated(origin)) {
+                    builder.append(" (");
+                    builder.append(self.program.generated_name(origin.name));
+                    builder.append(")");
+                }
+                message = builder.into_string();
+            }
             add_lowering_error(
                 self.diagnostics$.mut_ref(),
-                "JIL lowering left generated functions unfinished",
+                message.bytes(),
                 "jil_unfinished_generated_function"
             );
+        }
+    }
+
+    Void close_referenced_instances(
+        Self&! self,
+        database.InstanceJilQuery& instance_query,
+        database.LayoutQuery&! layouts,
+        map.WyHashMap<Int, Bool>&! active_finalization,
+        Int&! referenced_global_cursor,
+        Int&! referenced_function_cursor,
+        Int&! finalization_cursor,
+        list.ArrayList<jil.FunctionId>&! pending_finalization
+    ) {
+        Bool continue_closure! = true;
+        while (continue_closure) {
+            Int previous_function_count = self.program.functions.len();
+            Int previous_global_count = self.program.globals.len();
+            self.lower_referenced_instances(
+                instance_query,
+                layouts,
+                referenced_global_cursor,
+                referenced_function_cursor
+            );
+            Bool finalized = self.finalize_instance_functions(
+                instance_query,
+                layouts,
+                active_finalization,
+                finalization_cursor,
+                pending_finalization
+            );
+            Bool discovered = previous_function_count != self.program.functions.len()
+                || previous_global_count != self.program.globals.len();
+            continue_closure = discovered
+                || (finalized && !pending_finalization.empty());
         }
     }
 

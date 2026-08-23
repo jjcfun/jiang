@@ -1,0 +1,599 @@
+// 从 concrete JIL instance 派生 closure vtable 与运行时 shim。
+//
+// Template 只保存 lambda DefId、GenericArgs 和具体化所需类型；本模块只消费已经
+// 完成替换的 ClosureRvalue，禁止在 template lowering 时发布 global/function。
+
+import database = "../../db.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import drop_semantics = "../../sema/drop.jiang";
+import types = "../../sema/type.jiang";
+import layout = "../../layout.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import references = "../references.jiang";
+import std;
+import * = "./model.jiang";
+import lower_context = "./context.jiang";
+import * = "./context.jiang";
+
+public extend lower_context.Context {
+    public Void materialize_closure(
+        Self&! self,
+        database.LayoutQuery&! layouts,
+        references.ClosureReference closure,
+        types.GenericArg[]& args,
+        token.Span span
+    ) {
+        Bool heap_environment = closure.environment_storage == .heap;
+        if (self.program.closure_vtable_global(
+            closure.lambda_def, args, heap_environment
+        ) != null) {
+            return;
+        }
+        qid.TypeId vtable_type = self.closure_vtable_value_type(closure.vtable_type);
+        qid.TypeId code_type = self.closure_vtable_field_type(vtable_type, 0);
+        qid.TypeId drop_type = self.closure_vtable_field_type(vtable_type, 1);
+        jil.GeneratedGlobalOrigin origin = self.closure_vtable_origin(
+            closure, vtable_type, heap_environment
+        );
+        jil.FunctionTarget code_target = self.closure_code_target(
+            closure, args, span
+        );
+        jil.FunctionId drop_id = self.closure_drop_function(
+            layouts, closure, args, drop_type, heap_environment, span
+        );
+        jil.FunctionRef code = jil.FunctionRef(
+            target: code_target,
+            args: self.storage.generic_arg_array(args),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: code_type
+        );
+        jil.FunctionRef drop = jil.FunctionRef(
+            target: .generated(self.program.generated_function_target(drop_id)),
+            args: self.storage.empty_generic_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: drop_type
+        );
+        list.ArrayList<jil.StaticField> fields! = list.ArrayList<jil.StaticField>(2);
+        fields.add(jil.StaticField(
+            type_id: code_type,
+            value: jil.function_static_value(code)
+        ));
+        fields.add(jil.StaticField(
+            type_id: drop_type,
+            value: jil.function_static_value(drop)
+        ));
+        jil.GlobalId global_id = jil.GlobalId.from_index(self.program.globals.len());
+        self.program.add_global(jil.Global(
+            id: global_id,
+            origin: .generated(origin),
+            type_id: vtable_type,
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: jil.StaticValue.aggregate(
+                self.storage.static_field_array(fields$.ref())
+            )
+        ));
+        self.program.set_closure_vtable_global(
+            closure.lambda_def, args, heap_environment, global_id
+        );
+    }
+
+    qid.TypeId closure_vtable_value_type(self, qid.TypeId pointer_type) {
+        types.TypeInfo info = self.store.types.get(pointer_type);
+        guard info.data is .handle_type(handle) else {
+            return self.store.types.invalid_type();
+        }
+        return handle.element;
+    }
+
+    qid.TypeId closure_vtable_field_type(
+        self,
+        qid.TypeId vtable_type,
+        Int index
+    ) {
+        types.TypeInfo info = self.store.types.get(vtable_type);
+        guard info.data is .tuple_type(tuple) else {
+            return self.store.types.invalid_type();
+        }
+        if (index < 0 || index >= tuple.items.length) {
+            return self.store.types.invalid_type();
+        }
+        return tuple.items[index];
+    }
+
+    jil.GeneratedGlobalOrigin closure_vtable_origin(
+        Self&! self,
+        references.ClosureReference closure,
+        qid.TypeId vtable_type,
+        Bool heap_environment
+    ) {
+        std.String name! = build_text_int(
+            "__closure_vtable_stack_", closure.lambda_def.to_index()
+        );
+        jil.GeneratedGlobalKind kind! = .lambda_vtable_stack;
+        if (heap_environment) {
+            name = build_text_int(
+                "__closure_vtable_heap_", closure.lambda_def.to_index()
+            );
+            kind = .lambda_vtable_heap;
+        }
+        def.DefRecord record = self.store.defs.get(closure.lambda_def);
+        return jil.GeneratedGlobalOrigin(
+            name: self.program.add_generated_name(name.bytes()),
+            module_id: record.module_id,
+            kind: kind,
+            provenance_def: closure.lambda_def,
+            identity_type: vtable_type
+        );
+    }
+
+    jil.FunctionTarget closure_code_target(
+        Self&! self,
+        references.ClosureReference closure,
+        types.GenericArg[]& args,
+        token.Span span
+    ) {
+        if (!self.closure_type_is_async(closure.closure_type)) {
+            return .source(closure.lambda_def);
+        }
+        jil.FunctionId start = self.ensure_async_callable_shims(
+            closure.lambda_def, args, span
+        );
+        return .generated(self.program.generated_function_target(start));
+    }
+
+    Bool closure_type_is_async(self, qid.TypeId closure_type) {
+        guard self.store.types.function_type_head(closure_type)
+            is .some(function_type) else { return false; }
+        return function_type.effects.has_async;
+    }
+
+    jil.FunctionId ensure_async_callable_shims(
+        Self&! self,
+        qid.DefId source_def,
+        types.GenericArg[]& args,
+        token.Span span
+    ) {
+        Int key = self.program.function_instance_identity(
+            self.storage, source_def, args
+        );
+        if (self.async_callable_start_shims.get(key) is .some(existing)) {
+            jil.FunctionId function_id = existing$.get();
+            self.program.set_async_start_function(
+                self.storage, source_def, args, function_id
+            );
+            return function_id;
+        }
+        jil.GeneratedFunctionOrigin start_origin = self.closure_function_origin(
+            source_def, "__async_fn_start_", .async_callable_start, null
+        );
+        jil.GeneratedFunctionOrigin completion_origin = self.closure_function_origin(
+            source_def, "__async_fn_complete_", .async_callable_completion, null
+        );
+        jil.FunctionId start = self.program.reserve_generated_function(
+            self.storage,
+            start_origin,
+            args,
+            span
+        );
+        jil.FunctionId completion = self.program.reserve_generated_function(
+            self.storage,
+            completion_origin,
+            args,
+            span
+        );
+        self.async_callable_start_shims.set(key, start);
+        self.async_callable_completion_shims.set(key, completion);
+        self.program.set_async_start_function(
+            self.storage, source_def, args, start
+        );
+        return start;
+    }
+
+    jil.FunctionId ensure_async_sync_shim(
+        Self&! self,
+        qid.DefId source_def,
+        types.GenericArg[]& args,
+        token.Span span
+    ) {
+        Int key = self.program.function_instance_identity(
+            self.storage, source_def, args
+        );
+        if (self.async_callable_sync_shims.get(key) is .some(existing)) {
+            jil.FunctionId function_id = existing$.get();
+            self.program.set_async_sync_function(
+                self.storage, source_def, args, function_id
+            );
+            return function_id;
+        }
+        jil.GeneratedFunctionOrigin origin = self.closure_function_origin(
+            source_def, "__async_fn_sync_", .async_callable_sync, null
+        );
+        jil.FunctionId function_id = self.program.reserve_generated_function(
+            self.storage, origin, args, span
+        );
+        self.async_callable_sync_shims.set(key, function_id);
+        self.program.set_async_sync_function(
+            self.storage, source_def, args, function_id
+        );
+        return function_id;
+    }
+
+    jil.FunctionId closure_drop_function(
+        Self&! self,
+        database.LayoutQuery&! layouts,
+        references.ClosureReference closure,
+        types.GenericArg[]& args,
+        qid.TypeId drop_type,
+        Bool heap_environment,
+        token.Span span
+    ) {
+        qid.TypeId env_type = closure.environment_type;
+        jil.FunctionId drop!;
+        if (self.closure_environment_empty(env_type)) {
+            drop = self.ensure_closure_noop_drop(
+                closure.lambda_def, args, drop_type, span
+            );
+        } else {
+            drop = self.ensure_closure_environment_drop(
+                layouts,
+                closure.lambda_def,
+                args,
+                env_type,
+                drop_type,
+                heap_environment,
+                span
+            );
+        }
+        return drop;
+    }
+
+    Bool closure_environment_empty(self, qid.TypeId env_type) {
+        types.TypeInfo info = self.store.types.get(env_type);
+        guard info.data is .closure_environment_type(environment) else {
+            return true;
+        }
+        return environment.capture_types.length == 0;
+    }
+
+    jil.FunctionId ensure_closure_noop_drop(
+        Self&! self,
+        qid.DefId owner_def,
+        types.GenericArg[]& owner_args,
+        qid.TypeId drop_type,
+        token.Span span
+    ) {
+        if (self.closure_noop_drop_shim is .some(existing)) { return existing; }
+        jil.GeneratedFunctionOrigin origin = self.closure_function_origin(
+            owner_def, "__closure_drop_noop", .closure_noop_drop, drop_type
+        );
+        list.ArrayList<jil.LocalDecl> locals! = self.noop_drop_locals(span);
+        list.ArrayList<jil.Block> blocks! = self.noop_drop_blocks(span);
+        jil.FunctionId function_id = self.add_closure_drop_function(
+            origin,
+            owner_def,
+            owner_args,
+            locals$.ref(),
+            blocks$.ref(),
+            span
+        );
+        self.closure_noop_drop_shim = function_id;
+        return function_id;
+    }
+
+    jil.FunctionId ensure_closure_environment_drop(
+        Self&! self,
+        database.LayoutQuery&! layouts,
+        qid.DefId owner_def,
+        types.GenericArg[]& owner_args,
+        qid.TypeId env_type,
+        qid.TypeId drop_type,
+        Bool heap_environment,
+        token.Span span
+    ) {
+        Int key! = env_type.to_index() * 2;
+        if (heap_environment) { key = key + 1; }
+        if (self.lambda_env_drop_shims.get(key) is .some(existing)) {
+            return existing$.get();
+        }
+        jil.GeneratedFunctionKind kind! = .closure_env_drop_stack;
+        UInt8[]& prefix! = "__closure_drop_env_stack_";
+        if (heap_environment) {
+            kind = .closure_env_drop_heap;
+            prefix = "__closure_drop_env_heap_";
+        }
+        jil.GeneratedFunctionOrigin origin = self.closure_function_origin(
+            owner_def,
+            build_text_int(prefix, env_type.to_index()).bytes(),
+            kind,
+            env_type
+        );
+        jil.FunctionId function_id = self.add_closure_environment_drop(
+            layouts,
+            origin,
+            owner_def,
+            owner_args,
+            env_type,
+            drop_type,
+            heap_environment,
+            span
+        );
+        self.lambda_env_drop_shims.set(key, function_id);
+        return function_id;
+    }
+
+    jil.GeneratedFunctionOrigin closure_function_origin(
+        Self&! self,
+        qid.DefId owner_def,
+        UInt8[]& prefix,
+        jil.GeneratedFunctionKind kind,
+        qid.TypeId? identity_type
+    ) {
+        def.DefRecord record = self.store.defs.get(owner_def);
+        std.String name = build_text_int(prefix, owner_def.to_index());
+        return jil.GeneratedFunctionOrigin(
+            name: self.program.add_generated_name(name.bytes()),
+            module_id: record.module_id,
+            kind: kind,
+            provenance_def: owner_def,
+            identity_type: identity_type
+        );
+    }
+
+    list.ArrayList<jil.LocalDecl> noop_drop_locals(
+        self,
+        token.Span span
+    ) {
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(2);
+        locals.add(self.closure_drop_local(
+            0, .return_place, self.store.types.unit_type(), span
+        ));
+        locals.add(self.closure_drop_local(
+            1, .param, self.store.types.opaque_pointer_type(span), span
+        ));
+        return locals;
+    }
+
+    list.ArrayList<jil.Block> noop_drop_blocks(self, token.Span span) {
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(1);
+        blocks.add(self.closure_drop_return_block(
+            StatementSlice(values: self.storage.empty_statements()), span, 0
+        ));
+        return blocks;
+    }
+
+    jil.FunctionId add_closure_environment_drop(
+        Self&! self,
+        database.LayoutQuery&! layouts,
+        jil.GeneratedFunctionOrigin origin,
+        qid.DefId owner_def,
+        types.GenericArg[]& owner_args,
+        qid.TypeId env_type,
+        qid.TypeId drop_type,
+        Bool heap_environment,
+        token.Span span
+    ) {
+        qid.TypeId pointer_type = self.store.types.raw_pointer_type(env_type, span);
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(3);
+        locals.add(self.closure_drop_local(
+            0, .return_place, self.store.types.unit_type(), span
+        ));
+        locals.add(self.closure_drop_local(
+            1, .param, self.store.types.opaque_pointer_type(span), span
+        ));
+        locals.add(self.closure_drop_local(2, .compiler_temp, pointer_type, span));
+        list.ArrayList<jil.Block> blocks = self.closure_environment_drop_blocks(
+            layouts, env_type, pointer_type, heap_environment, span
+        );
+        return self.add_closure_drop_function(
+            origin,
+            owner_def,
+            owner_args,
+            locals$.ref(),
+            blocks$.ref(),
+            span
+        );
+    }
+
+    list.ArrayList<jil.Block> closure_environment_drop_blocks(
+        Self&! self,
+        database.LayoutQuery&! layouts,
+        qid.TypeId env_type,
+        qid.TypeId pointer_type,
+        Bool heap_environment,
+        token.Span span
+    ) {
+        drop_semantics.DropQuery query = drop_semantics.DropQuery(self.store$.ref());
+        Bool needs_drop = query.type_needs_runtime_drop(layouts, env_type);
+        list.ArrayList<jil.Statement> entry! = list.ArrayList<jil.Statement>(1);
+        if (needs_drop) { entry.add(self.closure_env_pointer_assign(pointer_type, span)); }
+        list.ArrayList<jil.Statement> exit! = list.ArrayList<jil.Statement>(1);
+        if (heap_environment) { exit.add(self.closure_env_free(span)); }
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+        if (needs_drop) {
+            blocks.add(self.closure_env_drop_block(entry$.ref(), span));
+            blocks.add(self.closure_drop_return_block(
+                StatementSlice(values: self.storage.statement_array(exit$.ref())),
+                span,
+                1
+            ));
+            return blocks;
+        }
+        blocks.add(self.closure_drop_return_block(
+            StatementSlice(values: self.storage.statement_array(exit$.ref())),
+            span,
+            0
+        ));
+        return blocks;
+    }
+
+    jil.Statement closure_env_pointer_assign(
+        self,
+        qid.TypeId pointer_type,
+        token.Span span
+    ) {
+        return jil.Statement(
+            span: span,
+            kind: .assign_stmt(jil.AssignStatement(
+                destination: self.closure_drop_place(2),
+                value: jil.cast_rvalue(jil.CastRvalue(
+                    kind: .ptr_to_ptr,
+                    value: jil.copy_operand_value(jil.CopyOperand(
+                        place: self.closure_drop_place(1)
+                    )),
+                    target_type: pointer_type
+                ))
+            ))
+        );
+    }
+
+    jil.Statement closure_env_free(self, token.Span span) {
+        return jil.Statement(
+            span: span,
+            kind: .assign_stmt(jil.AssignStatement(
+                destination: self.closure_drop_place(0),
+                value: jil.free_rvalue(jil.FreeRvalue(
+                    pointer: jil.copy_operand_value(jil.CopyOperand(
+                        place: self.closure_drop_place(1)
+                    ))
+                ))
+            ))
+        );
+    }
+
+    jil.Block closure_env_drop_block(
+        self,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(1);
+        projection.add(jil.deref_projection_elem(jil.DerefProjection(
+            raw_pointer: true
+        )));
+        jil.Place pointee = jil.local_place(
+            jil.LocalId.from_index(2), self.storage.projection_array(projection$.ref())
+        );
+        return jil.Block(
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.storage.statement_array(statements),
+            terminator: jil.Terminator(
+                span: span,
+                kind: .drop_term(jil.DropTerminator(
+                    place: pointee,
+                    target: jil.BlockId.from_index(1),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    @life(return: self & statements)
+    jil.Block closure_drop_return_block(
+        self,
+        StatementSlice statements,
+        token.Span span,
+        Int index
+    ) {
+        return jil.Block(
+            id: jil.BlockId.from_index(index),
+            span: span,
+            statements: statements.values,
+            terminator: jil.Terminator(
+                span: span,
+                kind: .return_term(jil.ReturnTerminator(implicit_unit: true))
+            )
+        );
+    }
+
+    jil.LocalDecl closure_drop_local(
+        self,
+        Int index,
+        jil.LocalKind kind,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        return jil.LocalDecl(
+            id: jil.LocalId.from_index(index),
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    jil.Place closure_drop_place(self, Int index) {
+        return jil.local_place(
+            jil.LocalId.from_index(index), self.storage.empty_projection()
+        );
+    }
+
+    jil.FunctionId add_closure_drop_function(
+        Self&! self,
+        jil.GeneratedFunctionOrigin origin,
+        qid.DefId owner_def,
+        types.GenericArg[]& owner_args,
+        list.ArrayList<jil.LocalDecl>& locals,
+        list.ArrayList<jil.Block>& blocks,
+        token.Span span
+    ) {
+        Int function_index = self.program.functions.len();
+        jil.FunctionId function_id = jil.FunctionId.from_index(function_index);
+        jil.Body body = jil.Body(
+            id: jil.BodyId.from_index(function_index),
+            span: span,
+            locals: self.freeze_closure_drop_locals(locals),
+            blocks: self.storage.block_array(blocks),
+            entry: jil.BlockId.from_index(0),
+            return_local: jil.LocalId.from_index(0)
+        );
+        self.program.add_generated_function(jil.Function(
+            id: function_id,
+            origin: .generated(origin),
+            args: self.storage.empty_generic_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: false,
+            naked: false,
+            span: span,
+            body: body
+        ));
+        if (owner_args.length != 0) {
+            self.program.mark_shared_codegen_function(function_id);
+        }
+        self.program.mark_borrow_check_exempt(function_id);
+        return function_id;
+    }
+
+    @life(return: self.b)
+    jil.LocalDecl[]& freeze_closure_drop_locals(
+        self,
+        list.ArrayList<jil.LocalDecl>& locals
+    ) {
+        unsafe {
+            jil.LocalDecl*! stored = self.storage.alloc_local_array(locals.len());
+            Int index! = 0;
+            while (index < locals.len()) {
+                stored[index] = locals.get(index);
+                index = index + 1;
+            }
+            return stored[0..locals.len()];
+        }
+    }
+}
