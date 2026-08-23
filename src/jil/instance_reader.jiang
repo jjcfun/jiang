@@ -1,0 +1,361 @@
+// generic JIL 的实例读取入口。
+//
+// InstanceReader 只解释 InstanceKey 对应的类型、const 和 callee，不复制 CFG。
+
+import compiler_store = "../store.jiang";
+import def = "../resolve/def.jiang";
+import generic_bindings = "../sema/generic/bindings.jiang";
+import comptime_value = "../sema/comptime/value.jiang";
+import types = "../sema/type.jiang";
+import qid = "../id.jiang";
+import list = "../support/list.jiang";
+import jil = "./model.jiang";
+
+public struct ResolvedCallee: Movable {
+    public jil.FunctionTarget target;
+    public list.ArrayList<types.GenericArg> args!;
+    public qid.TypeId? dispatch_type;
+}
+
+@region(a)
+public struct InstanceReader: Movable {
+    @life(a)
+    compiler_store.CompilerStore& store;
+    @life(a)
+    generic_bindings.GenericBindings& bindings;
+
+    public init(
+        self,
+        compiler_store.CompilerStore& store,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        self.store = store;
+        self.bindings = bindings;
+    }
+
+    public qid.TypeId type_id(self, qid.TypeId value) {
+        return generic_bindings.substitute_type(
+            self.store.types$.ref(), value, self.bindings
+        );
+    }
+
+    public types.EffectSet effects(self, types.EffectSet value) {
+        return generic_bindings.substitute_effects(
+            self.store.types$.ref(), value, self.bindings
+        );
+    }
+
+    public qid.DefId const_binding_def(self, qid.DefId value) {
+        if (self.bindings.const_binding_def(value) is .some(concrete)) {
+            return concrete;
+        }
+        return value;
+    }
+
+    public qid.DefId? optional_const_binding_def(self, qid.DefId? value) {
+        guard value is .some(binding) else { return null; }
+        return self.const_binding_def(binding);
+    }
+
+    public comptime_value.ComptimeValue comptime_value(
+        self,
+        comptime_value.ComptimeValue value
+    ) {
+        if (value.data is .const_param_value(param_def)) {
+            if (self.bindings.const_binding(param_def) is .some(concrete)) {
+                return concrete;
+            }
+        }
+        return value;
+    }
+
+    public list.ArrayList<types.GenericArg> generic_args(
+        self,
+        types.GenericArg[]& raw_args
+    ) {
+        list.ArrayList<types.GenericArg> result! =
+            list.ArrayList<types.GenericArg>(raw_args.length);
+        Int index! = 0;
+        while (index < raw_args.length) {
+            types.GenericArg arg = raw_args[index];
+            if (arg is .type_arg(type_arg)) {
+                self.append_type_arg(type_arg, result$.mut_ref());
+            } else if (arg is .const_arg(const_arg)) {
+                self.append_const_arg(const_arg, result$.mut_ref());
+            }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    public ResolvedCallee callee(
+        self,
+        jil.FunctionTarget source_target,
+        types.GenericArg[]& source_args,
+        qid.TypeId? source_dispatch_type
+    ) {
+        qid.TypeId? dispatch_type! = null;
+        jil.FunctionTarget target! = source_target;
+        list.ArrayList<types.GenericArg> concrete_args! = self.generic_args(source_args);
+        if (source_dispatch_type is .some(raw_dispatch_type)) {
+            qid.TypeId concrete_dispatch_type = self.type_id(raw_dispatch_type);
+            dispatch_type = concrete_dispatch_type;
+            if (source_target is .source(trait_member)) {
+                if (self.resolve_static_dispatch(trait_member, concrete_dispatch_type)
+                    is .some(impl_member)) {
+                    target = .source(impl_member);
+                    dispatch_type = null;
+                    if (impl_member != trait_member) {
+                        concrete_args = self.retarget_trait_args(
+                            trait_member,
+                            impl_member,
+                            concrete_dispatch_type,
+                            concrete_args.slice()
+                        );
+                    }
+                }
+            }
+        }
+        return ResolvedCallee(
+            target: target,
+            args: concrete_args.take(),
+            dispatch_type: dispatch_type
+        );
+    }
+
+    public qid.TypeId function_type(
+        self,
+        jil.FunctionTarget target,
+        types.GenericArg[]& args,
+        qid.TypeId caller_type
+    ) {
+        guard target is .source(function_def) else { return self.type_id(caller_type); }
+        return generic_bindings.type_for_instance(
+            self.store.defs$.ref(),
+            self.store.model$.ref(),
+            self.store.types$.ref(),
+            function_def,
+            self.type_id(caller_type),
+            args
+        );
+    }
+
+    Void append_type_arg(
+        self,
+        types.GenericTypeArg type_arg,
+        list.ArrayList<types.GenericArg>&! result
+    ) {
+        qid.TypeId concrete_type = self.type_id(type_arg.value);
+        if (type_arg.param_def is .some(param_def)) {
+            result.add(types.generic_type_param_arg(param_def, concrete_type));
+            return;
+        }
+        result.add(types.generic_type_arg(concrete_type));
+    }
+
+    Void append_const_arg(
+        self,
+        types.GenericConstArg const_arg,
+        list.ArrayList<types.GenericArg>&! result
+    ) {
+        comptime_value.ComptimeValue concrete_value = self.comptime_value(const_arg.value);
+        qid.DefId? binding_def = self.optional_const_binding_def(const_arg.binding_def);
+        if (const_arg.param_def is .some(param_def)) {
+            result.add(types.generic_const_param_arg(param_def, concrete_value, binding_def));
+            return;
+        }
+        result.add(types.generic_const_arg(concrete_value, binding_def));
+    }
+
+    list.ArrayList<types.GenericArg> retarget_trait_args(
+        self,
+        qid.DefId trait_member,
+        qid.DefId impl_member,
+        qid.TypeId receiver_type,
+        types.GenericArg[]& args
+    ) {
+        list.ArrayList<types.GenericArg> result! = list.ArrayList<types.GenericArg>();
+        self.append_receiver_args(impl_member, receiver_type, result$.mut_ref());
+        Int index! = 0;
+        while (index < self.store.model.def_generic_param_count(trait_member)
+            && index < self.store.model.def_generic_param_count(impl_member)) {
+            qid.DefId source_param =
+                self.store.model.def_generic_param_at(trait_member, index);
+            qid.DefId target_param =
+                self.store.model.def_generic_param_at(impl_member, index);
+            if (self.generic_arg_for_param(args, source_param) is .some(arg)) {
+                result.add(self.retarget_arg(target_param, arg));
+            }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    types.GenericArg? generic_arg_for_param(
+        self,
+        types.GenericArg[]& args,
+        qid.DefId param_def
+    ) {
+        Int index! = 0;
+        while (index < args.length) {
+            types.GenericArg arg = args[index];
+            if (arg is .type_arg(type_arg)) {
+                if (type_arg.param_def is .some(source_param)
+                    && source_param == param_def) {
+                    return arg;
+                }
+            }
+            if (arg is .const_arg(const_arg)) {
+                if (const_arg.param_def is .some(source_param)
+                    && source_param == param_def) {
+                    return arg;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Void append_receiver_args(
+        self,
+        qid.DefId impl_member,
+        qid.TypeId receiver_type,
+        list.ArrayList<types.GenericArg>&! result
+    ) {
+        guard self.store.defs.get(impl_member).owner_def is .some(owner_def) else {
+            return;
+        }
+        qid.TypeId value_type = self.reference_value_type(receiver_type);
+        types.TypeInfo info = self.store.types.get(value_type);
+        guard info.data is .named(named) else { return; }
+        if (named.def_id != owner_def) { return; }
+        Int index! = 0;
+        while (index < named.args.length
+            && index < self.store.model.def_generic_param_count(owner_def)) {
+            qid.DefId param_def = self.store.model.def_generic_param_at(owner_def, index);
+            result.add(self.retarget_arg(param_def, named.args[index]));
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId reference_value_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        if (info.data is .handle_type(handle) && handle.kind == .reference) {
+            return handle.element;
+        }
+        return type_id;
+    }
+
+    types.GenericArg retarget_arg(self, qid.DefId param_def, types.GenericArg arg) {
+        if (arg is .type_arg(type_arg)) {
+            return types.generic_type_param_arg(param_def, type_arg.value);
+        }
+        guard arg is .const_arg(const_arg) else { return arg; }
+        return types.generic_const_param_arg(
+            param_def, const_arg.value, const_arg.binding_def
+        );
+    }
+
+    qid.DefId? resolve_static_dispatch(
+        self,
+        qid.DefId trait_member,
+        qid.TypeId receiver_type
+    ) {
+        guard self.namespace_provider(receiver_type) is .some(provider_def) else {
+            return null;
+        }
+        Int index! = 0;
+        while (index < self.store.model.def_member_count(provider_def)) {
+            qid.DefId member_def = self.store.model.def_member_at(provider_def, index);
+            def.DefRecord member = self.store.defs.get(member_def);
+            if (member.associated_trait_member is .some(implemented)
+                && implemented == trait_member) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < self.store.defs.len()) {
+            qid.DefId candidate = qid.DefId.from_index(index);
+            def.DefRecord member = self.store.defs.get(candidate);
+            if (member.owner_def is .some(owner_def) && owner_def == provider_def) {
+                if (member.associated_trait_member is .some(implemented)
+                    && implemented == trait_member) {
+                    return candidate;
+                }
+            }
+            index = index + 1;
+        }
+        if (self.store.model.has_body(trait_member)) { return trait_member; }
+        return null;
+    }
+
+    qid.DefId? namespace_provider(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        if (info.data is .named(named)) { return named.def_id; }
+        if (info.data is .handle_type(handle) && handle.kind == .reference) {
+            return self.namespace_provider(handle.element);
+        }
+        if (info.data is .bool_type) { return self.store.resolve.core_types.bool_type; }
+        if (info.data is .char_type) { return self.store.resolve.core_types.char_type; }
+        if (info.data is .int_type(int_type)) {
+            return self.integer_namespace_provider(int_type);
+        }
+        if (info.data is .float_type(float_type)) {
+            return self.float_namespace_provider(float_type);
+        }
+        if (info.data is .array_type(array_type)) {
+            if (array_type.sentinel != null) {
+                return self.store.resolve.core_types.sentinel_array_type;
+            }
+            return self.store.resolve.core_types.array_type;
+        }
+        if (info.data is .slice_value_type(slice_type)) {
+            if (slice_type.sentinel != null) {
+                return self.store.resolve.core_types.sentinel_slice_type;
+            }
+            return self.store.resolve.core_types.slice_type;
+        }
+        if (self.store.types.type_owner_def(type_id) is .some(owner_def)) {
+            return owner_def;
+        }
+        return null;
+    }
+
+    qid.DefId? integer_namespace_provider(self, types.IntType int_type) {
+        if (int_type.bits == 0) {
+            if (int_type.signed) { return self.store.resolve.core_types.int_type; }
+            return self.store.resolve.core_types.uint_type;
+        }
+        if (int_type.bits == 8) {
+            if (int_type.signed) { return self.store.resolve.core_types.int8_type; }
+            return self.store.resolve.core_types.uint8_type;
+        }
+        if (int_type.bits == 16) {
+            if (int_type.signed) { return self.store.resolve.core_types.int16_type; }
+            return self.store.resolve.core_types.uint16_type;
+        }
+        if (int_type.bits == 32) {
+            if (int_type.signed) { return self.store.resolve.core_types.int32_type; }
+            return self.store.resolve.core_types.uint32_type;
+        }
+        if (int_type.bits == 64) {
+            if (int_type.signed) { return self.store.resolve.core_types.int64_type; }
+            return self.store.resolve.core_types.uint64_type;
+        }
+        return null;
+    }
+
+    qid.DefId? float_namespace_provider(self, types.FloatType float_type) {
+        if (float_type.bits == 16) {
+            return self.store.resolve.core_types.float16_type;
+        }
+        if (float_type.bits == 32) {
+            return self.store.resolve.core_types.float_type;
+        }
+        if (float_type.bits == 64) {
+            return self.store.resolve.core_types.double_type;
+        }
+        return null;
+    }
+}

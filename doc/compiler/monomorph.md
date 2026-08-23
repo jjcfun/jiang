@@ -14,9 +14,10 @@ type check
 ## 身份与所有权
 
 - `FunctionRef` 使用 `DefId + GenericArgs` 表示源码函数引用。
-- `TemplateJilQuery` 缓存当前 JIL Store 中的 `TemplateId`。
-- `InstanceJilQuery` 缓存当前 JIL Store 中的 concrete `FunctionId`。
-- template 和 instance 共用同一套 JIL 数据结构，由各自的 owner 表区分。
+- `TemplateJilQuery` 直接以源码 `DefId` 标识当前 JIL Store 中唯一的 generic body。
+- `InstanceJilQuery` 只缓存该 `InstanceKey` 的求值完成状态，实例 identity 由 `Program` 拥有。
+- backend 对源码实例通过 `InstanceReader` 读取 generic body；编译器派生函数仍使用
+  `FunctionId`。
 - 不存在独立的全局实例 store，也不保存第二份 reachable instance 集合。
 
 ## 求值

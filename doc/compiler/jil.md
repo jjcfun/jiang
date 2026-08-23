@@ -245,7 +245,7 @@ lowering 为 `__jiang_runtime_task_handoff(...)`。静态 Domain identity 只用
 用户类型。
 
 已知无环 direct async call 把 child frame 嵌入 caller frame。JIL lowering 用 concrete
-`jil.FunctionKey` 记录正在构造的 coroutine；遇到 self/mutual-recursive 回边时不再递归形成无限
+`jil.InstanceKey` 记录正在构造的 coroutine；遇到 self/mutual-recursive 回边时不再递归形成无限
 frame type，而是调用该 concrete callee 的 heap async-context start shim。start shim 和动态
 async Fn/RawFn start 都携带当前 Task pointer，并以 `task_handoff` 转移 Job；caller resume、start
 shim 和 runtime handoff 的返回块必须保持 codegen-empty，使 LLVM 能生成 tail call。

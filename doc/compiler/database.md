@@ -33,11 +33,12 @@ CompilerContext
 ```
 
 `CompilerStore` 拥有跨阶段事实。query cache 不复制这些事实：例如 layout query 缓存
-`LayoutId`，真正的 `Layout` 仍由 `LayoutStore` 拥有；JIL body query 缓存 `FunctionId`，
-function/body 仍由当前 JIL Store 拥有。
+`LayoutId`，真正的 `Layout` 仍由 `LayoutStore` 拥有；JIL body query 只缓存求值完成状态，
+function/body 和 instance identity 仍由当前 JIL Store 拥有。
 
 `jil.Store^` 等 Movable 结果直接沿 pipeline 传递，不通过 ID owner、callback 或第二张 cache
-间接持有。JIL query 只缓存当前 Store 中的 `TemplateId` / `FunctionId`。
+间接持有。generic JIL 直接使用源码 `DefId`，instance query 以 `InstanceKey` 驱动当前
+Store 中的实例固化。
 
 ## 2. QueryCache
 
