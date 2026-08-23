@@ -29,31 +29,6 @@ import llvm_value = "./value.jiang";
 import instance_reader = "../../jil/instance_reader.jiang";
 import std;
 
-backend_abi.FunctionAbi classify_codegen_function(
-    context.CompilerContext& ctx,
-    jil.Function& function
-) {
-    generic_bindings.GenericBindings bindings! =
-        generic_bindings.GenericBindings();
-    if (function.origin is .source(function_def)
-        && function.args.length > 0) {
-        bindings = generic_bindings.bindings_for_instance(
-            ctx.store.defs$.ref(),
-            ctx.store.model$.ref(),
-            ctx.store.types$.ref(),
-            function_def,
-            function.args,
-            bindings$.ref()
-        );
-    }
-    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
-        ctx.store$.ref(), bindings$.ref()
-    );
-    return backend_abi.classify_jil_instance(
-        ctx, reader$.ref(), function.body$.ref()
-    );
-}
-
 // 独立 LLVM object 拥有自己的 LLVM Context 和 Module。它在当前 CGU 完成 pass
 // 和 object emission 后立即释放，不跨 CGU 保留 CompilerStore 或 JIL 状态。
 public struct ObjectUnit: Movable {
@@ -805,9 +780,13 @@ struct LlvmLowerer: Movable {
 
     ffi.Value declare_new_function(Self&! self, jil.Function& function) {
         jil.Body& body = function.body$.ref();
-        backend_abi.FunctionAbi function_abi! =
-            classify_codegen_function(self.ctx, function);
-        llvm_state.LowerState state! = self.lower_state();
+        llvm_state.LowerState state! = self.lower_state_for_function(function);
+        instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+            self.ctx.store$.ref(), state.bindings$.ref()
+        );
+        backend_abi.FunctionAbi function_abi! = backend_abi.classify_jil_instance(
+            self.ctx, reader$.ref(), body
+        );
         ffi.Type function_type = llvm_abi.function_type(state$.ref(), function_abi$.ref());
         if (!ffi.type_valid(function_type)) {
             self.add_function_codegen_error(
@@ -918,6 +897,10 @@ struct LlvmLowerer: Movable {
         ffi.Value llvm_function
     ) {
         jil.Body& body = function.body$.ref();
+        llvm_state.LowerState state! = self.lower_state_for_function(function);
+        instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+            self.ctx.store$.ref(), state.bindings$.ref()
+        );
         if (body.blocks.length == 0) {
             return true;
         }
@@ -936,14 +919,19 @@ struct LlvmLowerer: Movable {
             return false;
         }
         ffi.builder_position_at_end(self.builder$.ref(), prologue);
-        list.ArrayList<ffi.Value> local_slots! = self.allocate_local_slots(body);
+        list.ArrayList<ffi.Value> local_slots! = self.allocate_local_slots(
+            state$.ref(), body
+        );
         if (local_slots.len() != body.locals.length) {
             self.add_codegen_error("failed to allocate LLVM local slots", "llvm_local_slot_alloc_failed");
             return false;
         }
-        backend_abi.FunctionAbi function_abi! =
-            classify_codegen_function(self.ctx, function);
-        if (!self.store_function_params(body, function_abi$.ref(), llvm_function, local_slots$.ref())) {
+        backend_abi.FunctionAbi function_abi! = backend_abi.classify_jil_instance(
+            self.ctx, reader$.ref(), body
+        );
+        if (!self.store_function_params(
+            state$.ref(), body, function_abi$.ref(), llvm_function, local_slots$.ref()
+        )) {
             self.add_codegen_error("failed to store LLVM function parameters", "llvm_param_store_failed");
             return false;
         }
@@ -952,7 +940,8 @@ struct LlvmLowerer: Movable {
             return false;
         }
         return self.lower_blocks(
-            body, function_abi$.ref(), llvm_function, blocks$.ref(), local_slots$.ref()
+            state$.ref(), body, function_abi$.ref(), llvm_function, blocks$.ref(),
+            local_slots$.ref()
         );
     }
 
@@ -974,7 +963,9 @@ struct LlvmLowerer: Movable {
         return blocks;
     }
 
-    Bool store_function_params(Self&! self,
+    Bool store_function_params(
+        self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
@@ -996,7 +987,9 @@ struct LlvmLowerer: Movable {
                     llvm_index = llvm_index + 1;
                 } else if (param_abi.kind == .indirect) {
                     ffi.Value param = ffi.function_param(llvm_function, llvm_index);
-                    if (!self.store_indirect_param(local, local_slots, param)) { return false; }
+                    if (!self.store_indirect_param(
+                        state, local, local_slots, param
+                    )) { return false; }
                     llvm_index = llvm_index + 1;
                 }
                 source_param_index = source_param_index + 1;
@@ -1006,19 +999,22 @@ struct LlvmLowerer: Movable {
         return true;
     }
 
-    Bool store_indirect_param(Self&! self,
+    Bool store_indirect_param(
+        self,
+        llvm_state.LowerState& state,
         jil.LocalDecl local,
         list.ArrayList<ffi.Value>& local_slots,
         ffi.Value param_pointer
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         ffi.Value pointer = local_slots.get(local.id.to_index());
         if (!ffi.value_valid(pointer)) {
             return false;
         }
         // indirect 参数在 LLVM ABI 中已经是指针；本地 slot 需要拷贝参数指向的
         // 实际对象，不能先 load 成聚合值再 store。
-        return copy_pointer_bytes(state$.ref(), param_pointer, pointer, local.type_id);
+        return copy_pointer_bytes(
+            state, param_pointer, pointer, state.type_id(local.type_id)
+        );
     }
 
     Bool store_local_value(self,
@@ -1036,11 +1032,15 @@ struct LlvmLowerer: Movable {
         return ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), value, pointer));
     }
 
-    list.ArrayList<ffi.Value> allocate_local_slots(Self&! self, jil.Body& body) {
+    list.ArrayList<ffi.Value> allocate_local_slots(
+        self,
+        llvm_state.LowerState& state,
+        jil.Body& body
+    ) {
         list.ArrayList<ffi.Value> values! = list.ArrayList<ffi.Value>(body.locals.length);
         Int index! = 0;
         while (index < body.locals.length) {
-            ffi.Value slot = self.allocate_local_slot(body.locals[index]);
+            ffi.Value slot = self.allocate_local_slot(state, body.locals[index]);
             if (!ffi.value_valid(slot)) {
                 return values;
             }
@@ -1050,12 +1050,16 @@ struct LlvmLowerer: Movable {
         return values;
     }
 
-    ffi.Value allocate_local_slot(Self&! self, jil.LocalDecl local) {
-        llvm_state.LowerState state! = self.lower_state();
-        if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
-            return ffi.const_null(ffi.context_pointer_type(self.llvm_context$.ref()));
+    ffi.Value allocate_local_slot(
+        self,
+        llvm_state.LowerState& state,
+        jil.LocalDecl local
+    ) {
+        qid.TypeId type_id = state.type_id(local.type_id);
+        if (!llvm_type.type_has_abi_value(state, type_id)) {
+            return ffi.const_null(ffi.context_pointer_type(state.llvm_context$.ref()));
         }
-        ffi.Type type = llvm_type.lower_type(state$.ref(), local.type_id);
+        ffi.Type type = llvm_type.lower_type(state, type_id);
         if (!ffi.type_valid(type)) {
             return ffi.Value();
         }
@@ -1065,6 +1069,7 @@ struct LlvmLowerer: Movable {
     // JIL 是 place-based、非 SSA。LLVM lowering 的 baseline 先把 local
     // 映射为 stack slot，assignment 生成 store，operand 生成 load。
     Bool lower_statements(Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         ffi.Value llvm_function,
         jil.Block& block,
@@ -1072,7 +1077,9 @@ struct LlvmLowerer: Movable {
     ) {
         Int index! = 0;
         while (index < block.statements.length) {
-            if (!self.lower_statement(body, llvm_function, block.statements[index], local_slots)) {
+            if (!self.lower_statement(
+                state, body, llvm_function, block.statements[index], local_slots
+            )) {
                 return false;
             }
             index = index + 1;
@@ -1081,6 +1088,7 @@ struct LlvmLowerer: Movable {
     }
 
     Bool lower_blocks(Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
@@ -1090,10 +1098,13 @@ struct LlvmLowerer: Movable {
         Int index! = 0;
         while (index < body.blocks.length) {
             ffi.builder_position_at_end(self.builder$.ref(), blocks.get(index));
-            if (!self.lower_statements(body, llvm_function, body.blocks[index]$.ref(), local_slots)) {
+            if (!self.lower_statements(
+                state, body, llvm_function, body.blocks[index]$.ref(), local_slots
+            )) {
                 return false;
             }
             if (!self.lower_terminator(
+                state,
                 body,
                 function_abi,
                 llvm_function,
@@ -1109,25 +1120,25 @@ struct LlvmLowerer: Movable {
     }
 
     Bool lower_statement(Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         ffi.Value llvm_function,
         jil.Statement statement,
         list.ArrayList<ffi.Value>& local_slots
     ) {
         if (statement.kind is .assign_stmt(assign_stmt)) {
-            if (!self.lower_assign(body, assign_stmt, local_slots)) {
+            if (!self.lower_assign(state, body, assign_stmt, local_slots)) {
                 self.add_codegen_error("failed to lower LLVM assignment", "llvm_assign_lower_failed");
                 return false;
             }
             return true;
         }
         if (statement.kind is .atomic_store_stmt(atomic_store)) {
-            llvm_state.LowerState state! = self.lower_state();
             ffi.Value pointer = llvm_place.lower_place_pointer(
-                state$.ref(), self.output$.mut_ref(), body, atomic_store.destination, local_slots
+                state, self.output$.mut_ref(), body, atomic_store.destination, local_slots
             );
             ffi.Value value = llvm_value.lower_operand(
-                state$.ref(), self.output$.mut_ref(), body, atomic_store.value, local_slots
+                state, self.output$.mut_ref(), body, atomic_store.value, local_slots
             );
             if (atomic_store.mode == .coroutine_local) {
                 return ffi.value_valid(ffi.builder_build_store(state.builder$.ref(), value, pointer));
@@ -1140,7 +1151,6 @@ struct LlvmLowerer: Movable {
             ));
         }
         if (statement.kind is .executor_leave_stmt(executor_leave)) {
-            llvm_state.LowerState state! = self.lower_state();
             ffi.Value runtime = ffi.module_get_function(
                 state.module$.ref(), "__jiang_runtime_executor_leave"
             );
@@ -1148,20 +1158,20 @@ struct LlvmLowerer: Movable {
             ffi.Type function_type = ffi.global_value_type(runtime);
             list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(2);
             args.add(llvm_place.lower_local_load(
-                state$.ref(), body.locals[executor_leave.executor.to_index()], local_slots
+                state, body.locals[executor_leave.executor.to_index()], local_slots
             ));
             args.add(llvm_place.lower_local_load(
-                state$.ref(), body.locals[executor_leave.previous_context.to_index()], local_slots
+                state, body.locals[executor_leave.previous_context.to_index()], local_slots
             ));
             return ffi.value_valid(ffi.builder_build_call(
                 state.builder$.ref(), function_type, runtime, args$.ref()
             ));
         }
         if (statement.kind is .task_suspend_stmt(suspend)) {
-            return self.lower_task_suspend(body, suspend, local_slots);
+            return self.lower_task_suspend(state, body, suspend, local_slots);
         }
         if (statement.kind is .task_complete_stmt(complete)) {
-            return self.lower_task_complete(body, complete, local_slots);
+            return self.lower_task_complete(state, body, complete, local_slots);
         }
         if (statement.kind is .storage_live_stmt(_)) {
             return true;
@@ -1185,27 +1195,25 @@ struct LlvmLowerer: Movable {
             return true;
         }
         if (statement.kind is .task_wait_stmt(wait)) {
-            llvm_state.LowerState state! = self.lower_state();
             ffi.Value pointer = llvm_place.lower_place_pointer(
-                state$.ref(), self.output$.mut_ref(), body, wait.state, local_slots
+                state, self.output$.mut_ref(), body, wait.state, local_slots
             );
             if (!ffi.value_valid(pointer)) { return false; }
             if (wait.wake) { return self.lower_task_wake(pointer); }
             ffi.Value expected = llvm_value.lower_operand(
-                state$.ref(), self.output$.mut_ref(), body, wait.expected, local_slots
+                state, self.output$.mut_ref(), body, wait.expected, local_slots
             );
             return self.lower_task_wait(pointer, expected);
         }
         if (statement.kind is .task_release_stmt(release)) {
-            return self.lower_task_release(body, llvm_function, release, local_slots);
+            return self.lower_task_release(state, body, llvm_function, release, local_slots);
         }
         if (statement.kind is .task_owner_release_stmt(release)) {
-            return self.lower_task_owner_release(body, release.pointer, local_slots);
+            return self.lower_task_owner_release(state, body, release.pointer, local_slots);
         }
         if (statement.kind is .set_discriminant_stmt(set_discriminant)) {
-            llvm_state.LowerState state! = self.lower_state();
             return llvm_value.lower_set_discriminant(
-                state$.ref(),
+                state,
                 self.output$.mut_ref(),
                 body,
                 set_discriminant,
@@ -1218,13 +1226,13 @@ struct LlvmLowerer: Movable {
 
     Bool lower_task_suspend(
         Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         jil.TaskSuspendStatement suspend,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         ffi.Value task_value = llvm_value.lower_operand(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             jil.copy_operand_value(jil.CopyOperand (place: suspend.task)),
@@ -1247,13 +1255,13 @@ struct LlvmLowerer: Movable {
 
     Bool lower_task_complete(
         Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         jil.TaskCompleteStatement complete,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         ffi.Value task_value = llvm_value.lower_operand(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             jil.copy_operand_value(jil.CopyOperand (place: complete.task)),
@@ -1316,14 +1324,14 @@ struct LlvmLowerer: Movable {
 
     Bool lower_task_release(
         Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         ffi.Value llvm_function,
         jil.TaskReleaseStatement release,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         ffi.Value task_pointer = llvm_value.lower_operand(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             jil.copy_operand_value(jil.CopyOperand (place: release.task_pointer)),
@@ -1347,7 +1355,7 @@ struct LlvmLowerer: Movable {
         ))) { return false; }
         ffi.builder_position_at_end(state.builder$.ref(), release_block);
         if (!self.lower_owned_task_release(
-            state$.ref(), body, llvm_function, release, local_slots
+            state, body, llvm_function, release, local_slots
         )) { return false; }
         if (!ffi.value_valid(ffi.builder_build_br(state.builder$.ref(), continue_block))) { return false; }
         ffi.builder_position_at_end(state.builder$.ref(), continue_block);
@@ -1404,13 +1412,13 @@ struct LlvmLowerer: Movable {
 
     Bool lower_task_owner_release(
         Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         jil.Place pointer_place,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         ffi.Value pointer = llvm_value.lower_operand(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             jil.copy_operand_value(jil.CopyOperand (place: pointer_place)),
@@ -1545,14 +1553,14 @@ struct LlvmLowerer: Movable {
     }
 
     Bool lower_assign(Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         jil.AssignStatement assign_stmt,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
-        qid.TypeId result_type = llvm_place.place_type(state$.ref(), body, assign_stmt.destination);
+        qid.TypeId result_type = llvm_place.place_type(state, body, assign_stmt.destination);
         if (llvm_value.lower_closure_into_place(
-                state$.ref(),
+                state,
                 self.output$.mut_ref(),
                 body,
                 assign_stmt.value,
@@ -1566,7 +1574,7 @@ struct LlvmLowerer: Movable {
         // layout 计算出的真实字节布局，避免 LLVM aggregate value 在大 payload 上
         // 产生不可靠的按值 load/store。
         if (llvm_value.lower_optional_into_place(
-                state$.ref(),
+                state,
                 self.output$.mut_ref(),
                 body,
                 assign_stmt.value,
@@ -1578,7 +1586,7 @@ struct LlvmLowerer: Movable {
             return true;
         }
         if (llvm_value.lower_aggregate_into_place(
-                state$.ref(),
+                state,
                 self.output$.mut_ref(),
                 body,
                 assign_stmt.value,
@@ -1589,20 +1597,20 @@ struct LlvmLowerer: Movable {
             return true;
         }
         if (lower_place_copy_assign(
-                state$.ref(), self.output$.mut_ref(), body, assign_stmt, result_type, local_slots
+                state, self.output$.mut_ref(), body, assign_stmt, result_type, local_slots
             )
         ) {
             return true;
         }
         ffi.Value value = llvm_value.lower_rvalue(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             assign_stmt.value,
             local_slots,
             result_type
         );
-        if (!llvm_type.type_has_abi_value(state$.ref(), result_type)) {
+        if (!llvm_type.type_has_abi_value(state, result_type)) {
             return true;
         }
         if (!ffi.value_valid(value)) {
@@ -1610,7 +1618,7 @@ struct LlvmLowerer: Movable {
             return false;
         }
         ffi.Value pointer = llvm_place.lower_place_pointer(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             assign_stmt.destination,
@@ -1731,6 +1739,7 @@ struct LlvmLowerer: Movable {
     }
 
     Bool lower_terminator(Self&! self,
+        llvm_state.LowerState& state,
         jil.Body& body,
         backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
@@ -1738,9 +1747,8 @@ struct LlvmLowerer: Movable {
         list.ArrayList<ffi.BasicBlock>& blocks,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState state! = self.lower_state();
         return llvm_terminator.lower_terminator(
-            state$.ref(),
+            state,
             self.output$.mut_ref(),
             body,
             function_abi,
@@ -1759,7 +1767,37 @@ struct LlvmLowerer: Movable {
             self.llvm_context,
             self.module,
             self.builder,
-            self.allocator
+            self.allocator,
+            generic_bindings.GenericBindings()
+        );
+    }
+
+    @life(return: (self.a, self.b, self.c))
+    llvm_state.LowerState lower_state_for_function(
+        Self&! self,
+        jil.Function& function
+    ) {
+        generic_bindings.GenericBindings bindings! =
+            generic_bindings.GenericBindings();
+        if (function.origin is .source(function_def)
+            && function.args.length > 0) {
+            bindings = generic_bindings.bindings_for_instance(
+                self.ctx.store.defs$.ref(),
+                self.ctx.store.model$.ref(),
+                self.ctx.store.types$.ref(),
+                function_def,
+                function.args,
+                bindings$.ref()
+            );
+        }
+        return llvm_state.LowerState(
+            self.ctx,
+            self.store,
+            self.llvm_context,
+            self.module,
+            self.builder,
+            self.allocator,
+            bindings
         );
     }
 
