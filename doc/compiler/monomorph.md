@@ -6,8 +6,9 @@
 ```text
 type check
   -> template_jil(DefId)
+  -> borrow_check(template_jil)
   -> instance_jil(DefId + GenericArgs)
-  -> borrow check / drop elaboration / backend
+  -> drop elaboration / backend
 ```
 
 ## 身份与所有权
@@ -30,7 +31,8 @@ Layout 不由单态化预收集。instance、drop、ABI 或 backend 在真实使
 ## 不变量
 
 - template lowering 不读取 concrete instance 或 concrete Layout。
+- borrow check 直接检查 generic template；源码 concrete instance 不重复检查。
 - instance 输出不得包含未绑定泛型参数。
-- borrow check、drop elaboration 和 backend 只消费 concrete function。
+- drop elaboration 和 backend 只消费 concrete function。
 - 单态化不重新 resolve、type check 或验证 trait bound。
 - 未可达的泛型函数、vtable 和 Layout 不生成结果。
