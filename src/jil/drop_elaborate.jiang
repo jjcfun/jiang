@@ -1,4 +1,4 @@
-// JIL drop elaboration，把隐式析构义务转换为显式 CFG cleanup。
+// 泛型 JIL 记录语义 drop 与部分移动状态；具体实例按需展开必要路径并调用共享 drop glue。
 
 import context = "../context.jiang";
 import compiler_store = "../store.jiang";
@@ -38,7 +38,7 @@ struct DropContext: Movable {
 struct DropFlagMap: Movable {
     public Int*! flag_indexes;
     @life(a)
-    public list.ArrayList<ProjectionDropFlag> projection_flags!;
+    public list.ArrayList<jil.DropProjectionFlag> projection_flags!;
     public Int length!;
     public Int flag_count!;
 
@@ -46,7 +46,7 @@ struct DropFlagMap: Movable {
         unsafe {
             self.length = length;
             self.flag_count = 0;
-            self.projection_flags = list.ArrayList<ProjectionDropFlag>();
+            self.projection_flags = list.ArrayList<jil.DropProjectionFlag>();
             self.flag_indexes = unsafe {
                 Int$.alloc(length)
             };
@@ -91,32 +91,40 @@ struct DropFlagMap: Movable {
         }
     }
 
-    public Void add_projection_flag(Self&! self, jil.Place place, Int flag_index) {
+    public Void add_projection_flag(
+        Self&! self,
+        jil.Place place,
+        Int flag_index
+    ) {
         if (place.projection.length == 0) { return; }
         if (self.projection_flag_for(place) != null) { return; }
-        self.projection_flags.add(ProjectionDropFlag(
+        self.projection_flags.add(jil.DropProjectionFlag(
             place: place,
-            flag: jil.LocalId.from_index(flag_index)
+            flag: jil.local_place(
+                jil.LocalId.from_index(flag_index),
+                place.projection[0..0]
+            )
         ));
         self.flag_count = self.flag_count + 1;
+    }
+
+    public Void bind_projection_flag(
+        Self&! self,
+        jil.DropProjectionFlag binding
+    ) {
+        if (self.projection_flag_for(binding.place) != null) { return; }
+        self.projection_flags.add(binding);
     }
 
     public jil.LocalId? projection_flag_for(self, jil.Place place) {
         Int index! = 0;
         while (index < self.projection_flags.len()) {
-            ProjectionDropFlag entry = self.projection_flags.get(index);
-            if (drop_places_equal(entry.place, place)) { return entry.flag; }
+            jil.DropProjectionFlag entry = self.projection_flags.get(index);
+            if (drop_places_equal(entry.place, place)) { return entry.flag.local_id; }
             index = index + 1;
         }
         return null;
     }
-}
-
-@region(a)
-struct ProjectionDropFlag: Copyable {
-    @life(a)
-    public jil.Place place;
-    public jil.LocalId flag;
 }
 
 struct DropExpansion: Copyable {
@@ -170,6 +178,19 @@ Void elaborate_package_parts(
     }
 
     DropContext drop_ctx! = DropContext(ctx.store$.ref(), ctx.query.layout$.mut_ref());
+    Int source_index! = 0;
+    while (source_index < program.source_function_count()) {
+        jil.Function source = program.source_function_at(source_index);
+        guard source.origin is .source(def_id) else {
+            source_index = source_index + 1;
+            continue;
+        }
+        jil.Function scheduled = schedule_function_with_context(
+            drop_ctx$.mut_ref(), output, source
+        );
+        program.set_source_function(def_id, scheduled);
+        source_index = source_index + 1;
+    }
     Int function_index! = 0;
     while (function_index < program.functions.len()) {
         jil.Function function = program.functions.get(function_index);
@@ -178,8 +199,14 @@ Void elaborate_package_parts(
             continue;
         }
         jil.FunctionId function_id = function.id;
-        jil.Function elaborated = elaborate_function_with_context(
+        jil.Function scheduled = schedule_function_with_context(
             drop_ctx$.mut_ref(), output, function
+        );
+        jil.Function expanded = expand_function_with_context(
+            drop_ctx$.mut_ref(), output, scheduled
+        );
+        jil.Function elaborated = materialize_function_drops_with_context(
+            drop_ctx$.mut_ref(), output, program, drop_elaboration, expanded
         );
         program.set_function(elaborated);
         drop_elaboration.mark(function_id);
@@ -216,23 +243,33 @@ public jil.Function elaborate_function(
     compiler_store.CompilerStore& store,
     database.LayoutQuery&! layouts,
     jil.Storage& output,
+    jil.Program&! program,
+    jil.DropElaborationState&! drop_elaboration,
     jil.Function function
 ) {
     DropContext ctx! = DropContext(store, layouts);
-    return elaborate_function_with_context(ctx$.mut_ref(), output, function);
+    jil.Function scheduled = schedule_function_with_context(
+        ctx$.mut_ref(), output, function
+    );
+    jil.Function expanded = expand_function_with_context(
+        ctx$.mut_ref(), output, scheduled
+    );
+    return materialize_function_drops_with_context(
+        ctx$.mut_ref(), output, program, drop_elaboration, expanded
+    );
 }
 
 @life(return: (
     output & function.a,
     output & function.b
 ))
-jil.Function elaborate_function_with_context(
+jil.Function schedule_function_with_context(
     DropContext&! ctx,
     jil.Storage& output,
     jil.Function function
 ) {
     jil.Body body! = function.body;
-    if (!function_needs_drop_elaboration(ctx, body)) {
+    if (!function_needs_drop_scheduling(ctx, body)) {
         return function;
     }
     if (body.locals.length == 0 || body.blocks.length == 0) {
@@ -265,18 +302,13 @@ jil.Function elaborate_function_with_context(
 
     DropFlagMap flags! = build_drop_flags(ctx, body);
     // cleanup 临时位既用于自定义 deinit 的 unit 结果，也用于 owner pointer 的 free statement。
-    Bool needs_cleanup_result = flags.flag_count > 0 || body_has_drop_terminator(body);
-    Bool needs_slice_drop_temps = body_needs_contiguous_drop_temps(ctx, body);
-    DropTemps temps = drop_temps(
-        body, flags$.ref(), needs_cleanup_result, needs_slice_drop_temps
-    );
     jil.LocalDecl[]& locals = copy_locals_with_drop_flags(
         ctx,
         output,
         body.locals,
         flags$.ref(),
-        needs_cleanup_result,
-        needs_slice_drop_temps
+        false,
+        false
     );
     body = body_with_locals(function.body, locals);
 
@@ -290,13 +322,8 @@ jil.Function elaborate_function_with_context(
         output,
         body,
         flags$.ref(),
-        temps,
         original_block_count,
         blocks$.mut_ref()
-    );
-
-    elaborate_drop_terminator_blocks(
-        ctx, output, body, flags$.ref(), temps, original_block_count, blocks$.mut_ref()
     );
 
     jil.Body storage_body = body_with_blocks(output, body, blocks$.ref());
@@ -306,7 +333,6 @@ jil.Function elaborate_function_with_context(
         output,
         storage_body,
         flags$.ref(),
-        temps,
         return_block_count,
         blocks$.mut_ref()
     );
@@ -339,16 +365,311 @@ jil.Function elaborate_function_with_context(
     );
 }
 
-Bool function_needs_drop_elaboration(DropContext&! ctx, jil.Body body) {
-    if (body_has_drop_terminator(body)) { return true; }
+Bool function_needs_drop_scheduling(DropContext&! ctx, jil.Body body) {
     Int index! = 0;
     while (index < body.locals.length) {
-        if (local_has_drop_flag(ctx, body.locals[index], body.return_local)) {
+        if (local_may_have_drop_flag(ctx, body.locals[index], body.return_local)) {
             return true;
         }
         index = index + 1;
     }
     return false;
+}
+
+@life(return: (
+    output & function.a,
+    output & function.b
+))
+jil.Function expand_function_with_context(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.Function function
+) {
+    jil.Body body! = function.body;
+    if (!body_has_drop_terminator(body)) { return function; }
+    DropFlagMap flags = semantic_drop_flags(body);
+    Bool needs_slice_drop_temps = body_needs_contiguous_drop_temps(ctx, body);
+    DropTemps temps = drop_temps(body, flags$.ref(), true, needs_slice_drop_temps);
+    jil.LocalDecl[]& locals = copy_locals_with_drop_flags(
+        ctx,
+        output,
+        body.locals,
+        flags$.ref(),
+        true,
+        needs_slice_drop_temps
+    );
+    body = body_with_locals(body, locals);
+    list.ArrayList<jil.Block> blocks! = copy_blocks(output, body.blocks);
+    elaborate_drop_terminator_blocks(
+        ctx,
+        output,
+        body,
+        flags$.ref(),
+        temps,
+        body.blocks.length,
+        blocks$.mut_ref()
+    );
+    return jil.function_with_body(
+        function,
+        body_with_blocks(output, body, blocks$.ref())
+    );
+}
+
+DropFlagMap semantic_drop_flags(jil.Body body) {
+    DropFlagMap flags! = DropFlagMap(body.locals.length);
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        jil.Terminator terminator = body.blocks[block_index].terminator;
+        block_index = block_index + 1;
+        if (terminator.kind is .drop_term(drop)) {
+            Int flag_index! = 0;
+            while (flag_index < drop.projection_flags.length) {
+                flags.bind_projection_flag(drop.projection_flags[flag_index]);
+                flag_index = flag_index + 1;
+            }
+        }
+    }
+    return flags;
+}
+
+@life(return: (
+    output & function.a,
+    output & function.b
+))
+jil.Function materialize_function_drops_with_context(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.Program&! program,
+    jil.DropElaborationState&! drop_elaboration,
+    jil.Function function
+) {
+    jil.Body body! = function.body;
+    if (!body_has_drop_terminator(body)) { return function; }
+    DropFlagMap flags! = DropFlagMap(body.locals.length);
+    jil.LocalId result = jil.LocalId.from_index(body.locals.length);
+    jil.LocalDecl[]& locals = copy_locals_with_drop_flags(
+        ctx, output, body.locals, flags$.ref(), true, false
+    );
+    body = body_with_locals(body, locals);
+    list.ArrayList<jil.Block> blocks! = copy_blocks(output, body.blocks);
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        jil.Block block = blocks.get(block_index);
+        if (block.terminator.kind is .drop_term(drop)) {
+            blocks.set(block_index, materialized_drop_block(
+                ctx,
+                output,
+                program,
+                drop_elaboration,
+                function,
+                body,
+                block,
+                drop,
+                result
+            ));
+        }
+        block_index = block_index + 1;
+    }
+    return jil.function_with_body(
+        function,
+        body_with_blocks(output, body, blocks$.ref())
+    );
+}
+
+@life(return: output & block)
+jil.Block materialized_drop_block(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.Program&! program,
+    jil.DropElaborationState&! drop_elaboration,
+    jil.Function function,
+    jil.Body body,
+    jil.Block block,
+    jil.DropTerminator drop,
+    jil.LocalId result
+) {
+    qid.TypeId type_id = place_type(ctx, body, drop.place);
+    if (!type_needs_drop(ctx, type_id)) {
+        return jil.Block(
+            id: block.id,
+            span: block.span,
+            statements: block.statements,
+            terminator: goto_terminator(block, drop.target)
+        );
+    }
+    jil.FunctionId glue = ensure_drop_glue(
+        ctx,
+        output,
+        program,
+        drop_elaboration,
+        type_id,
+        jil.function_provenance_def(function.origin),
+        block.terminator.span
+    );
+    list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+    args.add(jil.move_operand_value(jil.MoveOperand(place: drop.place)));
+    list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+    params.add(type_id);
+    qid.TypeId function_type = ctx.store.types.function_type(
+        params, ctx.store.types.unit_type(), block.terminator.span
+    );
+    return jil.Block(
+        id: block.id,
+        span: block.span,
+        statements: block.statements,
+        terminator: jil.Terminator(
+            span: block.terminator.span,
+            kind: jil.call_terminator_kind(jil.CallTerminator(
+                callee: jil.direct_function_callee(jil.FunctionRef(
+                    target: .generated(program.generated_function_target(glue)),
+                    args: program.function(glue).args,
+                    coroutine_resume: false,
+                    coroutine_completion: false,
+                    type_id: function_type
+                )),
+                args: output.operand_array(args$.ref()),
+                current_effects: types.EffectSet(),
+                is_suspend_point: false,
+                destination: local_place(output, result),
+                target: drop.target,
+                initialized_place: null,
+                exclusive_places: output.empty_places(),
+                cleanup: drop.cleanup
+            ))
+        )
+    );
+}
+
+jil.FunctionId ensure_drop_glue(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.Program&! program,
+    jil.DropElaborationState&! drop_elaboration,
+    qid.TypeId type_id,
+    qid.DefId provenance_def,
+    token.Span span
+) {
+    qid.TypeId canonical_type = ctx.store.types.canonical_substitution_type(type_id);
+    if (program.drop_glue(canonical_type) is .some(existing)) {
+        return existing;
+    }
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>(1);
+    args.add(types.generic_type_arg(canonical_type));
+    jil.GeneratedFunctionOrigin origin = jil.GeneratedFunctionOrigin(
+        name: program.add_generated_name("__drop_glue"),
+        module_id: ctx.store.defs.get(provenance_def).module_id,
+        kind: .drop_glue,
+        provenance_def: provenance_def,
+        identity_type: canonical_type
+    );
+    jil.FunctionId id = program.reserve_generated_function(
+        output, origin, args.slice(), span
+    );
+    program.bind_drop_glue(canonical_type, id);
+    jil.Function raw = raw_drop_glue(
+        ctx,
+        output,
+        id,
+        origin,
+        program.function(id).args,
+        canonical_type,
+        span
+    );
+    jil.Function expanded = expand_function_with_context(ctx, output, raw);
+    jil.Function materialized = materialize_function_drops_with_context(
+        ctx, output, program, drop_elaboration, expanded
+    );
+    program.finish_generated_function(materialized);
+    drop_elaboration.mark(id);
+    program.mark_shared_codegen_function(id);
+    program.mark_borrow_check_exempt(id);
+    return id;
+}
+
+@life(return: (output & args, output))
+jil.Function raw_drop_glue(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.FunctionId id,
+    jil.GeneratedFunctionOrigin origin,
+    types.GenericArg[]& args,
+    qid.TypeId type_id,
+    token.Span span
+) {
+    list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(2);
+    locals.add(drop_glue_local(
+        0, .return_place, ctx.store.types.unit_type(), span
+    ));
+    locals.add(drop_glue_local(1, .param, type_id, span));
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+    blocks.add(jil.Block(
+        id: jil.BlockId.from_index(0),
+        span: span,
+        statements: output.empty_statements(),
+        terminator: jil.Terminator(
+            span: span,
+            kind: jil.drop_terminator_kind(jil.DropTerminator(
+                place: local_place(output, jil.LocalId.from_index(1)),
+                projection_flags: output.empty_drop_projection_flags(),
+                target: jil.BlockId.from_index(1),
+                cleanup: null
+            ))
+        )
+    ));
+    blocks.add(jil.Block(
+        id: jil.BlockId.from_index(1),
+        span: span,
+        statements: output.empty_statements(),
+        terminator: jil.Terminator(
+            span: span,
+            kind: jil.return_terminator_kind(jil.ReturnTerminator(
+                implicit_unit: true
+            ))
+        )
+    ));
+    return jil.Function(
+        id: id,
+        origin: .generated(origin),
+        args: args,
+        signature_id: null,
+        effects: types.EffectSet(),
+        is_coroutine: false,
+        coroutine_frame: null,
+        is_coroutine_resume: false,
+        is_coroutine_completion: false,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: false,
+        naked: false,
+        span: span,
+        body: jil.Body(
+            id: jil.BodyId.from_index(id.to_index()),
+            span: span,
+            locals: copy_locals(output, locals.slice()),
+            blocks: output.block_array(blocks$.ref()),
+            entry: jil.BlockId.from_index(0),
+            return_local: jil.LocalId.from_index(0)
+        )
+    );
+}
+
+jil.LocalDecl drop_glue_local(
+    Int index,
+    jil.LocalKind kind,
+    qid.TypeId type_id,
+    token.Span span
+) {
+    return jil.LocalDecl(
+        id: jil.LocalId.from_index(index),
+        kind: kind,
+        type_id: type_id,
+        span: span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    );
 }
 
 Bool body_has_drop_terminator(jil.Body body) {
@@ -711,10 +1032,15 @@ jil.TerminatorKind copy_terminator_kind(jil.Storage& output, jil.TerminatorKind&
             suspend_child: call_term.suspend_child,
             task_handoff: call_term.task_handoff,
             async_start: call_term.async_start,
+            deferred_async_direct: call_term.deferred_async_direct,
+            deferred_async_task: call_term.deferred_async_task,
             destination: copy_place(output, call_term.destination),
             target: call_term.target,
             initialized_place: copy_optional_place(output, call_term.initialized_place),
             deferred_initialization: call_term.deferred_initialization,
+            return_lifetime_flows: call_term.return_lifetime_flows,
+            lifetime_args: call_term.lifetime_args,
+            lifetime_destination: call_term.lifetime_destination,
             exclusive_places: copy_places(output, call_term.exclusive_places),
             cleanup: call_term.cleanup
         ));
@@ -736,6 +1062,9 @@ jil.TerminatorKind copy_terminator_kind(jil.Storage& output, jil.TerminatorKind&
     if (kind is .drop_term(drop_term)) {
         return jil.drop_terminator_kind(jil.DropTerminator (
             place: copy_place(output, drop_term.place),
+            projection_flags: copy_drop_projection_flags(
+                output, drop_term.projection_flags
+            ),
             target: drop_term.target,
             cleanup: drop_term.cleanup
         ));
@@ -1102,6 +1431,46 @@ jil.Place copy_place(jil.Storage& output, jil.Place place) {
     return jil.local_place(place.local_id, output.projection_slice(place.projection));
 }
 
+@life(return: (output, output))
+jil.DropProjectionFlag[]& copy_drop_projection_flags(
+    jil.Storage& output,
+    jil.DropProjectionFlag[]& flags
+) {
+    list.ArrayList<jil.DropProjectionFlag> copied! =
+        list.ArrayList<jil.DropProjectionFlag>(flags.length);
+    Int index! = 0;
+    while (index < flags.length) {
+        copied.add(jil.DropProjectionFlag(
+            place: copy_place(output, flags[index].place),
+            flag: copy_place(output, flags[index].flag)
+        ));
+        index = index + 1;
+    }
+    return output.drop_projection_flag_array(copied$.ref());
+}
+
+@life(return: (output, output))
+jil.DropProjectionFlag[]& drop_projection_flags_for_local(
+    jil.Storage& output,
+    DropFlagMap& flags,
+    jil.LocalId local_id
+) {
+    list.ArrayList<jil.DropProjectionFlag> selected! =
+        list.ArrayList<jil.DropProjectionFlag>();
+    Int index! = 0;
+    while (index < flags.projection_flags.len()) {
+        jil.DropProjectionFlag entry = flags.projection_flags.get(index);
+        if (entry.place.local_id == local_id) {
+            selected.add(jil.DropProjectionFlag(
+                place: copy_place(output, entry.place),
+                flag: copy_place(output, entry.flag)
+            ));
+        }
+        index = index + 1;
+    }
+    return output.drop_projection_flag_array(selected$.ref());
+}
+
 @life(return: body)
 DropFlagMap build_drop_flags(
     DropContext&! ctx,
@@ -1112,7 +1481,7 @@ DropFlagMap build_drop_flags(
     Int local_index! = 0;
     while (local_index < body.locals.length) {
         jil.LocalDecl local = body.locals[local_index];
-        if (local_has_drop_flag(ctx, local, body.return_local)) {
+        if (local_may_have_drop_flag(ctx, local, body.return_local)) {
             flags.add_flag_for(local.id, next_flag);
             next_flag = next_flag + 1;
         }
@@ -1148,7 +1517,11 @@ DropTemps drop_temps(
     );
 }
 
-Bool local_has_drop_flag(DropContext&! ctx, jil.LocalDecl local, jil.LocalId return_local) {
+Bool local_may_have_drop_flag(
+    DropContext&! ctx,
+    jil.LocalDecl local,
+    jil.LocalId return_local
+) {
     if (local.id.to_index() == return_local.to_index()) {
         return false;
     }
@@ -1159,7 +1532,7 @@ Bool local_has_drop_flag(DropContext&! ctx, jil.LocalDecl local, jil.LocalId ret
         return false;
     }
     drop_semantics.DropQuery query = drop_semantics.DropQuery(ctx.store$.ref());
-    return query.type_needs_runtime_drop(ctx.layouts, local.type_id);
+    return query.type_may_need_runtime_drop(ctx.layouts, local.type_id);
 }
 
 Bool local_is_init_self(DropContext&! ctx, jil.LocalDecl local) {
@@ -1607,12 +1980,19 @@ jil.Terminator call_terminator_with_target(
             args: call_term.args,
             current_effects: call_term.current_effects,
             is_suspend_point: call_term.is_suspend_point,
+            suspend_wake: call_term.suspend_wake,
+            suspend_child: call_term.suspend_child,
             task_handoff: call_term.task_handoff,
             async_start: call_term.async_start,
+            deferred_async_direct: call_term.deferred_async_direct,
+            deferred_async_task: call_term.deferred_async_task,
             destination: call_term.destination,
             target: target,
             initialized_place: call_term.initialized_place,
             deferred_initialization: call_term.deferred_initialization,
+            return_lifetime_flows: call_term.return_lifetime_flows,
+            lifetime_args: call_term.lifetime_args,
+            lifetime_destination: call_term.lifetime_destination,
             exclusive_places: call_term.exclusive_places,
             cleanup: call_term.cleanup
         ))
@@ -1624,7 +2004,6 @@ Void elaborate_storage_dead_blocks(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     Int original_block_count,
     list.ArrayList<jil.Block>&! blocks
 ) {
@@ -1635,7 +2014,6 @@ Void elaborate_storage_dead_blocks(
             output,
             body,
             flags,
-            temps,
             blocks.get(block_index),
             blocks
         );
@@ -1648,7 +2026,6 @@ Void elaborate_storage_dead_block(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     list.ArrayList<jil.Block>&! blocks
 ) {
@@ -1662,7 +2039,6 @@ Void elaborate_storage_dead_block(
                 output,
                 body,
                 flags,
-                temps,
                 block,
                 kept$.mut_ref(),
                 statement_index,
@@ -1698,7 +2074,6 @@ Void split_storage_dead_block(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     list.ArrayList<jil.Statement>&! kept,
     Int statement_index,
@@ -1715,7 +2090,6 @@ Void split_storage_dead_block(
         ctx,
         output,
         flags,
-        temps,
         block,
         local,
         continuation,
@@ -1727,7 +2101,7 @@ Void split_storage_dead_block(
     );
 
     jil.Block next_block = blocks.get(continuation.to_index());
-    elaborate_storage_dead_block(ctx, output, body, flags, temps, next_block, blocks);
+    elaborate_storage_dead_block(ctx, output, body, flags, next_block, blocks);
 }
 
 jil.BlockId append_storage_dead_continuation(
@@ -1756,7 +2130,6 @@ jil.BlockId append_local_drop_block(
     DropContext&! ctx,
     jil.Storage& output,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block source_block,
     jil.LocalDecl local,
     jil.BlockId next_target,
@@ -1773,18 +2146,21 @@ jil.BlockId append_local_drop_block(
         source_block.terminator.span,
         statements$.mut_ref()
     );
-    blocks.set(drop_id.to_index(), drop_block(
-        ctx,
-        output,
-        temps,
-        flags,
-        drop_id,
-        source_block,
-        local_place(output, local.id),
-        local.type_id,
-        statements$.mut_ref(),
-        next_target,
-        blocks
+    blocks.set(drop_id.to_index(), jil.Block(
+        id: drop_id,
+        span: source_block.terminator.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: jil.Terminator(
+            span: source_block.terminator.span,
+            kind: jil.drop_terminator_kind(jil.DropTerminator(
+                place: local_place(output, local.id),
+                projection_flags: drop_projection_flags_for_local(
+                    output, flags, local.id
+                ),
+                target: next_target,
+                cleanup: null
+            ))
+        )
     ));
     return drop_id;
 }
@@ -1794,13 +2170,12 @@ Void elaborate_return_blocks(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     Int original_block_count,
     list.ArrayList<jil.Block>&! blocks
 ) {
     Int block_index! = 0;
     while (block_index < original_block_count) {
-        elaborate_return_block(ctx, output, body, flags, temps, blocks.get(block_index), blocks);
+        elaborate_return_block(ctx, output, body, flags, blocks.get(block_index), blocks);
         block_index = block_index + 1;
     }
 }
@@ -1810,16 +2185,15 @@ Void elaborate_return_block(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     list.ArrayList<jil.Block>&! blocks
 ) {
     if (block.terminator.kind is .return_term(return_term)) {
-        elaborate_return_path(ctx, output, body, flags, temps, block, return_term, blocks);
+        elaborate_return_path(ctx, output, body, flags, block, return_term, blocks);
         return;
     }
     if (block.terminator.kind is .cancel_term(cancel_term)) {
-        elaborate_cancel_path(ctx, output, body, flags, temps, block, cancel_term, blocks);
+        elaborate_cancel_path(ctx, output, body, flags, block, cancel_term, blocks);
     }
 }
 
@@ -1828,7 +2202,6 @@ Void elaborate_return_path(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     jil.ReturnTerminator return_term,
     list.ArrayList<jil.Block>&! blocks
@@ -1836,7 +2209,7 @@ Void elaborate_return_path(
     jil.BlockId final_return = jil.BlockId.from_index(blocks.len());
     blocks.add(return_block(output, final_return, block, return_term));
 
-    jil.BlockId target = append_drop_chain(ctx, output, body, flags, temps, block, final_return, blocks);
+    jil.BlockId target = append_drop_chain(ctx, output, body, flags, block, final_return, blocks);
     blocks.set(block.id.to_index(), goto_block(output, block, target));
 }
 
@@ -1845,14 +2218,13 @@ Void elaborate_cancel_path(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     jil.CancelTerminator cancel_term,
     list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId final_cancel = jil.BlockId.from_index(blocks.len());
     blocks.add(cancel_block(output, final_cancel, block, cancel_term));
-    jil.BlockId target = append_drop_chain(ctx, output, body, flags, temps, block, final_cancel, blocks);
+    jil.BlockId target = append_drop_chain(ctx, output, body, flags, block, final_cancel, blocks);
     blocks.set(block.id.to_index(), goto_block(output, block, target));
 }
 
@@ -1861,7 +2233,6 @@ jil.BlockId append_drop_chain(
     jil.Storage& output,
     jil.Body body,
     DropFlagMap& flags,
-    DropTemps temps,
     jil.Block block,
     jil.BlockId final_return,
     list.ArrayList<jil.Block>&! blocks
@@ -1878,7 +2249,6 @@ jil.BlockId append_drop_chain(
             ctx,
             output,
             flags,
-            temps,
             block,
             local,
             target,
@@ -2038,7 +2408,6 @@ DropExpansion append_drop_expansion_chain(
         return append_optional_payload_drop_chain(
             ctx,
             output,
-            temps,
             source_block,
             place,
             optional_type,
@@ -2050,7 +2419,6 @@ DropExpansion append_drop_expansion_chain(
         return append_error_union_payload_drop_chain(
             ctx,
             output,
-            temps,
             source_block,
             place,
             error_union_type,
@@ -2486,7 +2854,6 @@ jil.Block contiguous_drop_condition_block(
 DropExpansion append_optional_payload_drop_chain(
     DropContext&! ctx,
     jil.Storage& output,
-    DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     types.OptionalType optional_type,
@@ -2498,13 +2865,10 @@ DropExpansion append_optional_payload_drop_chain(
     }
 
     jil.BlockId payload_drop = append_layout_field_drop_block(
-        ctx,
         output,
-        temps,
         source_block,
         place,
         1,
-        optional_type.element,
         next_target,
         blocks
     );
@@ -2515,7 +2879,6 @@ DropExpansion append_optional_payload_drop_chain(
 DropExpansion append_error_union_payload_drop_chain(
     DropContext&! ctx,
     jil.Storage& output,
-    DropTemps temps,
     jil.Block source_block,
     jil.Place place,
     types.ErrorUnionType error_union_type,
@@ -2532,26 +2895,20 @@ DropExpansion append_error_union_payload_drop_chain(
     jil.BlockId error_target! = next_target;
     if (value_needs_drop) {
         value_target = append_layout_field_drop_block(
-            ctx,
             output,
-            temps,
             source_block,
             place,
             1,
-            error_union_type.value,
             next_target,
             blocks
         );
     }
     if (error_needs_drop) {
         error_target = append_layout_field_drop_block(
-            ctx,
             output,
-            temps,
             source_block,
             place,
             2,
-            error_union_type.error,
             next_target,
             blocks
         );
@@ -2666,54 +3023,75 @@ jil.BlockId append_place_drop_block(
     jil.BlockId next_target,
     list.ArrayList<jil.Block>&! blocks
 ) {
+    if (place_has_descendant_drop_flag(flags, place)) {
+        DropExpansion expansion = append_drop_expansion_chain(
+            ctx,
+            output,
+            temps,
+            flags,
+            source_block,
+            place,
+            type_id,
+            next_target,
+            blocks
+        );
+        if (expansion.expanded) { return expansion.target; }
+    }
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
-    blocks.add(placeholder_block(output, id, source_block, next_target));
-    list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
-    blocks.set(id.to_index(), drop_block(
-        ctx,
-        output,
-        temps,
-        flags,
-        id,
-        source_block,
-        place,
-        type_id,
-        statements$.mut_ref(),
-        next_target,
-        blocks
+    blocks.add(jil.Block(
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.empty_statements(),
+        terminator: jil.Terminator(
+            span: source_block.terminator.span,
+            kind: jil.drop_terminator_kind(jil.DropTerminator(
+                place: place,
+                projection_flags: output.empty_drop_projection_flags(),
+                target: next_target,
+                cleanup: null
+            ))
+        )
     ));
     return id;
 }
 
+Bool place_has_descendant_drop_flag(DropFlagMap&? flags, jil.Place place) {
+    guard flags is .some(flag_map) else { return false; }
+    Int index! = 0;
+    while (index < flag_map.projection_flags.len()) {
+        jil.Place candidate = flag_map.projection_flags.get(index).place;
+        if (candidate.projection.length > place.projection.length) {
+            if (drop_place_is_same_or_descendant(candidate, place)) { return true; }
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
 jil.BlockId append_layout_field_drop_block(
-    DropContext&! ctx,
     jil.Storage& output,
-    DropTemps temps,
     jil.Block source_block,
     jil.Place owner_place,
     Int field_index,
-    qid.TypeId field_type,
     jil.BlockId next_target,
     list.ArrayList<jil.Block>&! blocks
 ) {
     jil.BlockId id = jil.BlockId.from_index(blocks.len());
-    blocks.add(placeholder_block(output, id, source_block, next_target));
-    list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
     jil.Place field_place_value = field_index_place(output, owner_place, field_index);
-    jil.Block generated = drop_block(
-        ctx,
-        output,
-        temps,
-        null,
-        id,
-        source_block,
-        field_place_value,
-        field_type,
-        statements$.mut_ref(),
-        next_target,
-        blocks
-    );
-    blocks.set(id.to_index(), generated);
+    blocks.add(jil.Block(
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.empty_statements(),
+        terminator: jil.Terminator(
+            span: source_block.terminator.span,
+            kind: jil.drop_terminator_kind(jil.DropTerminator(
+                place: field_place_value,
+                projection_flags: output.empty_drop_projection_flags(),
+                target: next_target,
+                cleanup: null
+            ))
+        )
+    ));
     return id;
 }
 
@@ -3386,9 +3764,11 @@ Void push_projection_drop_flags(
 ) {
     Int index! = 0;
     while (index < flags.projection_flags.len()) {
-        ProjectionDropFlag entry = flags.projection_flags.get(index);
+        jil.DropProjectionFlag entry = flags.projection_flags.get(index);
         if (drop_place_is_same_or_descendant(entry.place, place)) {
-            push_set_drop_flag(ctx, output, entry.flag, value, span, statements);
+            push_set_drop_flag(
+                ctx, output, entry.flag.local_id, value, span, statements
+            );
         }
         index = index + 1;
     }
@@ -3406,10 +3786,12 @@ Void push_root_drop_flags(
     push_set_drop_flag(ctx, output, flags.flag_for(local_id), value, span, statements);
     Int index! = 0;
     while (index < flags.projection_flags.len()) {
-        ProjectionDropFlag entry = flags.projection_flags.get(index);
+        jil.DropProjectionFlag entry = flags.projection_flags.get(index);
         if (jil.place_local_id(entry.place) is .some(entry_local)) {
             if (entry_local == local_id) {
-                push_set_drop_flag(ctx, output, entry.flag, value, span, statements);
+                push_set_drop_flag(
+                    ctx, output, entry.flag.local_id, value, span, statements
+                );
             }
         }
         index = index + 1;
