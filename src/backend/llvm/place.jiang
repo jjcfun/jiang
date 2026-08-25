@@ -5,8 +5,10 @@
 
 import jil = "../../jil.jiang";
 import diagnostic = "../../diagnostic.jiang";
+import layout = "../../layout.jiang";
 import qid = "../../id.jiang";
 import list = "../../support/list.jiang";
+import types = "../../sema/type.jiang";
 import ffi = "./ffi.jiang";
 import llvm_state = "./state.jiang";
 import llvm_type = "./type.jiang";
@@ -18,22 +20,11 @@ public qid.TypeId place_type(llvm_state.LowerState& state, jil.Body& body, jil.P
     Int index! = 0;
     while (index < place.projection.length) {
         jil.PlaceElem elem = place.projection[index];
-        if (elem is .field_projection(field)) {
-            current = field.field_type;
-        } else if (elem is .frame_field_projection(field)) {
-            current = field.field_type;
-        } else if (elem is .deref_projection(_)) {
-            current = llvm_type.element_type(state, current);
-        } else if (elem is .index_projection(_)) {
-            current = llvm_type.element_type(state, current);
-        } else if (elem is .constant_index_projection(constant_index)) {
-            current = llvm_type.constant_index_type(state, current, constant_index.offset);
-        } else {
-            return state.ctx.store.types.invalid_type();
-        }
+        current = next_projection_type(state, current, elem);
+        if (current == state.ctx.store.types.invalid_type()) { return current; }
         index = index + 1;
     }
-    return current;
+    return state.type_id(current);
 }
 
 public ffi.Value lower_local_load(
@@ -221,13 +212,17 @@ ffi.Value lower_projection_elem(
 
 qid.TypeId next_projection_type(llvm_state.LowerState& state, qid.TypeId current_type, jil.PlaceElem elem) {
     if (elem is .field_projection(field)) {
-        return field.field_type;
+        guard llvm_type.layout_field_type_for_def(state, current_type, field.field_def)
+            is .some(field_type) else {
+            return state.ctx.store.types.invalid_type();
+        }
+        return field_type;
     }
     if (elem is .frame_field_projection(field)) {
-        return field.field_type;
+        return state.type_id(field.field_type);
     }
     if (elem is .constant_index_projection(constant_index)) {
-        return llvm_type.constant_index_type(state, current_type, constant_index.offset);
+        return state.type_id(constant_index.field_type);
     }
     return llvm_type.element_type(state, current_type);
 }
@@ -247,6 +242,14 @@ public ffi.Value lower_layout_field_pointer(
     if (llvm_type.is_trait_vtable_type(state, owner_type)) {
         return lower_trait_vtable_field_pointer(state, pointer, owner_type, field_index);
     }
+    layout.TypeLayout owner_layout = llvm_type.layout_for_type(state, owner_type);
+    if (owner_layout.kind == .zero_sized) { return pointer; }
+    if (field_index < owner_layout.fields.length) {
+        layout.TypeLayout field_layout = llvm_type.layout_for_type(
+            state, owner_layout.fields[field_index].field_type
+        );
+        if (field_layout.kind == .zero_sized) { return pointer; }
+    }
     ffi.Type owner_llvm_type = llvm_type.lower_type(state, owner_type);
     if (!ffi.type_valid(owner_llvm_type)) {
         add_place_codegen_error(output, "failed to lower LLVM field owner type", "llvm_field_owner_type_lower_failed");
@@ -255,8 +258,27 @@ public ffi.Value lower_layout_field_pointer(
 
     list.ArrayList<ffi.Value> indices! = list.ArrayList<ffi.Value>(2);
     indices.add(int32_value(state, 0));
-    indices.add(int32_value(state, llvm_type.layout_field_element_index(state, owner_type, field_index)));
-    return ffi.builder_build_gep(state.builder$.ref(), owner_llvm_type, pointer, indices$.ref());
+    Int element_index = llvm_type.layout_field_element_index(
+        state, owner_type, field_index
+    );
+    indices.add(int32_value(state, element_index));
+    ffi.Value result = ffi.builder_build_gep(
+        state.builder$.ref(), owner_llvm_type, pointer, indices$.ref()
+    );
+    if (ffi.value_valid(result)) { return result; }
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("failed to build LLVM field GEP: owner TypeId ");
+    message.append(state.type_id(owner_type).to_index());
+    message.append(", field ");
+    message.append(field_index);
+    message.append(", element ");
+    message.append(element_index);
+    message.append(", fields ");
+    message.append(llvm_type.layout_field_count(state, owner_type));
+    add_place_codegen_error(
+        output, message.into_string().bytes(), "llvm_field_gep_failed"
+    );
+    return ffi.Value();
 }
 
 ffi.Value lower_trait_vtable_field_pointer(
@@ -274,9 +296,10 @@ ffi.Value lower_trait_vtable_field_pointer(
     list.ArrayList<ffi.Value> indices! = list.ArrayList<ffi.Value>(2);
     indices.add(int32_value(state, 0));
     indices.add(int32_value(state, field_index));
+    ffi.Type storage_type = llvm_type.trait_vtable_storage_type(state, owner_type);
     return ffi.builder_build_gep(
         state.builder$.ref(),
-        llvm_type.trait_vtable_storage_type(state, owner_type),
+        storage_type,
         storage_pointer,
         indices$.ref()
     );
@@ -304,10 +327,90 @@ ffi.Value lower_constant_index_pointer(
     if (llvm_type.is_trait_vtable_type(state, owner_type)) {
         return lower_trait_vtable_field_pointer(state, pointer, owner_type, offset);
     }
-    if (offset < llvm_type.layout_field_count(state, owner_type)) {
+    Int field_count = llvm_type.layout_field_count(state, owner_type);
+    if (offset < field_count) {
         return lower_layout_field_pointer(state, output, pointer, owner_type, offset);
     }
-    return lower_dynamic_index_pointer(state, output, pointer, owner_type, int32_value(state, offset));
+    ffi.Value result = lower_dynamic_index_pointer(
+        state, output, pointer, owner_type, int32_value(state, offset)
+    );
+    if (ffi.value_valid(result)) { return result; }
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("failed to lower constant index: owner TypeId ");
+    message.append(state.type_id(owner_type).to_index());
+    message.append(", offset ");
+    message.append(offset);
+    message.append(", fields ");
+    message.append(field_count);
+    layout.TypeLayout owner_layout = llvm_type.layout_for_type(state, owner_type);
+    message.append(", layout kind ");
+    message.append(Int(owner_layout.kind));
+    append_type_details(state, message$.mut_ref(), owner_type);
+    add_place_codegen_error(
+        output, message.into_string().bytes(), "llvm_constant_index_type_failed"
+    );
+    return ffi.Value();
+}
+
+Void append_type_details(
+    llvm_state.LowerState& state,
+    std.StringBuilder&! message,
+    qid.TypeId type_id
+) {
+    types.TypeInfo info = llvm_type.type_info(state, type_id);
+    if (info.data is .named(named)) {
+        message.append(", named DefId ");
+        message.append(named.def_id.to_index());
+        return;
+    }
+    if (info.data is .function_type(function_type)) {
+        message.append(", function kind ");
+        message.append(Int(function_type.kind));
+        return;
+    }
+    if (info.data is .handle_type(handle)) {
+        message.append(", handle kind ");
+        message.append(Int(handle.kind));
+        return;
+    }
+    if (info.data is .tuple_type(tuple_type)) {
+        message.append(", tuple items ");
+        message.append(tuple_type.items.length);
+        Int index! = 0;
+        while (index < tuple_type.items.length && index < 2) {
+            qid.TypeId item = state.type_id(tuple_type.items[index]);
+            message.append(", item ");
+            message.append(index);
+            message.append(" TypeId ");
+            message.append(item.to_index());
+            append_type_kind(message, llvm_type.type_info(state, item));
+            index = index + 1;
+        }
+        return;
+    }
+    if (info.data is .int_type(_)) { message.append(", int"); return; }
+    if (info.data is .unit) { message.append(", void"); return; }
+    message.append(", other type");
+}
+
+Void append_type_kind(std.StringBuilder&! message, types.TypeInfo info) {
+    if (info.data is .named(named)) {
+        message.append(" named DefId ");
+        message.append(named.def_id.to_index());
+        return;
+    }
+    if (info.data is .function_type(function_type)) {
+        message.append(" function kind ");
+        message.append(Int(function_type.kind));
+        return;
+    }
+    if (info.data is .handle_type(handle)) {
+        message.append(" handle kind ");
+        message.append(Int(handle.kind));
+        return;
+    }
+    if (info.data is .unit) { message.append(" void"); return; }
+    message.append(" other");
 }
 
 ffi.Value lower_dynamic_index_pointer(

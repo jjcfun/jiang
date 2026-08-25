@@ -5,13 +5,14 @@ LLVM-specific lowering 不写进 JIL 或 layout。
 
 ## 输入
 
-- JIL function bodies。
+- generic source JIL body、对应的 `InstanceKey`，以及编译器派生 JIL body。
 - `LayoutStore` 中的 concrete type layout。
 - target 配置。
 - root package import closure 中所有 reachable concrete functions。
 
-backend 只消费 `instance_jil(InstanceKey)` 产生的 concrete function；不能接收 template body，
-也不能自行重新实例化泛型。
+源码实例由 backend 通过 `InstanceReader(generic body, InstanceKey)` 读取，不生成 concrete CFG
+副本。编译器派生的 drop glue、coroutine ABI 和 thunk 使用独立 `FunctionId` body。进入 Layout
+和 LLVM lowering 的类型、const 与 callee 必须已经由实例读取视图解释为 concrete 结果。
 
 ## LLVM 关系
 

@@ -17,6 +17,7 @@ import context = "../context.jiang";
 import driver_options = "../driver/options.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
+import fingerprint = "../incremental/fingerprint.jiang";
 import source_graph = "../incremental/source_graph.jiang";
 import jil = "../jil.jiang";
 import source = "../source.jiang";
@@ -32,12 +33,17 @@ import link_plan = "./link_plan.jiang";
 import std;
 
 public struct DebugTiming: Copyable {
+    public codegen_unit.Statistics codegen_units!;
     public UInt64 state_ns! = UInt64(0);
     public UInt64 prepare_store_ns! = UInt64(0);
     public UInt64 plan_ns! = UInt64(0);
     public UInt64 unit_lower_ns! = UInt64(0);
     public UInt64 unit_emit_ns! = UInt64(0);
     public UInt64 units_ns! = UInt64(0);
+
+    public init(self) {
+        self.codegen_units = codegen_unit.Statistics();
+    }
 }
 
 public struct DebugWorkProducts: Movable {
@@ -90,10 +96,18 @@ public DebugWorkProducts prepare(
     link_plan.LinkPlan links! = link_plan.LinkPlan();
     UInt8[]^ object_dir = artifact_path.object_dir(context_root);
     if (!system_fs.create_dirs(object_dir[..])) {
+        add_work_product_error(
+            ctx,
+            "failed to create debug work-product directory",
+            "debug_work_product_directory_failed"
+        );
         return DebugWorkProducts(false, links, next, target_identity);
     }
 
     codegen_unit.CodegenUnitSet units! = codegen_unit.build_codegen_units(ctx, lowered);
+    if (timing_enabled) {
+        timing.codegen_units = codegen_unit.statistics(units$.ref());
+    }
     restore_interface_units(ctx, units$.mut_ref(), previous$.ref());
     timing.state_ns = timing_elapsed(timing_enabled, started);
     started = timing_start(timing_enabled);
@@ -117,6 +131,11 @@ public DebugWorkProducts prepare(
     );
     list.ArrayList<Int> order = stable_unit_order(ctx, units$.ref());
     if (order.len() != units.len()) {
+        add_work_product_error(
+            ctx,
+            "a codegen unit has no stable source identity",
+            "codegen_unit_source_identity_missing"
+        );
         return DebugWorkProducts(false, links, next, target_identity);
     }
     map.WyHashMap<qkey.Fingerprint128, Bool> reused_sources! =
@@ -201,21 +220,6 @@ public Bool publish_success(
         // 不在每次成功构建后重新读取并哈希整个文件。
         qkey.Fingerprint128()
     );
-    return build_manifest.publish(
-        context_root,
-        products.target_identity,
-        products.state$.ref()
-    );
-}
-
-// unit 已逐个原子发布，即使后续 unit 或链接失败，也可保存本轮已经证明
-// 可复用的 work product；last_success 仍保持 false，不能形成错误 no-op。
-public Bool publish_work_products(
-    UInt8[]& context_root,
-    UInt8[]& source_base,
-    DebugWorkProducts& products
-) {
-    if (!sources_unchanged(source_base, products)) { return false; }
     return build_manifest.publish(
         context_root,
         products.target_identity,
@@ -316,6 +320,7 @@ Bool prepare_unit(
 ) {
     qid.ModuleId module_id = qid.ModuleId.from_index(unit.key.module_index);
     guard source_ji.source_identity_for_module(ctx, module_id) is .some(source_identity) else {
+        add_unit_preparation_error(ctx, unit.key, "has no stable source identity");
         return false;
     }
     build_manifest.WorkProductKind kind = work_product_kind(unit.key.kind);
@@ -326,7 +331,7 @@ Bool prepare_unit(
         ) {
             return true;
         }
-        return reuse_interface_unit(
+        Bool reused = reuse_interface_unit(
             ctx,
             previous,
             reused_sources,
@@ -336,12 +341,16 @@ Bool prepare_unit(
             source_identity.fingerprint,
             kind
         );
+        if (!reused) {
+            add_unit_preparation_error(ctx, unit.key, "has no reusable interface object");
+        }
+        return reused;
     }
     if (kind == .monomorph_unit && unit.functions.len() == 0) {
         if (!reused_sources.has(source_identity.fingerprint)) {
             return true;
         }
-        return reuse_previous_unit(
+        Bool reused = reuse_previous_unit(
             ctx,
             previous,
             next,
@@ -350,6 +359,10 @@ Bool prepare_unit(
             source_identity.fingerprint,
             kind
         );
+        if (!reused) {
+            add_unit_preparation_error(ctx, unit.key, "has no reusable monomorph object");
+        }
+        return reused;
     }
     guard unit_input_fingerprint(
         ctx,
@@ -358,6 +371,7 @@ Bool prepare_unit(
         module_id,
         fingerprints
     ) is .some(input_fingerprint) else {
+        add_unit_preparation_error(ctx, unit.key, "has no stable input fingerprint");
         return false;
     }
     database.ObjectUnitKey object_key = database.ObjectUnitKey(
@@ -532,6 +546,7 @@ Bool emit_pending_units(
             link_libc,
             llvm_triple
         ) is .some(object_unit) else {
+            add_object_lowering_error(ctx, unit.key);
             remove_pending_temporaries(pending);
             return false;
         }
@@ -551,7 +566,7 @@ Bool emit_pending_units(
         PendingUnit& plan = pending.ref_at(index);
         if (!results.get(index)) {
             system_fs.remove_file(plan.temporary.bytes());
-            add_object_emission_error(ctx);
+            add_object_emission_error(ctx, units.unit_at(plan.unit_index).key);
             ok = false;
         } else if (!publish_pending_unit(ctx, plan, next)) {
             system_fs.remove_file(plan.temporary.bytes());
@@ -561,6 +576,53 @@ Bool emit_pending_units(
         index = index + 1;
     }
     return ok;
+}
+
+Void add_object_lowering_error(
+    context.CompilerContext&! ctx,
+    codegen_unit.CodegenUnitKey key
+) {
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("LLVM object unit lowering failed for package ");
+    message.append(key.package_index);
+    message.append(" module ");
+    message.append(key.module_index);
+    message.append(" kind ");
+    message.append(Int(key.kind));
+    diagnostic_helper.add_package_error(
+        ctx.store.diagnostics$.mut_ref(),
+        message.into_string().bytes(),
+        "llvm_object_unit_lower_failed"
+    );
+}
+
+Void add_work_product_error(
+    context.CompilerContext&! ctx,
+    UInt8[]& message,
+    UInt8[]& code
+) {
+    diagnostic_helper.add_package_error(ctx.store.diagnostics$.mut_ref(), message, code);
+}
+
+Void add_unit_preparation_error(
+    context.CompilerContext&! ctx,
+    codegen_unit.CodegenUnitKey key,
+    UInt8[]& reason
+) {
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("codegen unit for package ");
+    message.append(key.package_index);
+    message.append(" module ");
+    message.append(key.module_index);
+    message.append(" kind ");
+    message.append(Int(key.kind));
+    message.append(" ");
+    message.append(reason);
+    add_work_product_error(
+        ctx,
+        message.into_string().bytes(),
+        "codegen_unit_preparation_failed"
+    );
 }
 
 Void remove_pending_temporaries(list.ArrayList<PendingUnit>& pending) {
@@ -584,10 +646,20 @@ Int forced_emission_failure_index(Int unit_count) {
     return -1;
 }
 
-Void add_object_emission_error(context.CompilerContext&! ctx) {
+Void add_object_emission_error(
+    context.CompilerContext&! ctx,
+    codegen_unit.CodegenUnitKey key
+) {
+    std.StringBuilder message! = std.StringBuilder();
+    message.append("LLVM object unit emission failed for package ");
+    message.append(key.package_index);
+    message.append(" module ");
+    message.append(key.module_index);
+    message.append(" kind ");
+    message.append(Int(key.kind));
     diagnostic_helper.add_package_error(
         ctx.store.diagnostics$.mut_ref(),
-        "LLVM object unit emission failed",
+        message.into_string().bytes(),
         "llvm_object_unit_emit_failed"
     );
 }
@@ -649,24 +721,42 @@ qkey.Fingerprint128? unit_input_fingerprint(
     list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
     Int index! = 0;
     while (index < unit.functions.len()) {
-        jil.FunctionId function_id = codegen_unit.codegen_function_id(
-            lowered, unit.functions.get(index)
+        jil.Function function = codegen_unit.codegen_function(
+            ctx, lowered, unit.functions.get(index)
         );
-        jil.Function function = lowered.program.function(function_id);
-        guard object_key_builder.stable_instance_key_for_function(
+        if (object_key_builder.stable_instance_key_for_function(
             ctx,
             function,
             fingerprints.target,
             fingerprints.compiler,
             fingerprints.profile
-        ) is .some(key) else {
-            return null;
+        ) is .some(key)) {
+            parts.add(object_key.stable_instance_fingerprint(key$.ref()));
+            index = index + 1;
+            continue;
         }
-        parts.add(object_key.stable_instance_fingerprint(key$.ref()));
+        guard function.origin is .generated(_) else { return null; }
+        parts.add(generated_function_input_fingerprint(
+            ctx, lowered, function, fingerprints
+        ));
         index = index + 1;
     }
     sort_fingerprints(parts$.mut_ref());
     return object_key.combine_fingerprints(UInt64(123), parts$.ref());
+}
+
+qkey.Fingerprint128 generated_function_input_fingerprint(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    jil.Function function,
+    UnitFingerprintContext fingerprints
+) {
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(fingerprints.target);
+    parts.add(fingerprints.compiler);
+    parts.add(fingerprints.profile);
+    parts.add(fingerprint.jil_function_fingerprint(ctx, lowered, function));
+    return object_key.combine_fingerprints(UInt64(124), parts$.ref());
 }
 
 qkey.Fingerprint128? source_unit_input_fingerprint(

@@ -15,9 +15,9 @@ driver/cli -> pipeline.compile
                        provider dylib      public syntax       early comptime
                          prepare           expansion           source select
 
-        Semantic Model -> type facts + const values -> template JIL -> concrete JIL -> checked JIL -> backend output
-                 \                    \                 \              \          \
-                  --------------------- layout facts -----------------------------
+        Semantic Model -> type facts + const values -> generic JIL -> reachable instance views -> backend output
+                 \                    \                 \                   \
+                  --------------------- on-demand layout facts ------------------
 ```
 
 流程中的几个块对应：
@@ -31,9 +31,9 @@ driver/cli -> pipeline.compile
 - `Semantic Model`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
   source selection 在 resolve/Semantic Model lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
-- `template JIL`：每个源码函数 lowering 一次、允许包含泛型参数的 CFG。
-- `concrete JIL`：从真实入口和调用引用出发，按 `InstanceKey` 渐进实例化的 CFG。
-- `checked JIL`：borrow check 后经过 drop elaboration 的 JIL。
+- `generic JIL`：每个源码函数 lowering 和 borrow check 一次，允许包含泛型参数的 CFG。
+- `reachable instance views`：从真实入口和调用引用出发，以 `InstanceKey` 渐进发现实例；
+  `InstanceReader` 解释 generic JIL，不复制 CFG。
 - `backend output`：LLVM IR、object file 或 executable。
 - `layout facts`：由 Semantic Model、type facts 和 target layout 按需查询得到，供 JIL、borrow/drop 和
   backend 使用。
@@ -367,7 +367,7 @@ src/
     model/      ID、Place、Value、CFG、Program 和 Store
     lower.jiang Semantic Model -> JIL lowering 入口
     lower/      package lowering 和共享 support
-    instantiate.jiang template JIL -> concrete JIL 实例化
+    instance_reader.jiang generic JIL 的实例读取视图
     analysis.jiang  JIL dataflow analysis 入口
     analysis/   provenance、escape 和参数属性证明
     optimize.jiang JIL 优化编排入口
@@ -394,7 +394,7 @@ src/
 
 - `WyHashMap<K, V>`：默认的内存 hash 映射；key 必须满足 `Hashable`，而 `Hashable` 继承
   `Equatable`。它使用 `WyHasher`；稳定 artifact fingerprint 仍使用 BLAKE3。`get` 返回 `V?`，
-  `get_ref` 返回 `V&?`。`HashTable<K, V>` 只保留给尚未迁移的旧实现，不应作为新增代码的选择。
+  `get_ref` 返回 `V&?`。
 - `ArrayTable<Id, T>`：append-only 实体主表；`next_id` 和 `append`
   通过 `Indexable.from_index` 返回强类型 Id。
 - `SideTable<Id, T>`：已有 Id 到附加数据的直接索引表，适合半稠密 side data。

@@ -1,32 +1,52 @@
 // 按最终 JIL 引用建立调用方拥有的泛型实例闭包。
 //
-// Semantic Model 只能给出源码层面的实例来源，lowering 还会生成 shim、析构函数和
-// coroutine 变体。这里扫描最终 JIL，使每个 source unit 的 monomorph unit 完整包含
-// 该源码直接或间接引用的 concrete function。不同调用方可以重复包含同一实例，
-// backend 会用 weak/linkonce 定义合并它们。
+// 每个 MonoItem 的直接引用只从 generic JIL 解析一次。source unit 仍分别遍历
+// 传递闭包，因此不同调用方可以继续拥有同一 weak/linkonce 实例定义。
 
 import codegen_unit = "./codegen_unit/model.jiang";
 import context = "../context.jiang";
 import jil = "../jil.jiang";
+import instance_reader = "../jil/instance_reader.jiang";
 import jil_references = "../jil/references.jiang";
+import function_resolver = "./function_resolver.jiang";
 import generic_bindings = "../sema/generic/bindings.jiang";
 import types = "../sema/type.jiang";
 import qid = "../id.jiang";
 import list = "../support/list.jiang";
-import symbol = "./symbol.jiang";
+import map = "../support/map.jiang";
+import table = "../support/table.jiang";
+
+struct DirectReferenceCache: Movable {
+    map.WyHashMap<Int, Bool> ready!;
+    table.MultiTable<Int, jil.MonoItem> references!;
+
+    init(self) {
+        self.ready = map.WyHashMap<Int, Bool>();
+        self.references = table.MultiTable<Int, jil.MonoItem>();
+    }
+}
 
 public Void assign(
     context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units
 ) {
-    list.ArrayList<Int> visited! = visited_functions(store.program.functions.len());
+    map.WyHashMap<Int, Int> visited! = map.WyHashMap<Int, Int>();
+    DirectReferenceCache references! = DirectReferenceCache();
     Int source_unit_count = units.len();
     Int index! = 0;
     while (index < source_unit_count) {
         codegen_unit.CodegenUnitKey key = units.unit_at(index).key;
         if (key.kind == .source_unit) {
-            assign_source(ctx, store, units, index, key, visited$.mut_ref());
+            assign_source(
+                ctx,
+                store,
+                units,
+                index,
+                key,
+                visited$.mut_ref(),
+                references$.mut_ref()
+            );
         }
         index = index + 1;
     }
@@ -38,74 +58,68 @@ Void assign_source(
     codegen_unit.CodegenUnitSet&! units,
     Int source_unit_index,
     codegen_unit.CodegenUnitKey source_key,
-    list.ArrayList<Int>&! visited
+    map.WyHashMap<Int, Int>&! visited,
+    DirectReferenceCache&! references
 ) {
-    list.ArrayList<jil.FunctionId> worklist! = list.ArrayList<jil.FunctionId>();
+    list.ArrayList<jil.MonoItem> worklist! = list.ArrayList<jil.MonoItem>();
     Int generation = source_key.module_index + 1;
     enqueue_source_roots(
-        store, units, source_unit_index, generation, visited, worklist$.mut_ref()
+        units, source_unit_index, generation, visited, worklist$.mut_ref()
     );
     enqueue_global_references(
-        ctx, store, units, source_unit_index, source_key, visited, worklist$.mut_ref()
+        store, units, source_unit_index, source_key, visited, worklist$.mut_ref()
     );
     while (!worklist.empty()) {
-        jil.FunctionId function_id = worklist.pop();
+        jil.MonoItem function = worklist.pop();
         collect_function_references(
-            ctx, store, units, source_key, function_id, visited, worklist$.mut_ref()
+            ctx,
+            store,
+            units,
+            source_key,
+            function,
+            visited,
+            worklist$.mut_ref(),
+            references
         );
     }
 }
 
-list.ArrayList<Int> visited_functions(Int count) {
-    list.ArrayList<Int> visited! = list.ArrayList<Int>(count);
-    Int index! = 0;
-    while (index < count) {
-        visited.add(0);
-        index = index + 1;
-    }
-    return visited;
-}
-
 Void enqueue_source_roots(
-    jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     Int source_unit_index,
     Int generation,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist
 ) {
     codegen_unit.CodegenUnit& unit = units.unit_at(source_unit_index);
     Int index! = 0;
     while (index < unit.functions.len()) {
-        jil.FunctionId function_id = codegen_unit.codegen_function_id(
-            store,
-            unit.functions.get(index)
-        );
-        enqueue_function(function_id, generation, visited, worklist);
+        enqueue_function(unit.functions.get(index), generation, visited, worklist);
         index = index + 1;
     }
 }
 
 Void enqueue_function(
-    jil.FunctionId function_id,
+    jil.MonoItem function,
     Int generation,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist
 ) {
-    Int index = function_id.to_index();
-    if (visited.get(index) == generation) { return; }
-    visited.set(index, generation);
-    worklist.add(function_id);
+    Int identity = jil.mono_item_identity(function);
+    if (visited.get(identity) is .some(value) && value$.get() == generation) {
+        return;
+    }
+    visited.set(identity, generation);
+    worklist.add(function);
 }
 
 Void enqueue_global_references(
-    context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     Int source_unit_index,
     codegen_unit.CodegenUnitKey source_key,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist
 ) {
     Int global_count = units.unit_at(source_unit_index).globals.len();
     Int index! = 0;
@@ -114,7 +128,7 @@ Void enqueue_global_references(
         jil.Global& global = store.program.globals.ref_at(global_id.to_index());
         if (global.initializer is .some(value)) {
             collect_static_value(
-                ctx, store, units, source_key, value, visited, worklist
+                store, units, source_key, value, visited, worklist
             );
         }
         index = index + 1;
@@ -122,17 +136,18 @@ Void enqueue_global_references(
 }
 
 Void collect_static_value(
-    context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     codegen_unit.CodegenUnitKey source_key,
     jil.StaticValue value,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist
 ) {
     if (value is .function(function_ref)) {
-        collect_function_ref(
-            ctx, store, units, source_key, function_ref, visited, worklist
+        guard function_resolver.for_ref(store, function_ref)
+            is .some(function) else { return; }
+        collect_codegen_function(
+            store, units, source_key, function, visited, worklist
         );
         return;
     }
@@ -140,7 +155,7 @@ Void collect_static_value(
     Int index! = 0;
     while (index < fields.length) {
         collect_static_value(
-            ctx, store, units, source_key, fields[index].value, visited, worklist
+            store, units, source_key, fields[index].value, visited, worklist
         );
         index = index + 1;
     }
@@ -151,544 +166,217 @@ Void collect_function_references(
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     codegen_unit.CodegenUnitKey source_key,
-    jil.FunctionId function_id,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    jil.MonoItem item,
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist,
+    DirectReferenceCache&! references
 ) {
-    jil.Function function = store.program.functions.get(function_id.to_index());
-    if (function.origin is .source(def_id)
-        && store.program.has_source_function(def_id)) {
-        collect_source_instance_references(
-            ctx,
+    Int identity = jil.mono_item_identity(item);
+    if (!references.ready.has(identity)) {
+        cache_direct_references(ctx, store, item, references);
+        references.ready.set(identity, true);
+    }
+    table.MultiTableCursor cursor! = references.references.first(identity);
+    while (cursor.valid()) {
+        collect_codegen_function(
             store,
             units,
             source_key,
-            function,
+            references.references.get(cursor),
             visited,
             worklist
+        );
+        cursor = references.references.next(cursor);
+    }
+}
+
+Void cache_direct_references(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    jil.MonoItem item,
+    DirectReferenceCache&! references
+) {
+    Int identity = jil.mono_item_identity(item);
+    if (item is .source_instance(instance_identity)) {
+        jil.InstanceKey instance = store.program.function_instance_at(instance_identity);
+        cache_source_references(
+            ctx,
+            store,
+            identity,
+            instance,
+            store.program.source_function(instance.def_id),
+            references
         );
         return;
     }
-    Int index! = 0;
-    while (index < function.body.blocks.length) {
-        jil.Block block = function.body.blocks[index];
-        collect_statements(
-            ctx, store, units, source_key, block.statements, visited, worklist
+    if (item is .source_resume_instance(resume)) {
+        jil.InstanceKey instance = store.program.function_instance_at(resume.identity);
+        jil.CoroutineResumeTemplate source =
+            store.program.source_resume_template(instance.def_id, resume.mode);
+        cache_source_references(
+            ctx, store, identity, instance, source.function, references
         );
-        collect_terminator(
-            ctx, store, units, source_key, block.terminator, visited, worklist
-        );
-        index = index + 1;
+        return;
     }
+    jil.Function function = codegen_unit.codegen_function(ctx, store, item);
+    jil_references.References direct = jil_references.collect_function_refs(function);
+    cache_resolved_references(ctx, store, identity, direct$.ref(), references);
 }
 
-Void collect_source_instance_references(
+Void cache_source_references(
     context.CompilerContext& ctx,
     jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Function function,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    Int identity,
+    jil.InstanceKey instance,
+    jil.Function source,
+    DirectReferenceCache&! references
 ) {
-    guard function.origin is .source(def_id) else { return; }
     generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
-    generic_bindings.GenericBindings substitutions =
-        generic_bindings.bindings_for_instance(
-            ctx.store.defs$.ref(),
-            ctx.store.model$.ref(),
-            ctx.store.types$.ref(),
-            def_id,
-            function.args,
-            empty$.ref()
-        );
-    jil_references.References references =
-        jil_references.collect_instance_function_refs(
-            ctx.store$.ref(),
-            substitutions$.ref(),
-            store.program.source_function(def_id)
-        );
+    generic_bindings.GenericBindings bindings = generic_bindings.bindings_for_instance(
+        ctx.store.defs$.ref(),
+        ctx.store.model$.ref(),
+        ctx.store.types$.ref(),
+        instance.def_id,
+        instance.args,
+        empty$.ref()
+    );
+    jil_references.References direct = jil_references.collect_instance_function_refs(
+        ctx.store$.ref(), bindings$.ref(), source
+    );
+    cache_resolved_references(ctx, store, identity, direct$.ref(), references);
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        ctx.store$.ref(), bindings$.ref()
+    );
+    cache_source_drop_glues(
+        ctx, store, identity, reader$.ref(), source, references
+    );
+}
+
+Void cache_resolved_references(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    Int identity,
+    jil_references.References& direct,
+    DirectReferenceCache&! references
+) {
     Int index! = 0;
-    while (index < references.functions.len()) {
-        jil_references.FunctionReference& reference = references.functions.ref_at(index);
-        if (function_id_for_reference(ctx, store, reference) is .some(referenced_id)) {
-            collect_function_id(
-                store,
-                units,
-                source_key,
-                referenced_id,
-                visited,
-                worklist
-            );
+    while (index < direct.functions.len()) {
+        jil_references.FunctionReference& reference = direct.functions.ref_at(index);
+        if (codegen_function_for_reference(store, reference)
+            is .some(function)) {
+            cache_reference(store, identity, function, references);
         }
         index = index + 1;
     }
     index = 0;
-    while (index < references.generated_functions.len()) {
-        collect_function_id(
+    while (index < direct.generated_functions.len()) {
+        cache_reference(
             store,
-            units,
-            source_key,
-            references.generated_functions.get(index),
-            visited,
-            worklist
-        );
-        index = index + 1;
-    }
-    jil_references.References concrete = jil_references.collect_function_refs(function);
-    index = 0;
-    while (index < concrete.functions.len()) {
-        jil_references.FunctionReference& reference = concrete.functions.ref_at(index);
-        if (function_id_for_reference(ctx, store, reference) is .some(referenced_id)) {
-            collect_function_id(
-                store,
-                units,
-                source_key,
-                referenced_id,
-                visited,
-                worklist
-            );
-        }
-        index = index + 1;
-    }
-    index = 0;
-    while (index < concrete.generated_functions.len()) {
-        collect_function_id(
-            store,
-            units,
-            source_key,
-            concrete.generated_functions.get(index),
-            visited,
-            worklist
+            identity,
+            jil.generated_function_mono_item(direct.generated_functions.get(index)),
+            references
         );
         index = index + 1;
     }
 }
 
-jil.FunctionId? function_id_for_reference(
+Void cache_source_drop_glues(
     context.CompilerContext& ctx,
+    jil.Store& store,
+    Int identity,
+    instance_reader.InstanceReader& reader,
+    jil.Function source,
+    DirectReferenceCache&! references
+) {
+    Int index! = 0;
+    while (index < source.body.blocks.length) {
+        jil.Terminator terminator = source.body.blocks[index].terminator;
+        index = index + 1;
+        guard terminator.kind is .drop_term(drop) else { continue; }
+        qid.TypeId type_id = ctx.store.types.canonical_substitution_type(
+            reader.place_type(source.body$.ref(), drop.place)
+        );
+        if (store.program.drop_glue(type_id) is .some(glue_id)) {
+            cache_reference(
+                store,
+                identity,
+                jil.generated_function_mono_item(glue_id),
+                references
+            );
+        }
+    }
+}
+
+Void cache_reference(
+    jil.Store& store,
+    Int identity,
+    jil.MonoItem item,
+    DirectReferenceCache&! references
+) {
+    if (!caller_owned(item, store)) { return; }
+    references.references.add(identity, item);
+}
+
+jil.MonoItem? codegen_function_for_reference(
     jil.Store& store,
     jil_references.FunctionReference& reference
 ) {
     types.GenericArg[]& args = reference.args.slice();
     if (reference.coroutine_start) {
-        return store.program.async_start_function(reference.def_id, args);
+        guard store.program.async_start_function(reference.def_id, args)
+            is .some(function_id) else { return null; }
+        return jil.generated_function_mono_item(function_id);
     }
     if (reference.coroutine_sync) {
-        return store.program.async_sync_function(reference.def_id, args);
+        guard store.program.async_sync_function(reference.def_id, args)
+            is .some(function_id) else { return null; }
+        return jil.generated_function_mono_item(function_id);
     }
-    symbol.BackendSymbolKey expected = symbol.source_function_symbol_key(
-        ctx, reference.def_id, args
-    );
-    if (store.program.function_id_for_instance(reference.def_id, args)
-        is .some(candidate)) {
-        symbol.BackendSymbolKey actual = symbol.function_symbol_key(
-            ctx, store.program.functions.ref_at(candidate.to_index())
-        );
-        if (symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref())) {
-            return candidate;
-        }
-    }
-    Int index! = 0;
-    while (index < store.program.functions.len()) {
-        jil.Function& function = store.program.functions.ref_at(index);
-        symbol.BackendSymbolKey actual = symbol.function_symbol_key(ctx, function);
-        if (symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref())) {
-            return function.id;
-        }
-        index = index + 1;
-    }
-    return null;
-}
-
-Void collect_statements(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Statement[]& statements,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    Int index! = 0;
-    while (index < statements.length) {
-        collect_statement(
-            ctx, store, units, source_key, statements[index], visited, worklist
-        );
-        index = index + 1;
-    }
-}
-
-Void collect_statement(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Statement statement,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (statement.kind is .assign_stmt(assign)) {
-        collect_rvalue(ctx, store, units, source_key, assign.value, visited, worklist);
-        return;
-    }
-    if (statement.kind is .atomic_store_stmt(atomic_store)) {
-        collect_operand(
-            ctx, store, units, source_key, atomic_store.value, visited, worklist
-        );
-        return;
-    }
-    if (statement.kind is .task_wait_stmt(wait)) {
-        collect_operand(ctx, store, units, source_key, wait.expected, visited, worklist);
-        return;
-    }
-    if (statement.kind is .task_region_start_stmt(start)
-        && start.child_resume is .some(function_ref)
-    ) {
-        collect_function_ref(
-            ctx, store, units, source_key, function_ref, visited, worklist
-        );
-        return;
-    }
-    if (statement.kind is .task_release_stmt(release)) {
-        collect_function_ref(
-            ctx, store, units, source_key, release.result_drop, visited, worklist
-        );
-    }
-}
-
-Void collect_terminator(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Terminator terminator,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (terminator.kind is .call_term(call)) {
-        collect_call(ctx, store, units, source_key, call, visited, worklist);
-        return;
-    }
-    if (terminator.kind is .branch_term(branch)) {
-        collect_operand(ctx, store, units, source_key, branch.condition, visited, worklist);
-        return;
-    }
-    if (terminator.kind is .switch_term(switch_term)) {
-        collect_operand(
-            ctx, store, units, source_key, switch_term.discriminator, visited, worklist
-        );
-        return;
-    }
-    if (terminator.kind is .assert_term(assert_term)) {
-        collect_operand(
-            ctx, store, units, source_key, assert_term.condition, visited, worklist
-        );
-        return;
-    }
-    if (terminator.kind is .throw_term(throw_term)) {
-        collect_operand(
-            ctx, store, units, source_key, throw_term.error_value, visited, worklist
-        );
-    }
-}
-
-Void collect_call(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.CallTerminator call,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    collect_callee(ctx, store, units, source_key, call.callee, visited, worklist);
-    collect_operands(ctx, store, units, source_key, call.args, visited, worklist);
-    if (call.lifetime_args is .some(args)) {
-        collect_operands(ctx, store, units, source_key, args, visited, worklist);
-    }
-    if (call.suspend_child is .some(function_ref)) {
-        collect_function_ref(
-            ctx, store, units, source_key, function_ref, visited, worklist
-        );
-    }
-}
-
-Void collect_callee(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.CallCallee callee,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (callee is .direct_function(function_ref)) {
-        collect_function_ref(
-            ctx, store, units, source_key, function_ref, visited, worklist
-        );
-        return;
-    }
-    if (callee is .indirect_operand(operand)) {
-        collect_operand(ctx, store, units, source_key, operand, visited, worklist);
-        return;
-    }
-    if (callee is .domain_enqueue(enqueue)) {
-        collect_optional_operand(
-            ctx, store, units, source_key, enqueue.task, visited, worklist
-        );
-        collect_operand(ctx, store, units, source_key, enqueue.resume, visited, worklist);
-        return;
-    }
-    guard callee is .dynamic_domain_enqueue(enqueue) else { return; }
-    collect_operand(ctx, store, units, source_key, enqueue.executor, visited, worklist);
-    collect_optional_operand(
-        ctx, store, units, source_key, enqueue.task, visited, worklist
-    );
-    collect_operand(ctx, store, units, source_key, enqueue.resume, visited, worklist);
-}
-
-Void collect_rvalue(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Rvalue value,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (value is .use_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    } else if (value is .unary_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    } else if (value is .binary_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.lhs, visited, worklist);
-        collect_operand(ctx, store, units, source_key, item.rhs, visited, worklist);
-    } else if (value is .cast_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    } else if (value is .inline_asm_value(item)) {
-        collect_inline_asm(ctx, store, units, source_key, item, visited, worklist);
-    } else {
-        collect_extended_rvalue(ctx, store, units, source_key, value, visited, worklist);
-    }
-}
-
-Void collect_extended_rvalue(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Rvalue value,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (value is .atomic_exchange_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.desired, visited, worklist);
-    } else if (value is .atomic_compare_exchange_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.expected, visited, worklist);
-        collect_operand(ctx, store, units, source_key, item.desired, visited, worklist);
-    } else if (value is .coroutine_frame_alloc_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.executor, visited, worklist);
-    } else if (value is .alloc_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    } else if (value is .alloc_array_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.count, visited, worklist);
-    } else if (value is .free_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.pointer, visited, worklist);
-    } else {
-        collect_tail_rvalue(ctx, store, units, source_key, value, visited, worklist);
-    }
-}
-
-Void collect_tail_rvalue(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Rvalue value,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    if (value is .coroutine_frame_free_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.pointer, visited, worklist);
-        collect_operand(ctx, store, units, source_key, item.executor, visited, worklist);
-    } else if (value is .slice_value(item)) {
-        collect_optional_operand(ctx, store, units, source_key, item.start, visited, worklist);
-        collect_optional_operand(ctx, store, units, source_key, item.end, visited, worklist);
-    } else if (value is .aggregate_value(item)) {
-        collect_optional_operand(ctx, store, units, source_key, item.tag, visited, worklist);
-        collect_operands(ctx, store, units, source_key, item.fields, visited, worklist);
-    } else if (value is .closure_value(item)) {
-        collect_operands(ctx, store, units, source_key, item.captures, visited, worklist);
-    } else if (value is .optional_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    } else if (value is .error_union_value(item)) {
-        collect_operand(ctx, store, units, source_key, item.value, visited, worklist);
-    }
-}
-
-Void collect_inline_asm(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.InlineAsmRvalue value,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    Int index! = 0;
-    while (index < value.operands.length) {
-        if (value.operands[index] is .input(input)) {
-            collect_operand(
-                ctx, store, units, source_key, input.value, visited, worklist
+    if (reference.coroutine_resume) {
+        guard store.program.coroutine_resume_item(reference.def_id, args)
+            is .some(item) else { return null; }
+        if (item is .source_resume_instance(resume)) {
+            return jil.source_resume_mono_item(
+                resume.identity, reference.coroutine_resume_mode
             );
         }
-        index = index + 1;
+        return item;
     }
-}
-
-Void collect_operands(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Operand[]& operands,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    Int index! = 0;
-    while (index < operands.length) {
-        collect_operand(
-            ctx, store, units, source_key, operands[index], visited, worklist
-        );
-        index = index + 1;
+    if (reference.coroutine_completion) {
+        if (reference.coroutine_serial_completion) {
+            guard store.program.serial_completion_function(reference.def_id, args)
+                is .some(function_id) else { return null; }
+            return jil.generated_function_mono_item(function_id);
+        }
+        guard store.program.coroutine_completion_function(reference.def_id, args)
+            is .some(function_id) else { return null; }
+        return jil.generated_function_mono_item(function_id);
     }
+    return function_resolver.source(store, reference.def_id, args);
 }
 
-Void collect_optional_operand(
-    context.CompilerContext& ctx,
+Void collect_codegen_function(
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     codegen_unit.CodegenUnitKey source_key,
-    jil.Operand? operand,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
+    jil.MonoItem item,
+    map.WyHashMap<Int, Int>&! visited,
+    list.ArrayList<jil.MonoItem>&! worklist
 ) {
-    if (operand is .some(value)) {
-        collect_operand(ctx, store, units, source_key, value, visited, worklist);
-    }
-}
-
-Void collect_operand(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.Operand operand,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    guard operand is .function_operand(function_ref) else { return; }
-    collect_function_ref(
-        ctx, store, units, source_key, function_ref, visited, worklist
-    );
-}
-
-Void collect_function_ref(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.FunctionRef function_ref,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    guard function_for_ref(ctx, store, function_ref) is .some(function_id) else {
+    if (!caller_owned(item, store)) { return; }
+    Int generation = source_key.module_index + 1;
+    Int identity = jil.mono_item_identity(item);
+    if (visited.get(identity) is .some(value) && value$.get() == generation) {
         return;
     }
-    collect_function_id(
-        store, units, source_key, function_id, visited, worklist
-    );
-}
-
-Void collect_function_id(
-    jil.Store& store,
-    codegen_unit.CodegenUnitSet&! units,
-    codegen_unit.CodegenUnitKey source_key,
-    jil.FunctionId function_id,
-    list.ArrayList<Int>&! visited,
-    list.ArrayList<jil.FunctionId>&! worklist
-) {
-    jil.Function function = store.program.functions.get(function_id.to_index());
-    if (!caller_owned(function, store)) { return; }
-    Int generation = source_key.module_index + 1;
-    if (visited.get(function_id.to_index()) == generation) { return; }
     codegen_unit.CodegenUnitKey mono_key = codegen_unit.CodegenUnitKey(
         .monomorph_unit, source_key.package_index, source_key.module_index
     );
-    Int unit_index = units.add_function(
-        mono_key,
-        codegen_unit.codegen_function_for_id(store, function_id)
-    );
+    Int unit_index = units.add_function(mono_key, item);
     units.mark_weak_monomorph_definitions(unit_index);
-    enqueue_function(function_id, generation, visited, worklist);
+    enqueue_function(item, generation, visited, worklist);
 }
 
-Bool caller_owned(jil.Function function, jil.Store& store) {
-    if (function.args.length > 0) {
-        return true;
-    }
-    return store.program.function_is_shared_codegen(function.id);
-}
-
-jil.FunctionId? function_for_ref(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    jil.FunctionRef value
-) {
-    jil.FunctionId? candidate = store.program.function_id_for_ref(value);
-    if (candidate is .some(function_id)
-        && (value.coroutine_start || value.coroutine_sync)) {
-        return function_id;
-    }
-    if (candidate is .some(function_id)
-        && function_ref_matches(ctx, store, value, function_id)
-    ) {
-        return function_id;
-    }
-    return scan_function_for_ref(ctx, store, value);
-}
-
-Bool function_ref_matches(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    jil.FunctionRef value,
-    jil.FunctionId function_id
-) {
-    jil.Function function = store.program.functions.get(function_id.to_index());
-    symbol.BackendSymbolKey expected =
-        symbol.symbol_key_for_function_ref(ctx, store, value, false);
-    symbol.BackendSymbolKey actual =
-        symbol.function_symbol_key(ctx, function$.ref());
-    return symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref());
-}
-
-jil.FunctionId? scan_function_for_ref(
-    context.CompilerContext& ctx,
-    jil.Store& store,
-    jil.FunctionRef value
-) {
-    symbol.BackendSymbolKey expected =
-        symbol.symbol_key_for_function_ref(ctx, store, value, false);
-    Int index! = 0;
-    while (index < store.program.functions.len()) {
-        jil.Function function = store.program.functions.get(index);
-        symbol.BackendSymbolKey actual =
-            symbol.function_symbol_key(ctx, function$.ref());
-        if (symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref())) {
-            return function.id;
-        }
-        index = index + 1;
-    }
-    return null;
+Bool caller_owned(jil.MonoItem function, jil.Store& store) {
+    return store.program.mono_item_is_shared_codegen(function);
 }

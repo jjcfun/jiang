@@ -15,6 +15,7 @@ import list = "../../support/list.jiang";
 import map = "../../support/map.jiang";
 import system_target = "../../system/target.jiang";
 import jil = "../model.jiang";
+import drop_elaborate = "../drop_elaborate.jiang";
 import std;
 import coroutine_confinement = "../coroutine/confinement.jiang";
 import coroutine_rtc = "../coroutine/run_to_completion.jiang";
@@ -59,9 +60,9 @@ public jil.Store^ lower_package(
     diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
     lower_package_into(
         ctx.store$.ref(),
-        ctx.query.template_jil$.ref(),
+        ctx.query.source_jil$.ref(),
         ctx.query.trait_vtable$.ref(),
-        ctx.query.instance_jil$.ref(),
+        ctx.query.jil_instance$.ref(),
         ctx.query.layout$.mut_ref(),
         ctx.output,
         model,
@@ -88,9 +89,9 @@ public jil.Store^ lower_package(
 
 Void lower_package_into(
     compiler_store.CompilerStore& store,
-    database.TemplateJilQuery& template_query,
+    database.SourceJilQuery& template_query,
     database.TraitVTableQuery& trait_vtable_query,
-    database.InstanceJilQuery& instance_query,
+    database.JilInstanceQuery& instance_query,
     database.LayoutQuery&! layouts,
     system_target.BuildOutputKind output_kind,
     sem_store.Store& model,
@@ -117,56 +118,97 @@ Void lower_package_into(
     lowerer.lower_package(instance_query, layouts);
 }
 
+public Void lower_drop_references(
+    context.CompilerContext&! ctx,
+    module_graph.ModuleGraph& graph,
+    jil.Store&! output,
+    Int mono_item_cursor
+) {
+    qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    {
+        lower_context.Context lowerer! = lower_context.Context(
+            ctx.store$.ref(),
+            ctx.output,
+            ctx.store.model$.ref(),
+            ctx.store.typeck$.ref(),
+            graph,
+            ctx.query.source_jil$.ref(),
+            ctx.query.trait_vtable$.ref(),
+            closure_env_symbol,
+            output.storage$.ref(),
+            output.program$.mut_ref(),
+            output.drop_elaboration$.mut_ref(),
+            diagnostics$.mut_ref()
+        );
+        lowerer.close_drop_references(
+            ctx.query.jil_instance$.ref(),
+            ctx.query.layout$.mut_ref(),
+            mono_item_cursor
+        );
+    }
+    ctx.store.diagnostics.append(diagnostics$.move());
+}
+
 public extend lower_context.Context {
     public Void lower_package(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts
     ) {
-        // 先为 source function 建立可含泛型参数的 template JIL。具体实例由
-        // runtime roots 和 concrete JIL 中的函数引用驱动，不再维护全量实例集合。
+        // 先为 source function 建立可含泛型参数的 generic JIL。具体实例由
+        // runtime roots 和实例视图中的函数引用驱动，不再维护全量实例集合。
         Int module_index! = 0;
         while (module_index < self.graph.module_count()) {
             store.ModuleRecord& module = self.store.resolve.module_ref(self.graph.module_at(module_index));
             self.lower_def_tree(instance_query, layouts, module.def_id);
             module_index = module_index + 1;
         }
+        self.materialize_template_async_operations(instance_query, layouts);
+        self.prepare_template_coroutine_resume_functions();
         self.lower_runtime_entry(instance_query, layouts);
-        map.WyHashMap<Int, Bool> active_finalization! =
-            map.WyHashMap<Int, Bool>();
         Int referenced_global_cursor! = 0;
-        Int referenced_source_cursor! = 0;
-        Int referenced_function_cursor! = 0;
+        Int mono_item_cursor! = 0;
         Int finalization_cursor! = 0;
-        list.ArrayList<jil.FunctionId> pending_finalization! =
-            list.ArrayList<jil.FunctionId>();
+        list.ArrayList<jil.MonoItem> pending_finalization! =
+            list.ArrayList<jil.MonoItem>();
         self.close_referenced_instances(
             instance_query,
             layouts,
-            active_finalization$.mut_ref(),
             referenced_global_cursor$.mut_ref(),
-            referenced_source_cursor$.mut_ref(),
-            referenced_function_cursor$.mut_ref(),
+            mono_item_cursor$.mut_ref(),
             finalization_cursor$.mut_ref(),
             pending_finalization$.mut_ref()
         );
         list.ArrayList<coroutine_confinement.Summary> confinement! =
-            coroutine_confinement.analyze(self.program);
+            coroutine_confinement.analyze(self.store, self.program);
         self.apply_coroutine_confinement(confinement$.ref());
-        self.rtc_eligible = coroutine_rtc.analyze(self.program, self.storage);
+        self.rtc_eligible = coroutine_rtc.analyze(
+            self.store, self.program, self.storage
+        );
         self.prepare_coroutine_plans();
-        self.prepare_coroutine_source_layouts();
+        self.prepare_generated_coroutine_variant_sources();
         self.lower_coroutine_resume_functions();
         self.close_referenced_instances(
             instance_query,
             layouts,
-            active_finalization$.mut_ref(),
             referenced_global_cursor$.mut_ref(),
-            referenced_source_cursor$.mut_ref(),
-            referenced_function_cursor$.mut_ref(),
+            mono_item_cursor$.mut_ref(),
             finalization_cursor$.mut_ref(),
             pending_finalization$.mut_ref()
         );
+        while (self.finish_async_callable_abi_functions()) {
+            self.close_referenced_instances(
+                instance_query,
+                layouts,
+                referenced_global_cursor$.mut_ref(),
+                mono_item_cursor$.mut_ref(),
+                finalization_cursor$.mut_ref(),
+                pending_finalization$.mut_ref()
+            );
+        }
+        self.publish_template_coroutine_resume_functions();
+        self.source_resume_templates.clear();
         if (self.program.has_pending_generated_functions()) {
             self.program.mark_error();
             std.String message! = std.String(
@@ -195,39 +237,58 @@ public extend lower_context.Context {
 
     Void close_referenced_instances(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
-        map.WyHashMap<Int, Bool>&! active_finalization,
         Int&! referenced_global_cursor,
-        Int&! referenced_source_cursor,
-        Int&! referenced_function_cursor,
+        Int&! mono_item_cursor,
         Int&! finalization_cursor,
-        list.ArrayList<jil.FunctionId>&! pending_finalization
+        list.ArrayList<jil.MonoItem>&! pending_finalization
     ) {
         Bool continue_closure! = true;
         while (continue_closure) {
-            Int previous_function_count = self.program.functions.len();
-            Int previous_source_count = self.program.source_instance_count();
-            Int previous_global_count = self.program.globals.len();
-            self.lower_referenced_instances(
-                instance_query,
-                layouts,
-                referenced_global_cursor,
-                referenced_source_cursor,
-                referenced_function_cursor
+            self.lower_global_references(
+                instance_query, layouts, referenced_global_cursor
             );
+            while (mono_item_cursor$.get() < self.program.mono_item_count()) {
+                jil.MonoItem item = self.program.mono_item_at(
+                    mono_item_cursor$.get()
+                );
+                mono_item_cursor$.set(mono_item_cursor$.get() + 1);
+                self.lower_mono_item_references(instance_query, layouts, item);
+            }
             Bool finalized = self.finalize_instance_functions(
                 instance_query,
                 layouts,
-                active_finalization,
                 finalization_cursor,
                 pending_finalization
             );
-            Bool discovered = previous_function_count != self.program.functions.len()
-                || previous_source_count != self.program.source_instance_count()
-                || previous_global_count != self.program.globals.len();
-            continue_closure = discovered
+            continue_closure = mono_item_cursor$.get() < self.program.mono_item_count()
+                || referenced_global_cursor$.get() < self.program.globals.len()
                 || (finalized && !pending_finalization.empty());
+        }
+    }
+
+    Void close_drop_references(
+        Self&! self,
+        database.JilInstanceQuery& instance_query,
+        database.LayoutQuery&! layouts,
+        Int mono_item_cursor
+    ) {
+        Int cursor! = mono_item_cursor;
+        while (cursor < self.program.mono_item_count()) {
+            jil.MonoItem item = self.program.mono_item_at(cursor);
+            cursor = cursor + 1;
+            self.lower_mono_item_references(instance_query, layouts, item);
+            if (item is .source_instance(identity)) {
+                drop_elaborate.ensure_source_instance_drop_glue(
+                    self.store,
+                    layouts,
+                    self.storage,
+                    self.program,
+                    self.drop_elaboration,
+                    identity
+                );
+            }
         }
     }
 

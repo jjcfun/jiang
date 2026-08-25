@@ -4,11 +4,14 @@
 // value。place projection 和 type/layout 规则分别委托给同目录 helper。
 
 import jil = "../../jil.jiang";
+import instance_reader = "../../jil/instance_reader.jiang";
 import diagnostic = "../../diagnostic.jiang";
 import qid = "../../id.jiang";
 import layout = "../../layout.jiang";
 import list = "../../support/list.jiang";
 import backend_abi = "../abi.jiang";
+import codegen_unit = "../codegen_unit/model.jiang";
+import function_resolver = "../function_resolver.jiang";
 import symbol = "../symbol.jiang";
 import string = "../../support/string.jiang";
 import table = "../../support/table.jiang";
@@ -74,6 +77,9 @@ public qid.TypeId operand_type(llvm_state.LowerState& state, jil.Body& body, jil
     if (operand is .global_address_operand(global_value)) {
         return global_value.type_id;
     }
+    if (operand is .trait_vtable_operand(vtable)) {
+        return vtable.type_id;
+    }
     if (operand is .copy_operand(copy_operand)) {
         return llvm_place.place_type(state, body, copy_operand.place);
     }
@@ -87,7 +93,7 @@ public ffi.Value lower_rvalue(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
     jil.Body& body,
-    jil.Rvalue value,
+    jil.Rvalue& value,
     list.ArrayList<ffi.Value>& local_slots,
     qid.TypeId result_type
 ) {
@@ -122,14 +128,31 @@ public ffi.Value lower_rvalue(
         return lower_domain_executor(state, domain_executor);
     }
     if (value is .scheduled_continuation_resume_value(_)) {
-        return ffi.module_get_function(state.module$.ref(), "__jiang_runtime_scheduled_continuation_resume");
+        ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+        list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(1);
+        params.add(pointer_type);
+        ffi.Type function_type = ffi.function_type(
+            ffi.context_void_type(state.llvm_context$.ref()),
+            params$.ref()
+        );
+        return runtime_function(
+            state,
+            "__jiang_runtime_scheduled_continuation_resume",
+            function_type
+        );
     }
     if (value is .executor_enter_value(executor_enter)) {
-        ffi.Value runtime = ffi.module_get_function(
-            state.module$.ref(), "__jiang_runtime_executor_enter"
+        ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+        list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(2);
+        params.add(pointer_type);
+        params.add(pointer_type);
+        ffi.Type function_type = ffi.function_type(pointer_type, params$.ref());
+        ffi.Value runtime = runtime_function(
+            state,
+            "__jiang_runtime_executor_enter",
+            function_type
         );
         if (!ffi.value_valid(runtime)) { return ffi.Value(); }
-        ffi.Type function_type = ffi.global_value_type(runtime);
         list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(2);
         args.add(llvm_place.lower_local_load(
             state, body.locals[executor_enter.executor.to_index()], local_slots
@@ -219,6 +242,16 @@ public ffi.Value lower_rvalue(
     return ffi.Value();
 }
 
+ffi.Value runtime_function(
+    llvm_state.LowerState& state,
+    UInt8[]& name,
+    ffi.Type function_type
+) {
+    ffi.Value existing = ffi.module_get_function(state.module$.ref(), name);
+    if (ffi.value_valid(existing)) { return existing; }
+    return ffi.module_add_function(state.module$.ref(), name, function_type);
+}
+
 ffi.Value lower_layout_value(
     llvm_state.LowerState& state,
     jil.LayoutValueRvalue value,
@@ -237,14 +270,8 @@ public ffi.Value lower_domain_executor(
     llvm_state.LowerState& state,
     jil.DomainExecutorRvalue domain_executor
 ) {
-    ffi.Value materialize = ffi.module_get_function(state.module$.ref(), "__jiang_runtime_domain_executor");
-    if (!ffi.value_valid(materialize)) { return ffi.Value(); }
     ffi.Type int_type = ffi.context_int_type(state.llvm_context$.ref(), 64);
     ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
-    ffi.Value slot = domain_executor_slot(state, domain_executor.domain_def, int_type);
-    if (!ffi.value_valid(slot)) { return ffi.Value(); }
-    ffi.Value cached = ffi.builder_build_atomic_load(state.builder$.ref(), int_type, slot, Int32(4));
-    if (!ffi.value_valid(cached)) { return ffi.Value(); }
     list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(7);
     params.add(pointer_type);
     params.add(int_type);
@@ -254,6 +281,21 @@ public ffi.Value lower_domain_executor(
     params.add(pointer_type);
     params.add(pointer_type);
     ffi.Type function_type = ffi.function_type(pointer_type, params$.ref());
+    ffi.Value materialize! = ffi.module_get_function(
+        state.module$.ref(), "__jiang_runtime_domain_executor"
+    );
+    if (!ffi.value_valid(materialize)) {
+        materialize = ffi.module_add_function(
+            state.module$.ref(), "__jiang_runtime_domain_executor", function_type
+        );
+    }
+    if (!ffi.value_valid(materialize)) { return ffi.Value(); }
+    ffi.Value slot = domain_executor_slot(state, domain_executor.domain_def, int_type);
+    if (!ffi.value_valid(slot)) { return ffi.Value(); }
+    ffi.Value cached = ffi.builder_build_atomic_load(
+        state.builder$.ref(), int_type, slot, Int32(4)
+    );
+    if (!ffi.value_valid(cached)) { return ffi.Value(); }
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(7);
     args.add(slot);
     args.add(cached);
@@ -452,6 +494,9 @@ public ffi.Value lower_operand(
     if (operand is .global_address_operand(global_value)) {
         return global_address_for_ref(state, global_value);
     }
+    if (operand is .trait_vtable_operand(vtable)) {
+        return lower_trait_vtable_operand(state, vtable);
+    }
     if (operand is .copy_operand(copy_operand)) {
         return llvm_place.lower_place_value(state, output, body, copy_operand.place, local_slots);
     }
@@ -464,11 +509,31 @@ public ffi.Value lower_operand(
     return ffi.Value();
 }
 
+public ffi.Value lower_trait_vtable_operand(
+    llvm_state.LowerState& state,
+    jil.TraitVTableRef vtable
+) {
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        state.ctx.store$.ref(), state.bindings$.ref()
+    );
+    jil.TraitVTableKey key = jil.TraitVTableKey(
+        vtable.key.trait_def,
+        reader.type_id(vtable.key.subject_type)
+    );
+    guard state.store.program.trait_vtable_global(key) is .some(global_id) else {
+        return ffi.Value();
+    }
+    return global_address_for_ref(state, jil.GlobalRef(
+        id: global_id,
+        type_id: reader.type_id(vtable.type_id)
+    ));
+}
+
 public Bool lower_aggregate_into_place(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
     jil.Body& body,
-    jil.Rvalue rvalue,
+    jil.Rvalue& rvalue,
     jil.Place destination,
     list.ArrayList<ffi.Value>& local_slots
 ) {
@@ -550,7 +615,7 @@ public Bool lower_closure_into_place(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
     jil.Body& body,
-    jil.Rvalue rvalue,
+    jil.Rvalue& rvalue,
     jil.Place destination,
     list.ArrayList<ffi.Value>& local_slots
 ) {
@@ -568,12 +633,16 @@ public Bool lower_closure_into_place(
         return false;
     }
     Bool heap_environment = value.environment_storage == .heap;
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        state.ctx.store$.ref(), state.bindings$.ref()
+    );
+    list.ArrayList<types.GenericArg> concrete_args = reader.generic_args(value.args);
     guard state.store.program.closure_vtable_global(
-        value.lambda_def, value.args, heap_environment
+        value.lambda_def, concrete_args.slice(), heap_environment
     ) is .some(vtable_global) else { return false; }
     jil.Operand vtable_operand = jil.global_address_operand_value(jil.GlobalRef(
         id: vtable_global,
-        type_id: value.vtable_type
+        type_id: state.type_id(value.vtable_type)
     ));
     ffi.Value vtable = lower_operand(
         state, output, body, vtable_operand, local_slots
@@ -760,7 +829,7 @@ public Bool lower_optional_into_place(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
     jil.Body& body,
-    jil.Rvalue rvalue,
+    jil.Rvalue& rvalue,
     jil.Place destination,
     list.ArrayList<ffi.Value>& local_slots,
     qid.TypeId result_type
@@ -1001,14 +1070,19 @@ public ffi.Value lower_const_as_type(
     jil.Const value,
     qid.TypeId result_type
 ) {
-    jil.ConstValue const_value = value.value;
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        state.ctx.store$.ref(), state.bindings$.ref()
+    );
+    jil.Const concrete_value = reader.constant(value);
+    qid.TypeId concrete_result_type = state.type_id(result_type);
+    jil.ConstValue const_value = concrete_value.value;
     if (jil.string_const_value(const_value) is .some(string_value)) {
-        return lower_string_const(state, output, string_value, result_type);
+        return lower_string_const(state, output, string_value, concrete_result_type);
     }
     if (jil.is_null_const_value(const_value)) {
-        return lower_null_const(state, result_type);
+        return lower_null_const(state, concrete_result_type);
     }
-    ffi.Type value_type = llvm_type.lower_type(state, value.type_id);
+    ffi.Type value_type = llvm_type.lower_type(state, concrete_value.type_id);
     if (!ffi.type_valid(value_type)) {
         return ffi.Value();
     }
@@ -1328,7 +1402,10 @@ ffi.Value lower_alloc_value(
     if (!ffi.value_valid(raw)) {
         return ffi.Value();
     }
-    ffi.Value pointer = ffi.builder_build_cast(state.builder$.ref(), 6, raw, llvm_type.lower_type(state, result_type));
+    ffi.Type pointer_type = llvm_type.lower_type(state, result_type);
+    ffi.Value pointer = ffi.builder_build_cast(
+        state.builder$.ref(), 6, raw, pointer_type
+    );
     if (!ffi.value_valid(pointer)) {
         return ffi.Value();
     }
@@ -1348,7 +1425,8 @@ ffi.Value lower_alloc_box(
     if (!ffi.value_valid(raw)) {
         return ffi.Value();
     }
-    return ffi.builder_build_cast(state.builder$.ref(), 6, raw, llvm_type.lower_type(state, result_type));
+    ffi.Type result_pointer_type = llvm_type.lower_type(state, result_type);
+    return ffi.builder_build_cast(state.builder$.ref(), 6, raw, result_pointer_type);
 }
 
 ffi.Value lower_coroutine_frame_alloc(
@@ -1359,13 +1437,21 @@ ffi.Value lower_coroutine_frame_alloc(
     list.ArrayList<ffi.Value>& local_slots,
     qid.TypeId result_type
 ) {
-    ffi.Value runtime = ffi.module_get_function(
-        state.module$.ref(), "__jiang_runtime_coroutine_frame_alloc"
+    ffi.Type size_type = allocator_size_type(state);
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(3);
+    params.add(pointer_type);
+    params.add(size_type);
+    params.add(size_type);
+    ffi.Type function_type = ffi.function_type(pointer_type, params$.ref());
+    ffi.Value runtime = runtime_function(
+        state,
+        "__jiang_runtime_coroutine_frame_alloc",
+        function_type
     );
     if (!ffi.value_valid(runtime)) { return ffi.Value(); }
     ffi.Value executor = lower_operand(state, output, body, value.executor, local_slots);
     if (!ffi.value_valid(executor)) { return ffi.Value(); }
-    ffi.Type size_type = allocator_size_type(state);
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(3);
     args.add(executor);
     args.add(ffi.const_int(size_type, UInt64(llvm_type.layout_size(state, value.value_type))));
@@ -1374,7 +1460,8 @@ ffi.Value lower_coroutine_frame_alloc(
         state.builder$.ref(), ffi.global_value_type(runtime), runtime, args$.ref()
     );
     if (!ffi.value_valid(raw)) { return ffi.Value(); }
-    return ffi.builder_build_cast(state.builder$.ref(), 6, raw, llvm_type.lower_type(state, result_type));
+    ffi.Type result_pointer_type = llvm_type.lower_type(state, result_type);
+    return ffi.builder_build_cast(state.builder$.ref(), 6, raw, result_pointer_type);
 }
 
 ffi.Value lower_alloc_array(
@@ -1416,7 +1503,10 @@ ffi.Value lower_alloc_array(
     if (!ffi.value_valid(raw)) {
         return ffi.Value();
     }
-    ffi.Value data = ffi.builder_build_cast(state.builder$.ref(), 6, raw, owned_array_data_type(state, result_type));
+    ffi.Type data_type = owned_array_data_type(state, result_type);
+    ffi.Value data = ffi.builder_build_cast(
+        state.builder$.ref(), 6, raw, data_type
+    );
     if (!ffi.value_valid(data)) {
         return ffi.Value();
     }
@@ -1521,8 +1611,18 @@ ffi.Value lower_coroutine_frame_free(
     list.ArrayList<ffi.Value>& local_slots,
     qid.TypeId result_type
 ) {
-    ffi.Value runtime = ffi.module_get_function(
-        state.module$.ref(), "__jiang_runtime_coroutine_frame_free"
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(2);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    ffi.Type function_type = ffi.function_type(
+        ffi.context_void_type(state.llvm_context$.ref()),
+        params$.ref()
+    );
+    ffi.Value runtime = runtime_function(
+        state,
+        "__jiang_runtime_coroutine_frame_free",
+        function_type
     );
     if (!ffi.value_valid(runtime)) { return ffi.Value(); }
     ffi.Value executor = lower_operand(state, output, body, value.executor, local_slots);
@@ -1531,9 +1631,7 @@ ffi.Value lower_coroutine_frame_free(
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(2);
     args.add(executor);
     args.add(pointer);
-    ffi.Value call = ffi.builder_build_call(
-        state.builder$.ref(), ffi.global_value_type(runtime), runtime, args$.ref()
-    );
+    ffi.Value call = ffi.builder_build_call(state.builder$.ref(), function_type, runtime, args$.ref());
     if (!ffi.value_valid(call)) { return ffi.Value(); }
     return zero_aggregate(state, result_type);
 }
@@ -1613,10 +1711,11 @@ ffi.Value cast_allocator_size_value(llvm_state.LowerState& state, ffi.Value valu
     if (source_bits == target_bits) {
         return value;
     }
+    ffi.Type size_type = allocator_size_type(state);
     if (source_bits > target_bits) {
-        return ffi.builder_build_cast(state.builder$.ref(), 1, value, allocator_size_type(state));
+        return ffi.builder_build_cast(state.builder$.ref(), 1, value, size_type);
     }
-    return ffi.builder_build_cast(state.builder$.ref(), 0, value, allocator_size_type(state));
+    return ffi.builder_build_cast(state.builder$.ref(), 0, value, size_type);
 }
 
 public ffi.Value declare_free(
@@ -2143,10 +2242,16 @@ ffi.Value lower_unary(
         return lower_int_compare(state, 32, operand, zero_value(state, result_type));
     }
     if (value.op == .bit_not) {
-        return ffi.builder_build_binary(state.builder$.ref(), .int_xor, operand, all_ones_value(state, result_type));
+        ffi.Value all_ones = all_ones_value(state, result_type);
+        return ffi.builder_build_binary(
+            state.builder$.ref(), .int_xor, operand, all_ones
+        );
     }
     if (value.op == .neg) {
-        return ffi.builder_build_binary(state.builder$.ref(), .int_sub, zero_value(state, result_type), operand);
+        ffi.Value zero = zero_value(state, result_type);
+        return ffi.builder_build_binary(
+            state.builder$.ref(), .int_sub, zero, operand
+        );
     }
     return ffi.Value();
 }
@@ -2185,6 +2290,40 @@ ffi.Value lower_binary(
         return lower_int_compare(state, predicate, lhs, rhs);
     }
     return ffi.Value();
+}
+
+public ffi.Value lower_builtin_equality(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    jil.Operand lhs_operand,
+    jil.Operand rhs_operand,
+    qid.TypeId receiver_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value lhs_pointer = lower_operand(
+        state, output, body, lhs_operand, local_slots
+    );
+    ffi.Value rhs_pointer = lower_operand(
+        state, output, body, rhs_operand, local_slots
+    );
+    qid.TypeId value_type = state.type_id(receiver_type);
+    ffi.Type llvm_value_type = llvm_type.lower_type(state, value_type);
+    if (!ffi.value_valid(lhs_pointer) || !ffi.value_valid(rhs_pointer)
+        || !ffi.type_valid(llvm_value_type)) {
+        return ffi.Value();
+    }
+    ffi.Value lhs = ffi.builder_build_load(
+        state.builder$.ref(), llvm_value_type, lhs_pointer
+    );
+    ffi.Value rhs = ffi.builder_build_load(
+        state.builder$.ref(), llvm_value_type, rhs_pointer
+    );
+    if (!ffi.value_valid(lhs) || !ffi.value_valid(rhs)) { return ffi.Value(); }
+    if (type_is_float(state, value_type)) {
+        return lower_float_binary(state, .eq, lhs, rhs);
+    }
+    return lower_int_compare(state, 32, lhs, rhs);
 }
 
 ffi.Value lower_structural_binary(
@@ -2275,8 +2414,9 @@ ffi.Value lower_structural_scalar(
 }
 
 ffi.Value invert_bool(llvm_state.LowerState& state, ffi.Value value) {
+    ffi.Value inverted = bool_value(state, true);
     return ffi.builder_build_binary(
-        state.builder$.ref(), .int_xor, value, bool_value(state, true)
+        state.builder$.ref(), .int_xor, value, inverted
     );
 }
 
@@ -2479,7 +2619,10 @@ ffi.Value lower_payload_storage_field_pointer(
             UInt64(llvm_type.layout_field_element_index(state, type_id, field_index))
         )
     );
-    return ffi.builder_build_gep(state.builder$.ref(), llvm_type.lower_type(state, type_id), slot, indices$.ref());
+    ffi.Type value_type = llvm_type.lower_type(state, type_id);
+    return ffi.builder_build_gep(
+        state.builder$.ref(), value_type, slot, indices$.ref()
+    );
 }
 
 Bool store_layout_field(
@@ -2570,84 +2713,107 @@ public ffi.Value function_value_for_ref(
     llvm_state.LowerOutput&! output,
     jil.FunctionRef value
 ) {
-    symbol.BackendSymbolKey key =
-        symbol.symbol_key_for_function_ref(state.ctx, state.store, value, false);
-    std.String name = symbol.symbol_name(key);
-    ffi.Value function = ensure_function_for_ref(state, output, value);
+    if (state.instance_is_identity() && value.dispatch_type == null) {
+        return function_value_for_concrete_ref(state, output, value);
+    }
+    instance_reader.ResolvedCallee callee = resolved_callee(state, value);
+    jil.FunctionRef concrete = concrete_function_ref(
+        state, value, callee$.ref()
+    );
+    return function_value_for_concrete_ref(state, output, concrete);
+}
+
+ffi.Value function_value_for_concrete_ref(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.FunctionRef concrete
+) {
+    ffi.Value function = ensure_concrete_function_for_ref(
+        state, output, concrete
+    );
     if (ffi.value_valid(function)) {
         return function;
     }
+    symbol.BackendSymbolKey key =
+        symbol.symbol_key_for_function_ref(state.ctx, state.store, concrete, false);
+    std.String name = symbol.symbol_name(key);
     add_missing_function_error(
         state,
         output,
-        jil.function_target_provenance_def(value.target),
+        jil.function_target_provenance_def(concrete.target),
         name.bytes()
     );
     return ffi.Value();
 }
 
-public ffi.Value ensure_function_for_ref(
+public ffi.Value ensure_concrete_function_for_ref(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
     jil.FunctionRef value
 ) {
     // unit object 只预声明自己的函数；跨 unit 直接引用在首次使用时补 external declaration。
-    guard function_for_ref(state, value) is .some(function_id) else { return ffi.Value(); }
-    jil.Function& function = state.store.program.functions.ref_at(function_id.to_index());
-    std.String name = symbol.function_symbol_name(state.ctx, state.store, function);
-    if (output.declared_function_index(function_id) is .some(index)) {
-        return output.declared_function_values.get(index);
+    guard function_resolver.for_ref(state.store, value)
+        is .some(item) else { return ffi.Value(); }
+    if (output.declared_function(item) is .some(existing)) {
+        return existing;
     }
-    backend_abi.FunctionAbi function_abi! = backend_abi.classify_jil_body(state.ctx, function.body$.ref());
+    jil.Function function = codegen_unit.codegen_function(
+        state.ctx, state.store, item
+    );
+    std.String name = symbol.function_symbol_name(
+        state.ctx, state.store, function$.ref()
+    );
+    ffi.Value existing = ffi.module_get_function(state.module$.ref(), name.bytes());
+    if (ffi.value_valid(existing)) {
+        output.bind_declared_function(item, existing);
+        return existing;
+    }
+    backend_abi.FunctionAbi function_abi! =
+        backend_abi.classify_jil_function(state.ctx, function$.ref());
     ffi.Type function_type = llvm_abi.function_type(state, function_abi$.ref());
     if (!ffi.type_valid(function_type)) { return ffi.Value(); }
-    ffi.Value llvm_function! = ffi.module_get_function(state.module$.ref(), name.bytes());
-    if (!ffi.value_valid(llvm_function)) {
-        llvm_function = ffi.module_add_function(state.module$.ref(), name.bytes(), function_type);
-    }
+    ffi.Value llvm_function = ffi.module_add_function(
+        state.module$.ref(), name.bytes(), function_type
+    );
     if (!ffi.value_valid(llvm_function)) { return ffi.Value(); }
     llvm_abi.add_function_attributes(state, llvm_function, function_abi$.ref());
-    Int index = output.declared_function_values.len();
-    output.bind_declared_function(function_id, index);
-    output.declared_function_values.add(llvm_function);
+    output.bind_declared_function(item, llvm_function);
     return llvm_function;
 }
 
-jil.FunctionId? function_for_ref(llvm_state.LowerState& state, jil.FunctionRef value) {
-    jil.FunctionId? candidate = state.store.program.function_id_for_ref(value);
-    if (candidate is .some(function_id)) {
-        if (value.coroutine_start || value.coroutine_sync) { return function_id; }
-        jil.Function& function = state.store.program.functions.ref_at(function_id.to_index());
-        if (function_ref_matches(state, value, function)) { return function_id; }
-    }
-    return scan_function_for_ref(state, value);
-}
-
-jil.FunctionId? scan_function_for_ref(llvm_state.LowerState& state, jil.FunctionRef value) {
-    symbol.BackendSymbolKey expected =
-        symbol.symbol_key_for_function_ref(state.ctx, state.store, value, false);
-    Int index! = 0;
-    while (index < state.store.program.functions.len()) {
-        jil.Function& function = state.store.program.functions.ref_at(index);
-        symbol.BackendSymbolKey actual = symbol.function_symbol_key(state.ctx, function);
-        if (symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref())) {
-            return function.id;
-        }
-        index = index + 1;
-    }
-    return null;
-}
-
-Bool function_ref_matches(
+public instance_reader.ResolvedCallee resolved_callee(
     llvm_state.LowerState& state,
-    jil.FunctionRef value,
-    jil.Function& function
+    jil.FunctionRef value
 ) {
-    symbol.BackendSymbolKey expected =
-        symbol.symbol_key_for_function_ref(state.ctx, state.store, value, false);
-    symbol.BackendSymbolKey actual = symbol.function_symbol_key(state.ctx, function);
-    return symbol.BackendSymbolKey.equal(expected$.ref(), actual$.ref());
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        state.ctx.store$.ref(), state.bindings$.ref()
+    );
+    return reader.callee(value.target, value.args, value.dispatch_type);
 }
+
+@life(return: callee)
+public jil.FunctionRef concrete_function_ref(
+    llvm_state.LowerState& state,
+    jil.FunctionRef source,
+    instance_reader.ResolvedCallee& callee
+) {
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+        state.ctx.store$.ref(), state.bindings$.ref()
+    );
+    return jil.FunctionRef(
+        target: callee.target,
+        dispatch_type: callee.dispatch_type,
+        args: callee.args.slice(),
+        coroutine_start: source.coroutine_start,
+        coroutine_sync: source.coroutine_sync,
+        coroutine_resume: source.coroutine_resume,
+        coroutine_resume_mode: source.coroutine_resume_mode,
+        coroutine_completion: source.coroutine_completion,
+        coroutine_serial_completion: source.coroutine_serial_completion,
+        type_id: reader.type_id(source.type_id)
+    );
+}
+
 
 Void add_missing_function_error(
     llvm_state.LowerState& state,

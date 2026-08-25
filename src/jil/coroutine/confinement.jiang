@@ -4,7 +4,9 @@
 // 的 async wrapper 可以得到 binding(X)，调用点在 X 上时仍可选择零原子变体。
 
 import list = "../../support/list.jiang";
+import compiler_store = "../../store.jiang";
 import jil = "../model.jiang";
+import instance_reader = "../instance_reader.jiang";
 import qid = "../../id.jiang";
 
 public enum SummaryKind {
@@ -19,21 +21,41 @@ public struct Summary: Copyable {
     public Bool may_defer;
 }
 
-public list.ArrayList<Summary> analyze(jil.Program& output) {
-    list.ArrayList<Summary> states! = initial_states(output);
+public list.ArrayList<Summary> analyze(
+    compiler_store.CompilerStore& store,
+    jil.Program& output
+) {
+    list.ArrayList<Summary> states! = initial_states(store, output);
     Bool changed! = true;
     while (changed) {
-        changed = refine(output, states$.mut_ref());
+        changed = refine(store, output, states$.mut_ref());
     }
     return states;
 }
 
-list.ArrayList<Summary> initial_states(jil.Program& output) {
-    list.ArrayList<Summary> states! = list.ArrayList<Summary>(output.functions.len());
+list.ArrayList<Summary> initial_states(
+    compiler_store.CompilerStore& store,
+    jil.Program& output
+) {
+    list.ArrayList<Summary> states! =
+        list.ArrayList<Summary>(output.mono_item_count());
     Int index! = 0;
-    while (index < output.functions.len()) {
-        jil.Function function = output.functions.get(index);
-        if (function.is_coroutine && !function.is_external) {
+    while (index < output.mono_item_count()) {
+        jil.MonoItem item = output.mono_item_at(index);
+        Bool coroutine! = false;
+        Bool external! = true;
+        if (item is .source_instance(identity)) {
+            jil.Function function = instance_reader.source_instance_function(
+                store, output, identity
+            );
+            coroutine = function.is_coroutine;
+            external = function.is_external;
+        } else if (item is .generated_function(function_id)) {
+            jil.Function function = output.function(function_id);
+            coroutine = function.is_coroutine;
+            external = function.is_external;
+        }
+        if (coroutine && !external) {
             states.add(unconstrained());
         } else {
             states.add(deferred(escaping()));
@@ -43,11 +65,16 @@ list.ArrayList<Summary> initial_states(jil.Program& output) {
     return states;
 }
 
-Bool refine(jil.Program& output, list.ArrayList<Summary>&! states) {
+Bool refine(
+    compiler_store.CompilerStore& store,
+    jil.Program& output,
+    list.ArrayList<Summary>&! states
+) {
     Bool changed! = false;
     Int index! = 0;
-    while (index < output.functions.len()) {
-        Summary next = function_summary(output, output.functions.get(index), states);
+    while (index < output.mono_item_count()) {
+        jil.MonoItem item = output.mono_item_at(index);
+        Summary next = function_summary(store, output, item, states);
         if (!summary_equal(states.get(index), next)) {
             states.set(index, next);
             changed = true;
@@ -58,7 +85,30 @@ Bool refine(jil.Program& output, list.ArrayList<Summary>&! states) {
 }
 
 Summary function_summary(
+    compiler_store.CompilerStore& store,
     jil.Program& output,
+    jil.MonoItem item,
+    list.ArrayList<Summary>& states
+) {
+    if (item is .source_instance(identity)) {
+        return function_summary_for_value(
+            output,
+            item,
+            instance_reader.source_instance_function(store, output, identity),
+            states
+        );
+    }
+    guard item is .generated_function(function_id) else {
+        return deferred(escaping());
+    }
+    return function_summary_for_value(
+        output, item, output.function(function_id), states
+    );
+}
+
+Summary function_summary_for_value(
+    jil.Program& output,
+    jil.MonoItem item,
     jil.Function function,
     list.ArrayList<Summary>& states
 ) {
@@ -67,7 +117,7 @@ Summary function_summary(
     Int index! = 0;
     while (index < function.body.blocks.length) {
         Summary requirement = terminator_summary(
-            output, function, function.body.blocks[index].terminator, states
+            output, item, function, function.body.blocks[index].terminator, states
         );
         result = merge(result, requirement);
         index = index + 1;
@@ -77,6 +127,7 @@ Summary function_summary(
 
 Summary terminator_summary(
     jil.Program& output,
+    jil.MonoItem item,
     jil.Function function,
     jil.Terminator terminator,
     list.ArrayList<Summary>& states
@@ -85,7 +136,7 @@ Summary terminator_summary(
         return call_summary(output, call, states);
     }
     if (terminator.kind is .suspend_pending_term(suspend)) {
-        return suspend_summary(output, function, suspend, states);
+        return suspend_summary(output, item, suspend, states);
     }
     return unconstrained();
 }
@@ -138,14 +189,16 @@ Summary cross_executor_summary(
 
 Summary suspend_summary(
     jil.Program& output,
-    jil.Function function,
+    jil.MonoItem item,
     jil.SuspendPendingTerminator suspend,
     list.ArrayList<Summary>& states
 ) {
     if (suspend.suspend_wake == .none) { return deferred(unconstrained()); }
     if (suspend.suspend_wake != .task_child) { return deferred(escaping()); }
     guard suspend.task_local is .some(task_local) else { return deferred(escaping()); }
-    guard function.coroutine_frame is .some(frame) else { return deferred(escaping()); }
+    guard output.coroutine_frame_for_mono_item(item) is .some(frame) else {
+        return deferred(escaping());
+    }
     return task_child_summary(output, frame.task_regions, task_local, states);
 }
 
@@ -181,14 +234,14 @@ Summary child_summary(
     jil.FunctionRef child,
     list.ArrayList<Summary>& states
 ) {
-    guard function_id(output, child) is .some(function_id) else { return deferred(escaping()); }
-    Int index = function_id.to_index();
+    guard output.coroutine_source_item_for_ref(child) is .some(item) else {
+        return deferred(escaping());
+    }
+    guard output.mono_item_index(item) is .some(index) else {
+        return deferred(escaping());
+    }
     if (index < 0 || index >= states.len()) { return deferred(escaping()); }
     return states.get(index);
-}
-
-jil.FunctionId? function_id(jil.Program& output, jil.FunctionRef child) {
-    return output.function_id_for_ref(child);
 }
 
 Summary normalize_declared_domain(jil.Function function, Summary summary) {

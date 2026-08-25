@@ -11,10 +11,78 @@ import qid = "../id.jiang";
 import list = "../support/list.jiang";
 import jil = "./model.jiang";
 
+@life(return: (program.a, program.b))
+public jil.Function source_instance_function(
+    compiler_store.CompilerStore& store,
+    jil.Program& program,
+    Int identity
+) {
+    jil.InstanceKey instance = program.function_instance_at(identity);
+    jil.Function source = program.source_function(instance.def_id);
+    generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
+    generic_bindings.GenericBindings bindings = generic_bindings.bindings_for_instance(
+        store.defs$.ref(),
+        store.model$.ref(),
+        store.types$.ref(),
+        instance.def_id,
+        instance.args,
+        empty$.ref()
+    );
+    InstanceReader reader = InstanceReader(store, bindings$.ref());
+    jil.Function function = reader.source_function(source, source.id, instance.args);
+    jil.CoroutineInstanceProperties properties =
+        program.instance_coroutine_properties(identity);
+    return jil.function_with_confinement(
+        function,
+        properties.confinement,
+        properties.confinement_domain
+    );
+}
+
+@life(return: (program.a, program.b))
+public jil.Function source_resume_instance_function(
+    compiler_store.CompilerStore& store,
+    jil.Program& program,
+    Int identity,
+    jil.CoroutineResumeMode mode
+) {
+    jil.InstanceKey instance = program.function_instance_at(identity);
+    jil.CoroutineResumeTemplate template =
+        program.source_resume_template(instance.def_id, mode);
+    generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
+    generic_bindings.GenericBindings bindings = generic_bindings.bindings_for_instance(
+        store.defs$.ref(),
+        store.model$.ref(),
+        store.types$.ref(),
+        instance.def_id,
+        instance.args,
+        empty$.ref()
+    );
+    InstanceReader reader = InstanceReader(store, bindings$.ref());
+    jil.Function function! = reader.source_function(
+        template.function, template.function.id, instance.args
+    );
+    jil.CoroutineInstanceProperties properties =
+        program.instance_coroutine_properties(identity);
+    function = jil.function_with_confinement(
+        function,
+        properties.confinement,
+        properties.confinement_domain
+    );
+    return jil.function_with_coroutine_resume_mode(function, mode);
+}
+
 public struct ResolvedCallee: Movable {
     public jil.FunctionTarget target;
     public list.ArrayList<types.GenericArg> args!;
     public qid.TypeId? dispatch_type;
+    public InstanceBuiltin? builtin;
+}
+
+public enum InstanceBuiltin {
+    equality,
+    contiguous_pointer,
+    contiguous_length,
 }
 
 @region(a)
@@ -34,14 +102,119 @@ public struct InstanceReader: Movable {
     }
 
     public qid.TypeId type_id(self, qid.TypeId value) {
+        if (self.bindings.len() == 0) { return value; }
+        if (!self.store.types.type_needs_substitution(value)) { return value; }
+        if (self.bindings.type_substitution(value) is .some(concrete)) {
+            return concrete;
+        }
         return generic_bindings.substitute_type(
             self.store.types$.ref(), value, self.bindings
         );
     }
 
+    public qid.TypeId place_type(self, jil.Body& body, jil.Place place) {
+        qid.TypeId current! = self.place_base_type(body, place);
+        Int index! = 0;
+        while (index < place.projection.length) {
+            jil.PlaceElem elem = place.projection[index];
+            if (elem is .field_projection(field)) {
+                current = self.field_type(current, field);
+            } else if (elem is .frame_field_projection(field)) {
+                current = self.type_id(field.field_type);
+            } else if (elem is .constant_index_projection(field)) {
+                current = self.type_id(field.field_type);
+            } else if (elem is .deref_projection(_)
+                || elem is .index_projection(_)) {
+                current = self.element_type(current);
+            }
+            index = index + 1;
+        }
+        return current;
+    }
+
+    public qid.TypeId field_type(
+        self,
+        qid.TypeId owner_type,
+        jil.FieldProjection field
+    ) {
+        if (!self.store.types.type_needs_substitution(field.field_type)) {
+            return field.field_type;
+        }
+        guard self.store.typeck.def_type(field.field_def) is .some(template_type) else {
+            return self.store.types.invalid_type();
+        }
+        qid.TypeId concrete_owner = self.type_id(owner_type);
+        return generic_bindings.member_type_for_owner_instance(
+            self.store.defs$.ref(),
+            self.store.model$.ref(),
+            self.store.types$.ref(),
+            concrete_owner,
+            field.field_def,
+            template_type
+        );
+    }
+
+    qid.TypeId place_base_type(self, jil.Body& body, jil.Place place) {
+        if (place.base is .local(local_id)) {
+            return self.type_id(body.locals[local_id.to_index()].type_id);
+        }
+        guard place.base is .global(global_ref) else {
+            return self.store.types.invalid_type();
+        }
+        return self.type_id(global_ref.type_id);
+    }
+
+    qid.TypeId element_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(self.type_id(type_id));
+        if (info.data is .handle_type(handle)) { return self.type_id(handle.element); }
+        if (info.data is .slice_value_type(slice_type)) {
+            return self.type_id(slice_type.element);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.type_id(array_type.element);
+        }
+        return self.store.types.invalid_type();
+    }
+
     public types.EffectSet effects(self, types.EffectSet value) {
+        if (self.bindings.len() == 0) { return value; }
         return generic_bindings.substitute_effects(
             self.store.types$.ref(), value, self.bindings
+        );
+    }
+
+    @life(return: (args, source.b))
+    public jil.Function source_function(
+        self,
+        jil.Function source,
+        jil.FunctionId id,
+        types.GenericArg[]& args
+    ) {
+        qid.TypeId? capture_env_type! = null;
+        if (source.coroutine_capture_env_type is .some(raw_type)) {
+            capture_env_type = self.type_id(raw_type);
+        }
+        return jil.Function(
+            id: id,
+            origin: source.origin,
+            args: args,
+            signature_id: source.signature_id,
+            effects: self.effects(source.effects),
+            is_coroutine: self.effects(source.effects).has_async,
+            coroutine_capture_env_type: capture_env_type,
+            coroutine_frame: null,
+            confinement: source.confinement,
+            confinement_domain: source.confinement_domain,
+            is_coroutine_resume: source.is_coroutine_resume,
+            coroutine_resume_mode: source.coroutine_resume_mode,
+            is_coroutine_completion: source.is_coroutine_completion,
+            is_language_entry: source.is_language_entry,
+            is_runtime_entry: source.is_runtime_entry,
+            is_external: source.is_external,
+            inline_always: source.inline_always,
+            naked: source.naked,
+            span: source.span,
+            body: source.body
         );
     }
 
@@ -67,6 +240,20 @@ public struct InstanceReader: Movable {
             }
         }
         return value;
+    }
+
+    public jil.Const constant(self, jil.Const source) {
+        qid.TypeId concrete_type = self.type_id(source.type_id);
+        if (source.value is .const_param(param)) {
+            if (self.bindings.const_binding(param.def_id) is .some(value)) {
+                return self.constant_from_comptime(value, concrete_type, source);
+            }
+        }
+        return jil.Const(
+            type_id: concrete_type,
+            span: source.span,
+            value: source.value
+        );
     }
 
     public list.ArrayList<types.GenericArg> generic_args(
@@ -95,6 +282,7 @@ public struct InstanceReader: Movable {
         qid.TypeId? source_dispatch_type
     ) {
         qid.TypeId? dispatch_type! = null;
+        InstanceBuiltin? builtin! = null;
         jil.FunctionTarget target! = source_target;
         list.ArrayList<types.GenericArg> concrete_args! = self.generic_args(source_args);
         if (source_dispatch_type is .some(raw_dispatch_type)) {
@@ -113,31 +301,83 @@ public struct InstanceReader: Movable {
                             concrete_args.slice()
                         );
                     }
+                } else {
+                    builtin = self.builtin_dispatch(
+                        trait_member, concrete_dispatch_type
+                    );
                 }
             }
         }
         return ResolvedCallee(
             target: target,
             args: concrete_args.take(),
-            dispatch_type: dispatch_type
+            dispatch_type: dispatch_type,
+            builtin: builtin
         );
     }
 
-    public qid.TypeId function_type(
+    @life(return: output)
+    public jil.FunctionRef function_ref(
         self,
-        jil.FunctionTarget target,
-        types.GenericArg[]& args,
-        qid.TypeId caller_type
+        jil.Storage& output,
+        jil.FunctionRef source
     ) {
-        guard target is .source(function_def) else { return self.type_id(caller_type); }
-        return generic_bindings.type_for_instance(
-            self.store.defs$.ref(),
-            self.store.model$.ref(),
-            self.store.types$.ref(),
-            function_def,
-            self.type_id(caller_type),
-            args
+        ResolvedCallee resolved! = self.callee(
+            source.target, source.args, source.dispatch_type
         );
+        list.ArrayList<types.GenericArg> concrete_args! = resolved.args.take();
+        return jil.FunctionRef(
+            target: resolved.target,
+            dispatch_type: resolved.dispatch_type,
+            args: output.generic_arg_array(concrete_args.slice()),
+            coroutine_start: source.coroutine_start,
+            coroutine_sync: source.coroutine_sync,
+            coroutine_resume: source.coroutine_resume,
+            coroutine_resume_mode: source.coroutine_resume_mode,
+            coroutine_completion: source.coroutine_completion,
+            coroutine_serial_completion: source.coroutine_serial_completion,
+            type_id: self.type_id(source.type_id)
+        );
+    }
+
+    InstanceBuiltin? builtin_dispatch(
+        self,
+        qid.DefId trait_member,
+        qid.TypeId receiver_type
+    ) {
+        guard self.store.defs.get(trait_member).owner_def is .some(owner_def) else {
+            return null;
+        }
+        if (self.store.resolve.core_traits.equatable_trait is .some(equatable)
+            && owner_def == equatable
+            && self.type_has_builtin_equality(receiver_type)) {
+            return InstanceBuiltin.equality;
+        }
+        guard self.store.resolve.core_traits.contiguous_trait is .some(contiguous)
+            else { return null; }
+        if (owner_def != contiguous) { return null; }
+        qid.TypeId value_type = self.reference_value_type(receiver_type);
+        if (!(self.store.types.get(value_type).data is .array_type(_))) { return null; }
+        qid.SymbolId symbol = self.store.defs.get(trait_member).name.symbol;
+        if (self.store.symbols.find("ptr") is .some(ptr_symbol)
+            && symbol == ptr_symbol) {
+            return InstanceBuiltin.contiguous_pointer;
+        }
+        if (self.store.symbols.find("length") is .some(length_symbol)
+            && symbol == length_symbol) {
+            return InstanceBuiltin.contiguous_length;
+        }
+        return null;
+    }
+
+    Bool type_has_builtin_equality(self, qid.TypeId receiver_type) {
+        types.TypeInfo info = self.store.types.get(receiver_type);
+        if (info.data is .bool_type || info.data is .char_type
+            || info.data is .int_type(_) || info.data is .float_type(_)) {
+            return true;
+        }
+        guard info.data is .named(named) else { return false; }
+        return self.store.defs.get(named.def_id).kind == .enum_def;
     }
 
     Void append_type_arg(
@@ -151,6 +391,44 @@ public struct InstanceReader: Movable {
             return;
         }
         result.add(types.generic_type_arg(concrete_type));
+    }
+
+    jil.Const constant_from_comptime(
+        self,
+        comptime_value.ComptimeValue source,
+        qid.TypeId type_id,
+        jil.Const original
+    ) {
+        if (source.data is .unit_value) {
+            return jil.Const(type_id: type_id, span: original.span,
+                value: jil.unit_const_kind(jil.UnitConst(unit_value: true)));
+        }
+        if (source.data is .bool_value(value)) {
+            return jil.Const(type_id: type_id, span: original.span,
+                value: jil.bool_const_kind(jil.BoolConst(value: value)));
+        }
+        if (source.data is .int_value(value)) {
+            return jil.Const(type_id: type_id, span: original.span, value: jil.int_const_kind(
+                jil.IntConst(bits: unsafe { value$.as(UInt64) }, signed_value: true)
+            ));
+        }
+        if (source.data is .uint_value(value)) {
+            return jil.Const(type_id: type_id, span: original.span,
+                value: jil.int_const_kind(jil.IntConst(bits: value, signed_value: false)));
+        }
+        if (source.data is .char_value(value)) {
+            return jil.Const(type_id: type_id, span: original.span,
+                value: jil.int_const_kind(jil.IntConst(bits: value, signed_value: false)));
+        }
+        if (source.data is .const_param_value(param_def)) {
+            return jil.Const(type_id: type_id, span: original.span,
+                value: jil.const_param_kind(jil.ConstParam(def_id: param_def)));
+        }
+        return jil.Const(
+            type_id: type_id,
+            span: original.span,
+            value: original.value
+        );
     }
 
     Void append_const_arg(

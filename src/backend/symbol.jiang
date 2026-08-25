@@ -5,6 +5,7 @@
 // backend-independent key，后续真实 codegen/mangling 都从这个 key 派生。
 
 import jil = "../jil.jiang";
+import codegen_unit = "./codegen_unit/model.jiang";
 import object_key_builder = "../artifact/object_key_builder.jiang";
 import core_traits = "../core/traits.jiang";
 import context = "../context.jiang";
@@ -16,6 +17,7 @@ import comptime_value = "../sema/comptime/value.jiang";
 import types = "../sema/type.jiang";
 import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
+import map = "../support/map.jiang";
 import string = "../support/string.jiang";
 import table = "../support/table.jiang";
 import std;
@@ -29,6 +31,7 @@ public struct BackendSymbolKey: Copyable, Hashable, Equatable {
     public types.GenericArg[]& args;
     public Bool runtime_entry;
     public Bool coroutine_resume;
+    public jil.CoroutineResumeMode coroutine_resume_mode;
     public Bool coroutine_completion;
     // 0 表示源码函数；其余值是当前 session 内生成函数的符号身份加一。
     public Int generated_symbol_index;
@@ -41,6 +44,7 @@ public struct BackendSymbolKey: Copyable, Hashable, Equatable {
         Bool runtime_entry,
         Bool coroutine_resume,
         Bool coroutine_completion,
+        jil.CoroutineResumeMode coroutine_resume_mode,
         Int generated_symbol_index = 0
     ) {
         self.package_index = package_index;
@@ -49,6 +53,7 @@ public struct BackendSymbolKey: Copyable, Hashable, Equatable {
         self.args = args;
         self.runtime_entry = runtime_entry;
         self.coroutine_resume = coroutine_resume;
+        self.coroutine_resume_mode = coroutine_resume_mode;
         self.coroutine_completion = coroutine_completion;
         self.generated_symbol_index = generated_symbol_index;
     }
@@ -59,9 +64,11 @@ public struct BackendSymbolKey: Copyable, Hashable, Equatable {
         hasher.write(Int(self.def_id.to_index()));
         Bool runtime_entry = self.runtime_entry;
         Bool coroutine_resume = self.coroutine_resume;
+        jil.CoroutineResumeMode coroutine_resume_mode = self.coroutine_resume_mode;
         Bool coroutine_completion = self.coroutine_completion;
         hasher.write(runtime_entry);
         hasher.write(coroutine_resume);
+        hasher.write(Int(coroutine_resume_mode));
         hasher.write(coroutine_completion);
         hasher.write(self.generated_symbol_index);
         hasher.write(Int(self.args.length));
@@ -88,6 +95,7 @@ public struct BackendSymbolKey: Copyable, Hashable, Equatable {
         if (lhs.coroutine_resume != rhs.coroutine_resume) {
             return false;
         }
+        if (lhs.coroutine_resume_mode != rhs.coroutine_resume_mode) { return false; }
         if (lhs.coroutine_completion != rhs.coroutine_completion) { return false; }
         if (lhs.generated_symbol_index != rhs.generated_symbol_index) { return false; }
         if (lhs.args.length != rhs.args.length) {
@@ -133,6 +141,7 @@ public BackendSymbolKey symbol_key_for_function_ref(
         runtime_entry,
         value.coroutine_resume,
         value.coroutine_completion,
+        value.coroutine_resume_mode,
         generated_symbol_index
     );
 }
@@ -156,7 +165,8 @@ public BackendSymbolKey source_function_symbol_key(
         args,
         false,
         false,
-        false
+        false,
+        .standard
     );
 }
 
@@ -181,6 +191,7 @@ public BackendSymbolKey function_symbol_key(context.CompilerContext& ctx, jil.Fu
         function.is_runtime_entry,
         function.is_coroutine_resume,
         function.is_coroutine_completion,
+        function.coroutine_resume_mode,
         generated_symbol_index
     );
 }
@@ -243,7 +254,14 @@ std.String stable_function_symbol_name(context.CompilerContext& ctx, jil.Functio
     builder.append(Int(stable_id.high));
     std.String name! = builder.into_string();
     name = append_generic_arg_fingerprints(ctx, name, function.args);
-    if (function.is_coroutine_resume) { name = append_text(name, "_Resume"); }
+    if (function.is_coroutine_resume) {
+        name = append_text(name, "_Resume");
+        if (function.coroutine_resume_mode == .confined) {
+            name = append_text(name, "_Confined");
+        } else if (function.coroutine_resume_mode == .run_to_completion) {
+            name = append_text(name, "_RTC");
+        }
+    }
     if (function.is_coroutine_completion) { name = append_text(name, "_Complete"); }
     return name;
 }
@@ -354,6 +372,11 @@ public std.String symbol_name(BackendSymbolKey key) {
     }
     if (key.coroutine_resume) {
         name = append_text(name, "_Resume");
+        if (key.coroutine_resume_mode == .confined) {
+            name = append_text(name, "_Confined");
+        } else if (key.coroutine_resume_mode == .run_to_completion) {
+            name = append_text(name, "_RTC");
+        }
     }
     if (key.coroutine_completion) {
         name = append_text(name, "_Complete");
@@ -467,11 +490,16 @@ std.String comptime_value_symbol_part(comptime_value.ComptimeValue value) {
 }
 
 public Bool validate_unique_function_symbols(context.CompilerContext& ctx, jil.Store& store) {
-    table.HashTable<BackendSymbolKey, Bool> seen! = table.HashTable<BackendSymbolKey, Bool>();
+    map.WyHashMap<BackendSymbolKey, Bool> seen! =
+        map.WyHashMap<BackendSymbolKey, Bool>();
+    list.ArrayList<jil.MonoItem> functions =
+        backend_functions(store);
     Int index! = 0;
-    while (index < store.program.functions.len()) {
-        jil.Function& function = store.program.functions.ref_at(index);
-        BackendSymbolKey key = function_symbol_key(ctx, function);
+    while (index < functions.len()) {
+        jil.Function function = codegen_unit.codegen_function(
+            ctx, store, functions.get(index)
+        );
+        BackendSymbolKey key = function_symbol_key(ctx, function$.ref());
         if (seen.has(key)) {
             return false;
         }
@@ -486,50 +514,98 @@ public Bool validate_unique_function_symbol_names(context.CompilerContext& ctx, 
 }
 
 public std.String? duplicate_function_symbol_name(context.CompilerContext& ctx, jil.Store& store) {
-    table.MultiTable<UInt64, Int> indexes! = table.MultiTable<UInt64, Int>();
+    table.MultiTable<UInt64, jil.MonoItem> indexes! =
+        table.MultiTable<UInt64, jil.MonoItem>();
+    list.ArrayList<jil.MonoItem> functions =
+        backend_functions(store);
     Int index! = 0;
-    while (index < store.program.functions.len()) {
-        jil.Function& function = store.program.functions.ref_at(index);
-        std.String symbol_name = function_symbol_name(ctx, store, function);
+    while (index < functions.len()) {
+        jil.MonoItem item = functions.get(index);
+        jil.Function function = codegen_unit.codegen_function(ctx, store, item);
+        std.String symbol_name = function_symbol_name(
+            ctx, store, function$.ref()
+        );
         UInt64 name_hash = hash.hash_bytes(symbol_name.bytes());
-        Int? previous_index = duplicate_symbol_function_index(
+        jil.MonoItem? previous_item = duplicate_symbol_function(
             ctx,
             store,
             indexes$.ref(),
             name_hash,
             symbol_name.bytes()
         );
-        if (previous_index is .some(existing_index)) {
-            Int previous_index = existing_index;
-            jil.Function& previous = store.program.functions.ref_at(previous_index);
-            if (!compatible_duplicate_function_name(ctx, store, previous, function)) {
-                return duplicate_function_symbol_description(ctx, symbol_name.bytes(), previous, function);
+        if (previous_item is .some(existing)) {
+            jil.Function previous = codegen_unit.codegen_function(
+                ctx, store, existing
+            );
+            if (!compatible_duplicate_function_name(
+                ctx, store, previous$.ref(), function$.ref()
+            )) {
+                return duplicate_function_symbol_description(
+                    ctx, symbol_name.bytes(), previous$.ref(), function$.ref()
+                );
             }
         }
-        indexes.add(name_hash, index);
+        indexes.add(name_hash, item);
         index = index + 1;
     }
     return null;
 }
 
-Int? duplicate_symbol_function_index(
+jil.MonoItem? duplicate_symbol_function(
     context.CompilerContext& ctx,
     jil.Store& store,
-    table.MultiTable<UInt64, Int>& indexes,
+    table.MultiTable<UInt64, jil.MonoItem>& indexes,
     UInt64 name_hash,
     UInt8[]& symbol_name
 ) {
     table.MultiTableCursor cursor! = indexes.first(name_hash);
     while (cursor.valid()) {
-        Int previous_index = indexes.get(cursor);
-        jil.Function& previous = store.program.functions.ref_at(previous_index);
-        std.String previous_name = function_symbol_name(ctx, store, previous);
+        jil.MonoItem previous_item = indexes.get(cursor);
+        jil.Function previous = codegen_unit.codegen_function(
+            ctx, store, previous_item
+        );
+        std.String previous_name = function_symbol_name(
+            ctx, store, previous$.ref()
+        );
         if (string.equal(previous_name.bytes(), symbol_name)) {
-            return previous_index;
+            return previous_item;
         }
         cursor = indexes.next(cursor);
     }
     return null;
+}
+
+list.ArrayList<jil.MonoItem> backend_functions(jil.Store& store) {
+    list.ArrayList<jil.MonoItem> result! =
+        list.ArrayList<jil.MonoItem>();
+    Int index! = 0;
+    while (index < store.program.source_instance_count()) {
+        Int identity = store.program.source_instance_identity_at(index);
+        result.add(jil.source_instance_mono_item(identity));
+        jil.InstanceKey instance = store.program.function_instance_at(identity);
+        if (store.program.has_source_resume_template(instance.def_id, .standard)) {
+            result.add(jil.source_resume_instance_mono_item(identity));
+        }
+        if (store.program.has_source_resume_template(instance.def_id, .confined)) {
+            result.add(jil.source_resume_mono_item(identity, .confined));
+        }
+        if (store.program.has_source_resume_template(
+                instance.def_id, .run_to_completion
+            )
+        ) {
+            result.add(jil.source_resume_mono_item(identity, .run_to_completion));
+        }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < store.program.functions.len()) {
+        jil.Function& function = store.program.functions.ref_at(index);
+        if (function.origin is .generated(_)) {
+            result.add(jil.generated_function_mono_item(function.id));
+        }
+        index = index + 1;
+    }
+    return result;
 }
 
 std.String duplicate_function_symbol_description(
@@ -642,6 +718,7 @@ public Bool same_stable_function_instance(
     }
     if (lhs.is_runtime_entry != rhs.is_runtime_entry) { return false; }
     if (lhs.is_coroutine_resume != rhs.is_coroutine_resume) { return false; }
+    if (lhs.coroutine_resume_mode != rhs.coroutine_resume_mode) { return false; }
     if (lhs.is_coroutine_completion != rhs.is_coroutine_completion) { return false; }
     std.String lhs_name = function_symbol_name(ctx, store, lhs);
     std.String rhs_name = function_symbol_name(ctx, store, rhs);

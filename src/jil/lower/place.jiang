@@ -4,13 +4,13 @@
 
 import context = "../../context.jiang";
 import sem = "../../sema/model.jiang";
-import layout = "../../layout.jiang";
 import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import module_graph = "../../resolve/module_graph.jiang";
 import store = "../../resolve/store.jiang";
 import source = "../../source.jiang";
 import typeck_store = "../../sema/type_check/store.jiang";
+import generic_bindings = "../../sema/generic/bindings.jiang";
 import types = "../../sema/type.jiang";
 import hash = "../../support/hash.jiang";
 import list = "../../support/list.jiang";
@@ -19,6 +19,7 @@ import string = "../../support/string.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
 import jil = "../model.jiang";
+import trait_abi = "../trait_abi.jiang";
 import drop_elaborate = "../drop_elaborate.jiang";
 import std;
 import support = "./support.jiang";
@@ -387,11 +388,12 @@ public extend body_context.BodyLowerer {
         if (self.lowerer.store.defs.get(member_def).kind != .field_def) {
             return null;
         }
+        qid.TypeId field_type = self.type_for_node(node_id);
         jil.Place base! = self.pointer_base_place(member_access.base);
         if (self.member_base_needs_deref(base)) {
             base = self.project_deref(base, self.place_is_raw_pointer(base));
         }
-        return self.project_field(base, member_def, self.type_for_node(node_id));
+        return self.project_field(base, member_def, field_type);
     }
 
     @life(return: self.d)
@@ -473,7 +475,7 @@ public extend body_context.BodyLowerer {
             } else if (elem is .frame_field_projection(field)) {
                 current = field.field_type;
             } else if (elem is .constant_index_projection(constant_index)) {
-                current = self.constant_index_projection_type(current, constant_index.offset);
+                current = constant_index.field_type;
             } else {
                 current = self.pointer_like_element_type(current);
             }
@@ -490,6 +492,62 @@ public extend body_context.BodyLowerer {
         if (info.data is .tuple_type(tuple_type)) {
             assert(offset >= 0 && offset < tuple_type.items.length);
             return tuple_type.items[offset];
+        }
+        if (info.data is .optional(optional_type)) {
+            assert(offset >= 0 && offset < 2);
+            if (offset == 0) { return self.lowerer.store.types.bool_type(); }
+            return optional_type.element;
+        }
+        if (info.data is .error_union(error_union_type)) {
+            assert(offset >= 0 && offset < 3);
+            if (offset == 0) { return self.lowerer.store.types.bool_type(); }
+            if (offset == 1) { return error_union_type.value; }
+            return error_union_type.error;
+        }
+        if (info.data is .slice_value_type(slice_value)) {
+            assert(offset >= 0 && offset < 2);
+            if (offset == 0) {
+                return self.lowerer.store.types.raw_pointer_type(
+                    slice_value.element, token.Span()
+                );
+            }
+            return self.lowerer.store.types.uint_type();
+        }
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .slice) {
+                assert(offset >= 0 && offset < 2);
+                if (offset == 0) {
+                    return self.lowerer.store.types.raw_pointer_type(
+                        handle.element, token.Span()
+                    );
+                }
+                return self.lowerer.store.types.uint_type();
+            }
+            if (self.handle_is_owned_slice_value(handle)) {
+                types.TypeInfo element_info = self.lowerer.store.types.get(handle.element);
+                guard element_info.data is .slice_value_type(slice_value) else {
+                    return self.lowerer.store.types.invalid_type();
+                }
+                assert(offset >= 0 && offset < 2);
+                if (offset == 0) {
+                    return self.lowerer.store.types.raw_pointer_type(
+                        slice_value.element, token.Span()
+                    );
+                }
+                return self.lowerer.store.types.uint_type();
+            }
+            if (self.handle_is_trait_object(handle)) {
+                guard self.lowerer.store.types.trait_companion(handle.element)
+                    is .some(companion) else {
+                    return self.lowerer.store.types.invalid_type();
+                }
+                assert(offset >= 0 && offset < 2);
+                types.TraitCompanionKind kind! = .receiver;
+                if (offset == 1) { kind = .vtable; }
+                return self.lowerer.store.types.trait_companion_type(
+                    companion.trait_def, kind, token.Span()
+                );
+            }
         }
         if (info.data is .closure_environment_type(environment)) {
             assert(offset >= 0 && offset < environment.capture_types.length);
@@ -509,12 +567,48 @@ public extend body_context.BodyLowerer {
             if (offset == 0) { return self.closure_env_type(token.Span()); }
             return self.closure_vtable_pointer_type(type_id, token.Span());
         }
-        guard self.layouts.layout_id_for_type(type_id) is .some(layout_id) else {
-            return self.lowerer.store.types.invalid_type();
+        if (info.data is .trait_companion(companion)
+            && companion.kind == .vtable) {
+            return trait_abi.vtable_field_type(
+                self.lowerer.store, companion.trait_def, offset
+            );
         }
-        layout.TypeLayout type_layout = self.layouts.layout(layout_id);
-        assert(offset >= 0 && offset < type_layout.fields.length);
-        return type_layout.fields[offset].field_type;
+        return self.lowerer.store.types.invalid_type();
+    }
+
+    @life(return: self.d)
+    public jil.Place? project_nominal_field_at(
+        self,
+        jil.Place base,
+        Int field_index
+    ) {
+        qid.TypeId owner_type = self.jil_place_type(base);
+        types.TypeInfo info = self.lowerer.store.types.get(owner_type);
+        guard info.data is .named(named) else { return null; }
+        guard self.lowerer.model.def(named.def_id) is .some(model_def) else {
+            return null;
+        }
+        generic_bindings.GenericBindings substitutions =
+            self.nominal_substitution(named.def_id, named.args);
+        Int member_index! = 0;
+        Int current_field! = 0;
+        while (member_index < model_def.members.len()) {
+            qid.DefId member_def = model_def.members.get(member_index);
+            member_index = member_index + 1;
+            if (self.lowerer.store.defs.get(member_def).kind != .field_def) {
+                continue;
+            }
+            if (current_field != field_index) {
+                current_field = current_field + 1;
+                continue;
+            }
+            guard self.field_expected_type(member_def, substitutions$.ref())
+                is .some(field_type) else {
+                return null;
+            }
+            return self.project_field(base, member_def, field_type);
+        }
+        return null;
     }
 
     public qid.TypeId jil_place_base_type(self, jil.Place place) {
@@ -575,7 +669,13 @@ public extend body_context.BodyLowerer {
             elems.add(base.projection[index]);
             index = index + 1;
         }
-        elems.add(jil.constant_index_projection_elem(jil.ConstantIndexProjection (offset: offset)));
+        qid.TypeId field_type = self.constant_index_projection_type(
+            self.jil_place_type(base), offset
+        );
+        elems.add(jil.constant_index_projection_elem(jil.ConstantIndexProjection (
+            offset: offset,
+            field_type: field_type
+        )));
         return self.place_with_projection(base, elems$.ref());
     }
 

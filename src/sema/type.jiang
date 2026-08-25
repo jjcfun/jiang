@@ -55,6 +55,9 @@ public struct FloatType: Copyable {
 @region(a)
 public struct NamedType: Copyable {
     public qid.DefId def_id;
+    // 泛型参数与 trait Self 都沿用 named identity，但可被 Instance 绑定替换。
+    // 该事实属于类型节点，重建类型时必须保留。
+    public Bool is_substitutable;
     // args preserves the declaration/call-site order, e.g.
     // Foo<T, N: const Int, R> becomes [type_arg(T), const_arg(N), type_arg(self, R)].
     // The projection fields below keep existing type-only algorithms simple
@@ -641,6 +644,9 @@ public struct TypeInfo: Copyable {
     @life(a)
     public TypeData data;
     public Bool is_mutable;
+    // 与 rustc Ty::HAS_PARAM 相同：类型构造时向上传播，实例读取时据此
+    // 跳过绝大多数不需要泛型替换的 concrete 类型。
+    public Bool needs_substitution;
 }
 
 public struct TypeParamInfo: Copyable {
@@ -756,13 +762,98 @@ public struct TypeStore: Movable {
             id: type_id,
             span: span,
             data: data,
-            is_mutable: is_mutable
+            is_mutable: is_mutable,
+            needs_substitution: self.type_data_needs_substitution(data)
         ));
         return type_id;
     }
 
+    Bool type_data_needs_substitution(self, TypeData data) {
+        if (data is .named(named)) {
+            return named.is_substitutable
+                || self.generic_args_need_substitution(named.args);
+        }
+        if (data is .optional(optional)) {
+            return self.type_needs_substitution(optional.element);
+        }
+        if (data is .error_union(error_union)) {
+            return self.type_needs_substitution(error_union.value)
+                || self.type_needs_substitution(error_union.error);
+        }
+        if (data is .handle_type(handle)) {
+            return self.type_needs_substitution(handle.element)
+                || self.sentinel_needs_substitution(handle.sentinel);
+        }
+        if (data is .slice_value_type(slice_value)) {
+            return self.type_needs_substitution(slice_value.element)
+                || self.sentinel_needs_substitution(slice_value.sentinel);
+        }
+        if (data is .array_type(array_type)) {
+            if (array_type.count_param != null) { return true; }
+            return self.type_needs_substitution(array_type.element)
+                || self.sentinel_needs_substitution(array_type.sentinel);
+        }
+        if (data is .tuple_type(tuple_type)) {
+            return self.type_ids_need_substitution(tuple_type.items);
+        }
+        if (data is .closure_environment_type(environment)) {
+            return self.generic_args_need_substitution(environment.args)
+                || self.type_ids_need_substitution(environment.capture_types);
+        }
+        if (data is .task_state_type(state)) {
+            return self.type_needs_substitution(state.result)
+                || self.type_ids_need_substitution(state.field_types);
+        }
+        if (data is .function_type(function_type)) {
+            if (function_type.effects.domain != null) { return true; }
+            return self.type_needs_substitution(function_type.result)
+                || self.type_ids_need_substitution(function_type.params);
+        }
+        if (data is .task_type(task_type)) {
+            return self.type_needs_substitution(task_type.result)
+                || self.type_needs_substitution(task_type.state_type);
+        }
+        return false;
+    }
+
+    Bool generic_args_need_substitution(self, GenericArg[]& args) {
+        Int index! = 0;
+        while (index < args.length) {
+            GenericArg arg = args[index];
+            if (arg is .type_arg(type_arg)
+                && self.type_needs_substitution(type_arg.value)) {
+                return true;
+            }
+            if (arg is .const_arg(const_arg)
+                && const_arg.value.data is .const_param_value(_)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool type_ids_need_substitution(self, qid.TypeId[]& values) {
+        Int index! = 0;
+        while (index < values.length) {
+            if (self.type_needs_substitution(values[index])) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool sentinel_needs_substitution(self, Sentinel? sentinel) {
+        guard sentinel is .some(value) else { return false; }
+        return value.value.data is .const_param_value(_)
+            || self.type_needs_substitution(value.type_id);
+    }
+
     public TypeInfo get(self, qid.TypeId id) {
         return self.types.get(id);
+    }
+
+    public Bool type_needs_substitution(self, qid.TypeId id) {
+        return self.types.get(id).needs_substitution;
     }
 
     public FunctionTypeHead? function_type_head(self, qid.TypeId id) {
@@ -1058,6 +1149,35 @@ public struct TypeStore: Movable {
         return self.named_type_with_args(def_id, args, span);
     }
 
+    public qid.TypeId substitutable_named_type(self, qid.DefId def_id, token.Span span) {
+        list.ArrayList<GenericArg> args! = list.ArrayList<GenericArg>();
+        list.ArrayList<qid.TypeId> type_args! = list.ArrayList<qid.TypeId>();
+        list.ArrayList<comptime_value.ComptimeValue> const_args! =
+            list.ArrayList<comptime_value.ComptimeValue>();
+        return self.create_named_type(
+            def_id,
+            args$.ref(),
+            type_args$.ref(),
+            const_args$.ref(),
+            span,
+            true
+        );
+    }
+
+    public qid.TypeId rebuild_named_type(
+        self,
+        NamedType source,
+        list.ArrayList<GenericArg> args,
+        token.Span span
+    ) {
+        return self.named_type_with_substitution(
+            source.def_id,
+            args,
+            span,
+            source.is_substitutable
+        );
+    }
+
     public qid.TypeId closure_environment_type(
         self,
         qid.DefId lambda_def,
@@ -1146,6 +1266,30 @@ public struct TypeStore: Movable {
         list.ArrayList<GenericArg> args,
         token.Span span
     ) {
+        return self.named_type_with_substitution(
+            def_id,
+            args,
+            span,
+            self.named_def_is_substitutable(def_id)
+        );
+    }
+
+    public qid.TypeId substitutable_named_type_with_ordered_generic_args(
+        self,
+        qid.DefId def_id,
+        list.ArrayList<GenericArg> args,
+        token.Span span
+    ) {
+        return self.named_type_with_substitution(def_id, args, span, true);
+    }
+
+    qid.TypeId named_type_with_substitution(
+        self,
+        qid.DefId def_id,
+        list.ArrayList<GenericArg> args,
+        token.Span span,
+        Bool is_substitutable
+    ) {
         list.ArrayList<qid.TypeId> type_args! = list.ArrayList<qid.TypeId>(args.len());
         list.ArrayList<comptime_value.ComptimeValue> const_args! =
             list.ArrayList<comptime_value.ComptimeValue>(args.len());
@@ -1160,7 +1304,21 @@ public struct TypeStore: Movable {
             }
             index = index + 1;
         }
-        return self.create_named_type(def_id, args$.ref(), type_args$.ref(), const_args$.ref(), span);
+        return self.create_named_type(
+            def_id,
+            args$.ref(),
+            type_args$.ref(),
+            const_args$.ref(),
+            span,
+            is_substitutable
+        );
+    }
+
+    Bool named_def_is_substitutable(self, qid.DefId def_id) {
+        guard self.named_type_defs.get(def_id) is .some(type_id) else { return false; }
+        TypeInfo info = self.get(type_id$.get());
+        guard info.data is .named(named) else { return false; }
+        return named.is_substitutable;
     }
 
     qid.TypeId create_named_type(self,
@@ -1168,7 +1326,8 @@ public struct TypeStore: Movable {
         list.ArrayList<GenericArg>& args,
         list.ArrayList<qid.TypeId>& type_args,
         list.ArrayList<comptime_value.ComptimeValue>& const_args,
-        token.Span span
+        token.Span span,
+        Bool is_substitutable = false
     ) {
         unsafe {
             Int arg_count = args.len();
@@ -1184,6 +1343,7 @@ public struct TypeStore: Movable {
             }
             return self.create(.named(NamedType (
                 def_id: def_id,
+                is_substitutable: is_substitutable,
                 args: stored_args[0..arg_count],
                 type_args: self.type_arg_array(type_args),
                 const_args: self.const_arg_array(const_args)

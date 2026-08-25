@@ -11,6 +11,7 @@ import sem = "../sema/model.jiang";
 import layout = "../layout.jiang";
 import database = "../db.jiang";
 import jil = "../jil.jiang";
+import callable_abi = "../jil/callable_abi.jiang";
 import qid = "../id.jiang";
 import def = "../resolve/def.jiang";
 import copy_semantics = "../sema/copy.jiang";
@@ -34,6 +35,17 @@ import borrow_store = "./store.jiang";
 import loan_facts = "./loan_facts.jiang";
 
 public struct BorrowCheckTiming: Copyable {
+    public Int functions! = 0;
+    public Int block_visits! = 0;
+    public Int active_loan_facts! = 0;
+    public Int max_active_loans! = 0;
+    public Int slowest_def! = -1;
+    public Int slowest_blocks! = 0;
+    public Int slowest_locals! = 0;
+    public Int slowest_move_paths! = 0;
+    public Int slowest_loans! = 0;
+    public Int slowest_region_value_loans! = 0;
+    public UInt64 slowest_function_ns! = UInt64(0);
     public UInt64 move_paths_ns! = UInt64(0);
     public UInt64 liveness_facts_ns! = UInt64(0);
     public UInt64 liveness_solve_ns! = UInt64(0);
@@ -43,6 +55,21 @@ public struct BorrowCheckTiming: Copyable {
     public UInt64 dataflow_merge_ns! = UInt64(0);
 
     public Void add(Self&! self, BorrowCheckTiming other) {
+        self.functions = self.functions + other.functions;
+        self.block_visits = self.block_visits + other.block_visits;
+        self.active_loan_facts = self.active_loan_facts + other.active_loan_facts;
+        if (other.max_active_loans > self.max_active_loans) {
+            self.max_active_loans = other.max_active_loans;
+        }
+        if (other.slowest_function_ns > self.slowest_function_ns) {
+            self.slowest_def = other.slowest_def;
+            self.slowest_blocks = other.slowest_blocks;
+            self.slowest_locals = other.slowest_locals;
+            self.slowest_move_paths = other.slowest_move_paths;
+            self.slowest_loans = other.slowest_loans;
+            self.slowest_region_value_loans = other.slowest_region_value_loans;
+            self.slowest_function_ns = other.slowest_function_ns;
+        }
         self.move_paths_ns = self.move_paths_ns + other.move_paths_ns;
         self.liveness_facts_ns = self.liveness_facts_ns + other.liveness_facts_ns;
         self.liveness_solve_ns = self.liveness_solve_ns + other.liveness_solve_ns;
@@ -220,6 +247,16 @@ public struct PackageBorrowChecker: Movable {
             self.timing_enabled, started
         );
         checker.check();
+        checker.timing.functions = 1;
+        checker.timing.slowest_def = jil.function_provenance_def(
+            function.origin
+        ).to_index();
+        checker.timing.slowest_blocks = checker.body.blocks.length;
+        checker.timing.slowest_locals = checker.body.locals.length;
+        checker.timing.slowest_move_paths = checker.paths.len();
+        checker.timing.slowest_loans = checker.loan_ids.len();
+        checker.timing.slowest_region_value_loans = checker.region_value_loan_count;
+        checker.timing.slowest_function_ns = checker.timing.dataflow_check_ns;
         self.timing.add(checker.timing);
     }
 }
@@ -246,6 +283,47 @@ struct TaskConsumeFact: Copyable {
 struct BorrowBoundaryFact: Copyable {
     public move_path.MovePathId boundary;
     public move_path.MovePathId target;
+}
+
+struct LoanKey: Copyable, Hashable, Equatable {
+    Int kind;
+    Int source;
+    Int target;
+    Int domain;
+    Int carried;
+
+    init(
+        self,
+        loan.LoanKind kind,
+        move_path.MovePathId source,
+        move_path.MovePathId target,
+        qid.DefId? domain_type,
+        Bool carried
+    ) {
+        self.kind = Int(kind);
+        self.source = source.to_index();
+        self.target = target.to_index();
+        self.domain = -1;
+        if (domain_type is .some(value)) { self.domain = value.to_index(); }
+        self.carried = 0;
+        if (carried) { self.carried = 1; }
+    }
+
+    public Void hash<H: core_traits.Hasher>(self, H&! hasher) {
+        hasher.write(self.kind);
+        hasher.write(self.source);
+        hasher.write(self.target);
+        hasher.write(self.domain);
+        hasher.write(self.carried);
+    }
+
+    public Bool equal(LoanKey& lhs, LoanKey& rhs) {
+        return lhs.kind == rhs.kind
+            && lhs.source == rhs.source
+            && lhs.target == rhs.target
+            && lhs.domain == rhs.domain
+            && lhs.carried == rhs.carried;
+    }
 }
 
 struct BorrowDataflowState: Movable {
@@ -289,6 +367,8 @@ struct LoanLivenessData: Movable {
     public UInt64*! live_after;
     public UInt64*! overlap_bits;
     public Bool*! overlap_ready;
+    public Bool*! closure_drop_known;
+    public Bool*! closure_drop_uses_borrow;
     public Int*! block_points;
     public Int*! path_bits;
     public Int*! tracked_paths;
@@ -313,6 +393,8 @@ struct LoanLivenessData: Movable {
             self.live_after = UInt64$.alloc(point_count * self.word_count);
             self.overlap_bits = UInt64$.alloc(path_count * self.word_count);
             self.overlap_ready = Bool$.alloc(path_count);
+            self.closure_drop_known = Bool$.alloc(path_count);
+            self.closure_drop_uses_borrow = Bool$.alloc(path_count);
             self.block_points = Int$.alloc(block_count);
             self.path_bits = Int$.alloc(path_count);
             self.tracked_paths = Int$.alloc(tracked_path_count);
@@ -329,6 +411,8 @@ struct LoanLivenessData: Movable {
             index = 0;
             while (index < path_count) {
                 self.overlap_ready[index] = false;
+                self.closure_drop_known[index] = false;
+                self.closure_drop_uses_borrow[index] = false;
                 index = index + 1;
             }
             index = 0;
@@ -347,7 +431,11 @@ struct LoanLivenessData: Movable {
             if (self.path_count > 0 && self.word_count > 0) {
                 self.overlap_bits$.dealloc();
             }
-            if (self.path_count > 0) { self.overlap_ready$.dealloc(); }
+            if (self.path_count > 0) {
+                self.overlap_ready$.dealloc();
+                self.closure_drop_known$.dealloc();
+                self.closure_drop_uses_borrow$.dealloc();
+            }
             if (self.block_count > 0) { self.block_points$.dealloc(); }
             if (self.path_count > 0) { self.path_bits$.dealloc(); }
             if (self.tracked_path_count > 0) { self.tracked_paths$.dealloc(); }
@@ -412,7 +500,8 @@ struct FunctionBorrowChecker: Movable {
     public jil.Body body;
     @life(f)
     public jil.CoroutineFrameLayout? coroutine_frame;
-    public Int loan_start_index;
+    map.WyHashMap<LoanKey, loan.LoanId> loan_ids!;
+    Int region_value_loan_count!;
     public move_path.MovePathTree paths!;
     table.SideTable<move_path.MovePathId, qid.TypeId> path_types!;
     public BorrowDataflowState dataflow!;
@@ -433,7 +522,6 @@ struct FunctionBorrowChecker: Movable {
     ) {
         self.store = store;
         self.query = query;
-        self.loan_start_index = results.loans.len();
         self.results = results;
         self.diagnostics = diagnostics;
         self.function_id = function.id;
@@ -451,6 +539,8 @@ struct FunctionBorrowChecker: Movable {
         self.current_location = location.Location(function.id, body.entry, .terminator, -1);
         self.reported_diagnostics = map.WyHashMap<BorrowDiagnosticKey, Bool>();
         self.reported_dead_loan_sources = map.WyHashMap<move_path.MovePathId, Bool>();
+        self.loan_ids = map.WyHashMap<LoanKey, loan.LoanId>();
+        self.region_value_loan_count = 0;
         self.timing_enabled = timing_enabled;
         self.timing = BorrowCheckTiming();
     }
@@ -512,6 +602,7 @@ struct FunctionBorrowChecker: Movable {
                 self.timing.dataflow_clone_ns = self.timing.dataflow_clone_ns
                     + borrow_timing_elapsed(self.timing_enabled, operation_started);
                 operation_started = borrow_timing_start(self.timing_enabled);
+                self.record_dataflow_size();
                 self.check_block(self.body.blocks[block_index]);
                 self.timing.dataflow_check_ns = self.timing.dataflow_check_ns
                     + borrow_timing_elapsed(self.timing_enabled, operation_started);
@@ -531,6 +622,15 @@ struct FunctionBorrowChecker: Movable {
             queued$.dealloc();
             self.timing.dataflow_ns = self.timing.dataflow_ns
                 + borrow_timing_elapsed(self.timing_enabled, started);
+        }
+    }
+
+    Void record_dataflow_size(Self&! self) {
+        Int active_loans = self.dataflow.active_loans.len();
+        self.timing.block_visits = self.timing.block_visits + 1;
+        self.timing.active_loan_facts = self.timing.active_loan_facts + active_loans;
+        if (active_loans > self.timing.max_active_loans) {
+            self.timing.max_active_loans = active_loans;
         }
     }
 
@@ -837,7 +937,10 @@ struct FunctionBorrowChecker: Movable {
         Int index! = 0;
         while (index < tuple_type.items.length) {
             jil.PlaceElem projection = jil.constant_index_projection_elem(
-                jil.ConstantIndexProjection(offset: index)
+                jil.ConstantIndexProjection(
+                    offset: index,
+                    field_type: tuple_type.items[index]
+                )
             );
             move_path.MovePathId child = self.paths.ensure_child_for_projection(root, projection);
             self.prebuild_type_lifetime_paths(
@@ -1386,6 +1489,7 @@ struct FunctionBorrowChecker: Movable {
             self.clear_liveness_words(
                 edge_kills, edge_count * self.loan_liveness.word_count
             );
+            self.initialize_closure_drop_liveness();
             self.build_liveness_facts(uses, kills, edge_points, edge_kills);
             self.timing.liveness_facts_ns = self.timing.liveness_facts_ns
                 + borrow_timing_elapsed(self.timing_enabled, started);
@@ -1529,6 +1633,47 @@ struct FunctionBorrowChecker: Movable {
             );
             block_index = block_index + 1;
         }
+    }
+
+    Void initialize_closure_drop_liveness(Self&! self) {
+        Int block_index! = 0;
+        while (block_index < self.body.blocks.length) {
+            jil.Block block = self.body.blocks[block_index];
+            Int statement_index! = 0;
+            while (statement_index < block.statements.length) {
+                self.record_closure_drop_definition(block.statements[statement_index]);
+                statement_index = statement_index + 1;
+            }
+            block_index = block_index + 1;
+        }
+    }
+
+    Void record_closure_drop_definition(Self&! self, jil.Statement statement) {
+        guard statement.kind is .assign_stmt(assign) else { return; }
+        move_path.MovePathId destination = self.paths.existing_path_for_place(
+            assign.destination
+        );
+        if (!self.valid_move_path(destination)) { return; }
+        qid.TypeId destination_type = self.move_path_type(destination);
+        guard self.type_is_closure_callable(destination_type) else { return; }
+        Int path_index = destination.to_index();
+        unsafe { self.loan_liveness.closure_drop_known[path_index] = true; }
+        guard assign.value is .closure_value(closure) else {
+            unsafe { self.loan_liveness.closure_drop_uses_borrow[path_index] = true; }
+            return;
+        }
+        drop_semantics.DropQuery query = drop_semantics.DropQuery(self.store$.ref());
+        if (query.type_may_need_runtime_drop(
+            self.query.layout$.mut_ref(), closure.environment_type
+        )) {
+            unsafe { self.loan_liveness.closure_drop_uses_borrow[path_index] = true; }
+        }
+    }
+
+    Bool type_is_closure_callable(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.kind == .closure;
     }
 
     Void build_block_liveness_facts(
@@ -1848,6 +1993,7 @@ struct FunctionBorrowChecker: Movable {
             return;
         }
         if (terminator.kind is .drop_term(drop_term)) {
+            if (self.closure_drop_does_not_use_borrow(drop_term.place)) { return; }
             self.record_place_liveness_bits(uses, point, drop_term.place);
             return;
         }
@@ -1863,6 +2009,16 @@ struct FunctionBorrowChecker: Movable {
             self.record_path_liveness_bits(
                 uses, point, self.paths.root_for_local(self.body.return_local)
             );
+        }
+    }
+
+    Bool closure_drop_does_not_use_borrow(Self&! self, jil.Place place) {
+        move_path.MovePathId path = self.paths.existing_path_for_place(place);
+        if (!self.valid_move_path(path)) { return false; }
+        Int path_index = path.to_index();
+        unsafe {
+            return self.loan_liveness.closure_drop_known[path_index]
+                && !self.loan_liveness.closure_drop_uses_borrow[path_index];
         }
     }
 
@@ -3230,7 +3386,10 @@ struct FunctionBorrowChecker: Movable {
             }
         }
         jil.PlaceElem projection = jil.constant_index_projection_elem(
-            jil.ConstantIndexProjection(offset: field_index)
+            jil.ConstantIndexProjection(
+                offset: field_index,
+                field_type: self.aggregate_field_type(value, field_index)
+            )
         );
         return self.paths.child_for_projection(destination_path, projection);
     }
@@ -3253,7 +3412,10 @@ struct FunctionBorrowChecker: Movable {
             }
         }
         jil.PlaceElem projection = jil.constant_index_projection_elem(
-            jil.ConstantIndexProjection(offset: field_index)
+            jil.ConstantIndexProjection(
+                offset: field_index,
+                field_type: self.aggregate_field_type(value, field_index)
+            )
         );
         return self.paths.ensure_child_for_projection(destination_path, projection);
     }
@@ -3273,9 +3435,12 @@ struct FunctionBorrowChecker: Movable {
         move_path.MovePathId variant_path =
             self.paths.child_for_projection(destination_path, variant_projection);
         types.TypeInfo payload_info = self.store.types.get(payload_type);
-        if (!(payload_info.data is .tuple_type(_))) { return variant_path; }
+        guard payload_info.data is .tuple_type(tuple_type) else { return variant_path; }
         jil.PlaceElem item_projection = jil.constant_index_projection_elem(
-            jil.ConstantIndexProjection(offset: field_index)
+            jil.ConstantIndexProjection(
+                offset: field_index,
+                field_type: tuple_type.items[field_index]
+            )
         );
         return self.paths.child_for_projection(variant_path, item_projection);
     }
@@ -3297,9 +3462,12 @@ struct FunctionBorrowChecker: Movable {
             variant_projection
         );
         types.TypeInfo payload_info = self.store.types.get(payload_type);
-        if (!(payload_info.data is .tuple_type(_))) { return variant_path; }
+        guard payload_info.data is .tuple_type(tuple_type) else { return variant_path; }
         jil.PlaceElem item_projection = jil.constant_index_projection_elem(
-            jil.ConstantIndexProjection(offset: field_index)
+            jil.ConstantIndexProjection(
+                offset: field_index,
+                field_type: tuple_type.items[field_index]
+            )
         );
         return self.paths.ensure_child_for_projection(variant_path, item_projection);
     }
@@ -3340,10 +3508,7 @@ struct FunctionBorrowChecker: Movable {
                 return self.place_type(place);
             }
         }
-        return self.projected_type(
-            value.type_id,
-            jil.constant_index_projection_elem(jil.ConstantIndexProjection(offset: field_index))
-        );
+        return self.constant_indexed_type(value.type_id, field_index);
     }
 
     Void record_slice_loan(Self&! self, jil.Place destination, jil.SliceRvalue value) {
@@ -3492,7 +3657,7 @@ struct FunctionBorrowChecker: Movable {
         Bool has_precise_targets =
             self.active_loans_have_descendant_target(source_path, original_len);
         Bool has_matching_precise_target = has_precise_targets
-            || self.active_loans_have_exact_target(source_path, original_len);
+            || self.dataflow.active_loans.has_target(source_path);
         Int index! = 0;
         while (index < original_len) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
@@ -3955,54 +4120,18 @@ struct FunctionBorrowChecker: Movable {
         qid.DefId? domain_type,
         Bool carried
     ) {
-        if (self.existing_loan(kind, source, target, domain_type, carried) is .some(loan_id)) {
-            return loan_id;
+        LoanKey key = LoanKey(kind, source, target, domain_type, carried);
+        if (self.loan_ids.get(key) is .some(loan_id)) {
+            return loan_id$.get();
         }
-        return self.results.add_loan(
+        loan.LoanId loan_id = self.results.add_loan(
             kind, self.function_id, source, target, domain_type, carried
         );
-    }
-
-    loan.LoanId? existing_loan(self,
-        loan.LoanKind kind,
-        move_path.MovePathId source,
-        move_path.MovePathId target,
-        qid.DefId? domain_type,
-        Bool carried
-    ) {
-        Int index! = self.loan_start_index;
-        while (index < self.results.loans.len()) {
-            loan.Loan current = self.results.loans.get(loan.LoanId(index));
-            if (self.same_loan(current, kind, source, target, domain_type, carried)) {
-                return current.id;
-            }
-            index = index + 1;
+        self.loan_ids.set(key, loan_id);
+        if (kind == .region_value) {
+            self.region_value_loan_count = self.region_value_loan_count + 1;
         }
-        return null;
-    }
-
-    Bool same_loan(self,
-        loan.Loan current,
-        loan.LoanKind kind,
-        move_path.MovePathId source,
-        move_path.MovePathId target,
-        qid.DefId? domain_type,
-        Bool carried
-    ) {
-        if (current.function_id.to_index() != self.function_id.to_index()) { return false; }
-        if (current.kind != kind) { return false; }
-        if (current.source != source) { return false; }
-        if (current.target != target) { return false; }
-        if (current.carried != carried) { return false; }
-        return self.same_optional_def(current.domain_type, domain_type);
-    }
-
-    Bool same_optional_def(self, qid.DefId? lhs, qid.DefId? rhs) {
-        if (lhs is .some(left)) {
-            guard rhs is .some(right) else { return false; }
-            return left.to_index() == right.to_index();
-        }
-        return rhs == null;
+        return loan_id;
     }
 
     Void add_active_loan(Self&! self, move_path.MovePathId target, loan.LoanId loan_id) {
@@ -4096,11 +4225,11 @@ struct FunctionBorrowChecker: Movable {
         }
         move_path.MovePathId path = self.paths.path_for_place(place);
         if (!self.valid_move_path(path)) { return; }
-        // 部分移动后的 root 仍需析构剩余字段。只有 root 本身或祖先已经
-        // 被移动时，当前 drop 才是无效使用。
+        // DropTerminator 由 drop scheduling 生成，并受对应 drop flag 控制。
+        // root 或祖先已经移动时，这条控制流表示条件 drop 未激活；部分移动
+        // 仍需继续析构 root 中尚未移动的字段。
         if (self.path_or_ancestor_is_moved(path)) {
-            self.results.mark_error();
-            self.add_use_after_move_diagnostic();
+            return;
         }
         self.check_move_place_conflicts(path);
         self.mark_moved(path);
@@ -4729,6 +4858,10 @@ struct FunctionBorrowChecker: Movable {
         while (index < self.dataflow.active_loans.len()) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (current.kind == .region_value) {
+                index = index + 1;
+                continue;
+            }
             if (self.loan_target_matches_path(fact.target, argument_path)) {
                 index = index + 1;
                 continue;
@@ -4749,6 +4882,10 @@ struct FunctionBorrowChecker: Movable {
         while (index < self.dataflow.active_loans.len()) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (current.kind == .region_value) {
+                index = index + 1;
+                continue;
+            }
             if (self.exclusive_place_statement_loan_conflicts(exclusive_path, current, fact.target)) {
                 self.results.mark_error();
                 self.add_mutable_borrow_diagnostic();
@@ -5367,7 +5504,7 @@ struct FunctionBorrowChecker: Movable {
                 continue;
             }
             jil.PlaceElem projection = jil.constant_index_projection_elem(
-                jil.ConstantIndexProjection(offset: index)
+                jil.ConstantIndexProjection(offset: index, field_type: item_type)
             );
             guard self.paths.existing_child_for_projection(root, projection)
                 is .some(child) else {
@@ -5718,14 +5855,16 @@ struct FunctionBorrowChecker: Movable {
     }
 
     move_path.MovePathId project_lifetime_move_path(
-        self,
+        Self&! self,
         move_path.MovePathId root,
         types.LifetimeProjectionPathId? projection_path
     ) {
         guard projection_path is .some(path_id) else { return root; }
         types.LifetimeProjectionPathNode node = self.store.types.lifetime_projection_path(path_id);
         move_path.MovePathId parent = self.project_lifetime_move_path(root, node.parent);
-        jil.PlaceElem projection = self.lifetime_place_projection(node);
+        jil.PlaceElem projection = self.lifetime_place_projection(
+            node, self.move_path_type(parent)
+        );
         guard self.paths.existing_child_for_projection(parent, projection)
             is .some(child) else {
             return parent;
@@ -5741,17 +5880,26 @@ struct FunctionBorrowChecker: Movable {
         guard projection_path is .some(path_id) else { return root; }
         types.LifetimeProjectionPathNode node = self.store.types.lifetime_projection_path(path_id);
         move_path.MovePathId parent = self.ensure_lifetime_move_path(root, node.parent);
-        jil.PlaceElem projection = self.lifetime_place_projection(node);
+        jil.PlaceElem projection = self.lifetime_place_projection(
+            node, self.move_path_type(parent)
+        );
         return self.paths.ensure_child_for_projection(parent, projection);
     }
 
-    jil.PlaceElem lifetime_place_projection(self, types.LifetimeProjectionPathNode node) {
+    jil.PlaceElem lifetime_place_projection(
+        Self&! self,
+        types.LifetimeProjectionPathNode node,
+        qid.TypeId parent_type
+    ) {
         if (node.kind == .reference_value) {
             return jil.deref_projection_elem(jil.DerefProjection(raw_pointer: false));
         }
         if (node.kind == .tuple_index) {
             return jil.constant_index_projection_elem(
-                jil.ConstantIndexProjection(offset: node.tuple_index)
+                jil.ConstantIndexProjection(
+                    offset: node.tuple_index,
+                    field_type: self.constant_indexed_type(parent_type, node.tuple_index)
+                )
             );
         }
         qid.DefId field_def = node.field_def$.some();
@@ -5929,7 +6077,7 @@ struct FunctionBorrowChecker: Movable {
         Bool has_precise_targets =
             self.active_loans_have_descendant_target(source_path, original_len);
         Bool has_matching_precise_target = has_precise_targets
-            || self.active_loans_have_exact_target(source_path, original_len);
+            || self.dataflow.active_loans.has_target(source_path);
         Int index! = 0;
         while (index < original_len) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
@@ -6020,21 +6168,6 @@ struct FunctionBorrowChecker: Movable {
         while (index < limit) {
             move_path.MovePathId target = self.dataflow.active_loans.get(index).target;
             if (target != root && self.is_descendant_of(target, root)) { return true; }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool active_loans_have_exact_target(
-        self,
-        move_path.MovePathId target,
-        Int limit
-    ) {
-        Int index! = 0;
-        while (index < limit) {
-            if (self.dataflow.active_loans.get(index).target == target) {
-                return true;
-            }
             index = index + 1;
         }
         return false;
@@ -6318,6 +6451,10 @@ struct FunctionBorrowChecker: Movable {
         while (index < self.dataflow.active_loans.len()) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (current.kind == .region_value) {
+                index = index + 1;
+                continue;
+            }
             if (self.exclusive_place_loan_conflicts(move_path, current, fact.target)) {
                 self.results.mark_error();
                 self.add_move_borrow_diagnostic();
@@ -6403,6 +6540,11 @@ struct FunctionBorrowChecker: Movable {
         Int index! = 0;
         while (index < self.dataflow.active_loans.len()) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (current.kind == .region_value) {
+                index = index + 1;
+                continue;
+            }
             if (self.loan_target_matches_path(fact.target, path) && self.loan_source_is_dead(fact)) {
                 self.report_dead_source_loan(fact.loan_id);
             }
@@ -6906,7 +7048,7 @@ struct FunctionBorrowChecker: Movable {
             return self.indexed_type(base_type);
         }
         if (projection is .constant_index_projection(constant_index)) {
-            return self.constant_indexed_type(base_type, constant_index.offset);
+            return constant_index.field_type;
         }
         if (projection is .subslice_projection) {
             return base_type;
@@ -6962,41 +7104,14 @@ struct FunctionBorrowChecker: Movable {
             if (offset < 0 || offset >= 2) {
                 return self.store.types.invalid_type();
             }
-            // Fn 的两个 runtime 字段都是 erased raw pointers。borrow check 只需
-            // 它们的所有权类别，不消费 vtable 内部的 ABI 类型。
-            return self.store.types.opaque_pointer_type(token.Span());
-        }
-        if (self.report_generic_param_layout_base(base_type)) {
-            return self.store.types.invalid_type();
-        }
-        layout.LayoutId layout_id = database.layout_of_type(
-            self.query$.mut_ref(), self.store$.ref(), base_type
-        );
-        layout.TypeLayout type_layout = self.query.layout.layout(layout_id);
-        if (offset >= 0 && offset < type_layout.fields.length) {
-            return type_layout.fields[offset].field_type;
+            if (offset == 0) {
+                return callable_abi.closure_environment_type(self.store.types$.ref());
+            }
+            return callable_abi.closure_vtable_pointer_type(
+                self.store.types$.ref(), base_type
+            );
         }
         return self.indexed_type(base_type);
-    }
-
-    Bool report_generic_param_layout_base(Self&! self, qid.TypeId base_type) {
-        types.TypeInfo info = self.store.types.get(base_type);
-        guard info.data is .named(named) else { return false; }
-        if (self.store.defs.get(named.def_id).kind != .generic_param_def) {
-            return false;
-        }
-        self.results.mark_error();
-        qid.SymbolId symbol = self.store.defs.get(named.def_id).name.symbol;
-        self.diagnostics.add(
-            diagnostic.Diagnostic(
-                self.current_diagnostic_severity(),
-                .borrow_check,
-                diagnostic.DiagnosticCode("borrow_generic_param_layout_base"),
-                self.current_source_range(),
-                self.store.symbols.text(symbol)
-            )
-        );
-        return true;
     }
 
     Bool is_implicit_copy_type(self, qid.TypeId type_id) {

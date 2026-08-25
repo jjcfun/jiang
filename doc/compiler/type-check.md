@@ -54,8 +54,8 @@ alias cycle、associated type default cycle、trait bound dependency 都应围�
 ## 泛型和 Trait
 
 type check 只负责证明泛型和 trait 约束在源程序层面成立。它不复制 Semantic Model，
-也不生成 concrete 函数体。JIL 先生成泛型 template，再从真实可达入口按需实例化
-concrete body。
+也不生成实例函数体。JIL 对每个源码定义只生成一份 generic body；真实可达入口产生
+`InstanceKey`，后续阶段通过 `InstanceReader` 读取具体实例，不复制 CFG。
 
 基础规则：
 

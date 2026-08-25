@@ -20,22 +20,25 @@ public enum Stage {
 }
 
 public Bool verify(
-    diagnostic.DiagnosticStore&! diagnostics,
+    store_api.CompilerStore&! compiler_store,
     jil.Store&! store,
-    Stage stage
+    Stage stage,
+    Bool verify_structure
 ) {
     if (store.program.has_errors()) { return false; }
+    if (!verify_emission_ready(compiler_store, store)) { return false; }
+    if (!verify_structure) { return true; }
     if (!verify_globals(store)
         || !verify_source_functions(store, stage)
         || !verify_functions(store, stage)) {
-        add_failure(diagnostics, stage);
+        add_failure(compiler_store.diagnostics$.mut_ref(), stage);
         store.program.mark_error();
         return false;
     }
     return true;
 }
 
-public Bool verify_concrete(
+Bool verify_emission_ready(
     store_api.CompilerStore&! compiler_store,
     jil.Store&! store
 ) {
@@ -43,12 +46,14 @@ public Bool verify_concrete(
     Int function_index! = 0;
     while (function_index < store.program.functions.len()) {
         jil.Function function = store.program.functions.get(function_index);
+        function_index = function_index + 1;
+        if (function.is_external) { continue; }
         jil_references.References references =
             jil_references.collect_function_refs(function);
         if (!references.trait_vtables.empty()) {
             diagnostic_helper.add_package_error(
                 compiler_store.diagnostics$.mut_ref(),
-                "concrete JIL contains an unresolved trait vtable demand",
+                "emission JIL contains an unresolved trait vtable demand",
                 "jil_concrete_trait_vtable"
             );
             store.program.mark_error();
@@ -60,7 +65,7 @@ public Bool verify_concrete(
             if (block.terminator.kind is .call_term(call)
                 && (call.deferred_async_direct || call.deferred_async_task != null)) {
                 std.StringBuilder message! = std.StringBuilder();
-                message.append("concrete JIL contains deferred async operation in FunctionId ");
+                message.append("emission JIL contains deferred async operation in FunctionId ");
                 message.append(function.id.to_index());
                 message.append(" block ");
                 message.append(block.id.to_index());
@@ -77,13 +82,12 @@ public Bool verify_concrete(
             }
             block_index = block_index + 1;
         }
-        function_index = function_index + 1;
     }
     guard type_requirements.concrete_failure(
         compiler_store$.ref(), store$.ref()
     ) is .some(failure) else { return true; }
     std.StringBuilder message! = std.StringBuilder();
-    message.append("concrete JIL contains an unbound generic parameter");
+    message.append("emission JIL contains an unbound generic parameter");
     if (failure.type_id is .some(type_id)) {
         message.append(" in TypeId ");
         message.append(type_id.to_index());
@@ -120,6 +124,8 @@ public Bool verify_concrete(
     append_concrete_failure_owner(
         compiler_store$.ref(), store$.ref(), message$.mut_ref(), failure
     );
+    message.append(" type-use ");
+    message.append(failure.type_use);
     diagnostic_helper.add_package_error(
         compiler_store.diagnostics$.mut_ref(),
         message.into_string().bytes(),
@@ -155,14 +161,14 @@ Void append_deferred_async_failure(
     guard function_ref.target is .source(callee_def) else { return; }
     message.append(" callee DefId ");
     message.append(callee_def.to_index());
-    guard store.program.function_id_for_ref(function_ref)
-        is .some(callee_id) else {
+    guard store.program.mono_item_for_ref(function_ref)
+        is .some(callee) else {
         message.append(" without instance");
         return;
     }
-    message.append(" FunctionId ");
-    message.append(callee_id.to_index());
-    if (store.program.function(callee_id).coroutine_frame == null) {
+    message.append(" MonoItem ");
+    message.append(jil.mono_item_identity(callee));
+    if (store.program.coroutine_frame_for_mono_item(callee) == null) {
         message.append(" without frame");
     }
 }
@@ -192,6 +198,49 @@ Void append_concrete_failure_owner(
     std.StringBuilder&! message,
     type_requirements.ConcreteFailure failure
 ) {
+    if (failure.source_instance is .some(identity)) {
+        jil.InstanceKey instance = store.program.function_instance_at(identity);
+        qid.DefId source_def = instance.def_id;
+        message.append(" in source instance for DefId ");
+        message.append(source_def.to_index());
+        message.append(" with ");
+        message.append(instance.args.length);
+        message.append(" generic args");
+        Int index! = 0;
+        while (index < instance.args.length) {
+            if (instance.args[index] is .type_arg(type_arg)) {
+                message.append(" TypeId ");
+                message.append(type_arg.value.to_index());
+                if (type_arg.param_def is .some(param_def)) {
+                    message.append(" for DefId ");
+                    message.append(param_def.to_index());
+                }
+            }
+            index = index + 1;
+        }
+        if (compiler_store.defs.has(source_def)) {
+            message.append(" (");
+            message.append(compiler_store.symbols.text(
+                compiler_store.defs.get(source_def).name.symbol
+            ));
+            message.append(")");
+        }
+        if (compiler_store.source_map.def_span(source_def) is .some(location)
+            && location.source_id is .some(source_id)) {
+            message.append(" at ");
+            message.append(compiler_store.sources.get(source_id).key.value);
+            message.append(":");
+            message.append(location.span.start);
+        }
+        qid.TypeId failed_type! = compiler_store.types.invalid_type();
+        if (failure.root_type is .some(root_type)) { failed_type = root_type; }
+        append_matching_local(
+            message,
+            store.program.source_function(source_def),
+            failed_type
+        );
+        return;
+    }
     if (failure.function_id is .some(function_id)) {
         jil.Function function = store.program.function(function_id);
         qid.DefId provenance = jil.function_provenance_def(function.origin);
@@ -334,6 +383,12 @@ Bool verify_functions(jil.Store& store, Stage stage) {
     while (index < store.program.functions.len()) {
         jil.Function function = store.program.functions.get(index);
         if (function.id.to_index() != index) { return false; }
+        if (function.origin is .source(_)
+            && !function.is_external
+            && !function.is_runtime_entry) {
+            index = index + 1;
+            continue;
+        }
         if (!verify_function(store, function, stage, false)) { return false; }
         index = index + 1;
     }

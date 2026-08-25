@@ -17,7 +17,8 @@ public import * = "./codegen_unit/model.jiang";
 
 public CodegenUnitSet build_codegen_units(context.CompilerContext& ctx, jil.Store& store) {
     CodegenUnitSet units! = CodegenUnitSet();
-    table.MultiTable<UInt64, jil.FunctionId> emitted! = table.MultiTable<UInt64, jil.FunctionId>();
+    table.MultiTable<UInt64, jil.MonoItem> emitted! =
+        table.MultiTable<UInt64, jil.MonoItem>();
     add_source_instances(ctx, store, units$.mut_ref(), emitted$.mut_ref());
     add_generated_functions(ctx, store, units$.mut_ref(), emitted$.mut_ref());
     assign_globals(ctx, store, units$.mut_ref());
@@ -30,47 +31,69 @@ Void add_source_instances(
     context.CompilerContext& ctx,
     jil.Store& store,
     CodegenUnitSet&! units,
-    table.MultiTable<UInt64, jil.FunctionId>&! emitted
+    table.MultiTable<UInt64, jil.MonoItem>&! emitted
 ) {
     Int index! = 0;
     while (index < store.program.source_instance_count()) {
         Int identity = store.program.source_instance_identity_at(index);
-        jil.InstanceKey instance = store.program.function_instance_at(identity);
-        jil.FunctionId function_id = store.program.function_id_for_instance(
-            instance.def_id, instance.args
-        )$.some();
-        jil.Function& function = store.program.functions.ref_at(function_id.to_index());
+        jil.MonoItem item = jil.source_instance_mono_item(identity);
+        jil.Function function = codegen_function(ctx, store, item);
         add_codegen_function(
             ctx,
             store,
             units,
             emitted,
-            source_instance_function(identity),
-            function
+            item,
+            function$.ref()
+        );
+        qid.DefId source_def = store.program.function_instance_at(identity).def_id;
+        add_source_resume(
+            ctx, store, units, emitted, identity, source_def, .standard
+        );
+        add_source_resume(
+            ctx, store, units, emitted, identity, source_def, .confined
+        );
+        add_source_resume(
+            ctx, store, units, emitted, identity, source_def, .run_to_completion
         );
         index = index + 1;
     }
+}
+
+Void add_source_resume(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    CodegenUnitSet&! units,
+    table.MultiTable<UInt64, jil.MonoItem>&! emitted,
+    Int identity,
+    qid.DefId source_def,
+    jil.CoroutineResumeMode mode
+) {
+    if (!store.program.has_source_resume_template(source_def, mode)) { return; }
+    jil.MonoItem item = jil.source_resume_mono_item(identity, mode);
+    jil.Function function = codegen_function(ctx, store, item);
+    add_codegen_function(ctx, store, units, emitted, item, function$.ref());
 }
 
 Void add_generated_functions(
     context.CompilerContext& ctx,
     jil.Store& store,
     CodegenUnitSet&! units,
-    table.MultiTable<UInt64, jil.FunctionId>&! emitted
+    table.MultiTable<UInt64, jil.MonoItem>&! emitted
 ) {
     Int index! = 0;
     while (index < store.program.functions.len()) {
         jil.Function& function = store.program.functions.ref_at(index);
-        if (function.origin is .generated(_)) {
-            add_codegen_function(
-                ctx,
-                store,
-                units,
-                emitted,
-                generated_function(function.id),
-                function
-            );
-        }
+        // Program.functions 只保存编译器派生 body。coroutine completion 为了稳定
+        // 符号保留 source provenance，不能再用 origin kind 判断是否属于该表。
+        add_codegen_function(
+            ctx,
+            store,
+            units,
+            emitted,
+            jil.generated_function_mono_item(function.id),
+            function
+        );
         index = index + 1;
     }
 }
@@ -79,18 +102,25 @@ Void add_codegen_function(
     context.CompilerContext& ctx,
     jil.Store& store,
     CodegenUnitSet&! units,
-    table.MultiTable<UInt64, jil.FunctionId>&! emitted,
-    CodegenFunction codegen_function,
+    table.MultiTable<UInt64, jil.MonoItem>&! emitted,
+    jil.MonoItem codegen_function,
     jil.Function& function
 ) {
     if (!function_has_codegen_body(function)) { return; }
     if (has_stable_function_instance(ctx, store, emitted$.ref(), function)) { return; }
-    if (!caller_owned_function(store, function)
+    if (!caller_owned_function(store, codegen_function)
         && !interface_only_source_function(ctx, function)) {
         units.add_function(unit_key_for_function(ctx, function), codegen_function);
     }
     std.String name = symbol.function_symbol_name(ctx, store, function);
-    emitted.add(hash.hash_bytes(name.bytes()), function.id);
+    emitted.add(hash.hash_bytes(name.bytes()), codegen_function);
+}
+
+Bool caller_owned_function(
+    jil.Store& store,
+    jil.MonoItem function
+) {
+    return store.program.mono_item_is_shared_codegen(function);
 }
 
 // 原始 coroutine function 只描述异步入口，不拥有 backend body；真正生成的是
@@ -114,18 +144,8 @@ Bool interface_only_source_function(
     return ctx.store.resolve.module_ref(module_id).interface_only;
 }
 
-Bool caller_owned_function(
-    jil.Store& store,
-    jil.Function& function
-) {
-    if (function.args.length > 0) {
-        return true;
-    }
-    return store.program.function_is_shared_codegen(function.id);
-}
-
-// Global 在 planning 时一次性归属 source unit；后续 reference closure 和 LLVM
-// lowering 直接消费 unit.globals，不再各自扫描完整 global 表。
+// Global 在 planning 时一次性归属 source unit；后续 fingerprint 和 LLVM lowering
+// 直接消费 unit.globals，不再各自扫描完整 global 表。
 Void assign_globals(
     context.CompilerContext& ctx,
     jil.Store& store,
@@ -171,16 +191,20 @@ Void ensure_parsed_source_units(
 Bool has_stable_function_instance(
     context.CompilerContext& ctx,
     jil.Store& store,
-    table.MultiTable<UInt64, jil.FunctionId>& emitted,
+    table.MultiTable<UInt64, jil.MonoItem>& emitted,
     jil.Function& function
 ) {
     std.String name = symbol.function_symbol_name(ctx, store, function);
     table.MultiTableCursor cursor! = emitted.first(hash.hash_bytes(name.bytes()));
     while (cursor.valid()) {
-        jil.Function& previous = store.program.functions.ref_at(emitted.get(cursor).to_index());
-        std.String previous_name = symbol.function_symbol_name(ctx, store, previous);
+        jil.Function previous = codegen_function(ctx, store, emitted.get(cursor));
+        std.String previous_name = symbol.function_symbol_name(
+            ctx, store, previous$.ref()
+        );
         if (string.equal(previous_name.bytes(), name.bytes())) {
-            return symbol.same_stable_function_instance(ctx, store, previous, function);
+            return symbol.same_stable_function_instance(
+                ctx, store, previous$.ref(), function
+            );
         }
         cursor = emitted.next(cursor);
     }

@@ -251,8 +251,8 @@ check_dependency_invalidation() {
   require_stat_ge "$WORK_DIR/unused-public.log" artifact_parsed_sources 1
   require_stat_ge "$WORK_DIR/unused-public.log" artifact_interface_hit 1
   require_stat_ge "$WORK_DIR/unused-public.log" artifact_source_dirty 1
-  require_stat_ge "$WORK_DIR/unused-public.log" artifact_dependency_candidates 1
-  require_stat_eq "$WORK_DIR/unused-public.log" artifact_emitted_units 1
+  require_stat_eq "$WORK_DIR/unused-public.log" artifact_dependency_candidates 0
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_emitted_units 2
   require_stat_ge "$WORK_DIR/unused-public.log" artifact_reused_units 1
   expect_exit "$WORK_DIR/unused-public" 52
 
@@ -261,10 +261,36 @@ check_dependency_invalidation() {
     "$WORK_DIR/public-change" "$input"
   require_stat_ge "$WORK_DIR/public-change.log" artifact_parsed_sources 1
   require_stat_ge "$WORK_DIR/public-change.log" artifact_source_dirty 2
-  require_stat_ge "$WORK_DIR/public-change.log" artifact_dependency_candidates 1
+  require_stat_eq "$WORK_DIR/public-change.log" artifact_dependency_candidates 0
   require_stat_eq "$WORK_DIR/public-change.log" artifact_emitted_units 2
   require_stat_ge "$WORK_DIR/public-change.log" artifact_reused_units 1
   expect_exit "$WORK_DIR/public-change" 53
+}
+
+check_hidden_caller_coverage() {
+  local fixture="$WORK_DIR/hidden-caller-coverage"
+  local cache="$WORK_DIR/hidden-caller-cache"
+  local output="$WORK_DIR/hidden-caller"
+  mkdir -p "$fixture"
+  printf '%s\n' \
+    '[package]' \
+    'name = hidden_caller_coverage' \
+    'root = main.jiang' >"$fixture/package.ini"
+  printf '%s\n' \
+    'import api = "./api.jiang";' \
+    'Int main() { api.value() }' >"$fixture/main.jiang"
+  printf '%s\n' 'public Int value() { 7 }' >"$fixture/api.jiang"
+
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/hidden-caller-cold.log" \
+    "$output" "$fixture"
+  expect_exit "$output" 7
+
+  printf '%s\n' 'public Int value() { 8 }' >"$fixture/api.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/hidden-caller-hot.log" \
+    "$output" "$fixture"
+  require_stat_ge "$WORK_DIR/hidden-caller-hot.log" artifact_source_dirty 2
+  require_stat_ge "$WORK_DIR/hidden-caller-hot.log" artifact_emitted_units 1
+  expect_exit "$output" 8
 }
 
 check_metadata_only_change() {
@@ -856,8 +882,8 @@ check_backend_emission() {
   require_stat_ge "$WORK_DIR/backend-failed-unit.log" artifact_emitted_units 1
   require_stat_eq "$WORK_DIR/backend-failed-unit.log" artifact_linked_objects 0
   require_stat_eq "$WORK_DIR/backend-failed-unit.log" artifact_no_op_hits 0
-  [ -n "$(find "$failed_cache" -type f -name '*.jbuild' -print -quit)" ] \
-    || fail "failed backend emission did not preserve build state"
+  [ -z "$(find "$failed_cache" -type f -name '*.jbuild' -print -quit)" ] \
+    || fail "failed backend emission published build state"
   require_no_temporary_files "$failed_cache"
 
   if env JIANG_INTERNAL_BACKEND_FAIL_UNIT=0 \
@@ -874,8 +900,8 @@ check_backend_emission() {
 
   "$JIANGC" --artifact-cache-dir "$failed_cache" --artifact-stats \
     -o "$failed_output" "$input" >"$WORK_DIR/backend-failed-unit-retry.log" 2>&1
-  require_stat_eq "$WORK_DIR/backend-failed-unit-retry.log" artifact_emitted_units 1
-  require_stat_ge "$WORK_DIR/backend-failed-unit-retry.log" artifact_object_hit 1
+  require_stat_ge "$WORK_DIR/backend-failed-unit-retry.log" artifact_emitted_units 2
+  require_stat_eq "$WORK_DIR/backend-failed-unit-retry.log" artifact_object_hit 0
   expect_exit "$failed_output" 52
   require_no_temporary_files "$failed_cache"
 }
@@ -896,7 +922,7 @@ check_explicit_cache_clean() {
   require_stat_ge "$WORK_DIR/clean-rebuild.log" artifact_emitted_units 1
 }
 
-check_failed_link_preserves_work_products() {
+check_failed_link_discards_manifest() {
   local source="$WORK_DIR/failed-link.jiang"
   local cache="$WORK_DIR/failed-link-cache"
   local output="$WORK_DIR/failed-link"
@@ -908,13 +934,13 @@ check_failed_link_preserves_work_products() {
   then
     fail "missing linker unexpectedly succeeded"
   fi
-  [ -n "$(find "$cache" -type f -name '*.jbuild' -print -quit)" ] \
-    || fail "failed link did not preserve build state"
+  [ -z "$(find "$cache" -type f -name '*.jbuild' -print -quit)" ] \
+    || fail "failed link published build state"
 
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/failed-link-retry.log" \
     "$output" "$source"
-  require_stat_eq "$WORK_DIR/failed-link-retry.log" artifact_emitted_units 0
-  require_stat_ge "$WORK_DIR/failed-link-retry.log" artifact_object_hit 1
+  require_stat_ge "$WORK_DIR/failed-link-retry.log" artifact_emitted_units 1
+  require_stat_eq "$WORK_DIR/failed-link-retry.log" artifact_object_hit 0
   expect_exit "$output" 0
 }
 
@@ -986,6 +1012,7 @@ command -v nm >/dev/null 2>&1 || fail "missing nm"
 
 run_check cold_hot "cold/hot and profiles" check_cold_hot_and_profiles
 run_check invalidation "dependency invalidation" check_dependency_invalidation
+run_check coverage "hidden caller object coverage" check_hidden_caller_coverage
 run_check metadata "mtime-only source change" check_metadata_only_change
 run_check check_codegen "--check and codegen transition" check_check_then_codegen
 run_check import_graph "import graph changes" check_import_graph_changes
@@ -1002,7 +1029,7 @@ run_check trait_interface "trait interface" check_trait_interface
 run_check backend_emission "serial backend emission" check_backend_emission
 run_check concurrent "concurrent publication" check_concurrent_publish
 run_check clean "explicit cache clean" check_explicit_cache_clean
-run_check partial "failed link preserves work products" check_failed_link_preserves_work_products
+run_check partial "failed link does not publish manifest" check_failed_link_discards_manifest
 run_check source_race "source change before link" check_source_change_before_link
 run_check dylib "lang provider dylib" check_lang_provider_dylib
 

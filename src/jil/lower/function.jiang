@@ -16,9 +16,10 @@ import layout = "../../layout.jiang";
 import token = "../../syntax/token.jiang";
 import jil = "../model.jiang";
 import jil_diagnostics = "../diagnostics.jiang";
-import jil_instantiate = "../instantiate.jiang";
+import instance_reader = "../instance_reader.jiang";
 import jil_references = "../references.jiang";
 import drop_elaborate = "../drop_elaborate.jiang";
+import coroutine_frame_layout = "../coroutine/frame_layout.jiang";
 import coroutine_task_abi = "../coroutine/task_abi.jiang";
 import list = "../../support/list.jiang";
 import map = "../../support/map.jiang";
@@ -44,10 +45,15 @@ import lower_support = "./support.jiang";
 import lower_task = "./task.jiang";
 import lower_trait_object = "./trait_object.jiang";
 
+struct TemplateAsyncDependency: Copyable {
+    qid.DefId target_def;
+    Bool task;
+}
+
 public extend lower_context.Context {
     public Void lower_def_tree(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
         qid.DefId def_id
     ) {
@@ -56,7 +62,7 @@ public extend lower_context.Context {
 
     public Void lower_def_tree_with_generics(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
         qid.DefId def_id,
         Int inherited_generic_count
@@ -77,9 +83,7 @@ public extend lower_context.Context {
                 // Dynamic libraries share runtime facilities but do not own a process entry.
             } else if (!self.is_external_function_decl(def_id)
                 && self.model.has_body(def_id)) {
-                if (self.output_kind == .check_only) {
-                    self.lower_template(instance_query, layouts, def_id);
-                }
+                self.lower_template(instance_query, layouts, def_id);
                 if ((self.output_kind == .check_only || emission_root)
                     && generic_count == 0
                     && self.function_signature_is_concrete(def_id)) {
@@ -111,7 +115,7 @@ public extend lower_context.Context {
 
     public Void lower_async_lambda_members(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
         qid.DefId def_id,
         Int member_count,
@@ -147,7 +151,7 @@ public extend lower_context.Context {
 
     public Void lower_function(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def
     ) {
@@ -179,13 +183,13 @@ public extend lower_context.Context {
 
     public Void lower_template(
         Self&! self,
-        database.InstanceJilQuery& instance_query,
+        database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def
     ) {
         if (self.program.has_source_function(function_def)) { return; }
         guard self.model.def(function_def) is .some(model_def) else { return; }
-        database.TemplateJilKey query_key = database.TemplateJilKey(
+        database.SourceJilKey query_key = database.SourceJilKey(
             self.program.query_identity, function_def
         );
         self.template_query.evaluate(
@@ -209,7 +213,7 @@ public extend lower_context.Context {
 
     Void compute_template_function(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def,
         sem.Def& model_def
@@ -268,7 +272,7 @@ public extend lower_context.Context {
         list.ArrayList<types.GenericArg>&! args
     ) {
         if (self.store.defs.get(function_def).owner_def is .some(owner_def)) {
-            self.append_template_args(owner_def, args);
+            self.collect_template_args(owner_def, args);
         }
         self.append_template_args(function_def, args);
     }
@@ -281,7 +285,9 @@ public extend lower_context.Context {
         if (self.store.defs.get(owner_def).kind == .trait_def) {
             args.add(types.generic_type_param_arg(
                 owner_def,
-                self.store.types.named_type(owner_def, self.def_span(owner_def))
+                self.store.types.substitutable_named_type(
+                    owner_def, self.def_span(owner_def)
+                )
             ));
         }
         Int index! = 0;
@@ -292,7 +298,9 @@ public extend lower_context.Context {
             if (record.domain == .type_name) {
                 args.add(types.generic_type_param_arg(
                     param_def,
-                    self.store.types.named_type(param_def, self.def_span(param_def))
+                    self.store.types.substitutable_named_type(
+                        param_def, self.def_span(param_def)
+                    )
                 ));
                 continue;
             }
@@ -325,13 +333,11 @@ public extend lower_context.Context {
         return model_def.decl.extern_kind != .none;
     }
 
-    public Void lower_referenced_instances(
+    public Void lower_global_references(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
-        Int&! global_cursor,
-        Int&! source_cursor,
-        Int&! function_cursor
+        Int&! global_cursor
     ) {
         while (global_cursor$.get() < self.program.globals.len()) {
             Int global_index = global_cursor$.get();
@@ -356,27 +362,25 @@ public extend lower_context.Context {
                 reference_index = reference_index + 1;
             }
         }
-        while (source_cursor$.get() < self.program.source_instance_count()) {
-            Int source_index = source_cursor$.get();
-            source_cursor$.set(source_index + 1);
-            Int identity = self.program.source_instance_identity_at(source_index);
-            self.lower_source_instance_references(
-                body_query, layouts, identity
-            );
+    }
+
+    public Void lower_mono_item_references(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        jil.MonoItem item
+    ) {
+        if (item is .source_instance(identity)) {
+            self.lower_source_instance_references(body_query, layouts, identity);
+            return;
         }
-        while (function_cursor$.get() < self.program.functions.len()) {
-            Int function_index = function_cursor$.get();
-            function_cursor$.set(function_index + 1);
-            jil.Function function = self.program.functions.get(function_index);
-            if (function.origin is .generated(_)) {
-                self.lower_function_references(body_query, layouts, function_index);
-            }
-        }
+        guard item is .generated_function(function_id) else { return; }
+        self.lower_function_references(body_query, layouts, function_id.to_index());
     }
 
     Void lower_source_instance_references(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         Int identity
     ) {
@@ -416,11 +420,20 @@ public extend lower_context.Context {
 
     Void lower_function_references(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         Int function_index
     ) {
         jil.Function function = self.program.functions.get(function_index);
+        self.lower_function_value_references(body_query, layouts, function);
+    }
+
+    Void lower_function_value_references(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        jil.Function function
+    ) {
         qid.DefId? caller_def! = null;
         if (function.origin is .source(def_id)) { caller_def = def_id; }
         jil_references.References references =
@@ -446,7 +459,7 @@ public extend lower_context.Context {
 
     Void lower_referenced_instance(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId? caller_def,
         jil_references.FunctionReference& function_ref,
@@ -483,10 +496,13 @@ public extend lower_context.Context {
             );
             return;
         }
-        if (self.program.function_id_for_instance(function_def, args) == null) {
+        if (!self.program.has_source_instance(function_def, args)) {
             self.ensure_referenced_function(
                 body_query, layouts, function_def, args
             );
+        }
+        if (function_ref.coroutine_serial_completion) {
+            self.ensure_serial_completion_shim(function_def, args, span);
         }
         if (function_ref.coroutine_start) {
             self.ensure_async_callable_shims(function_def, args, span);
@@ -525,7 +541,7 @@ public extend lower_context.Context {
 
     Void ensure_referenced_function(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def,
         types.GenericArg[]& args
@@ -539,7 +555,7 @@ public extend lower_context.Context {
             return;
         }
         if (args.length == 0) {
-            if (self.program.function_id_for_def(function_def) != null) { return; }
+            if (self.program.has_source_instance(function_def, args)) { return; }
             self.lower_function(body_query, layouts, function_def);
             return;
         }
@@ -548,7 +564,7 @@ public extend lower_context.Context {
 
     Void lower_instance_for_generic_args(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def,
         types.GenericArg[]& args
@@ -576,7 +592,7 @@ public extend lower_context.Context {
     }
 
     public Void lower_function_with_substitution(Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def,
         generic_bindings.GenericBindings& substitutions,
@@ -587,7 +603,7 @@ public extend lower_context.Context {
             self.storage, function_def, args
         );
         self.program.mark_source_instance(identity);
-        database.InstanceJilKey query_key = database.InstanceJilKey(
+        database.JilInstanceKey query_key = database.JilInstanceKey(
             self.program.query_identity, function_def, identity
         );
         body_query.evaluate(
@@ -615,7 +631,7 @@ public extend lower_context.Context {
 
     Void compute_instance_function(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
         qid.DefId function_def,
         sem.Def& model_def,
@@ -635,8 +651,6 @@ public extend lower_context.Context {
         token.Span template_span = self.program.source_function(function_def).span;
         jil.BodyId template_body_id = self.program.source_function(function_def).body.id;
         Bool template_is_async = self.program.source_function(function_def).effects.has_async;
-        map.WyHashMap<jil.TraitVTableKey, jil.GlobalId> trait_vtables! =
-            map.WyHashMap<jil.TraitVTableKey, jil.GlobalId>();
         self.materialize_instance_trait_vtables(
             body_query,
             layouts,
@@ -646,214 +660,184 @@ public extend lower_context.Context {
             template_body_id,
             template_is_async,
             substitutions,
-            args,
-            trait_vtables$.mut_ref()
-        );
-        jil.Function template = self.program.source_function(function_def);
-        Int function_index = self.program.functions.len();
-        jil.Function function = jil_instantiate.instantiate_function(
-            self.store,
-            substitutions,
-            self.storage,
-            trait_vtables$.ref(),
-            template,
-            jil.FunctionId.from_index(function_index),
             args
         );
-        // instance_jil 只发布完成泛型替换的逻辑 body。需要 callee Layout 的
-        // async direct call、drop 与 coroutine frame 在可达实例闭合后统一固化。
-        self.publish_lowered_function(function, args);
     }
 
-    Void materialize_instance_trait_vtables(
+    public Void materialize_template_async_operations(
         Self&! self,
-        database.InstanceJilQuery& body_query,
-        database.LayoutQuery&! layouts,
-        sem.Def& model_def,
-        jil_references.References references,
-        token.Span template_span,
-        jil.BodyId template_body_id,
-        Bool template_is_async,
-        generic_bindings.GenericBindings& substitutions,
-        types.GenericArg[]& args,
-        map.WyHashMap<jil.TraitVTableKey, jil.GlobalId>&! trait_vtables
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts
     ) {
-        if (references.trait_vtables.empty()) { return; }
-        BodyBuilder builder! = BodyBuilder(
-            self.storage, template_span, template_is_async
-        );
-        BodyLowerer lowerer! = BodyLowerer(
-            self,
-            body_query,
-            layouts,
-            builder$.mut_ref(),
-            template_body_id,
-            model_def,
-            args,
-            template_span
-        );
+        map.WyHashMap<Int, Bool> active! = map.WyHashMap<Int, Bool>();
+        map.WyHashMap<Int, Bool> complete! = map.WyHashMap<Int, Bool>();
+        Bool progressed! = true;
+        while (progressed) {
+            progressed = false;
+            Int index! = 0;
+            while (index < self.program.source_function_count()) {
+                jil.Function source = self.program.source_function_at(index);
+                index = index + 1;
+                guard source.origin is .source(function_def) else { continue; }
+                if (complete.has(function_def.to_index())) { continue; }
+                if (self.materialize_template_async_function(
+                    body_query,
+                    layouts,
+                    function_def,
+                    active$.mut_ref(),
+                    complete$.mut_ref()
+                )) {
+                    progressed = true;
+                }
+            }
+        }
         Int index! = 0;
-        while (index < references.trait_vtables.len()) {
-            jil.TraitVTableRef reference = references.trait_vtables.get(index);
+        while (index < self.program.source_function_count()) {
+            jil.Function source = self.program.source_function_at(index);
             index = index + 1;
-            jil.TraitVTableKey key = reference.key;
-            guard lowerer.ensure_trait_vtable_global(
-                key.trait_def, key.subject_type, reference.span
-            ) is .some(global_id) else {
+            if (self.body_has_deferred_async_operation(source.body)) {
                 self.program.mark_error();
-                return;
             }
-            trait_vtables.set(key, global_id);
         }
     }
 
-    public Bool finalize_instance_functions(
+    Void schedule_source_function(
         Self&! self,
-        database.InstanceJilQuery& body_query,
         database.LayoutQuery&! layouts,
+        qid.DefId function_def
+    ) {
+        jil.Function source = drop_elaborate.schedule_function(
+            self.store,
+            layouts,
+            self.storage,
+            self.program.source_function(function_def)
+        );
+        if (!source.effects.has_async) {
+            self.program.set_source_function(function_def, source);
+            return;
+        }
+        qid.TypeId result_type =
+            source.body.locals[source.body.return_local.to_index()].type_id;
+        jil.TaskStateLayout task_state = self.create_task_state_layout(
+            result_type, source.span
+        );
+        generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
+        guard self.coroutine_frame_layout_for_body(
+            source.body,
+            source.effects,
+            task_state,
+            jil.BlockId.from_index(1),
+            source.coroutine_capture_env_type,
+            empty$.ref()
+        ) is .some(frame) else {
+            self.program.mark_error();
+            return;
+        }
+        self.program.set_source_function(
+            function_def,
+            jil.function_with_coroutine_frame(source, frame)
+        );
+    }
+
+    Bool materialize_template_async_function(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        qid.DefId function_def,
         map.WyHashMap<Int, Bool>&! active,
-        Int&! function_cursor,
-        list.ArrayList<jil.FunctionId>&! pending
+        map.WyHashMap<Int, Bool>&! complete
     ) {
-        while (function_cursor$.get() < self.program.functions.len()) {
-            Int function_index = function_cursor$.get();
-            function_cursor$.set(function_index + 1);
-            pending.add(jil.FunctionId.from_index(function_index));
-        }
-        list.ArrayList<jil.FunctionId> retry! =
-            list.ArrayList<jil.FunctionId>(pending.len());
-        Bool finalized! = false;
-        Int index! = 0;
-        while (index < pending.len()) {
-            jil.FunctionId function_id = pending.get(index);
-            index = index + 1;
-            if (self.finalize_instance_function(
-                body_query, layouts, function_id, active
-            )) {
-                finalized = true;
-            } else {
-                retry.add(function_id);
-            }
-        }
-        pending.clear();
-        index = 0;
-        while (index < retry.len()) {
-            pending.add(retry.get(index));
-            index = index + 1;
-        }
-        return finalized;
-    }
-
-    Bool finalize_instance_function(
-        Self&! self,
-        database.InstanceJilQuery& body_query,
-        database.LayoutQuery&! layouts,
-        jil.FunctionId function_id,
-        map.WyHashMap<Int, Bool>&! active
-    ) {
-        if (self.drop_elaboration.contains(function_id)) { return true; }
-        jil.Function source! = self.program.function(function_id);
-        if (source.is_external || source.is_runtime_entry) { return true; }
-        if (source.origin is .generated(_)) {
-            if (source.body.blocks.length == 0) { return false; }
-            self.finalize_generated_instance(layouts, source);
-            self.lower_function_references(
-                body_query, layouts, function_id.to_index()
-            );
+        Int key = function_def.to_index();
+        if (complete.has(key)) { return true; }
+        if (active.has(key)) { return false; }
+        if (!self.program.has_source_function(function_def)) { return false; }
+        if (!self.body_has_deferred_async_operation(
+            self.program.source_function(function_def).body
+        )) {
+            self.schedule_source_function(layouts, function_def);
+            complete.set(key, true);
             return true;
         }
-        guard source.origin is .source(function_def) else { return false; }
-        if (!self.model.has_body(function_def)) { return true; }
-        list.ArrayList<jil.FunctionId> dependencies =
-            self.deferred_async_dependencies(source.body);
-        Int key = function_id.to_index();
-        if (active.has(key)) { return false; }
         active.set(key, true);
-        if (self.has_active_deferred_task_dependency(source.body, active)) {
+        list.ArrayList<TemplateAsyncDependency> dependencies =
+            self.template_async_dependencies(function_def);
+        if (!self.materialize_template_async_dependencies(
+            body_query, layouts, dependencies$.ref(), active, complete
+        )) {
             active.remove(key);
             return false;
         }
-        Int index! = 0;
-        while (index < dependencies.len()) {
-            jil.FunctionId child_id = dependencies.get(index);
-            index = index + 1;
-            if (active.has(child_id.to_index())) { continue; }
-            if (!self.finalize_instance_function(body_query, layouts, child_id, active)) {
-                active.remove(key);
-                return false;
-            }
+        guard self.materialized_template_async_function(
+            body_query, layouts, function_def, active
+        ) is .some(materialized) else {
+            active.remove(key);
+            return false;
         }
-        source = self.program.function(function_id);
-        self.materialize_async_direct_calls(
-            body_query, layouts, source, active
-        );
-        self.lower_function_references(
-            body_query, layouts, function_id.to_index()
-        );
+        self.program.set_source_function(function_def, materialized);
+        self.schedule_source_function(layouts, function_def);
         active.remove(key);
+        complete.set(key, true);
         return true;
     }
 
-    Bool has_active_deferred_task_dependency(
-        self,
-        jil.Body body,
-        map.WyHashMap<Int, Bool>& active
+    Bool materialize_template_async_dependencies(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        list.ArrayList<TemplateAsyncDependency>& dependencies,
+        map.WyHashMap<Int, Bool>&! active,
+        map.WyHashMap<Int, Bool>&! complete
     ) {
         Int index! = 0;
-        while (index < body.blocks.length) {
-            jil.Terminator terminator = body.blocks[index].terminator;
+        while (index < dependencies.len()) {
+            TemplateAsyncDependency dependency = dependencies.get(index);
             index = index + 1;
-            guard terminator.kind is .call_term(call) else { continue; }
-            if (call.deferred_async_task == null) { continue; }
-            guard call.callee is .direct_function(function_ref) else { continue; }
-            guard self.program.function_id_for_ref(function_ref)
-                is .some(child_id) else { continue; }
-            if (active.has(child_id.to_index())) { return true; }
+            if (active.has(dependency.target_def.to_index())) {
+                if (dependency.task) { return false; }
+                continue;
+            }
+            if (!self.materialize_template_async_function(
+                body_query, layouts, dependency.target_def, active, complete
+            )) { return false; }
         }
-        return false;
+        return true;
     }
 
-    list.ArrayList<jil.FunctionId> deferred_async_dependencies(
+    list.ArrayList<TemplateAsyncDependency> template_async_dependencies(
         self,
-        jil.Body body
+        qid.DefId function_def
     ) {
-        list.ArrayList<jil.FunctionId> result! =
-            list.ArrayList<jil.FunctionId>();
+        list.ArrayList<TemplateAsyncDependency> result! =
+            list.ArrayList<TemplateAsyncDependency>();
+        jil.Function source = self.program.source_function(function_def);
         Int index! = 0;
-        while (index < body.blocks.length) {
-            jil.Terminator terminator = body.blocks[index].terminator;
+        while (index < source.body.blocks.length) {
+            jil.Terminator terminator = source.body.blocks[index].terminator;
             index = index + 1;
             guard terminator.kind is .call_term(call) else { continue; }
             if (!call.deferred_async_direct && call.deferred_async_task == null) {
                 continue;
             }
             guard call.callee is .direct_function(function_ref) else { continue; }
-            guard self.program.function_id_for_ref(function_ref)
-                is .some(child_id) else { continue; }
-            result.add(child_id);
+            guard function_ref.target is .source(target_def) else { continue; }
+            result.add(TemplateAsyncDependency(
+                target_def: target_def,
+                task: call.deferred_async_task != null
+            ));
         }
         return result;
     }
 
-    Void materialize_async_direct_calls(
+    @life(return: (self, self))
+    jil.Function? materialized_template_async_function(
         Self&! self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
-        jil.Function source,
+        qid.DefId function_def,
         map.WyHashMap<Int, Bool>& active
     ) {
-        if (!self.body_has_deferred_async_operation(source.body)) {
-            self.finalize_logical_instance(layouts, source);
-            return;
-        }
-        guard source.origin is .source(function_def) else {
-            self.program.mark_error();
-            return;
-        }
-        guard self.model.def(function_def) is .some(model_def) else {
-            self.program.mark_error();
-            return;
-        }
+        jil.Function source = self.program.source_function(function_def);
+        guard self.model.def(function_def) is .some(model_def) else { return null; }
         BodyBuilder builder! = BodyBuilder(self.storage, source.span, source.effects.has_async);
         builder.blocks.clear();
         Int index! = 0;
@@ -884,12 +868,25 @@ public extend lower_context.Context {
             jil.Block block = source.body.blocks[index];
             if (block.terminator.kind is .call_term(call)) {
                 if (call.deferred_async_direct) {
+                    guard call.callee is .direct_function(function_ref) else { return null; }
+                    Bool recursive! = false;
+                    if (function_ref.target is .source(target_def)) {
+                        recursive = active.has(target_def.to_index());
+                    }
+                    jil.CoroutineFrameLayout? frame! = null;
+                    if (!recursive) {
+                        frame = self.source_coroutine_frame_for_ref(function_ref);
+                        if (frame == null) { return null; }
+                    }
                     materialize_async_direct_call_block(
-                        lowerer$.mut_ref(), block, call, active
+                        lowerer$.mut_ref(), block, call, frame, recursive
                     );
                 } else if (call.deferred_async_task is .some(task)) {
+                    guard call.callee is .direct_function(function_ref) else { return null; }
+                    guard self.source_coroutine_frame_for_ref(function_ref)
+                        is .some(frame) else { return null; }
                     materialize_deferred_async_task_block(
-                        lowerer$.mut_ref(), block, call, task
+                        lowerer$.mut_ref(), block, call, task, frame$.ref()
                     );
                 }
             }
@@ -903,9 +900,188 @@ public extend lower_context.Context {
             entry: source.body.entry,
             return_local: source.body.return_local
         );
-        self.finalize_logical_instance(
-            layouts, jil.function_with_body(source, body)
+        return jil.Function(
+            id: source.id,
+            origin: source.origin,
+            args: self.storage.generic_arg_array(source.args),
+            signature_id: source.signature_id,
+            effects: source.effects,
+            is_coroutine: source.is_coroutine,
+            coroutine_capture_env_type: source.coroutine_capture_env_type,
+            coroutine_frame: null,
+            confinement: source.confinement,
+            confinement_domain: source.confinement_domain,
+            is_coroutine_resume: source.is_coroutine_resume,
+            coroutine_resume_mode: source.coroutine_resume_mode,
+            is_coroutine_completion: source.is_coroutine_completion,
+            is_language_entry: source.is_language_entry,
+            is_runtime_entry: source.is_runtime_entry,
+            is_external: source.is_external,
+            inline_always: source.inline_always,
+            naked: source.naked,
+            span: source.span,
+            body: body
         );
+    }
+
+    @life(return: self)
+    jil.CoroutineFrameLayout? source_coroutine_frame_for_ref(
+        self,
+        jil.FunctionRef function_ref
+    ) {
+        guard function_ref.target is .source(target_def) else { return null; }
+        if (!self.program.has_source_function(target_def)) { return null; }
+        jil.Function target = self.program.source_function(target_def);
+        guard target.coroutine_frame is .some(logical_frame) else { return null; }
+        generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
+        generic_bindings.GenericBindings substitutions =
+            generic_bindings.bindings_for_instance(
+                self.store.defs$.ref(),
+                self.store.model$.ref(),
+                self.store.types$.ref(),
+                target_def,
+                function_ref.args,
+                empty$.ref()
+            );
+        instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+            self.store, substitutions$.ref()
+        );
+        qid.TypeId result_type = reader.type_id(
+            target.body.locals[target.body.return_local.to_index()].type_id
+        );
+        jil.TaskStateLayout task_state = self.create_task_state_layout(
+            result_type, target.span
+        );
+        return coroutine_frame_layout.instantiate_frame_layout(
+            self.storage,
+            self.store.types$.ref(),
+            reader$.ref(),
+            logical_frame$.ref(),
+            task_state$.ref(),
+            target.span
+        );
+    }
+
+    Void materialize_instance_trait_vtables(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        sem.Def& model_def,
+        jil_references.References references,
+        token.Span template_span,
+        jil.BodyId template_body_id,
+        Bool template_is_async,
+        generic_bindings.GenericBindings& substitutions,
+        types.GenericArg[]& args
+    ) {
+        if (references.trait_vtables.empty()) { return; }
+        BodyBuilder builder! = BodyBuilder(
+            self.storage, template_span, template_is_async
+        );
+        BodyLowerer lowerer! = BodyLowerer(
+            self,
+            body_query,
+            layouts,
+            builder$.mut_ref(),
+            template_body_id,
+            model_def,
+            args,
+            template_span
+        );
+        Int index! = 0;
+        while (index < references.trait_vtables.len()) {
+            jil.TraitVTableRef reference = references.trait_vtables.get(index);
+            index = index + 1;
+            jil.TraitVTableKey key = reference.key;
+            guard lowerer.ensure_trait_vtable_global(
+                key.trait_def, key.subject_type, reference.span
+            ) is .some(_) else {
+                self.program.mark_error();
+                return;
+            }
+        }
+    }
+
+    public Bool finalize_instance_functions(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        Int&! item_cursor,
+        list.ArrayList<jil.MonoItem>&! pending
+    ) {
+        while (item_cursor$.get() < self.program.mono_item_count()) {
+            pending.add(self.program.mono_item_at(item_cursor$.get()));
+            item_cursor$.set(item_cursor$.get() + 1);
+        }
+        list.ArrayList<jil.MonoItem> retry! =
+            list.ArrayList<jil.MonoItem>(pending.len());
+        Bool finalized! = false;
+        Int index! = 0;
+        while (index < pending.len()) {
+            jil.MonoItem item = pending.get(index);
+            index = index + 1;
+            if (self.finalize_mono_item(body_query, layouts, item)) {
+                finalized = true;
+            } else {
+                retry.add(item);
+            }
+        }
+        pending.clear();
+        index = 0;
+        while (index < retry.len()) {
+            pending.add(retry.get(index));
+            index = index + 1;
+        }
+        return finalized;
+    }
+
+    Bool finalize_mono_item(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        jil.MonoItem item
+    ) {
+        if (item is .source_instance(identity)) {
+            return self.finalize_source_instance(body_query, layouts, identity);
+        }
+        guard item is .generated_function(function_id) else { return false; }
+        if (self.drop_elaboration.contains(function_id)) { return true; }
+        jil.Function source = self.program.function(function_id);
+        if (source.is_external || source.is_runtime_entry) { return true; }
+        if (source.body.blocks.length == 0) { return false; }
+        self.finalize_generated_instance(layouts, source);
+        self.lower_function_references(
+            body_query, layouts, function_id.to_index()
+        );
+        return true;
+    }
+
+    Bool finalize_source_instance(
+        Self&! self,
+        database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts,
+        Int identity
+    ) {
+        if (self.program.source_instance_is_finalized(identity)) { return true; }
+        jil.InstanceKey instance = self.program.function_instance_at(identity);
+        if (!self.program.has_source_function(instance.def_id)) {
+            self.program.mark_source_instance_finalized(identity);
+            return true;
+        }
+        jil.Function source = instance_reader.source_instance_function(
+            self.store, self.program$.ref(), identity
+        );
+        qid.DefId function_def = instance.def_id;
+        if (!self.model.has_body(function_def)) {
+            self.program.mark_source_instance_finalized(identity);
+            return true;
+        }
+        if (!source.effects.has_async) {
+            self.program.mark_source_instance_finalized(identity);
+            return true;
+        }
+        self.finalize_logical_instance(body_query, layouts, identity, source);
+        return true;
     }
 
     Bool body_has_deferred_async_operation(self, jil.Body body) {
@@ -924,19 +1100,11 @@ public extend lower_context.Context {
 
     Void finalize_logical_instance(
         Self&! self,
+        database.JilInstanceQuery& body_query,
         database.LayoutQuery&! layouts,
+        Int identity,
         jil.Function source
     ) {
-        jil.Function elaborated = drop_elaborate.elaborate_function(
-            self.store,
-            layouts,
-            self.storage,
-            self.program,
-            self.drop_elaboration,
-            source
-        );
-        jil.Function finalized! = elaborated;
-        jil.Function borrow_source! = source;
         if (source.effects.has_async) {
             generic_bindings.GenericBindings substitutions! =
                 generic_bindings.GenericBindings();
@@ -954,24 +1122,44 @@ public extend lower_context.Context {
                     substitutions$.ref()
                 );
             }
-            qid.TypeId result_type = source.body.locals[source.body.return_local.to_index()].type_id;
+            instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+                self.store, substitutions$.ref()
+            );
+            qid.TypeId result_type = reader.type_id(
+                source.body.locals[source.body.return_local.to_index()].type_id
+            );
             jil.TaskStateLayout task_state = self.create_task_state_layout(
                 result_type, source.span
             );
-            jil.CoroutineFrameLayout? coroutine_frame = self.coroutine_frame_layout_for_body(
-                elaborated.body,
-                source.effects,
-                task_state,
-                jil.BlockId.from_index(1),
-                source.coroutine_capture_env_type,
-                substitutions$.ref()
+            guard self.program.source_function(function_def).coroutine_frame
+                is .some(logical_frame) else {
+                self.program.mark_error();
+                return;
+            }
+            jil.CoroutineFrameLayout frame! =
+                coroutine_frame_layout.instantiate_frame_layout(
+                    self.storage,
+                    self.store.types$.ref(),
+                    reader$.ref(),
+                    logical_frame$.ref(),
+                    task_state$.ref(),
+                    source.span
+                );
+            if (frame.effects.domain is .some(domain)) {
+                frame = jil.coroutine_frame_with_runtime_properties(
+                    frame,
+                    self.domain_kind_for_type(domain.domain_type),
+                    frame.may_defer
+                );
+            }
+            self.program.set_instance_coroutine_frame(identity, frame);
+            self.program.set_coroutine_resume_function(
+                jil.source_instance_mono_item(identity),
+                jil.source_resume_instance_mono_item(identity)
             );
-            finalized = jil.function_with_coroutine_frame(elaborated, coroutine_frame);
-            borrow_source = jil.function_with_coroutine_frame(source, coroutine_frame);
         }
-        self.program.set_borrow_check_override(borrow_source);
-        self.drop_elaboration.mark(finalized.id);
-        self.program.set_function(finalized);
+        self.program.mark_source_instance_finalized(identity);
+        self.lower_function_value_references(body_query, layouts, source);
     }
 
     Void finalize_generated_instance(
@@ -991,25 +1179,14 @@ public extend lower_context.Context {
         self.program.set_function(finalized);
     }
 
-    Void publish_lowered_function(
-        Self&! self,
-        jil.Function function,
-        types.GenericArg[]& args
-    ) {
-        self.program.add_function(function);
-        if (args.length > 0) {
-            self.program.mark_shared_codegen_function(function.id);
-        }
-    }
-
     public Bool function_is_lowering(
         self,
-        database.InstanceJilQuery& body_query,
+        database.JilInstanceQuery& body_query,
         qid.DefId function_def,
         types.GenericArg[]& args
     ) {
         if (args.length == 0) {
-            database.TemplateJilKey template_key = database.TemplateJilKey(
+            database.SourceJilKey template_key = database.SourceJilKey(
                 self.program.query_identity, function_def
             );
             return self.template_query.is_active(template_key);
@@ -1017,7 +1194,7 @@ public extend lower_context.Context {
         guard self.program.existing_function_instance_identity(
             function_def, args
         ) is .some(identity) else { return false; }
-        database.InstanceJilKey query_key = database.InstanceJilKey(
+        database.JilInstanceKey query_key = database.JilInstanceKey(
             self.program.query_identity, function_def, identity
         );
         return body_query.is_active(query_key);
@@ -1046,14 +1223,14 @@ public extend lower_context.Context {
         qid.DefId function_def,
         types.GenericArg[]& args
     ) {
-        if (self.program.function_id_for_instance(function_def, args) != null) { return; }
+        if (self.program.has_source_instance(function_def, args)) { return; }
         if (!self.generic_args_are_concrete(args)) { return; }
+        self.ensure_external_source_function(function_def);
+        if (!self.program.has_source_function(function_def)) { return; }
         Int identity = self.program.function_instance_identity(
             self.storage, function_def, args
         );
         self.program.mark_source_instance(identity);
-        Int function_index = self.program.functions.len();
-        token.Span span = self.def_span(function_def);
         generic_bindings.GenericBindings substitutions! =
             generic_bindings.GenericBindings();
         if (args.length > 0 && self.model.has_def(function_def)) {
@@ -1067,39 +1244,61 @@ public extend lower_context.Context {
             );
         }
         guard self.typeck.def_type(function_def) is .some(raw_type) else { return; }
-        qid.TypeId concrete_type = self.substitute_type(raw_type, substitutions$.ref());
+        qid.TypeId concrete_type = self.substitute_type(
+            raw_type, substitutions$.ref()
+        );
         types.TypeInfo info = self.store.types.get(concrete_type);
         guard info.data is .function_type(function_type) else { return; }
-        types.EffectSet effects = function_type.effects;
-        qid.TypeId result_type = function_type.result;
-        jil.TaskStateLayout? task_state! = null;
-        if (effects.has_async) {
-            task_state = self.create_task_state_layout(result_type, span);
-        }
-        jil.Body body! = self.external_source_body_for_type(
-            jil.BodyId.from_index(function_index), function_type, span
+        if (!function_type.effects.has_async) { return; }
+        jil.TaskStateLayout task_state = self.create_task_state_layout(
+            function_type.result, self.def_span(function_def)
         );
-        if (effects.has_async) {
-            body = self.external_async_function_body(
-                jil.BodyId.from_index(function_index), function_type, span
-            );
+        instance_reader.InstanceReader reader = instance_reader.InstanceReader(
+            self.store, substitutions$.ref()
+        );
+        jil.Function source = reader.source_function(
+            self.program.source_function(function_def),
+            jil.FunctionId.from_index(function_def.to_index()),
+            self.storage.generic_arg_array(args)
+        );
+        if (self.coroutine_frame_layout_for_body(
+                source.body,
+                source.effects,
+                task_state,
+                source.body.entry,
+                null,
+                substitutions$.ref()
+            ) is .some(frame)) {
+            self.program.set_instance_coroutine_frame(identity, frame);
         }
-        jil.CoroutineFrameLayout? coroutine_frame! = null;
-        if (task_state is .some(layout)) {
-            coroutine_frame = self.coroutine_frame_layout_for_body(
-                body, effects, layout, body.entry, null, substitutions$.ref()
-            );
+    }
+
+    Void ensure_external_source_function(Self&! self, qid.DefId function_def) {
+        if (self.program.has_source_function(function_def)) { return; }
+        guard self.typeck.def_type(function_def) is .some(type_id) else { return; }
+        types.TypeInfo info = self.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return; }
+        token.Span span = self.def_span(function_def);
+        list.ArrayList<types.GenericArg> template_args! =
+            list.ArrayList<types.GenericArg>();
+        self.collect_template_args(function_def, template_args$.mut_ref());
+        jil.BodyId body_id = jil.BodyId.from_index(function_def.to_index());
+        jil.Body body! = self.external_source_body_for_type(
+            body_id, function_type, span
+        );
+        if (function_type.effects.has_async) {
+            body = self.external_async_function_body(body_id, function_type, span);
         }
-        self.program.add_function(jil.Function (
-            id: jil.FunctionId.from_index(function_index),
+        self.program.add_source_function(function_def, jil.Function(
+            id: jil.FunctionId.from_index(function_def.to_index()),
             origin: .source(function_def),
-            args: self.storage.generic_arg_array(args),
+            args: self.storage.generic_arg_array(template_args.slice()),
             signature_id: null,
-            effects: effects,
-            is_coroutine: effects.has_async,
-            coroutine_frame: coroutine_frame,
+            effects: function_type.effects,
+            is_coroutine: function_type.effects.has_async,
+            coroutine_frame: null,
             is_coroutine_resume: false,
-        is_coroutine_completion: false,
+            is_coroutine_completion: false,
             is_language_entry: false,
             is_runtime_entry: false,
             is_external: true,
@@ -1111,7 +1310,9 @@ public extend lower_context.Context {
     }
 
     public Void ensure_external_function(Self&! self, qid.DefId function_def) {
-        if (self.program.function_id_for_def(function_def) != null) {
+        if (self.program.has_source_instance(
+            function_def, self.storage.empty_generic_args()
+        )) {
             return;
         }
         if (self.def_is_trait_member(function_def)) {
@@ -1187,7 +1388,8 @@ Void materialize_async_direct_call_block(
     BodyLowerer&! lowerer,
     jil.Block source,
     jil.CallTerminator call,
-    map.WyHashMap<Int, Bool>& active
+    jil.CoroutineFrameLayout? child_frame,
+    Bool recursive
 ) {
     lowerer.builder.start_block(source.id);
     Int index! = 0;
@@ -1197,10 +1399,7 @@ Void materialize_async_direct_call_block(
     }
     guard call.callee is .direct_function(function_ref) else { return; }
     guard function_ref.target is .source(target_def) else { return; }
-    guard lowerer.lowerer.program.function_id_for_ref(function_ref)
-        is .some(child_id) else { return; }
-    jil.Function child = lowerer.lowerer.program.function(child_id);
-    if (active.has(child_id.to_index()) || child.coroutine_frame == null) {
+    if (recursive) {
         lowerer.lower_recursive_async_direct_call(
             target_def,
             function_ref.args,
@@ -1208,13 +1407,12 @@ Void materialize_async_direct_call_block(
             call.destination,
             source.terminator.span
         );
-    } else if (child.coroutine_frame is .some(frame)) {
+    } else if (child_frame is .some(frame)) {
         lowerer.lower_async_direct_continuation_call(
             target_def,
             function_ref.args,
             call.args,
             call.destination,
-            child_id,
             frame$.ref(),
             null,
             source.terminator.span
@@ -1229,16 +1427,13 @@ Void materialize_deferred_async_task_block(
     BodyLowerer&! lowerer,
     jil.Block source,
     jil.CallTerminator call,
-    jil.DeferredAsyncTask task
+    jil.DeferredAsyncTask task,
+    jil.CoroutineFrameLayout& frame
 ) {
     lowerer.builder.start_block(source.id);
     append_source_statements(lowerer, source);
     guard call.callee is .direct_function(function_ref) else { return; }
     guard function_ref.target is .source(target_def) else { return; }
-    guard lowerer.lowerer.program.function_id_for_ref(function_ref)
-        is .some(child_id) else { return; }
-    jil.Function child = lowerer.lowerer.program.function(child_id);
-    guard child.coroutine_frame is .some(frame) else { return; }
     if (async_start_is_detached(call.async_start)) {
         materialize_deferred_detached_task(
             lowerer,
@@ -1246,8 +1441,7 @@ Void materialize_deferred_async_task_block(
             function_ref.args,
             call,
             task,
-            child_id,
-            frame$.ref(),
+            frame,
             source.terminator.span
         );
         lowerer.builder.finish_block(
@@ -1281,7 +1475,7 @@ Void materialize_deferred_async_task_block(
     );
     lowerer.initialize_structured_task_state(
         call.destination,
-        frame$.ref(),
+        frame,
         task.task_local,
         task.storage,
         source.terminator.span
@@ -1294,27 +1488,30 @@ Void materialize_deferred_async_task_block(
         function_ref.args,
         call,
         task,
-        frame$.ref(),
+        frame,
         frame_place,
         source.terminator.span,
         logical_args$.mut_ref()
     );
     lowerer.lower_async_operands_into_frame(
-        logical_args.slice(), child_id, frame_place, source.terminator.span
+        logical_args.slice(),
+        frame,
+        frame_place,
+        source.terminator.span
     );
     append_deferred_task_argument_bindings(
-        lowerer, call.destination, logical_args.slice(), frame$.ref(), frame_place,
+        lowerer, call.destination, logical_args.slice(), frame, frame_place,
         task.environment_type != null, source.terminator.span
     );
     jil.FunctionRef completion = lowerer.task_completion_function_ref(
         target_def,
         function_ref.args,
-        frame$.ref(),
+        frame,
         task.storage.sync,
         source.terminator.span
     );
     lowerer.builder.append_initialized_task_statements(
-        frame$.ref(),
+        frame,
         call.destination,
         frame_place,
         resume,
@@ -1322,13 +1519,13 @@ Void materialize_deferred_async_task_block(
         source.terminator.span
     );
     lowerer.push_task_lifetime_initializers(
-        call.destination, frame$.ref(), task.storage, source.terminator.span
+        call.destination, frame, task.storage, source.terminator.span
     );
     lowerer.push_structured_task_frame_domain(
-        frame$.ref(), frame_place, task.storage, source.terminator.span
+        frame, frame_place, task.storage, source.terminator.span
     );
     lowerer.push_task_execution_domain_initializers(
-        frame$.ref(), call.destination, frame_place, source.terminator.span
+        frame, call.destination, frame_place, source.terminator.span
     );
     lowerer.lower_task_resume_call(
         call.destination, resume, call.async_start, source.terminator.span
@@ -1344,7 +1541,6 @@ Void materialize_deferred_detached_task(
     types.GenericArg[]& function_args,
     jil.CallTerminator call,
     jil.DeferredAsyncTask task,
-    jil.FunctionId child_id,
     jil.CoroutineFrameLayout& frame,
     token.Span span
 ) {
@@ -1392,7 +1588,7 @@ Void materialize_deferred_detached_task(
         args$.mut_ref()
     );
     lowerer.lower_async_operands_into_frame(
-        args.slice(), child_id, frame_place, span
+        args.slice(), frame, frame_place, span
     );
     lowerer.builder.push_statement(coroutine_task_abi.frame_state_initializer(
         lowerer.lowerer.storage, frame, frame_place, span
@@ -1453,6 +1649,7 @@ Void materialize_deferred_detached_task(
     lowerer.builder.push_assign(
         coroutine_task_abi.task_field_place(
             lowerer.lowerer.storage,
+            frame.task_abi.task_state_type_id,
             call.destination,
             frame.task_abi.state_field
         ),
@@ -1568,10 +1765,10 @@ Void append_deferred_task_argument_bindings(
     Int index! = 0;
     if (has_environment) { index = 1; }
     while (index < args.length) {
-        jil.LocalId param_local = jil.LocalId.from_index(index + 1);
-        if (lowerer.async_call_frame_field_place(
-            frame, frame_place, param_local
-        ) is .some(param_place)) {
+        if (lower_suspend.coroutine_frame_param_field(frame, index) is .some(field)) {
+            jil.Place param_place = lowerer.project_frame_field(
+                frame_place, frame, field.index
+            );
             lowerer.builder.push_statement(jil.Statement(
                 span: span,
                 kind: jil.capture_bind_statement_kind(jil.CaptureBindStatement(

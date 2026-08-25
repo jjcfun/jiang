@@ -1,7 +1,7 @@
 // 泛型实例绑定。
 //
 // GenericBindings 只描述“当前实例中泛型参数绑定到了什么”，不负责
-// 收集实例或生成 concrete JIL。comptime interpreter 和 JIL instantiator
+// 收集实例或生成 JIL。comptime interpreter 和 JIL instance reader
 // 都应消费同一套绑定/替换逻辑，避免各自维护一份泛型替换规则。
 
 import qid = "../../id.jiang";
@@ -14,17 +14,19 @@ import types = "../type.jiang";
 import comptime_value = "../comptime/value.jiang";
 
 public struct GenericBindings: Movable {
-    // GenericBindings 是 comptime interpreter 和 JIL instantiator 的共享实例绑定。
-    // type binding 由 JIL instantiator 消费；const binding 先服务 comptime
+    // GenericBindings 是 comptime interpreter 和 JIL instance reader 的共享实例绑定。
+    // type binding 由 JIL instance reader 消费；const binding 先服务 comptime
     // interpreter，后续语法接入 const generic 时复用同一入口。
     map.WyHashMap<qid.DefId, qid.TypeId> type_bindings!;
     map.WyHashMap<qid.DefId, comptime_value.ComptimeValue> const_bindings!;
     map.WyHashMap<qid.DefId, qid.DefId> const_binding_defs!;
+    map.WyHashMap<Int, qid.TypeId> type_substitutions!;
 
     public init(self) {
         self.type_bindings = map.WyHashMap<qid.DefId, qid.TypeId>();
         self.const_bindings = map.WyHashMap<qid.DefId, comptime_value.ComptimeValue>();
         self.const_binding_defs = map.WyHashMap<qid.DefId, qid.DefId>();
+        self.type_substitutions = map.WyHashMap<Int, qid.TypeId>();
     }
 
     public Int len(self) {
@@ -41,7 +43,22 @@ public struct GenericBindings: Movable {
     }
 
     public Void set_type(Self&! self, qid.DefId generic_param, qid.TypeId concrete_type) {
+        self.type_substitutions.clear();
         self.type_bindings.set(generic_param, concrete_type);
+    }
+
+    public qid.TypeId? type_substitution(self, qid.TypeId type_id) {
+        guard self.type_substitutions.get(type_id.to_index()) is .some(value) else {
+            return null;
+        }
+        return value$.get();
+    }
+
+    public Void set_type_substitutions(
+        Self&! self,
+        map.WyHashMap<Int, qid.TypeId> values
+    ) {
+        self.type_substitutions = values;
     }
 
     public Bool has_const(self, qid.DefId generic_param) {
@@ -54,6 +71,7 @@ public struct GenericBindings: Movable {
     }
 
     public Void set_const(Self&! self, qid.DefId generic_param, comptime_value.ComptimeValue concrete_value) {
+        self.type_substitutions.clear();
         self.const_bindings.set(generic_param, concrete_value);
     }
 
@@ -63,9 +81,9 @@ public struct GenericBindings: Movable {
     }
 
     public Void set_const_binding_def(Self&! self, qid.DefId generic_param, qid.DefId binding_def) {
+        self.type_substitutions.clear();
         self.const_binding_defs.set(generic_param, binding_def);
     }
-
 }
 
 public qid.TypeId substitute_type(
@@ -76,6 +94,19 @@ public qid.TypeId substitute_type(
     TypeSubstituter substituter = TypeSubstituter(type_store, bindings);
     map.WyHashMap<Int, qid.TypeId> cache! = map.WyHashMap<Int, qid.TypeId>();
     return substituter.substitute(cache$.mut_ref(), type_id);
+}
+
+public qid.TypeId substitute_type_cached(
+    types.TypeStore& type_store,
+    qid.TypeId type_id,
+    GenericBindings& bindings,
+    map.WyHashMap<Int, qid.TypeId>&! cache
+) {
+    if (bindings.len() == 0) { return type_id; }
+    if (!type_store.type_needs_substitution(type_id)) { return type_id; }
+    TypeSubstituter substituter = TypeSubstituter(type_store, bindings);
+    qid.TypeId concrete = substituter.substitute(cache, type_id);
+    return concrete;
 }
 
 public types.EffectSet substitute_effects(
@@ -131,7 +162,33 @@ public GenericBindings bindings_for_instance(
         caller_bindings,
         arg_index
     );
+    bind_tagged_args(type_store, bindings$.mut_ref(), args, caller_bindings);
     return bindings;
+}
+
+Void bind_tagged_args(
+    types.TypeStore& type_store,
+    GenericBindings&! bindings,
+    types.GenericArg[]& args,
+    GenericBindings& caller_bindings
+) {
+    Int index! = 0;
+    while (index < args.length) {
+        types.GenericArg arg = args[index];
+        index = index + 1;
+        if (arg is .type_arg(type_arg)
+            && type_arg.param_def is .some(param_def)) {
+            bindings.set_type(
+                param_def,
+                substitute_type(type_store, type_arg.value, caller_bindings)
+            );
+            continue;
+        }
+        if (arg is .const_arg(const_arg)
+            && const_arg.param_def is .some(param_def)) {
+            bind_const_arg(bindings, param_def, const_arg, caller_bindings);
+        }
+    }
 }
 
 public qid.TypeId type_for_instance(
@@ -147,6 +204,27 @@ public qid.TypeId type_for_instance(
         defs, model, type_store, def_id, args, empty$.ref()
     );
     return substitute_type(type_store, type_id, bindings$.ref());
+}
+
+public qid.TypeId member_type_for_owner_instance(
+    def.DefStore& defs,
+    sem_store.Store& model,
+    types.TypeStore& type_store,
+    qid.TypeId owner_type,
+    qid.DefId member_def,
+    qid.TypeId template_type
+) {
+    types.TypeInfo owner_info = type_store.get(owner_type);
+    guard owner_info.data is .named(named) else { return template_type; }
+    guard defs.get(member_def).owner_def is .some(owner_def) else {
+        return template_type;
+    }
+    if (owner_def != named.def_id) { return template_type; }
+    GenericBindings empty! = GenericBindings();
+    GenericBindings bindings = bindings_for_instance(
+        defs, model, type_store, named.def_id, named.args, empty$.ref()
+    );
+    return substitute_type(type_store, template_type, bindings$.ref());
 }
 
 Void bind_trait_self_type(
@@ -403,6 +481,7 @@ struct TypeSubstituter: Movable {
         if (!self.types.has(type_id)) {
             return self.types.invalid_type();
         }
+        if (!self.types.type_needs_substitution(type_id)) { return type_id; }
         if (cache.get(type_id.to_index()) is .some(cached)) {
             return cached$.get();
         }
@@ -555,6 +634,7 @@ struct TypeSubstituter: Movable {
     ) {
         qid.TypeId canonical = self.types.canonical_substitution_type(concrete_type);
         cache.set(template_type.to_index(), canonical);
+        cache.set(canonical.to_index(), canonical);
         return canonical;
     }
 
@@ -579,11 +659,7 @@ struct TypeSubstituter: Movable {
             }
             index = index + 1;
         }
-        qid.TypeId named_id = self.types.named_type_with_ordered_generic_args(
-            named.def_id,
-            args,
-            type_info.span
-        );
+        qid.TypeId named_id = self.types.rebuild_named_type(named, args, type_info.span);
         return self.preserve_mutability(type_info, named_id);
     }
 

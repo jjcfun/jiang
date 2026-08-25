@@ -7,10 +7,12 @@ import jil = "../../jil.jiang";
 import instance_reader = "../../jil/instance_reader.jiang";
 import qid = "../../id.jiang";
 import diagnostic = "../../diagnostic.jiang";
+import layout = "../../layout.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
 import symbol = "../symbol.jiang";
 import backend_abi = "../abi.jiang";
+import sema_drop = "../../sema/drop.jiang";
 import types = "../../sema/type.jiang";
 import ffi = "./ffi.jiang";
 import llvm_abi = "./abi.jiang";
@@ -19,6 +21,16 @@ import llvm_place = "./place.jiang";
 import llvm_type = "./type.jiang";
 import llvm_value = "./value.jiang";
 import std;
+
+struct LoweredCallTarget: Movable {
+    ffi.Value value;
+    backend_abi.FunctionAbi abi!;
+
+    init(self, ffi.Value value, backend_abi.FunctionAbi abi) {
+        self.value = value;
+        self.abi = abi;
+    }
+}
 
 public Bool lower_terminator(
     llvm_state.LowerState& state,
@@ -51,10 +63,434 @@ public Bool lower_terminator(
     if (terminator.kind is .assert_term(assert_term)) {
         return lower_assert_terminator(state, output, body, llvm_function, assert_term, blocks, local_slots);
     }
+    if (terminator.kind is .drop_term(drop_term)) {
+        return lower_semantic_drop_terminator(
+            state, output, body, llvm_function, drop_term, blocks, local_slots
+        );
+    }
     if (terminator.kind is .suspend_pending_term(_)) {
         return ffi.value_valid(ffi.builder_build_unreachable(state.builder$.ref()));
     }
     return ffi.value_valid(ffi.builder_build_unreachable(state.builder$.ref()));
+}
+
+Bool lower_semantic_drop_terminator(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    ffi.Value llvm_function,
+    jil.DropTerminator drop_term,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    qid.TypeId type_id = state.type_id(
+        llvm_place.place_type(state, body, drop_term.place)
+    );
+    qid.TypeId canonical_type =
+        state.ctx.store.types.canonical_substitution_type(type_id);
+    ffi.Value pointer = llvm_place.lower_place_pointer(
+        state, output, body, drop_term.place, local_slots
+    );
+    if (!ffi.value_valid(pointer)) { return false; }
+    if (drop_term.projection_flags.length == 0) {
+        if (!lower_drop_glue_call(state, output, canonical_type, pointer)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_br(
+            state.builder$.ref(), blocks.get(drop_term.target.to_index())
+        ));
+    }
+    list.ArrayList<DropFieldStep> path! = list.ArrayList<DropFieldStep>();
+    if (!lower_partial_drop_fields(
+        state,
+        output,
+        body,
+        llvm_function,
+        drop_term,
+        canonical_type,
+        pointer,
+        path$.mut_ref(),
+        local_slots
+    )) { return false; }
+    return ffi.value_valid(ffi.builder_build_br(
+        state.builder$.ref(), blocks.get(drop_term.target.to_index())
+    ));
+}
+
+struct DropFieldStep: Copyable {
+    qid.DefId? field_def;
+    Int field_index;
+}
+
+Bool lower_partial_drop_fields(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    ffi.Value llvm_function,
+    jil.DropTerminator drop_term,
+    qid.TypeId owner_type,
+    ffi.Value owner_pointer,
+    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (!partial_drop_type_is_expandable(state, owner_type)) {
+        add_backend_error(
+            output,
+            "partial semantic drop requires an aggregate value",
+            "llvm_partial_semantic_drop_type"
+        );
+        return false;
+    }
+    layout.TypeLayout owner_layout = llvm_type.layout_for_type(state, owner_type);
+    Int field_index! = 0;
+    while (field_index < owner_layout.fields.length) {
+        layout.FieldLayout field = owner_layout.fields[field_index];
+        guard drop_type_needs_runtime(state, output, field.field_type)
+            is .some(needs_drop) else { return false; }
+        if (!needs_drop) {
+            field_index = field_index + 1;
+            continue;
+        }
+        path.add(DropFieldStep(field_def: field.field_def, field_index: field_index));
+        Bool lowered = lower_partial_drop_field(
+            state,
+            output,
+            body,
+            llvm_function,
+            drop_term,
+            owner_type,
+            owner_pointer,
+            field,
+            field_index,
+            path,
+            local_slots
+        );
+        path.pop();
+        if (!lowered) { return false; }
+        field_index = field_index + 1;
+    }
+    return true;
+}
+
+Bool lower_partial_drop_field(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    ffi.Value llvm_function,
+    jil.DropTerminator drop_term,
+    qid.TypeId owner_type,
+    ffi.Value owner_pointer,
+    layout.FieldLayout field,
+    Int field_index,
+    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    jil.Place? flag = projection_flag_for_drop_path(drop_term, path$.ref());
+    Bool has_descendant = drop_path_has_descendant(drop_term, path$.ref());
+    ffi.Value field_pointer = llvm_place.lower_layout_field_pointer(
+        state, output, owner_pointer, owner_type, field_index
+    );
+    if (!ffi.value_valid(field_pointer)) { return false; }
+    if (flag is .some(flag_place)) {
+        return lower_flagged_partial_drop_field(
+            state,
+            output,
+            body,
+            llvm_function,
+            drop_term,
+            field.field_type,
+            field_pointer,
+            flag_place,
+            has_descendant,
+            path,
+            local_slots
+        );
+    }
+    if (has_descendant) {
+        return lower_partial_drop_fields(
+            state,
+            output,
+            body,
+            llvm_function,
+            drop_term,
+            field.field_type,
+            field_pointer,
+            path,
+            local_slots
+        );
+    }
+    return lower_drop_glue_call(state, output, field.field_type, field_pointer);
+}
+
+Bool lower_flagged_partial_drop_field(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    ffi.Value llvm_function,
+    jil.DropTerminator drop_term,
+    qid.TypeId field_type,
+    ffi.Value field_pointer,
+    jil.Place flag_place,
+    Bool has_descendant,
+    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value condition = llvm_place.lower_place_value(
+        state, output, body, flag_place, local_slots
+    );
+    ffi.BasicBlock drop_block = ffi.context_append_block(
+        state.llvm_context$.ref(), llvm_function, "partial.drop"
+    );
+    ffi.BasicBlock continue_block = ffi.context_append_block(
+        state.llvm_context$.ref(), llvm_function, "partial.drop.continue"
+    );
+    if (!ffi.value_valid(condition)
+        || !ffi.block_valid(drop_block)
+        || !ffi.block_valid(continue_block)
+    ) { return false; }
+    if (!ffi.value_valid(ffi.builder_build_cond_br(
+        state.builder$.ref(), condition, drop_block, continue_block
+    ))) { return false; }
+    ffi.builder_position_at_end(state.builder$.ref(), drop_block);
+    Bool lowered! = false;
+    if (has_descendant) {
+        lowered = lower_partial_drop_fields(
+            state,
+            output,
+            body,
+            llvm_function,
+            drop_term,
+            field_type,
+            field_pointer,
+            path,
+            local_slots
+        );
+    } else {
+        lowered = lower_drop_glue_call(state, output, field_type, field_pointer);
+    }
+    if (!lowered) { return false; }
+    if (!ffi.value_valid(ffi.builder_build_br(
+        state.builder$.ref(), continue_block
+    ))) { return false; }
+    ffi.builder_position_at_end(state.builder$.ref(), continue_block);
+    return true;
+}
+
+Bool lower_drop_glue_call(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    qid.TypeId type_id,
+    ffi.Value pointer
+) {
+    qid.TypeId canonical_type =
+        state.ctx.store.types.canonical_substitution_type(state.type_id(type_id));
+    guard drop_type_needs_runtime(state, output, canonical_type)
+        is .some(needs_drop) else { return false; }
+    if (!needs_drop) { return true; }
+    guard state.store.program.drop_glue(canonical_type) is .some(glue_id) else {
+        add_backend_error(
+            output,
+            "semantic drop glue was not generated",
+            "llvm_semantic_drop_glue_missing"
+        );
+        return false;
+    }
+    jil.Function& glue = state.store.program.functions.ref_at(glue_id.to_index());
+    backend_abi.FunctionAbi call_abi! = backend_abi.classify_jil_body(
+        state.ctx, glue.body$.ref()
+    );
+    if (call_abi.result.kind != .none || call_abi.params.len() != 1) {
+        add_backend_error(output, "invalid semantic drop glue ABI", "llvm_semantic_drop_glue_abi");
+        return false;
+    }
+    std.String name = symbol.function_symbol_name(state.ctx, state.store, glue);
+    ffi.Type function_type = llvm_abi.function_type(state, call_abi$.ref());
+    ffi.Value callee! = ffi.module_get_function(state.module$.ref(), name.bytes());
+    if (!ffi.value_valid(callee)) {
+        callee = ffi.module_add_function(state.module$.ref(), name.bytes(), function_type);
+        llvm_abi.add_function_attributes(state, callee, call_abi$.ref());
+    }
+    list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(1);
+    backend_abi.AbiArg param_abi = call_abi.params.get(0);
+    if (param_abi.kind != .none) {
+        ffi.Value arg! = pointer;
+        if (param_abi.kind != .indirect) {
+            ffi.Type value_type = llvm_type.lower_type(state, canonical_type);
+            if (!ffi.type_valid(value_type)) { return false; }
+            arg = ffi.builder_build_load(state.builder$.ref(), value_type, pointer);
+        }
+        if (!ffi.value_valid(arg)) {
+            add_backend_error(
+                output,
+                "failed to lower semantic drop glue argument",
+                "llvm_semantic_drop_glue_call"
+            );
+            return false;
+        }
+        args.add(arg);
+    }
+    ffi.Value call = ffi.builder_build_call(
+        state.builder$.ref(), function_type, callee, args$.ref()
+    );
+    if (!ffi.value_valid(call)) {
+        add_backend_error(output, "failed to build semantic drop glue call", "llvm_semantic_drop_glue_call");
+        return false;
+    }
+    llvm_abi.add_call_attributes(state, call, call_abi$.ref());
+    return true;
+}
+
+Bool? drop_type_needs_runtime(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    qid.TypeId type_id
+) {
+    qid.TypeId concrete = state.type_id(type_id);
+    guard state.ctx.query.layout.store().drop_category_for_type(concrete)
+        is .some(category) else {
+        add_backend_error(
+            output,
+            "semantic drop type was not prepared",
+            "llvm_semantic_drop_type_not_prepared"
+        );
+        return null;
+    }
+    return sema_drop.drop_category_needs_runtime_drop(category);
+}
+
+Bool partial_drop_type_is_expandable(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id
+) {
+    types.TypeInfo info = state.ctx.store.types.get(state.type_id(type_id));
+    if (info.data is .array_type(_)) { return true; }
+    if (info.data is .tuple_type(_)) { return true; }
+    if (info.data is .closure_environment_type(_)) { return true; }
+    guard info.data is .named(named) else { return false; }
+    return state.ctx.store.defs.get(named.def_id).kind == .struct_def;
+}
+
+@life(return: drop_term.a)
+jil.Place? projection_flag_for_drop_path(
+    jil.DropTerminator drop_term,
+    list.ArrayList<DropFieldStep>& path
+) {
+    Int index! = 0;
+    while (index < drop_term.projection_flags.length) {
+        jil.DropProjectionFlag flag = drop_term.projection_flags[index];
+        if (drop_path_matches_place(drop_term.place, path, flag.place, true)) {
+            return flag.flag;
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool drop_path_has_descendant(
+    jil.DropTerminator drop_term,
+    list.ArrayList<DropFieldStep>& path
+) {
+    Int index! = 0;
+    while (index < drop_term.projection_flags.length) {
+        if (drop_path_matches_place(
+            drop_term.place,
+            path,
+            drop_term.projection_flags[index].place,
+            false
+        )) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool drop_path_matches_place(
+    jil.Place root,
+    list.ArrayList<DropFieldStep>& path,
+    jil.Place candidate,
+    Bool exact
+) {
+    if (!drop_place_base_equal(root, candidate)) { return false; }
+    Int expected_length = root.projection.length + path.len();
+    if (candidate.projection.length < expected_length) { return false; }
+    if (exact && candidate.projection.length != expected_length) { return false; }
+    if (!exact && candidate.projection.length == expected_length) { return false; }
+    Int index! = 0;
+    while (index < root.projection.length) {
+        if (!drop_place_elem_equal(root.projection[index], candidate.projection[index])) {
+            return false;
+        }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < path.len()) {
+        if (!drop_field_step_matches(
+            path.get(index), candidate.projection[root.projection.length + index]
+        )) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool drop_place_base_equal(jil.Place lhs, jil.Place rhs) {
+    if (lhs.base is .local(lhs_local)) {
+        if (rhs.base is .local(rhs_local)) { return lhs_local == rhs_local; }
+        return false;
+    }
+    guard lhs.base is .global(lhs_global) else { return false; }
+    guard rhs.base is .global(rhs_global) else { return false; }
+    return lhs_global.id == rhs_global.id;
+}
+
+Bool drop_field_step_matches(DropFieldStep step, jil.PlaceElem candidate) {
+    if (step.field_def is .some(field_def)) {
+        if (candidate is .field_projection(field)) {
+            return field.field_def == field_def;
+        }
+        return false;
+    }
+    if (candidate is .constant_index_projection(field)) {
+        return field.offset == step.field_index;
+    }
+    if (candidate is .frame_field_projection(field)) {
+        return field.field_index == step.field_index;
+    }
+    return false;
+}
+
+Bool drop_place_elem_equal(jil.PlaceElem lhs, jil.PlaceElem rhs) {
+    if (lhs is .deref_projection(lhs_value)) {
+        if (rhs is .deref_projection(rhs_value)) {
+            return lhs_value.raw_pointer == rhs_value.raw_pointer;
+        }
+        return false;
+    }
+    if (lhs is .field_projection(lhs_value)) {
+        if (rhs is .field_projection(rhs_value)) {
+            return lhs_value.field_def == rhs_value.field_def;
+        }
+        return false;
+    }
+    if (lhs is .frame_field_projection(lhs_value)) {
+        if (rhs is .frame_field_projection(rhs_value)) {
+            return lhs_value.field_index == rhs_value.field_index;
+        }
+        return false;
+    }
+    if (lhs is .index_projection(lhs_value)) {
+        if (rhs is .index_projection(rhs_value)) {
+            return lhs_value.index_local == rhs_value.index_local;
+        }
+        return false;
+    }
+    if (lhs is .constant_index_projection(lhs_value)) {
+        if (rhs is .constant_index_projection(rhs_value)) {
+            return lhs_value.offset == rhs_value.offset;
+        }
+        return false;
+    }
+    guard lhs is .subslice_projection(lhs_value) else { return false; }
+    guard rhs is .subslice_projection(rhs_value) else { return false; }
+    return lhs_value.from == rhs_value.from && lhs_value.to == rhs_value.to;
 }
 
 Bool lower_branch_terminator(
@@ -133,21 +569,37 @@ Bool lower_call_terminator(
     if (call_term.callee is .dynamic_domain_enqueue(enqueue)) {
         return lower_dynamic_domain_enqueue_call(state, output, body, call_term, enqueue, blocks, local_slots);
     }
-    if (!call_callee_is_declared(state, output, call_term.callee)) {
-        std.String message = call_callee_error_message(state, call_term.callee);
-        add_backend_error(output, message.bytes(), "llvm_call_callee_not_declared");
-        return false;
+    if (lower_builtin_direct_call(
+        state, output, body, call_term, blocks, local_slots
+    ) is .some(lowered)) {
+        return lowered;
     }
-    ffi.Value callee = lower_call_callee(state, output, body, call_term.callee, local_slots);
-    if (!ffi.value_valid(callee)) {
+    guard lower_call_target(
+        state, output, body, call_term.callee, local_slots
+    ) is .some(target) else {
         std.String message = call_callee_lower_error_message(
             state, body, call_term.callee
         );
         add_backend_error(output, message.bytes(), "llvm_call_callee_lower_failed");
         return false;
     }
-    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
-    backend_abi.FunctionAbi call_abi! = backend_abi.classify_function_type(state.ctx, function_type_id);
+    ffi.Value callee = target.value;
+    backend_abi.FunctionAbi call_abi = target.abi;
+    if (call_term.args.length != call_abi.params.len()) {
+        std.StringBuilder builder! = std.StringBuilder();
+        builder.append("call ABI arity mismatch: operands ");
+        builder.append(Int(call_term.args.length));
+        builder.append(", parameters ");
+        builder.append(call_abi.params.len());
+        builder.append(", callee ");
+        builder.append(call_callee_error_message(state, call_term.callee).bytes());
+        add_backend_error(
+            output,
+            builder.into_string().bytes(),
+            "llvm_call_abi_arity_mismatch"
+        );
+        return false;
+    }
     list.ArrayList<ffi.Value> args! = lower_call_args(state, output, body, call_term, call_abi$.ref(), local_slots);
     if (args.len() != call_abi.llvm_param_count()) {
         std.StringBuilder builder! = std.StringBuilder();
@@ -167,7 +619,7 @@ Bool lower_call_terminator(
         add_backend_error(output, builder.into_string().bytes(), "llvm_call_args_lower_failed");
         return false;
     }
-    qid.TypeId result_type = call_result_type(state, body, call_term);
+    qid.TypeId result_type = call_abi.result.type_id;
     ffi.Type function_type = llvm_abi.function_type(state, call_abi$.ref());
     if (!ffi.type_valid(function_type)) {
         add_backend_error(output, "failed to lower call function type", "llvm_call_type_lower_failed");
@@ -190,6 +642,89 @@ Bool lower_call_terminator(
     return ffi.value_valid(ffi.builder_build_br(state.builder$.ref(), blocks.get(call_term.target.to_index())));
 }
 
+Bool? lower_builtin_direct_call(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    jil.CallTerminator& call,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    guard call.callee is .direct_function(function_ref) else { return null; }
+    instance_reader.ResolvedCallee resolved = llvm_value.resolved_callee(
+        state, function_ref
+    );
+    guard resolved.builtin is .some(builtin) else { return null; }
+    guard resolved.dispatch_type is .some(receiver_type) else { return false; }
+    ffi.Value value!;
+    if (builtin == .equality) {
+        if (call.args.length != 2) { return false; }
+        value = llvm_value.lower_builtin_equality(
+            state,
+            output,
+            body,
+            call.args[0],
+            call.args[1],
+            receiver_type,
+            local_slots
+        );
+    } else {
+        if (call.args.length != 1) { return false; }
+        value = lower_builtin_contiguous_call(
+            state, output, body, call, builtin, receiver_type, local_slots
+        );
+    }
+    if (!ffi.value_valid(value)) { return false; }
+    ffi.Value destination = llvm_place.lower_place_pointer(
+        state, output, body, call.destination, local_slots
+    );
+    if (!ffi.value_valid(destination)
+        || !ffi.value_valid(ffi.builder_build_store(
+            state.builder$.ref(), value, destination
+        ))) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_br(
+        state.builder$.ref(), blocks.get(call.target.to_index())
+    ));
+}
+
+ffi.Value lower_builtin_contiguous_call(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    jil.CallTerminator& call,
+    instance_reader.InstanceBuiltin builtin,
+    qid.TypeId receiver_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (builtin == .contiguous_pointer) {
+        return llvm_value.lower_operand(
+            state, output, body, call.args[0], local_slots
+        );
+    }
+    if (builtin != .contiguous_length) { return ffi.Value(); }
+    guard builtin_contiguous_array_type(state, receiver_type)
+        is .some(array_type) else { return ffi.Value(); }
+    qid.TypeId result_type = llvm_place.place_type(
+        state, body, call.destination
+    );
+    ffi.Type int_type = llvm_type.lower_type(state, result_type);
+    if (!ffi.type_valid(int_type)) { return ffi.Value(); }
+    return ffi.const_int(int_type, UInt64(array_type.count));
+}
+
+types.ArrayType? builtin_contiguous_array_type(
+    llvm_state.LowerState& state,
+    qid.TypeId receiver_type
+) {
+    types.TypeInfo receiver = state.ctx.store.types.get(receiver_type);
+    guard receiver.data is .handle_type(handle) else { return null; }
+    types.TypeInfo value = state.ctx.store.types.get(handle.element);
+    guard value.data is .array_type(array_type) else { return null; }
+    return array_type;
+}
+
 Bool lower_domain_enqueue_call(
     llvm_state.LowerState& state,
     llvm_state.LowerOutput&! output,
@@ -207,7 +742,19 @@ Bool lower_domain_enqueue_call(
     ffi.Value resume = llvm_value.lower_operand(state, output, body, enqueue.resume, local_slots);
     UInt8[]& symbol! = "__jiang_runtime_task_request";
     if (enqueue.handoff) { symbol = "__jiang_runtime_task_handoff"; }
-    ffi.Value runtime = ffi.module_get_function(state.module$.ref(), symbol);
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(4);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    ffi.Type runtime_type = ffi.function_type(
+        ffi.context_void_type(state.llvm_context$.ref()), params$.ref()
+    );
+    ffi.Value runtime! = ffi.module_get_function(state.module$.ref(), symbol);
+    if (!ffi.value_valid(runtime)) {
+        runtime = ffi.module_add_function(state.module$.ref(), symbol, runtime_type);
+    }
     ffi.Value executor = llvm_value.lower_domain_executor(
         state,
         jil.DomainExecutorRvalue (
@@ -221,18 +768,11 @@ Bool lower_domain_enqueue_call(
         add_backend_error(output, "failed to lower domain enqueue operands", "llvm_domain_enqueue_operand");
         return false;
     }
-    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
     ffi.Value task! = ffi.const_null(pointer_type);
     if (enqueue.task is .some(task_operand)) {
         task = llvm_value.lower_operand(state, output, body, task_operand, local_slots);
     }
     if (!ffi.value_valid(task)) { return false; }
-    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(4);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    ffi.Type runtime_type = ffi.function_type(ffi.context_void_type(state.llvm_context$.ref()), params$.ref());
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(4);
     args.add(executor);
     args.add(task);
@@ -266,7 +806,19 @@ Bool lower_dynamic_domain_enqueue_call(
     ffi.Value executor = llvm_value.lower_operand(state, output, body, enqueue.executor, local_slots);
     ffi.Value resume = llvm_value.lower_operand(state, output, body, enqueue.resume, local_slots);
     UInt8[]& symbol = dynamic_enqueue_symbol(enqueue);
-    ffi.Value runtime = ffi.module_get_function(state.module$.ref(), symbol);
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(4);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    params.add(pointer_type);
+    ffi.Type runtime_type = ffi.function_type(
+        ffi.context_void_type(state.llvm_context$.ref()), params$.ref()
+    );
+    ffi.Value runtime! = ffi.module_get_function(state.module$.ref(), symbol);
+    if (!ffi.value_valid(runtime)) {
+        runtime = ffi.module_add_function(state.module$.ref(), symbol, runtime_type);
+    }
     if (!ffi.value_valid(context_value)) {
         add_backend_error(output, "failed to lower dynamic enqueue context", "llvm_domain_enqueue_context");
         return false;
@@ -283,18 +835,11 @@ Bool lower_dynamic_domain_enqueue_call(
         add_backend_error(output, "dynamic enqueue runtime is not declared", "llvm_domain_enqueue_runtime");
         return false;
     }
-    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
     ffi.Value task! = ffi.const_null(pointer_type);
     if (enqueue.task is .some(task_operand)) {
         task = llvm_value.lower_operand(state, output, body, task_operand, local_slots);
     }
     if (!ffi.value_valid(task)) { return false; }
-    list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(4);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    params.add(pointer_type);
-    ffi.Type runtime_type = ffi.function_type(ffi.context_void_type(state.llvm_context$.ref()), params$.ref());
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(4);
     args.add(executor);
     args.add(task);
@@ -553,9 +1098,6 @@ ffi.Value lower_call_callee(
     jil.CallCallee callee,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    if (callee is .direct_function(function_value)) {
-        return llvm_value.function_value_for_ref(state, output, function_value);
-    }
     if (callee is .indirect_operand(operand)) {
         return llvm_value.lower_operand(state, output, body, operand, local_slots);
     }
@@ -566,6 +1108,52 @@ ffi.Value lower_call_callee(
         return llvm_value.lower_operand(state, output, body, enqueue.resume, local_slots);
     }
     return ffi.Value();
+}
+
+LoweredCallTarget? lower_call_target(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.Body& body,
+    jil.CallCallee callee,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (callee is .direct_function(function_ref)) {
+        if (state.instance_is_identity() && function_ref.dispatch_type == null) {
+            return lower_concrete_direct_call_target(
+                state, output, function_ref
+            );
+        }
+        instance_reader.ResolvedCallee resolved = llvm_value.resolved_callee(
+            state, function_ref
+        );
+        jil.FunctionRef concrete = llvm_value.concrete_function_ref(
+            state, function_ref, resolved$.ref()
+        );
+        return lower_concrete_direct_call_target(state, output, concrete);
+    }
+    ffi.Value value = lower_call_callee(
+        state, output, body, callee, local_slots
+    );
+    if (!ffi.value_valid(value)) { return null; }
+    backend_abi.FunctionAbi abi = classify_call_abi_for_callee(
+        state, body, callee
+    );
+    return LoweredCallTarget(value, abi);
+}
+
+LoweredCallTarget? lower_concrete_direct_call_target(
+    llvm_state.LowerState& state,
+    llvm_state.LowerOutput&! output,
+    jil.FunctionRef concrete
+) {
+    ffi.Value value = llvm_value.ensure_concrete_function_for_ref(
+        state, output, concrete
+    );
+    if (!ffi.value_valid(value)) { return null; }
+    backend_abi.FunctionAbi abi = backend_abi.classify_function_type(
+        state.ctx, concrete.type_id
+    );
+    return LoweredCallTarget(value, abi);
 }
 
 std.String call_callee_lower_error_message(
@@ -611,16 +1199,6 @@ std.String call_callee_lower_error_message(
     return std.String("failed to lower out indirect call callee");
 }
 
-Bool call_callee_is_declared(llvm_state.LowerState& state, llvm_state.LowerOutput&! output, jil.CallCallee callee) {
-    if (callee is .indirect_operand(_) || callee is .domain_enqueue(_)
-        || callee is .dynamic_domain_enqueue(_)
-    ) {
-        return true;
-    }
-    guard callee is .direct_function(function_value) else { return false; }
-    return ffi.value_valid(llvm_value.ensure_function_for_ref(state, output, function_value));
-}
-
 std.String call_callee_error_message(llvm_state.LowerState& state, jil.CallCallee callee) {
     if (callee is .indirect_operand(_)) {
         return std.String("indirect call callee is not a declared function");
@@ -634,15 +1212,55 @@ std.String call_callee_error_message(llvm_state.LowerState& state, jil.CallCalle
     guard callee is .direct_function(function_value) else {
         return std.String("call callee is not a function reference");
     }
+    instance_reader.ResolvedCallee resolved = llvm_value.resolved_callee(
+        state, function_value
+    );
+    jil.FunctionRef concrete = llvm_value.concrete_function_ref(
+        state, function_value, resolved$.ref()
+    );
     symbol.BackendSymbolKey key =
-        symbol.symbol_key_for_function_ref(state.ctx, state.store, function_value, false);
+        symbol.symbol_key_for_function_ref(state.ctx, state.store, concrete, false);
     std.String symbol_name = symbol.symbol_name(key);
-    qid.DefId provenance_def = jil.function_target_provenance_def(function_value.target);
+    qid.DefId provenance_def = jil.function_target_provenance_def(concrete.target);
     qid.SymbolId name = state.ctx.store.defs.get(provenance_def).name.symbol;
     UInt8[]& source_name = state.ctx.store.symbols.text(name);
-    std.String message =
-        call_callee_message_with_args(state, symbol_name.bytes(), source_name, function_value.args);
+    std.String message! =
+        call_callee_message_with_args(state, symbol_name.bytes(), source_name, concrete.args);
+    if (resolved.dispatch_type is .some(dispatch_type)) {
+        message = append_text(message, " dispatch_type=");
+        std.StringBuilder type_text! = std.StringBuilder();
+        type_text.append(dispatch_type.to_index());
+        message = append_text(message, type_text.into_string().bytes());
+        message = append_text(message, " bindings=");
+        std.StringBuilder binding_text! = std.StringBuilder();
+        binding_text.append(state.bindings.len());
+        message = append_text(message, binding_text.into_string().bytes());
+    }
+    if (concrete.target is .source(source_def)) {
+        message = append_instance_lookup(state, message, source_def, concrete.args);
+    }
     return append_call_callee_owner(state, message, provenance_def);
+}
+
+std.String append_instance_lookup(
+    llvm_state.LowerState& state,
+    std.String message,
+    qid.DefId function_def,
+    types.GenericArg[]& args
+) {
+    std.String result! = append_text(message, " instance=");
+    guard state.store.program.existing_function_instance_identity(
+        function_def, args
+    ) is .some(identity) else {
+        return append_text(result, "missing");
+    }
+    std.StringBuilder identity_text! = std.StringBuilder();
+    identity_text.append(identity);
+    result = append_text(result, identity_text.into_string().bytes());
+    if (!state.store.program.is_source_instance(identity)) {
+        result = append_text(result, " function=missing");
+    }
+    return result;
 }
 
 std.String append_call_callee_owner(
@@ -839,6 +1457,9 @@ ffi.Value lower_call_arg_value(
     if (operand is .global_address_operand(global_value)) {
         return llvm_value.global_address_for_ref(state, global_value);
     }
+    if (operand is .trait_vtable_operand(vtable)) {
+        return llvm_value.lower_trait_vtable_operand(state, vtable);
+    }
     if (operand is .copy_operand(copy_operand)) {
         return llvm_place.lower_place_value(state, output, body, copy_operand.place, local_slots);
     }
@@ -878,6 +1499,9 @@ qid.TypeId call_arg_operand_type(llvm_state.LowerState& state, jil.Body& body, j
     }
     if (operand is .global_address_operand(global_value)) {
         return global_value.type_id;
+    }
+    if (operand is .trait_vtable_operand(vtable)) {
+        return vtable.type_id;
     }
     if (operand is .copy_operand(copy_operand)) {
         return llvm_place.place_type(state, body, copy_operand.place);
@@ -946,16 +1570,44 @@ Void add_call_arg_error(
     add_backend_error(output, "failed to lower LLVM call argument", "llvm_call_arg_lower_failed");
 }
 
-qid.TypeId call_result_type(
+backend_abi.FunctionAbi classify_call_abi_for_callee(
     llvm_state.LowerState& state,
     jil.Body& body,
-    jil.CallTerminator& call_term
+    jil.CallCallee callee
 ) {
-    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
-    if (llvm_type.type_info(state, function_type_id).data is .function_type(function_info)) {
-        return function_info.result;
+    if (callee is .direct_function(function_ref)) {
+        return classify_function_ref_abi(state, function_ref);
     }
-    return local_type(state, body, call_term.destination.local_id);
+    if (callee is .indirect_operand(operand)
+        && operand is .function_operand(function_ref)) {
+        return classify_function_ref_abi(state, function_ref);
+    }
+    qid.TypeId function_type_id = state.type_id(
+        call_callee_type(state, body, callee)
+    );
+    return backend_abi.classify_function_type(
+        state.ctx, function_type_id
+    );
+}
+
+backend_abi.FunctionAbi classify_function_ref_abi(
+    llvm_state.LowerState& state,
+    jil.FunctionRef function_ref
+) {
+    if (state.instance_is_identity() && function_ref.dispatch_type == null) {
+        return backend_abi.classify_function_type(
+            state.ctx, function_ref.type_id
+        );
+    }
+    instance_reader.ResolvedCallee resolved = llvm_value.resolved_callee(
+        state, function_ref
+    );
+    jil.FunctionRef concrete = llvm_value.concrete_function_ref(
+        state, function_ref, resolved$.ref()
+    );
+    return backend_abi.classify_function_type(
+        state.ctx, concrete.type_id
+    );
 }
 
 qid.TypeId call_callee_type(
@@ -963,8 +1615,8 @@ qid.TypeId call_callee_type(
     jil.Body& body,
     jil.CallCallee callee
 ) {
-    if (callee is .direct_function(function_value)) {
-        return function_value.type_id;
+    if (callee is .direct_function(function_ref)) {
+        return function_ref.type_id;
     }
     if (callee is .indirect_operand(operand)) {
         return llvm_value.operand_type(state, body, operand);
@@ -1093,5 +1745,5 @@ Bool lower_return_value(
 }
 
 qid.TypeId local_type(llvm_state.LowerState& state, jil.Body& body, jil.LocalId local_id) {
-    return body.locals[local_id.to_index()].type_id;
+    return state.type_id(body.locals[local_id.to_index()].type_id);
 }

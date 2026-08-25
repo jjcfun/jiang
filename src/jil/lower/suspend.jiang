@@ -34,6 +34,45 @@ public union SuspendRecordLocation: Copyable {
     jil.LocalId pointer;
 }
 
+jil.AggregateField? coroutine_frame_field_for_local(
+    jil.CoroutineFrameLayout& layout,
+    jil.LocalId local_id
+) {
+    Int index! = 0;
+    while (index < layout.local_mappings.length) {
+        jil.CoroutineLocalFrameField mapping = layout.local_mappings[index];
+        if (mapping.local_id == local_id) {
+            return jil.AggregateField(
+                type_id: layout.fields[mapping.field_index].type_id,
+                index: mapping.field_index
+            );
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+public jil.AggregateField? coroutine_frame_param_field(
+    jil.CoroutineFrameLayout& layout,
+    Int param_index
+) {
+    Int field_index! = 0;
+    Int current_param! = 0;
+    while (field_index < layout.fields.length) {
+        jil.CoroutineFrameField field = layout.fields[field_index];
+        field_index = field_index + 1;
+        if (field.kind != .param) { continue; }
+        if (current_param == param_index) {
+            return jil.AggregateField(
+                type_id: field.type_id,
+                index: field_index - 1
+            );
+        }
+        current_param = current_param + 1;
+    }
+    return null;
+}
+
 public extend body_context.BodyLowerer {
     public Bool is_coroutine_suspend_def(self, qid.DefId target_def) {
         guard self.lowerer.store.resolve.core_functions.coroutine_suspend
@@ -180,7 +219,12 @@ public extend body_context.BodyLowerer {
         self.initialize_suspend_continuation(layout, record_pointer, destination, span);
         self.check_cancellation_before_suspend_registration(record_pointer, layout, span);
         jil.LocalId continuation_local = self.add_temp(continuation_type, span);
-        self.initialize_suspend_handle(layout, record_pointer, continuation_local, span);
+        if (!self.initialize_suspend_handle(
+            layout, record_pointer, continuation_local, span
+        )) {
+            self.mark_unsupported(node_id);
+            return;
+        }
         if (self.call_suspend_registration_lambda(
                 registration_id, continuation_local, record_pointer, layout, span
             )
@@ -499,7 +543,7 @@ public extend body_context.BodyLowerer {
         return self.operand_for_place(self.place_for_local(tagged));
     }
 
-    public Void initialize_suspend_handle(
+    public Bool initialize_suspend_handle(
         Self&! self,
         jil.SuspendContinuationLayout layout,
         SuspendRecordLocation record_pointer,
@@ -516,8 +560,12 @@ public extend body_context.BodyLowerer {
             span
         );
         qid.TypeId state_type = self.lowerer.store.types.uint_type();
+        guard self.project_nominal_field_at(self.place_for_local(continuation), 0)
+            is .some(state_place) else {
+            return false;
+        }
         self.builder.push_assign(
-            self.project_constant_index(self.place_for_local(continuation), 0),
+            state_place,
             jil.cast_rvalue(jil.CastRvalue (
                 kind: jil.CastKind.ptr_to_int,
                 value: self.operand_for_place(self.place_for_local(pointer)),
@@ -525,6 +573,7 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
+        return true;
     }
 
     public Void call_suspend_registration(
@@ -699,9 +748,11 @@ public extend body_context.BodyLowerer {
         jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
             self.type_for_node(value_id), span
         );
-        SuspendRecordLocation record_pointer = self.suspend_record_for_receiver(
-            receiver_id, layout, span
-        );
+        guard self.suspend_record_for_receiver(receiver_id, layout, span)
+            is .some(record_pointer) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
         self.builder.push_assign(destination, self.unit_rvalue(span), span);
         self.resume_suspend_record(value_id, record_pointer, layout, span);
     }
@@ -731,9 +782,11 @@ public extend body_context.BodyLowerer {
         jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
             result_type, span
         );
-        SuspendRecordLocation record_pointer = self.suspend_record_for_receiver(
-            receiver_id, layout, span
-        );
+        guard self.suspend_record_for_receiver(receiver_id, layout, span)
+            is .some(record_pointer) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
         sem.Node refreshed_handler_node = self.lowerer.model.node(handler_id);
         guard refreshed_handler_node.data is .lambda_expr(handler) else {
             self.mark_unsupported(handler_id);
@@ -964,7 +1017,7 @@ public extend body_context.BodyLowerer {
         return member_access.base;
     }
 
-    public SuspendRecordLocation suspend_record_for_receiver(
+    public SuspendRecordLocation? suspend_record_for_receiver(
         Self&! self,
         sem.NodeId receiver_id,
         jil.SuspendContinuationLayout layout,
@@ -974,9 +1027,10 @@ public extend body_context.BodyLowerer {
         if (self.type_is_reference(self.jil_place_type(receiver))) {
             receiver = self.project_deref(receiver, false);
         }
-        support.StablePlaceLocation state = self.stable_place_location(
-            self.project_constant_index(receiver, 0)
-        );
+        guard self.project_nominal_field_at(receiver, 0) is .some(state_place) else {
+            return null;
+        }
+        support.StablePlaceLocation state = self.stable_place_location(state_place);
         jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
         self.builder.push_assign(
             self.place_for_local(pointer),
@@ -987,7 +1041,8 @@ public extend body_context.BodyLowerer {
             )),
             span
         );
-        return .pointer(pointer);
+        SuspendRecordLocation location = .pointer(pointer);
+        return location;
     }
 
     public Void resume_suspend_record(
@@ -1433,7 +1488,6 @@ public extend body_context.BodyLowerer {
         types.GenericArg[]& function_args,
         jil.Operand[]& args,
         jil.Place destination,
-        jil.FunctionId function_id,
         jil.CoroutineFrameLayout& layout,
         jil.Place? prepared_frame,
         token.Span span
@@ -1445,7 +1499,9 @@ public extend body_context.BodyLowerer {
             prepared_frame,
             span
         );
-        self.lower_async_operands_into_frame(args, function_id, frame_place, span);
+        self.lower_async_operands_into_frame(
+            args, layout, frame_place, span
+        );
         jil.FunctionRef parent_resume = jil.FunctionRef (
             target: .source(self.def_id),
             args: self.lowerer.storage.generic_arg_array(self.function_args.slice()),
@@ -1644,25 +1700,13 @@ public extend body_context.BodyLowerer {
     public Void lower_async_operands_into_frame(
         Self&! self,
         jil.Operand[]& args,
-        jil.FunctionId function_id,
+        jil.CoroutineFrameLayout& layout,
         jil.Place frame_place,
         token.Span span
     ) {
         Int arg_index! = 0;
-        Int local_index! = 1;
-        Int local_count = self.lowerer.program.function(function_id).body.locals.length;
-        while (local_index < local_count && arg_index < args.length) {
-            jil.LocalDecl local =
-                self.lowerer.program.function(function_id).body.locals[local_index];
-            if (local.kind != .param) {
-                local_index = local_index + 1;
-                continue;
-            }
-            jil.LocalId param_local = local.id;
-            if (self.lowerer.program.coroutine_frame_field_for_local(
-                    function_id, param_local
-                ) is .some(field)
-            ) {
+        while (arg_index < args.length) {
+            if (coroutine_frame_param_field(layout, arg_index) is .some(field)) {
                 jil.Place param_place = self.project_frame_field(frame_place, field);
                 self.builder.push_assign(
                     param_place,
@@ -1671,7 +1715,6 @@ public extend body_context.BodyLowerer {
                 );
             }
             arg_index = arg_index + 1;
-            local_index = local_index + 1;
         }
     }
 
@@ -1758,15 +1801,10 @@ public extend body_context.BodyLowerer {
                 target_def, args, layout, false, span
             );
         }
-        jil.FunctionId shim_id = self.ensure_serial_completion_shim(
-            target_def, args, span
-        );
-        return self.generated_function_ref(
-            shim_id,
+        return self.lowerer.storage.source_serial_completion_function_ref(
             target_def,
             args,
-            layout.fields[layout.continuation_function_field_index].type_id,
-            span
+            layout.fields[layout.continuation_function_field_index].type_id
         );
     }
 

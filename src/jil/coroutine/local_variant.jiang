@@ -22,13 +22,6 @@ struct TaskRootVariant: Copyable {
     jil.FunctionRef variant_resume;
 }
 
-@region(a)
-struct LocalCallee: Copyable {
-    @life(a)
-    jil.CallCallee value;
-    Bool confined_direct;
-}
-
 @life(return: (source.a, output & source.b))
 public jil.Function select_task_roots(
     jil.Storage& output,
@@ -83,13 +76,14 @@ Void append_task_root_variant(
     guard statement.kind is .task_region_start_stmt(start) else { return; }
     guard start.child_resume is .some(source_resume) else { return; }
     if (start.storage.sync != .local_serial) { return; }
-    guard program.function_id_for_ref(source_resume) is .some(function_id) else { return; }
-    guard plans.get(function_id).confined_resume is .some(variant_id) else { return; }
+    guard program.coroutine_source_item_for_ref(source_resume)
+        is .some(item) else { return; }
+    guard plans.get(item).confined_resume is .some(variant) else { return; }
     variants.add(TaskRootVariant (
         task: start.task,
         source_resume: source_resume,
         variant_resume: variant_function_ref(
-            output, program, source_resume, variant_id
+            output, program, source_resume, variant
         )
     ));
 }
@@ -99,13 +93,37 @@ jil.FunctionRef variant_function_ref(
     jil.Storage& output,
     jil.Program& program,
     jil.FunctionRef source,
-    jil.FunctionId variant_id
+    jil.MonoItem variant
 ) {
+    if (variant is .source_resume_instance(resume)) {
+        return source_resume_variant_ref(output, source, resume.mode);
+    }
+    guard variant is .generated_function(variant_id) else {
+        assert(false, "invalid confined coroutine variant");
+        return source_resume_variant_ref(output, source, .standard);
+    }
     jil.Function reserved = program.function(variant_id);
     return jil.FunctionRef (
         target: .generated(program.generated_function_target(variant_id)),
         args: output.generic_arg_array(reserved.args),
         coroutine_resume: false,
+        coroutine_completion: false,
+        type_id: source.type_id
+    );
+}
+
+@life(return: output)
+jil.FunctionRef source_resume_variant_ref(
+    jil.Storage& output,
+    jil.FunctionRef source,
+    jil.CoroutineResumeMode mode
+) {
+    return jil.FunctionRef (
+        target: source.target,
+        dispatch_type: source.dispatch_type,
+        args: output.generic_arg_array(source.args),
+        coroutine_resume: true,
+        coroutine_resume_mode: mode,
         coroutine_completion: false,
         type_id: source.type_id
     );
@@ -276,7 +294,11 @@ jil.Statement function_assign_statement(
 
 Bool function_ref_equal(jil.FunctionRef lhs, jil.FunctionRef rhs) {
     if (lhs.coroutine_resume != rhs.coroutine_resume) { return false; }
+    if (lhs.coroutine_resume_mode != rhs.coroutine_resume_mode) { return false; }
     if (lhs.coroutine_completion != rhs.coroutine_completion) { return false; }
+    if (lhs.coroutine_serial_completion != rhs.coroutine_serial_completion) {
+        return false;
+    }
     if (!jil.function_target_equal(lhs.target, rhs.target)) { return false; }
     jil.InstanceKey lhs_key = jil.InstanceKey(
         jil.function_target_provenance_def(lhs.target), lhs.args
@@ -355,6 +377,7 @@ public jil.Function add(
     jil.Storage& output,
     jil.Program&! program,
     jil.DropElaborationState&! drop_elaboration,
+    jil.MonoItem source_item,
     jil.Function source,
     jil.FunctionId id,
     jil.Place? current_executor,
@@ -384,24 +407,24 @@ public jil.Function add(
             output,
             program,
             source.body,
-            id,
+            jil.BodyId.from_index(id.to_index()),
             current_executor,
             plans
         )
     );
     program.finish_generated_function(variant);
-    program.copy_shared_codegen_status(source.id, id);
+    program.copy_mono_item_shared_codegen_status(source_item, id);
     drop_elaboration.mark(id);
     program.mark_borrow_check_exempt(id);
     return variant;
 }
 
 @life(return: output & source & current_executor)
-jil.Body local_body(
+public jil.Body local_body(
     jil.Storage& output,
     jil.Program& program,
     jil.Body source,
-    jil.FunctionId function_id,
+    jil.BodyId body_id,
     jil.Place? current_executor,
     plan.Store& plans
 ) {
@@ -420,7 +443,7 @@ jil.Body local_body(
         index = index + 1;
     }
     return jil.Body (
-        id: jil.BodyId.from_index(function_id.to_index()),
+        id: body_id,
         span: source.span,
         locals: source.locals,
         blocks: output.block_array(blocks$.ref()),
@@ -639,7 +662,7 @@ jil.Terminator local_terminator(
 ) {
     guard source.kind is .call_term(call) else { return source; }
     Bool local_edge = !async_start_is_detached(call.async_start);
-    LocalCallee callee = local_callee(
+    jil.CallCallee callee = local_callee(
         output, program, call.callee, local_edge, plans
     );
     jil.FunctionRef? suspend_child! = call.suspend_child;
@@ -651,13 +674,13 @@ jil.Terminator local_terminator(
     return jil.Terminator (
         span: source.span,
         kind: jil.call_terminator_kind(jil.CallTerminator (
-            callee: callee.value,
+            callee: callee,
             args: local_operands(output, program, call.args, plans),
             current_effects: call.current_effects,
             is_suspend_point: call.is_suspend_point,
             suspend_wake: call.suspend_wake,
             suspend_child: suspend_child,
-            task_handoff: call.task_handoff && !callee.confined_direct,
+            task_handoff: call.task_handoff,
             async_start: call.async_start,
             destination: call.destination,
             target: call.target,
@@ -674,69 +697,50 @@ Bool async_start_is_detached(jil.AsyncStartKind? value) {
 }
 
 @life(return: output & source & plans)
-LocalCallee local_callee(
+jil.CallCallee local_callee(
     jil.Storage& output,
     jil.Program& program,
     jil.CallCallee source,
     Bool local_edge,
     plan.Store& plans
 ) {
-    if (!local_edge) {
-        return LocalCallee (value: source, confined_direct: false);
-    }
+    if (!local_edge) { return source; }
     if (source is .direct_function(function_ref)) {
         jil.FunctionRef localized = local_function_ref(
             output, program, function_ref, plans
         );
-        return LocalCallee (
-            value: jil.direct_function_callee(localized),
-            confined_direct: !function_ref_equal(function_ref, localized)
-        );
+        return jil.direct_function_callee(localized);
     }
     if (source is .indirect_operand(operand)) {
-        return LocalCallee (
-            value: jil.indirect_operand_callee(local_operand(
-                output, program, operand, plans
-            )),
-            confined_direct: false
-        );
+        return jil.indirect_operand_callee(local_operand(
+            output, program, operand, plans
+        ));
     }
     if (source is .domain_enqueue(enqueue)) {
         jil.Operand resume = local_operand(output, program, enqueue.resume, plans);
         if (localized_domain_resume(enqueue.resume, resume) is .some(local_ref)) {
-            return LocalCallee (
-                value: jil.direct_function_callee(local_ref),
-                confined_direct: true
-            );
+            return jil.direct_function_callee(local_ref);
         }
-        return LocalCallee (
-            value: .domain_enqueue(jil.DomainEnqueueCallee (
-                domain_def: enqueue.domain_def,
-                domain_kind: enqueue.domain_kind,
-                task: local_optional_operand(
-                    output, program, enqueue.task, plans
-                ),
-                resume: resume,
-                handoff: enqueue.handoff
-            )),
-            confined_direct: false
-        );
+        return .domain_enqueue(jil.DomainEnqueueCallee (
+            domain_def: enqueue.domain_def,
+            domain_kind: enqueue.domain_kind,
+            task: local_optional_operand(output, program, enqueue.task, plans),
+            resume: resume,
+            handoff: enqueue.handoff
+        ));
     }
     if (source is .dynamic_domain_enqueue(enqueue)) {
         // 外部线程只唤醒并发 root；confined 子树的 request/handoff 都发生在
         // root executor 内，因此保留状态机语义但改用普通 load/store。
-        return LocalCallee (
-            value: .dynamic_domain_enqueue(jil.DynamicDomainEnqueueCallee (
-                executor: local_operand(output, program, enqueue.executor, plans),
-                task: local_optional_operand(output, program, enqueue.task, plans),
-                resume: local_operand(output, program, enqueue.resume, plans),
-                handoff: enqueue.handoff,
-                mode: .local
-            )),
-            confined_direct: false
-        );
+        return .dynamic_domain_enqueue(jil.DynamicDomainEnqueueCallee (
+            executor: local_operand(output, program, enqueue.executor, plans),
+            task: local_optional_operand(output, program, enqueue.task, plans),
+            resume: local_operand(output, program, enqueue.resume, plans),
+            handoff: enqueue.handoff,
+            mode: .local
+        ));
     }
-    return LocalCallee (value: source, confined_direct: false);
+    return source;
 }
 
 @life(return: localized)
@@ -812,11 +816,13 @@ jil.FunctionRef local_function_ref(
     jil.FunctionRef source,
     plan.Store& plans
 ) {
-    if (source.coroutine_resume) {
-        if (program.function_id_for_ref(source) is .some(function_id)
-            && plans.get(function_id).confined_resume is .some(variant_id)
+    if (source.coroutine_resume
+        && source.coroutine_resume_mode == .standard
+    ) {
+        if (program.coroutine_source_item_for_ref(source) is .some(item)
+            && plans.get(item).confined_resume is .some(variant)
         ) {
-            return variant_function_ref(output, program, source, variant_id);
+            return variant_function_ref(output, program, source, variant);
         }
     }
     return source;

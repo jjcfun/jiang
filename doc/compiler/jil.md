@@ -12,10 +12,10 @@ JIL 的输入是 Semantic Model、`TypeCheckStore` 和 `ModuleGraph`；它不回
 - JIL place 表达语义位置，例如 local、field、index、deref。
 - JIL nominal field projection 只保存 field `DefId` 和 field `TypeId`。tuple、closure environment 和
   coroutine frame 等编译器生成结构保存逻辑 index；LLVM element index 不进入 JIL。
-- 每个源码函数先生成一份 template JIL body。template 可以包含泛型 `TypeId`、const parameter
+- 每个源码函数只生成一份 generic JIL body。body 可以包含泛型 `TypeId`、const parameter
   和 `DefId + GenericArgs` 形式的函数引用。
-- concrete JIL 由 `instance_jil(InstanceKey)` 按需从 template 实例化；template 与 concrete 使用
-  同一套 JIL 数据结构，不增加另一层 IR。
+- 可达源码实例由 `InstanceKey` 标识。`InstanceReader` 在消费 generic body 时解释实例类型、const、
+  callee 和 generic arguments，不复制第二份 CFG。
 - JIL lowering 不为 nominal field 或 union payload 固化 layout index。drop、ABI 和 backend 在
   concrete owner type 的真实使用点按需查询 `LayoutStore`；layout 不需要在 JIL lowering 前批量完成。
 - Semantic Model `for in` 在 JIL 中统一降成 index-loop CFG；range、array、slice 只影响 index 来源。
@@ -44,10 +44,10 @@ elaboration 改写 JIL。
 固定顺序如下：
 
 ```text
-Semantic Model/type facts -> initial JIL
-  -> concrete instance JIL
+Semantic Model/type facts -> generic source JIL
   -> optional structural verifier (--verify-jil)
-  -> concrete borrow check
+  -> generic borrow check
+  -> reachable InstanceKey worklist
   -> drop elaboration
   -> optional drop-output verifier (--verify-jil)
   -> direct self-call candidate selection
@@ -98,8 +98,8 @@ src/jil/model.jiang       数据模型入口
 src/jil/model/            ID、Place、Value、CFG、Program、Store
 src/jil/lower.jiang       Semantic Model -> JIL lowering 入口
 src/jil/lower/            package 入口、body lowering、阶段内模型与共享 support
-src/jil/instantiate.jiang template JIL -> concrete instance JIL
-src/jil/references.jiang  concrete body 的直接函数引用收集
+src/jil/instance_reader.jiang generic body 的实例读取视图
+src/jil/references.jiang  实例视图中的直接函数引用收集
 src/jil/analysis.jiang    dataflow analysis 入口
 src/jil/analysis/         provenance 与参数属性证明
 src/jil/optimize.jiang    优化编排入口
@@ -126,8 +126,8 @@ trait object、aggregate、task、suspend 和 intrinsic 按职责拆分。
 
 ```text
 jil.Store
-  templates: DefId -> jil.Function
-  functions: concrete jil.Function table
+  source functions: DefId -> generic jil.Function
+  generated functions: compiler-derived jil.Function table
 
 jil.Body
   locals: ArrayList<jil.LocalDecl>
@@ -196,19 +196,19 @@ control flow 由 terminator 表达：
 - `switch` 使用 discriminant/tag branch blocks；enum/union variant pattern 的具体选择来自
   `TypeCheckStore`。
 - `for in` 对 range 使用 `[start, end)` index loop；对 array/slice 使用 `len` 和 indexed place。
-- field/member access lowering 生成 concrete `jil.Place` projection。
+- field/member access lowering 生成语义 `jil.Place` projection。
 - hosted entry lowering 只从 `ModuleGraph.root_module` 查找 language `main`，dependency
   package 的 `main` 不会生成 C ABI `main` wrapper。
 
 ## 泛型实例
 
-`template_jil(DefId)` 对每个源码函数只 lower 一次。`FunctionRef` 只保存一份权威泛型身份：
+`source_jil(DefId)` 对每个源码函数只 lower 一次。`FunctionRef` 只保存一份权威泛型身份：
 `DefId + GenericArgs`；类型参数和 const 参数不再拆成两套平行数组。
 
-`instance_jil(InstanceKey)` 只替换当前函数体中的 type/const parameter，并解析 type check 已选择的
-静态 trait 分派。它不会在查询内部递归实例化 callee；concrete body 中收集到的
-函数引用由 emission
-worklist 继续请求目标实例。borrow check 和 drop elaboration 只消费 concrete instance。
+`jil_instance(InstanceKey)` 只保证实例 demand 求值一次，不保存实例 body。`InstanceReader` 结合
+generic body 与 `InstanceKey` 解释 type/const parameter 和 type check 已选择的静态 trait 分派；
+读取到的函数引用由 emission worklist 继续请求目标实例。borrow check 直接验证 generic body，
+drop、ABI、Layout 和 backend 在具体消费点使用实例读取视图。
 
 ## Async continuation ABI
 

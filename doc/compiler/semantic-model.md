@@ -8,7 +8,7 @@ Semantic Model 以 `DefId` 为 owner 组织：每个有语义所有权的 defini
 ## 职责
 
 - 保存 resolved source-level 语义结构。
-- 作为 type check、template JIL lowering 和后续工具的主要输入。
+- 作为 type check、generic JIL lowering 和后续工具的主要输入。
 - 把 AST 的语法细节整理成更稳定的语义节点。
 - 保留 source map 需要的定位信息，但不把 span 写进类型或布局事实。
 
