@@ -56,7 +56,7 @@ readonly `self` / `Self&! self` 的 Shape 非空时默认使用完整 receiver r
 callback 返回参数 borrow 时，必须通过 callable 的 result/参数契约名显式声明来源关系。
 
 binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示该存储位置可写，但不改变
-`TypeId`。字段、tuple 元素、union payload 和数组元素的写能力沿 place 传播；共享引用 `T&`
+`TypeId`。字段、tuple 元素、enum payload 和数组元素的写能力沿 place 传播；共享引用 `T&`
 不会授予写能力。borrow check 再处理需要 CFG 与 lifetime 信息的唯一借用冲突。
 
 ## 数据结构
@@ -114,7 +114,7 @@ symbolic 节点。
 
 `reference(value)` 保留外层 borrow slot 和完整 pointee shape；`T&` 与 `T&!` 的 shape 相同。
 raw pointer 不提供 slot，owner pointer 保留 pointee shape。tuple/struct 使用 product，
-array/slice value 使用 repeated element，optional/error union/union 使用有序
+array/slice value 使用 repeated element，optional/error union/payload enum 使用有序
 alternative。slice handle 由自身 slot 与 repeated element 组成；Task 使用 pending empty/completed
 result alternative。RawFn 为空 shape，Fn 的 slot 表示 capture environment lifetime。
 

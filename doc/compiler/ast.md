@@ -20,7 +20,7 @@ AstUnit.children -> ArrayList<AstId>
 AstId            -> 单个 AstUnit 内部的有效 node index
 ```
 
-`AstNode` 是固定大小节点，只包含 `span` 和 `AstData`。`AstData` 是 tagged union，
+`AstNode` 是固定大小节点，只包含 `span` 和 `AstData`。`AstData` 是 tagged enum，
 它本身就是节点种类，不再额外维护 `AstKind`。
 
 变长子节点通过 `AstRange` 指向 `children` 中的一段连续 `AstId`。函数参数、调用实参、

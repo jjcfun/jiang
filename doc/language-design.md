@@ -67,7 +67,7 @@ Token 只表示词法事实，不承载语义类型。
   identifier，lexer 应产生 `unicode_punctuation` 诊断。
 - 保留关键字包括 `new`、`where`、`life`、`import`、`public`、`const`、`alias`、
   `extern`、`return`、`if`、`else`、`guard`、`while`、`for`、`in`、`is`、`enum`、
-  `union`、`struct`、`trait`、`extend`、`associated`、`init`、`deinit`、`comptime`、
+  `struct`、`trait`、`extend`、`associated`、`init`、`deinit`、`comptime`、
   `switch`、`try`、`catch`、`await`、`break`、`continue`、`defer`、`do`、`throw`、
   `true`、`false`、`null`。`ref`、`unsafe`、`async`、`sync` 是上下文关键字；
   `self`、`Self` 是特殊名字。
@@ -160,7 +160,7 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 目标规则：除 `Tuple` 和 `Fn` 暂时排除外，所有类型都拥有自己的 namespace。这里的 namespace
 表示该类型可承载静态函数、实例方法、constructor、associated type、trait implementation
 和 extension 成员；它不要求该类型一定是 `struct` 内存模型。`Int`、`Bool`、array、slice、
-sentinel slice、pointer、reference、box、optional、result、user struct、enum、union、trait
+sentinel slice、pointer、reference、box、optional、result、user struct、enum、trait
 self type 等都应统一作为 type namespace provider 参与 `Type.member` 和 `value.method`
 lookup。
 
@@ -426,7 +426,7 @@ implicit copy / Movable 规则：
 - `T&!` 是唯一 capability，不能自由复制成两个可同时使用的引用；按值传播必须转移它，
   或建立受 lifetime 约束的 reborrow，并在派生借用存活期间冻结原引用。
 - tuple、array、optional 和 errorable 只有在所有组成类型都 Copyable 时才 Copyable。
-- 用户定义的 struct 和 union 不默认 Copyable；必须显式实现 `Copyable`，且所有字段或
+- 用户定义的 struct 和 payload enum 不默认 Copyable；必须显式实现 `Copyable`，且所有字段或
   payload 都必须 Copyable。带自定义 `deinit` 的 nominal 不能 Copyable。
 - `T^`、捕获环境的 `Fn` / `Fn^`、直接 `Task<T>` 和 `Task<T>^` 都不是 Copyable。
 - 非 Copyable、但 Movable 的值在普通按值位置默认 move；不需要写 `$.move()`。Copyable 值
@@ -500,11 +500,11 @@ product shape。
 - callable 的 result/参数契约名：对应 callable 位置的 lifetime shape。
 - public region 名：nominal 类型公开 shape 中的具名位置。
 
-struct / union 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
+struct / payload enum 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
 region，`target: source` 在声明 target 的同时表示 source 覆盖 target。每个 target 在
 annotation 中只出现一次，source 必须由同一 annotation 的其他 item 声明，但可以位于 target
 之前或之后。coverage 可以成环，例如 `a: b, b: a` 表示两个 region 互相覆盖。每个 public
-region 必须由字段或 union payload 的实际 lifetime slot 直接使用，不支持 phantom region：
+region 必须由字段或 enum payload 的实际 lifetime slot 直接使用，不支持 phantom region：
 
 ```jiang
 @region(a, b: a)
@@ -682,7 +682,6 @@ Int& take_second((Int& first, Int& second) value);
 - function declaration / definition
 - `struct`
 - `enum`
-- `union`
 - `trait`
 - `extend`
 
@@ -1024,7 +1023,7 @@ Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T
 
 - 直接 `Task<T>` 是 `!Movable`、非 Copyable 的结构化子任务，可放入 struct、tuple 或固定数组的
   静态 place；包含它的聚合也不可移动、按值传参、返回或捕获。
-  optional/errorable/union 等动态变体暂不承载直接 Task。
+  optional/errorable/payload enum 等动态变体暂不承载直接 Task。
 - `Task<T>^` 是 Movable、非 Copyable 的一等 owner，可以按值传参、返回、存入字段、容器和
   泛型实例。
   move 只转移 owner pointer，不移动 heap 上的 Task/TaskState。
@@ -1085,30 +1084,27 @@ callback 期间提供 `T&!`，callback 返回后自动解锁。公开 API 不提
 `with_lock` callback 表达；callback 返回值受生命周期约束，不能让受保护值的引用活过锁。
 `Mutex<T>` 是 `!Movable`，当前不提供 poison 状态；0.5.1 也不提供公共 Channel/RwLock API。
 
-## Struct、Enum、Union
+## Struct 与 Enum
 
 `struct` 用于普通名义类型，支持类型函数、实例函数、`init` 和 `deinit`。
 
 `enum` 是统一的 nominal sum type。无 payload enum 表示有限命名整数集合；variant 可以写成
 `case(T)` 或 `case(T name, U other)` 并携带 payload。
 
-`union` 是 0.5.3 迁移期保留的旧 tagged-union 语法。payload enum 直接复用同一套 tagged-sum
-layout、move、borrow、drop、pattern 和 JIL 语义，不建立第二套实现。
-
-union variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
-
-union variant 的外部可见性由外层类型是否 public 控制。
+payload enum 使用统一的 tagged-sum layout、move、borrow、drop、pattern 和 JIL 语义。
+enum variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
+enum variant 的外部可见性由外层类型是否 public 控制。
 
 当前命名空间规则：
 
 - module/package/import alias 使用 namespace namespace。
 - 顶层类型、trait 和 associated type 使用 type namespace。
 - 函数、全局变量、builtin value 和普通方法使用 value namespace。
-- 字段、enum case 和 union variant 使用 member namespace。
+- 字段和 enum case 使用 member namespace。
 - 每个 type namespace provider 拥有自己的 member/type/value 子 namespace，供 `Type.member`
-  路径继续解析；`struct`、`enum`、`union`、builtin type 和大部分语法糖类型都属于
+  路径继续解析；`struct`、`enum`、builtin type 和大部分语法糖类型都属于
   type namespace provider。
-- union variant 虽然底层在 member namespace，仍会和 method 的 value namespace 做额外同名冲突检查。
+- enum variant 虽然底层在 member namespace，仍会和 method 的 value namespace 做额外同名冲突检查。
 - `Tuple` 和 `Fn` 暂时不作为可扩展 namespace provider；后续如果需要 tuple method 或函数类型
   method，再单独冻结 lookup 和 ABI 规则。
 
@@ -1121,16 +1117,12 @@ enum Value<T> {
     pair(T value, Bool enabled),
 }
 
-union Maybe<T> {
-    T some;
-    Void none;
-}
 ```
 
-新 enum 使用 variant-first 语法，无 payload variant 不需要写 `Void`。旧 union 仍按字段式 grammar
-声明，直到 enum 迁移和自举验证完成后再删除。
+enum 使用 variant-first 语法，无 payload variant 不需要写 `Void`。case 必须位于成员之前；
+存在 method 或嵌套 nominal 成员时，用 `;` 分隔。
 payload variant 保留整数 enum 的 underlying type、隐式递增值和显式 discriminant；variant 上的
-`@life` 等语义注解与旧 union variant 使用同一条 lowering 和检查管线。
+`@life` 等语义注解使用统一的 lowering 和检查管线。
 
 ## Trait 和 Extend
 
@@ -1206,8 +1198,8 @@ trait Indexable {
   trait object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如
   `Holder<T>.get() -> T` 在 `Holder<Int*!>` 上调用时，结果类型为 `Int*!`。
-- union variant name 和同一 union 的类型函数/显式 method name 共享类型成员命名空间，
-  不能重名，避免 `Union.member(...)` 歧义。
+- enum variant name 和同一 enum 的类型函数/显式 method name 共享类型成员命名空间，
+  不能重名，避免 `Enum.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
   能区分调用。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
@@ -1461,7 +1453,7 @@ pattern 目前包括：
 
 binding/wildcard 只作为子 pattern 使用，不能作为 `is` 或 `switch` 分支根。
 tuple pattern 可以作为分支根，并递归保留括号层级。
-union/optional 的 Tuple payload 直接展开一层，因此 `(Int, Int)` payload 使用
+payload enum/optional 的 Tuple payload 直接展开一层，因此 `(Int, Int)` payload 使用
 `.case(left, right)`，不是 `.case((left, right))`。
 
 binding 的统一语义形态是 `binding_mode? type_pattern name binding_mutability?`。
@@ -1484,7 +1476,7 @@ if block is .some(Int dead!) {
 }
 ```
 
-普通 union variant 和 optional 都使用 dot case pattern；optional 不再支持旧 `some payload` pattern。
+普通 enum variant 和 optional 都使用 dot case pattern；optional 不再支持旧 `some payload` pattern。
 
 ## Module 和 Visibility
 
@@ -1505,7 +1497,7 @@ if block is .some(Int dead!) {
 
 ambiguous re-export 仍需后续完善；package dependency 第一版只支持本地源码路径。
 
-当前 resolver 已区分 module、type、value 和 member domain；字段、enum case、union variant 使用 member
+当前 resolver 已区分 module、type、value 和 member domain；字段和 enum case 使用 member
 domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的 module/type/value root 继续查找，
 不会仅凭文本在 JIL 或 backend 重判。`import dep;` 优先查当前 package dependency alias。
 

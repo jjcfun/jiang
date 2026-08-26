@@ -38,10 +38,10 @@ test/lang/<feature>/
 - `literal`：integer/float/char/string/bool/null，expected type 转换，字符串与 `UInt8[:0]&`、`UInt8*` 兼容语义。
 - `type`：type suffix 顺序、handle 限制、raw pointer/slice/array、已移除 many pointer 的反例、
   errorable。
-- `aggregate`：tuple、array、slice、struct 默认构造、union constructor。
+- `aggregate`：tuple、array、slice、struct 默认构造、enum constructor。
 - `function`：tail expr、call stmt、overload、default params、named args、constructor args。
 - `control_flow`：if/switch/guard/while/for/range/defer/break/continue/Never 合并。
-- `nominal`：struct/enum/union/init/deinit/type function/instance method/member namespace。
+- `nominal`：struct/enum/init/deinit/type function/instance method/member namespace。
 - `generic`：generic type/function、where bound、trait conformance、associated type、monomorph。
 - `ownership`：Copyable、默认 move、显式 move、`!Movable`、borrow reference、drop/defer cleanup。
 - `lifetime`：`@life` 语法、返回引用、字段引用、逃逸失败。

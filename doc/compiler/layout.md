@@ -53,7 +53,7 @@ arguments，所以 `Box<Int>` 和 `Box<Bool>` 会得到不同 layout。
 `Movable` 只约束值能否改变地址，不能代替析构判定。
 
 - `no_drop`：标量、function pointer、non-owning handle 等不需要析构。
-- `trivial_drop`：aggregate/optional/union 本身不需要自定义析构，成员也没有 owning drop。
+- `trivial_drop`：aggregate/optional/payload enum 本身不需要自定义析构，成员也没有 owning drop。
 - `recursive_drop`：类型自身或成员包含 `T^` owning pointer，需要 drop elaboration 递归处理。
 - `custom_drop`：nominal type 定义了 `deinit`，drop elaboration 先调用 custom deinit，
   再继续展开递归字段自动 drop。
@@ -71,7 +71,7 @@ arguments，所以 `Box<Int>` 和 `Box<Bool>` 会得到不同 layout。
 - `T[]` / `T[:0]` 是 unsized array type，没有独立 by-value layout；`T[]&` / `T[:0]&` borrowed view layout 是 pointer + pointer-sized unsigned length，sentinel 不改变物理 layout，只改变类型语义
 - `T[]^` / `T[:0]^` owned unsized array handle 当前也使用 pointer + pointer-sized unsigned length，但它表达 buffer 所有权，drop 时需要析构元素并释放 allocation
 - enum layout：当前 enum 无 associated value，使用 enum underlying integer scalar
-- union layout：Jiang union 是 tagged union，第一版使用 target int tag + max payload slot
+- payload enum layout：使用 target int tag + max payload slot
 - aggregate alignment policy
 
 不同 target 的 `LayoutKey` 查询结果不能复用。

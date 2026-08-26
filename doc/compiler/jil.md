@@ -16,7 +16,7 @@ JIL 的输入是 Semantic Model、`TypeCheckStore` 和 `ModuleGraph`；它不回
   和 `DefId + GenericArgs` 形式的函数引用。
 - 可达源码实例由 `InstanceKey` 标识。`InstanceReader` 在消费 generic body 时解释实例类型、const、
   callee 和 generic arguments，不复制第二份 CFG。
-- JIL lowering 不为 nominal field 或 union payload 固化 layout index。drop、ABI 和 backend 在
+- JIL lowering 不为 nominal field 或 enum payload 固化 layout index。drop、ABI 和 backend 在
   concrete owner type 的真实使用点按需查询 `LayoutStore`；layout 不需要在 JIL lowering 前批量完成。
 - Semantic Model `for in` 在 JIL 中统一降成 index-loop CFG；range、array、slice 只影响 index 来源。
 
@@ -193,7 +193,7 @@ control flow 由 terminator 表达：
 - `if` 使用 branch / then / else / join blocks。
 - `loop` 和 `while` 使用 header / body / exit blocks，并维护 loop target stack。
 - `return expr` 先把 expr lower 到 return local，再生成 return terminator。
-- `switch` 使用 discriminant/tag branch blocks；enum/union variant pattern 的具体选择来自
+- `switch` 使用 discriminant/tag branch blocks；enum variant pattern 的具体选择来自
   `TypeCheckStore`。
 - `for in` 对 range 使用 `[start, end)` index loop；对 array/slice 使用 `len` 和 indexed place。
 - field/member access lowering 生成语义 `jil.Place` projection。

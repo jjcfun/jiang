@@ -28,7 +28,7 @@
 | tuple / Void type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
-| union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
+| payload enum | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
 | trait / extend | `generic` | partial | type function requirement、move receiver trait object deferred |
 | block / tail expr | `function`, `control_flow` | covered | tail expr 与 defer/drop 组合 |
 | var / destructure stmt | `function`, `aggregate`, `control_flow` | covered | 递归 Tuple 与 ref binding 已覆盖 |
@@ -42,7 +42,7 @@
 | postfix call / member / index | `function`, `type`, `aggregate` | covered | optional chain runtime 行为更多 run 用例 |
 | implicit layer call | `type`, `ownership` | partial | `size/align/max_align` run/emit、非法 type arg 组合 |
 | struct expression | `aggregate`, `nominal` | covered | default field initializer 语义 deferred |
-| array expression | `aggregate` | covered | array literal 对 tuple/union 元素 expected type |
+| array expression | `aggregate` | covered | array literal 对 tuple/enum 元素 expected type |
 | pattern | `control_flow`, `nominal`, `ownership` | covered | Tuple payload、局部类型推导和 ref binding 已覆盖 |
 
 ## Semantic Coverage
@@ -61,7 +61,7 @@
 | trait object companion | `generic`, `package` | covered | owned receiver / move receiver trait object deferred |
 | monomorphization | `generic`, `package` | partial | 跨 package public generic body run 用例已覆盖，更多 nested instance 待补 |
 | package public surface | `package`, `import` | covered | public alias chain 已覆盖 |
-| layout-sensitive aggregate | `aggregate`, `nominal` | partial | emit/run 覆盖更多 tuple/array/union 嵌套 |
+| layout-sensitive aggregate | `aggregate`, `nominal` | partial | emit/run 覆盖更多 tuple/array/enum 嵌套 |
 | JIL control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
 | backend runtime entry | `runtime` | covered | argv/env deferred |
 | sentinel const | `generic`, `runtime`, `literal` | covered | `Bool` / `Char` / enum / struct sentinel 和非 Copyable 反例已覆盖 |
@@ -71,7 +71,7 @@
 
 1. `control_flow` + `ownership`：补 nested loop、early return、defer/drop cleanup 的 run 用例。
 2. `generic`：补 nested monomorph、associated type equality 和 parent trait 组合。
-3. `aggregate`：补 tuple/array/union 的嵌套 expected type 和 backend run/emit。
+3. `aggregate`：补 tuple/array/enum 的嵌套 expected type 和 backend run/emit。
 4. `literal`：补 float、escape、溢出和非法 numeric token 的 fail 用例。
 5. `destructure`：补更多局部递归 Tuple 的借用冲突、move/copy 和作用域组合。
 

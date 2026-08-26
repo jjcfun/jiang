@@ -377,7 +377,7 @@ Fn<Int>^ make_answer() {
 `Fn^$.ref()` 返回 `Fn&`，表示把 heap closure 临时借成栈内 callable view。`Fn^&` 如果以后需要，
 应表示 owner handle slot 的引用，不作为普通调用所需的借用形式。
 
-struct / union 的 public region、tuple 元素和 callable result/参数可提供契约名。callable
+struct / payload enum 的 public region、tuple 元素和 callable result/参数可提供契约名。callable
 契约只能使用这些声明名，例如 `@life(f.result: f.input)`；不支持 `f[0]`、`f[1]`
 一类位置路径。closure environment 是 ABI 隐藏参数，不能出现在公开 contract 中。
 

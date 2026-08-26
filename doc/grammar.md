@@ -130,7 +130,7 @@ Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)
 `@intrinsic(type, T)` 是编译器内部声明 `$` 内禀操作的 attribute block，
 只允许编译器内部源码和标准库内部源码使用；普通用户源码写 `@intrinsic` 会报错。
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
-struct / union 的 `@region(a, b: a)` 中，每个 item 声明一个 public region；
+struct / payload enum 的 `@region(a, b: a)` 中，每个 item 声明一个 public region；
 `target: source` 同时声明 target 并表示 outlives 约束，每个 target 只能出现一次。单-slot
 region 使用普通名字；`value: T` 声明 shape 来自同一 nominal 的类型泛型参数 `T`，并且必须
 位于固定 region 之后。`value: T = anchor` 还允许省略字段 binding，并用较早声明的固定 region
@@ -162,7 +162,6 @@ nominal_decl
             <- struct_decl
              / record_decl
              / enum_decl
-             / union_decl
 
 import_decl <- "import" (import_alias "=")? import_path ";"
 
@@ -211,7 +210,7 @@ binding_name
 
 说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。`unsafe` 只在紧邻 `extend`
 时作为 conformance 修饰符。
-因此 `struct_decl`、`record_decl`、`enum_decl`、`union_decl`、`trait_decl`
+因此 `struct_decl`、`record_decl`、`enum_decl`、`trait_decl`
 等规则本身不重复写 `"public"`。
 `const_global_decl` 同样经由 `top_level_decl` 接受 modifier，因此 `public const Type name = expr;`
 是合法顶层声明。
@@ -471,28 +470,9 @@ enum_member <- member_modifier* method_decl
 未显式指定值的 enum case 从 `0` 开始递增；显式值目前只接受整数 literal，包括负整数字面量。
 带 payload 的 enum 是 tagged sum type，并保留整数底层类型、隐式递增值和显式 discriminant。
 `case(T)` 声明匿名 payload，`case(T name, U other)` 声明带契约名的复合 payload。
-variant annotation 与 union variant 相同，例如使用 `@life` 把 payload 槽绑定到 nominal region。
-
-## union
-
-顶层可见性写在外层 `decl` 的 `decl_modifier` 中，例如
-`public union Value { ... }`。
-
-```peg
-union_decl  <- "union" ("[" name "]")? name generic_params? trait_list? union_body
-
-union_body  <- "{" union_member* "}"
-
-union_member
-            <- member_modifier* method_decl
-             / union_variants
-
-union_variants
-            <- type name ("," name)* ";"
-```
-
-0.5.3 迁移期继续接受 union；新增代码优先使用 payload enum。enum 完整迁移验证结束后再移除
-union 语法。
+variant annotation 可以使用 `@life` 把 payload 槽绑定到 nominal region。
+variant 必须写在成员之前；存在 method 或嵌套 nominal 成员时，用 `;` 分隔 variant 与成员。
+`union` 不再是 nominal declaration keyword；tagged sum 统一使用 payload enum。
 
 ## trait
 
@@ -865,7 +845,7 @@ pattern_list
   `Int[_] values`、`_[3] values`。
 - 绑定名后的 `!` 表示该绑定可重新赋值，例如 `ref T name!`；它不会把共享借用变成可变借用。
 - `_! name` 不合法；payload 共享借用使用 `ref T name`，唯一可变借用使用 `ref! T name`。
-- Tuple pattern 递归保留括号层级。union/optional 的 Tuple payload 直接展开一层：
+- Tuple pattern 递归保留括号层级。payload enum/optional 的 Tuple payload 直接展开一层：
   `.pair(left, right)` 匹配 `(Int, Int)` payload；嵌套结构写作
   `.nested((left, right), tail)`。
 - 单元素 Tuple 与元素等价，所以 `(ref name) = value;` 不会对 `value` 额外执行索引投影。

@@ -404,7 +404,7 @@ Task<Int>^ owned = new Task(domain: PageDomain) { load_page() };
 ```
 
 直接 `Task<T>` 是 `!Movable`，包含它的聚合值也不能移动、按值传参或返回。直接 Task 字段目前只支持
-struct、tuple 和固定数组中的静态位置，不支持 optional/error union/union 等动态变体。
+struct、tuple 和固定数组中的静态位置，不支持 optional/error union/payload enum 等动态变体。
 `Task<T>^` 是 Movable、非 Copyable 的一等
 owner，可以出现在参数、返回值、字段、容器、泛型实例和 public ABI：
 

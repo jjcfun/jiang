@@ -586,7 +586,7 @@ receiver 只参与普通唯一 root 规则。零个非空 root 时必须用 `@li
 任意显式 `@life(...)` 都完全替换默认返回契约。`@life(return: input)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 
-struct / union 使用 `@region` 显式声明公开 lifetime shape。单一 lifetime slot 字段写作
+struct / payload enum 使用 `@region` 显式声明公开 lifetime shape。单一 lifetime slot 字段写作
 `@life(a)`；字段类型具有多个公开 region 时可以按位置绑定，也可以使用具名映射：
 
 ```jiang
@@ -611,7 +611,7 @@ struct Wrapper {
 
 `b: a` 在声明 `b` 的同时表示 `a` outlives `b`。每个 target 在 `@region` 中只出现一次；
 source 也必须由同一 annotation 声明，但可以写在 target 之前或之后。coverage 允许成环，
-`@region(a: b, b: a)` 表示两个 region 互相覆盖。每个 region 都必须由字段或 union payload
+`@region(a: b, b: a)` 表示两个 region 互相覆盖。每个 region 都必须由字段或 enum payload
 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；named 模式不能与位置模式
 混用，也不能使用 `self` source。
 
@@ -658,7 +658,7 @@ callable contract 只能引用 result/参数的声明名；需要参与 contract
 - 经过 `T*!` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - `Movable` 是默认 auto trait；nominal 可用 `!Movable` 保持地址固定，包含它的聚合也不可移动。
-- `Copyable` 继承 `Movable`。基本标量和 enum 默认 Copyable；struct/union 必须显式实现 Copyable，
+- `Copyable` 继承 `Movable`。基本标量和 scalar enum 默认 Copyable；struct/payload enum 必须显式实现 Copyable，
   且所有字段或 payload 也必须 Copyable。带自定义 `deinit` 的类型不能 Copyable。
 - 非 Copyable、但 Movable 的值在普通按值位置默认 move；Copyable 值默认 copy。
 - `$.move()` 可以显式转移非 Copyable 值，也可以强制 move Copyable 值；源 place 随后失效。
@@ -1348,7 +1348,7 @@ Int y = switch (value) {
 - `{ ... }` 内只允许语句，不允许独立的 tail expression
 - 分支结果是右侧语句或 block 最后一条语句的值
 - 所有分支结果类型必须一致
-- `enum` / `union` / `optional` 仍然做穷尽性检查
+- `enum` / `optional` 仍然做穷尽性检查
 - 分支根 pattern 支持 variant / optional / tuple / literal
 - binding/wildcard 只作为子 pattern 使用，不能单独作为分支根
 - Tuple payload 在 variant/optional pattern 中展开一层，例如 `.pair(left, right)`；
@@ -1372,7 +1372,7 @@ RawFn<Bool@Err, Int, Int> compare
 - `T` 是成功值类型
 - `E` 是错误值类型
 - `T@E` 只允许作为函数返回类型，或出现在 callable 的返回位
-- 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
+- 底层布局复用通用 result/error-union 模型，不单独引入 runtime exception 机制
 - `T@E` 必须连续书写，`T @E` 和 `T@ E` 都不合法
 
 抛出错误使用 `throw expr;`：
@@ -1784,12 +1784,11 @@ Int use() {
 当前适用范围：
 
 - `struct`：支持 `init`、`deinit`、类型函数、实例函数
-- `union`：支持类型函数、实例函数
 - `enum`：支持类型函数、实例函数
 
 `init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。
-`union` / `enum` 不承诺自定义生命周期入口。
-union variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
+`enum` 不承诺自定义生命周期入口。
+enum variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
 
 ```c
 struct User {
@@ -1834,16 +1833,19 @@ Int b = mode.value();
 ```
 
 ```c
-union Result {
-  Int a;
-  Int b;
+enum Result {
+  a(Int),
+  b(Int);
 
   Int answer() {
     return 42;
   }
 
   Int value(self) {
-    return self.a;
+    switch self {
+      .a(value) => value,
+      .b(value) => value,
+    }
   }
 }
 
@@ -1966,126 +1968,12 @@ switch (priority) {
 }
 ```
 
-### 联合类型（Union）
+payload enum 是安全的 tagged sum：每个值携带当前 variant 的 discriminant，只有 active variant
+的 payload 会参与访问和析构。payload 支持普通类型、tuple、array、slice、引用、指针、optional、
+其他 enum 和泛型参数。
 
-0.5.3 迁移期仍支持旧 `union` 语法；新增 tagged sum type 优先使用上面的 payload enum。
-
-Jiang 的 `union` 是安全的 tagged union：每个值都会携带当前 variant 的 tag，并且每个 variant 可以有自己的 payload。它不是 C 风格的 untagged/raw union。
-
-`union` 可以复用已有 `enum` 作为 tag，也可以省略 tag enum，由编译器根据 variant 名自动生成隐式 tag。`enum` 只表示 tag/value set；`union` 表示 tag 加 payload 的 sum type。
-
-```c
-enum [UInt8] Kind {
-  a = 1,
-  b,
-  c,
-  d,
-  e
-}
-
-union MyUnion {
-	Int a;
-  Double b;
-  (Int, Int) c;
-	Foo d;
-	Void e;
-
-  struct Foo {
-    Int x;
-    Int y;
-  }
-}
-
-// 使用
-MyUnion x = MyUnion.a(123);
-
-// 类型推导
-MyUnion y = .b(3.15);
-
-// 使用 switch 处理所有情况（编译器确保完整性）
-switch (x) {
-	// 单个语句可以不用 {}
-  .a(value) => print("value = %d", value);
-
-  // 多个语句必须用 {}
-  .b(value!) => {
-    value += 0.1;
-    print("value = %f", value);
-  }
-
-  .c(v1, b2) => print("value = (%d, %d)", v1, v2);
-
-  .d(v) => print("value = Foo {x: %d, y: %d}", v.x, v.y);
-
-	else => break;
-}
-
-// 使用 if 判断
-if (x is .a(value)) {
-  print("value = %d", value)
-}
-```
-
-`union` 可以显式绑定 tag enum，也可以省略并让编译器按成员名自动生成隐式 tag：
-
-```c
-enum Kind {
-  a,
-  b,
-}
-
-union [Kind] ExplicitResult {
-  Int a;
-  Int b;
-}
-
-union ImplicitResult {
-  Int a;
-  Int b;
-}
-```
-
-规则：
-
-- `union [TagEnum]` 的 variant 名必须能对应到 `TagEnum` 的成员。
-- 省略 tag enum 时，编译器按 variant 声明生成隐式 tag。
-- `union` variant 本身不单独声明 `public` / `private`，只由外层 `union` 是否公开决定。
-- 如果 `union` 是 `public`，它的 variant 属于公开类型表面；如果 `union` 不公开，variant 也只在模块内可见。
-- 如果需要隐藏 union 的部分实现细节，优先用 public `struct` 包装 private union/data。
-
-同类型的多个 variant 也可以合并声明：
-
-```c
-union MyUnion {
-  Int a, b, c;
-  Float r;
-}
-```
-
-`union` 的 payload 当前支持任意普通类型，包括：
-
-- `struct`
-- tuple
-- array
-- slice
-- `RawFn<...>`
-- `T^`
-- `T&`
-- `T*` / `T*!`
-- `T*`
-- optional
-- 其他 `union` / `enum`
-
-`union` 也支持泛型：
-
-```c
-union Outcome<T, E> {
-  T value;
-  E error;
-}
-```
-
-
+variant 必须写在 method 或嵌套 nominal 成员之前；存在这些成员时，用 `;` 分隔。`union` 不再是
+nominal declaration keyword。
 
 ### 泛型（Generic）
 
@@ -2542,7 +2430,7 @@ extend User: HasValue {
 - 用户模块可以扩展 builtin 或其他模块公开的类型，不使用全局 orphan 禁令；extension 只参与当前模块
   可见集合中的 lookup。相同调用同时匹配多个同 specificity extension 时报告 ambiguity，concrete pattern
   优先于 generic pattern。
-- union variant name 和同一 union 的 method name 不能重名，避免 `Union.member(...)` 歧义
+- enum variant name 和同一 enum 的 method name 不能重名，避免 `Enum.member(...)` 歧义
 - 同名 method 可以 overload，但参数数量或参数类型必须不同
 - `extend Type: Trait { ... }` 会做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现
 - 不支持 `init`

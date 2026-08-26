@@ -119,7 +119,7 @@ compiler-private wrapper scaffold 位于 `src/lang/`：
 - `runtime.jiang` 负责 `dlopen` / `dlsym`、调用 `scan` / `parse` 和 provider 生命周期。
 - `handle.jiang` 定义已加载 provider dylib 的 runtime handle。
 - `registry.jiang` 定义 dependency alias 到 lang package id 的 registry，并持有该 dependency edge 的 dylib handle。
-- `resolve/store.jiang` 的 `PackageRecord.info` 使用 union 保存 package-specific info；lang package 的 dylib path、
+- `resolve/store.jiang` 的 `PackageRecord.info` 使用 enum 保存 package-specific info；lang package 的 dylib path、
   source path、wrapper version 和 cache 标记保存在 `PackageInfo.lang`。
 - `LangBlock` 只保存单个 DSL block 的 `Provider.Any^?` 实例和 syntax builder/input/scan result。
 

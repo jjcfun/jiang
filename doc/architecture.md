@@ -417,7 +417,7 @@ public trait Indexable {
 
 ### 命名
 
-- 类型、trait、enum、union、struct 使用 `UpperCamelCase`。
+- 类型、trait、enum、struct 使用 `UpperCamelCase`。
 - 函数、方法、局部变量、字段、模块文件名使用 `lower_snake_case`。
 - 常量使用 `SCREAMING_SNAKE_CASE`。
 - 缩写词按普通单词处理，只首字母大写：

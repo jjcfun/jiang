@@ -210,7 +210,7 @@ debug emission 使用与参数一一对应的保守事实，不运行这组优�
 - debug/release object emission；release 默认跑 LLVM `default<O2>`。
 - target triple / data layout 接入。
 - struct/tuple/array aggregate。
-- enum/union tag 与 union payload。
+- enum tag 与 payload。
 - branch、switch、call、return、range/array/slice loop。
 
 ## 待设计
