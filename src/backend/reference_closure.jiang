@@ -1,7 +1,8 @@
-// 按最终 JIL 引用建立调用方拥有的泛型实例闭包。
+// 按最终 JIL 引用建立泛型实例闭包。
 //
 // 每个 MonoItem 的直接引用只从 generic JIL 解析一次。source unit 仍分别遍历
-// 传递闭包，因此不同调用方可以继续拥有同一 weak/linkonce 实例定义。
+// 传递闭包，但 source concrete instance 只归属一个 caller monomorph unit。
+// generated body 的 provenance 只是来源标记，仍随 caller closure 放置。
 
 import codegen_unit = "./codegen_unit/model.jiang";
 import context = "../context.jiang";
@@ -9,9 +10,12 @@ import jil = "../jil.jiang";
 import instance_reader = "../jil/instance_reader.jiang";
 import jil_references = "../jil/references.jiang";
 import function_resolver = "./function_resolver.jiang";
+import symbol = "./symbol.jiang";
+import source_ji = "../artifact/source_ji.jiang";
 import generic_bindings = "../sema/generic/bindings.jiang";
 import types = "../sema/type.jiang";
 import qid = "../id.jiang";
+import qkey = "../incremental/key.jiang";
 import list = "../support/list.jiang";
 import map = "../support/map.jiang";
 import table = "../support/table.jiang";
@@ -26,30 +30,84 @@ struct DirectReferenceCache: Movable {
     }
 }
 
+struct SourceUnitCandidate: Copyable {
+    Int index;
+    qkey.Fingerprint128 identity;
+}
+
 public Void assign(
     context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units
 ) {
     map.WyHashMap<Int, Int> visited! = map.WyHashMap<Int, Int>();
+    map.WyHashMap<symbol.BackendSymbolKey, Bool> assigned! =
+        map.WyHashMap<symbol.BackendSymbolKey, Bool>();
     DirectReferenceCache references! = DirectReferenceCache();
-    Int source_unit_count = units.len();
+    list.ArrayList<SourceUnitCandidate> source_units = stable_source_units(ctx, units);
     Int index! = 0;
-    while (index < source_unit_count) {
+    while (index < source_units.len()) {
+        Int unit_index = source_units.get(index).index;
+        codegen_unit.CodegenUnitKey key = units.unit_at(unit_index).key;
+        assign_source(
+            ctx,
+            store,
+            units,
+            unit_index,
+            key,
+            visited$.mut_ref(),
+            assigned$.mut_ref(),
+            references$.mut_ref()
+        );
+        index = index + 1;
+    }
+}
+
+list.ArrayList<SourceUnitCandidate> stable_source_units(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnitSet& units
+) {
+    list.ArrayList<SourceUnitCandidate> result! =
+        list.ArrayList<SourceUnitCandidate>();
+    Int index! = 0;
+    while (index < units.len()) {
         codegen_unit.CodegenUnitKey key = units.unit_at(index).key;
         if (key.kind == .source_unit) {
-            assign_source(
-                ctx,
-                store,
-                units,
-                index,
-                key,
-                visited$.mut_ref(),
-                references$.mut_ref()
+            qid.ModuleId module_id = qid.ModuleId.from_index(key.module_index);
+            qkey.Fingerprint128 identity! = qkey.Fingerprint128(
+                UInt64(key.module_index), UInt64(key.package_index)
             );
+            if (source_ji.source_identity_for_module(ctx, module_id) is .some(stable)) {
+                identity = stable.fingerprint;
+            }
+            insert_source_unit(result$.mut_ref(), SourceUnitCandidate(
+                index: index,
+                identity: identity
+            ));
         }
         index = index + 1;
     }
+    return result;
+}
+
+Void insert_source_unit(
+    list.ArrayList<SourceUnitCandidate>&! units,
+    SourceUnitCandidate candidate
+) {
+    units.add(candidate);
+    Int index! = units.len() - 1;
+    while (index > 0 && source_unit_less(candidate, units.get(index - 1))) {
+        units.set(index, units.get(index - 1));
+        index = index - 1;
+    }
+    units.set(index, candidate);
+}
+
+Bool source_unit_less(SourceUnitCandidate lhs, SourceUnitCandidate rhs) {
+    if (lhs.identity.high != rhs.identity.high) {
+        return lhs.identity.high < rhs.identity.high;
+    }
+    return lhs.identity.low < rhs.identity.low;
 }
 
 Void assign_source(
@@ -59,6 +117,7 @@ Void assign_source(
     Int source_unit_index,
     codegen_unit.CodegenUnitKey source_key,
     map.WyHashMap<Int, Int>&! visited,
+    map.WyHashMap<symbol.BackendSymbolKey, Bool>&! assigned,
     DirectReferenceCache&! references
 ) {
     list.ArrayList<jil.MonoItem> worklist! = list.ArrayList<jil.MonoItem>();
@@ -67,7 +126,14 @@ Void assign_source(
         units, source_unit_index, generation, visited, worklist$.mut_ref()
     );
     enqueue_global_references(
-        store, units, source_unit_index, source_key, visited, worklist$.mut_ref()
+        ctx,
+        store,
+        units,
+        source_unit_index,
+        source_key,
+        visited,
+        assigned,
+        worklist$.mut_ref()
     );
     while (!worklist.empty()) {
         jil.MonoItem function = worklist.pop();
@@ -78,6 +144,7 @@ Void assign_source(
             source_key,
             function,
             visited,
+            assigned,
             worklist$.mut_ref(),
             references
         );
@@ -114,11 +181,13 @@ Void enqueue_function(
 }
 
 Void enqueue_global_references(
+    context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     Int source_unit_index,
     codegen_unit.CodegenUnitKey source_key,
     map.WyHashMap<Int, Int>&! visited,
+    map.WyHashMap<symbol.BackendSymbolKey, Bool>&! assigned,
     list.ArrayList<jil.MonoItem>&! worklist
 ) {
     Int global_count = units.unit_at(source_unit_index).globals.len();
@@ -128,7 +197,7 @@ Void enqueue_global_references(
         jil.Global& global = store.program.globals.ref_at(global_id.to_index());
         if (global.initializer is .some(value)) {
             collect_static_value(
-                store, units, source_key, value, visited, worklist
+                ctx, store, units, source_key, value, visited, assigned, worklist
             );
         }
         index = index + 1;
@@ -136,18 +205,20 @@ Void enqueue_global_references(
 }
 
 Void collect_static_value(
+    context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     codegen_unit.CodegenUnitKey source_key,
     jil.StaticValue value,
     map.WyHashMap<Int, Int>&! visited,
+    map.WyHashMap<symbol.BackendSymbolKey, Bool>&! assigned,
     list.ArrayList<jil.MonoItem>&! worklist
 ) {
     if (value is .function(function_ref)) {
         guard function_resolver.for_ref(store, function_ref)
             is .some(function) else { return; }
         collect_codegen_function(
-            store, units, source_key, function, visited, worklist
+            ctx, store, units, source_key, function, visited, assigned, worklist
         );
         return;
     }
@@ -155,7 +226,14 @@ Void collect_static_value(
     Int index! = 0;
     while (index < fields.length) {
         collect_static_value(
-            store, units, source_key, fields[index].value, visited, worklist
+            ctx,
+            store,
+            units,
+            source_key,
+            fields[index].value,
+            visited,
+            assigned,
+            worklist
         );
         index = index + 1;
     }
@@ -168,6 +246,7 @@ Void collect_function_references(
     codegen_unit.CodegenUnitKey source_key,
     jil.MonoItem item,
     map.WyHashMap<Int, Int>&! visited,
+    map.WyHashMap<symbol.BackendSymbolKey, Bool>&! assigned,
     list.ArrayList<jil.MonoItem>&! worklist,
     DirectReferenceCache&! references
 ) {
@@ -179,11 +258,13 @@ Void collect_function_references(
     table.MultiTableCursor cursor! = references.references.first(identity);
     while (cursor.valid()) {
         collect_codegen_function(
+            ctx,
             store,
             units,
             source_key,
             references.references.get(cursor),
             visited,
+            assigned,
             worklist
         );
         cursor = references.references.next(cursor);
@@ -356,11 +437,13 @@ jil.MonoItem? codegen_function_for_reference(
 }
 
 Void collect_codegen_function(
+    context.CompilerContext& ctx,
     jil.Store& store,
     codegen_unit.CodegenUnitSet&! units,
     codegen_unit.CodegenUnitKey source_key,
     jil.MonoItem item,
     map.WyHashMap<Int, Int>&! visited,
+    map.WyHashMap<symbol.BackendSymbolKey, Bool>&! assigned,
     list.ArrayList<jil.MonoItem>&! worklist
 ) {
     if (!caller_owned(item, store)) { return; }
@@ -369,11 +452,26 @@ Void collect_codegen_function(
     if (visited.get(identity) is .some(value) && value$.get() == generation) {
         return;
     }
-    codegen_unit.CodegenUnitKey mono_key = codegen_unit.CodegenUnitKey(
-        .monomorph_unit, source_key.package_index, source_key.module_index
-    );
-    Int unit_index = units.add_function(mono_key, item);
-    units.mark_weak_monomorph_definitions(unit_index);
+    if (item is .generated_function(_)) {
+        codegen_unit.CodegenUnitKey caller_key = codegen_unit.CodegenUnitKey(
+            .monomorph_unit, source_key.package_index, source_key.module_index
+        );
+        Int caller_unit_index = units.add_function(caller_key, item);
+        units.mark_weak_monomorph_definitions(caller_unit_index);
+    } else {
+        jil.Function function = codegen_unit.codegen_function(ctx, store, item);
+        symbol.BackendSymbolKey key = symbol.function_symbol_key(ctx, function$.ref());
+        if (assigned.has(key)) {
+            enqueue_function(item, generation, visited, worklist);
+            return;
+        }
+        codegen_unit.CodegenUnitKey mono_key = codegen_unit.CodegenUnitKey(
+            .monomorph_unit, source_key.package_index, source_key.module_index
+        );
+        Int unit_index = units.add_function(mono_key, item);
+        units.mark_weak_monomorph_definitions(unit_index);
+        assigned.set(key, true);
+    }
     enqueue_function(item, generation, visited, worklist);
 }
 

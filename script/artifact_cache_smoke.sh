@@ -142,7 +142,7 @@ weak_symbols() {
   nm -g "$object" | awk '$2 == "W" || $2 == "V" { print $3 }'
 }
 
-require_shared_weak_monomorphs() {
+require_unique_weak_monomorphs() {
   local cache="$1"
   local symbols="$WORK_DIR/shared-generic-weak.symbols"
   : >"$symbols"
@@ -154,8 +154,8 @@ require_shared_weak_monomorphs() {
     after="$(wc -l <"$symbols" | tr -d ' ')"
     [ "$after" -gt "$before" ] || fail "monomorph object has no weak definition: $object"
   done < <(find "$cache" -type f -name '*.mono.o' | sort)
-  [ -n "$(sort "$symbols" | uniq -d | head -n 1)" ] \
-    || fail "shared generic callers did not emit duplicate weak definitions"
+  [ -z "$(sort "$symbols" | uniq -d | head -n 1)" ] \
+    || fail "a monomorph definition was emitted by multiple codegen units"
 }
 
 require_no_temporary_files() {
@@ -576,7 +576,7 @@ check_shared_generic_callers() {
   mono_count="$(find "$cache" -type f -name '*.mono.o' | wc -l | tr -d ' ')"
   [ "$mono_count" -ge 2 ] \
     || fail "shared generic callers produced only ${mono_count} monomorph objects"
-  require_shared_weak_monomorphs "$cache"
+  require_unique_weak_monomorphs "$cache"
   perl -0pi -e 's/Int hidden\(\) \{\n    1\n\}/Int hidden() {\n    2\n}/' \
     "$fixture/common.jiang"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/shared-generic-private.log" \
@@ -612,7 +612,7 @@ check_shared_generic_callers() {
     '}' >"$fixture/common.jiang"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/shared-generic-template.log" \
     "$WORK_DIR/shared-generic-template" "$fixture"
-  require_stat_ge "$WORK_DIR/shared-generic-template.log" artifact_object_stale 2
+  require_stat_ge "$WORK_DIR/shared-generic-template.log" artifact_object_stale 1
 
   printf '%s\n' \
     'import left = "./left.jiang";' \
