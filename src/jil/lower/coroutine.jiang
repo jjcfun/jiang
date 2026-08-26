@@ -459,7 +459,7 @@ public extend lower_context.Context {
         list.ArrayList<jil.MonoItem>&! candidates
     ) {
         guard candidate is .some(function_ref) else { return; }
-        if (!function_ref.coroutine_resume) { return; }
+        if (!(function_ref.variant is .coroutine_resume(_))) { return; }
         guard self.program.coroutine_source_item_for_ref(function_ref)
             is .some(item) else { return; }
         candidates.add(item);
@@ -532,8 +532,16 @@ public extend lower_context.Context {
         types.GenericArg[]& args,
         token.Span span
     ) {
-        if (self.program.serial_completion_function(source_def, args)
-            is .some(existing)) { return existing; }
+        Int identity = self.program.function_instance_identity(
+            self.storage, source_def, args
+        );
+        jil.GeneratedKey key = jil.GeneratedKey(
+            .serial_completion,
+            parent: jil.source_instance_mono_item(identity)
+        );
+        if (self.program.generated_function(key) is .some(existing)) {
+            return existing;
+        }
         jil.GeneratedFunctionOrigin origin = self.coroutine_variant_origin(
             source_def,
             "__serial_task_complete_",
@@ -541,10 +549,7 @@ public extend lower_context.Context {
             span
         );
         jil.FunctionId shim_id = self.program.reserve_generated_function(
-            self.storage, origin, args, span
-        );
-        self.program.set_serial_completion_function(
-            self.storage, source_def, args, shim_id
+            self.storage, key, origin, args, span
         );
         return shim_id;
     }
@@ -560,7 +565,7 @@ public extend lower_context.Context {
             token.Span span = self.program.source_function(instance.def_id).span;
             types.GenericArg[]& args = self.storage.generic_arg_array(instance.args);
             return self.reserve_coroutine_variant_for(
-                instance.def_id, args, span, prefix, kind
+                item, instance.def_id, args, span, prefix, kind
             );
         }
         guard item is .generated_function(function_id) else {
@@ -572,24 +577,30 @@ public extend lower_context.Context {
         token.Span span = function.span;
         types.GenericArg[]& args = self.storage.generic_arg_array(function.args);
         return self.reserve_coroutine_variant_for(
-            provenance, args, span, prefix, kind
+            item, provenance, args, span, prefix, kind
         );
     }
 
     jil.FunctionId reserve_coroutine_variant_for(
         Self&! self,
+        jil.MonoItem parent,
         qid.DefId provenance,
         types.GenericArg[]& args,
         token.Span span,
         UInt8[]& prefix,
         jil.GeneratedFunctionKind kind
     ) {
+        jil.GeneratedKey key = jil.GeneratedKey(kind, parent: parent);
+        if (self.program.generated_function(key) is .some(existing)) {
+            return existing;
+        }
         jil.GeneratedFunctionOrigin origin = self.coroutine_variant_origin(
             provenance, prefix, kind, span
         );
-        return self.program.reserve_generated_function(
-            self.storage, origin, args, span
+        jil.FunctionId function_id = self.program.reserve_generated_function(
+            self.storage, key, origin, args, span
         );
+        return function_id;
     }
 
     public jil.GeneratedFunctionOrigin coroutine_variant_origin(
@@ -677,7 +688,9 @@ public extend lower_context.Context {
             return;
         }
         self.add_async_callable_abi_functions(item, function, frame$.ref());
-        jil.FunctionRef? env_drop = self.async_lambda_env_drop_function(function, function.span);
+        jil.FunctionRef? env_drop = self.async_lambda_env_drop_function(
+            function, frame$.ref(), function.span
+        );
         if (function.is_external) {
             coroutine_frame_rewrite.add_completion_function(
                 self.storage, self.program, item, function, frame$.ref(), env_drop
@@ -781,7 +794,6 @@ public extend lower_context.Context {
         coroutine_frame_rewrite.add_serial_completion_function(
             self.storage,
             self.program,
-            item,
             function,
             frame,
             env_drop,
@@ -940,15 +952,17 @@ public extend lower_context.Context {
     public jil.FunctionRef? async_lambda_env_drop_function(
         self,
         jil.Function function,
+        jil.CoroutineFrameLayout& frame,
         token.Span span
     ) {
         qid.DefId function_def = jil.function_provenance_def(function.origin);
         if (self.async_lambda_function_consumes_env(function_def)) { return null; }
-        guard self.program.existing_function_instance_identity(
-            function_def,
-            function.args
-        ) is .some(key) else { return null; }
-        guard self.async_lambda_env_drop_shims.get(key) is .some(shim_id) else { return null; }
+        if (frame.capture_env_field_index < 0) { return null; }
+        qid.TypeId env_type = frame.fields[frame.capture_env_field_index].type_id;
+        guard self.program.generated_function(jil.GeneratedKey(
+            .closure_env_drop_stack,
+            identity_type: env_type
+        )) is .some(shim_id) else { return null; }
         list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
         params.add(self.store.types.opaque_pointer_type(span));
         qid.TypeId function_type = self.store.types.function_type(
@@ -957,10 +971,8 @@ public extend lower_context.Context {
             span
         );
         return jil.FunctionRef (
-            target: .generated(self.program.generated_function_target(shim_id$.get())),
+            target: .generated(self.program.generated_function_target(shim_id)),
             args: self.storage.empty_generic_args(),
-            coroutine_resume: false,
-            coroutine_completion: false,
             type_id: function_type
         );
     }
@@ -980,18 +992,18 @@ public extend lower_context.Context {
     ) {
         guard self.program.existing_function_instance_identity(
             jil.function_provenance_def(source.origin), source.args
-        ) is .some(key) else { return false; }
+        ) is .some(identity) else { return false; }
+        jil.MonoItem parent = jil.source_instance_mono_item(identity);
         Bool finished! = false;
-        if (self.async_callable_start_shims.get(key) is .some(start_id)
-            && self.async_callable_completion_shims.get(key) is .some(completion_id)) {
-            jil.FunctionId start = start_id$.get();
-            jil.FunctionId completion = completion_id$.get();
+        if (self.program.generated_function(jil.GeneratedKey(
+            .async_callable_start, parent: parent
+        )) is .some(start)
+            && self.program.generated_function(jil.GeneratedKey(
+                .async_callable_completion, parent: parent
+            )) is .some(completion)) {
             if (self.program.generated_function_is_pending(start)) {
                 self.add_async_callable_start_function(
                     source, layout, start, completion
-                );
-                self.program.copy_mono_item_shared_codegen_status(
-                    source_item, start
                 );
                 finished = true;
             }
@@ -999,19 +1011,14 @@ public extend lower_context.Context {
                 self.add_async_callable_completion_function(
                     source, layout, completion
                 );
-                self.program.copy_mono_item_shared_codegen_status(
-                    source_item, completion
-                );
                 finished = true;
             }
         }
-        if (self.async_callable_sync_shims.get(key) is .some(sync_id)) {
-            jil.FunctionId sync = sync_id$.get();
+        if (self.program.generated_function(jil.GeneratedKey(
+            .async_callable_sync, parent: parent
+        )) is .some(sync)) {
             if (self.program.generated_function_is_pending(sync)) {
                 self.add_async_callable_sync_function(source, layout, sync);
-                self.program.copy_mono_item_shared_codegen_status(
-                    source_item, sync
-                );
                 finished = true;
             }
         }
@@ -1468,8 +1475,6 @@ public extend lower_context.Context {
             jil.FunctionRef (
                 target: .generated(self.program.generated_function_target(completion_id)),
                 args: self.storage.generic_arg_array(completion.args),
-                coroutine_resume: false,
-                coroutine_completion: false,
                 type_id: layout.fields[layout.continuation_function_field_index].type_id
             ),
             span
@@ -1492,8 +1497,7 @@ public extend lower_context.Context {
         jil.FunctionRef resume = jil.FunctionRef (
             target: .source(jil.function_provenance_def(source.origin)),
             args: self.storage.generic_arg_array(source.args),
-            coroutine_resume: true,
-            coroutine_completion: false,
+            variant: .coroutine_resume(.standard),
             type_id: layout.task_abi.resume_function_type_id
         );
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);

@@ -45,6 +45,7 @@ public struct DropElaborationState: Movable {
 @region(a, b, c)
 public struct Program: Movable {
     public Bool ok!;
+    Bool frozen!;
     public Int query_identity!;
     @life((a, b))
     public list.ArrayList<Function> functions!;
@@ -67,11 +68,6 @@ public struct Program: Movable {
 
     // source instance 只保存 InstanceKey；普通源码 body 始终从
     // source_functions 中的唯一 generic JIL 读取。
-    map.WyHashMap<Int, FunctionId> async_start_for_instance!;
-    map.WyHashMap<Int, FunctionId> async_sync_for_instance!;
-    map.WyHashMap<Int, MonoItem> coroutine_resume_for_instance!;
-    map.WyHashMap<Int, FunctionId> coroutine_completion_for_instance!;
-    map.WyHashMap<Int, FunctionId> serial_completion_for_instance!;
     @life((), b)
     map.WyHashMap<Int, CoroutineFrameLayout> coroutine_frame_for_instance!;
     map.WyHashMap<Int, CoroutineInstanceProperties>
@@ -88,11 +84,11 @@ public struct Program: Movable {
     map.WyHashMap<TraitVTableKey, GlobalId> trait_vtable_globals!;
     map.WyHashMap<Int, GlobalId> closure_vtable_globals!;
     map.WyHashMap<Int, Bool> borrow_check_exempt_functions!;
-    map.WyHashMap<Int, Bool> shared_codegen_functions!;
-    map.WyHashMap<qid.TypeId, FunctionId> drop_glue_for_type!;
+    map.WyHashMap<GeneratedKey, FunctionId> generated_function_ids!;
 
     public init(self, Bool ok) {
         self.ok = ok;
+        self.frozen = false;
         self.query_identity = -1;
         self.functions = list.ArrayList<Function>();
         self.source_functions = list.ArrayList<Function>();
@@ -108,11 +104,6 @@ public struct Program: Movable {
         self.global_for_def = map.WyHashMap<qid.DefId, GlobalId>();
         self.domain_executor_descriptors =
             map.WyHashMap<qid.DefId, DomainExecutorDescriptor>();
-        self.async_start_for_instance = map.WyHashMap<Int, FunctionId>();
-        self.async_sync_for_instance = map.WyHashMap<Int, FunctionId>();
-        self.coroutine_resume_for_instance = map.WyHashMap<Int, MonoItem>();
-        self.coroutine_completion_for_instance = map.WyHashMap<Int, FunctionId>();
-        self.serial_completion_for_instance = map.WyHashMap<Int, FunctionId>();
         self.coroutine_frame_for_instance =
             map.WyHashMap<Int, CoroutineFrameLayout>();
         self.coroutine_properties_for_instance =
@@ -127,8 +118,7 @@ public struct Program: Movable {
         self.trait_vtable_globals = map.WyHashMap<TraitVTableKey, GlobalId>();
         self.closure_vtable_globals = map.WyHashMap<Int, GlobalId>();
         self.borrow_check_exempt_functions = map.WyHashMap<Int, Bool>();
-        self.shared_codegen_functions = map.WyHashMap<Int, Bool>();
-        self.drop_glue_for_type = map.WyHashMap<qid.TypeId, FunctionId>();
+        self.generated_function_ids = map.WyHashMap<GeneratedKey, FunctionId>();
     }
 }
 
@@ -145,6 +135,34 @@ public struct Store: Movable {
 }
 
 public extend Program {
+    public Void freeze(Self&! self) {
+        assert(!self.has_pending_generated_functions());
+        self.frozen = true;
+    }
+
+    public Bool is_frozen(self) {
+        return self.frozen;
+    }
+
+    public FunctionId? generated_function(self, GeneratedKey key) {
+        guard self.generated_function_ids.get(key) is .some(value) else {
+            return null;
+        }
+        return value$.get();
+    }
+
+    Void bind_generated_function(
+        Self&! self,
+        GeneratedKey key,
+        FunctionId function_id
+    ) {
+        if (self.generated_function_ids.get(key) is .some(existing)) {
+            assert(existing$.get() == function_id);
+            return;
+        }
+        self.generated_function_ids.set(key, function_id);
+    }
+
     public Bool has_errors(self) {
         return !self.ok;
     }
@@ -270,36 +288,35 @@ public extend Program {
         ));
     }
 
-    public FunctionId add_generated_function(Self&! self, Function function) {
+    public FunctionId add_generated_function(
+        Self&! self,
+        GeneratedKey key,
+        Function function
+    ) {
+        assert(self.generated_function(key) == null, "generated function already exists");
         FunctionId id = function.id;
         self.functions.add(function);
         self.add_mono_item(generated_function_mono_item(id));
+        self.bind_generated_function(key, id);
         return id;
     }
 
     public FunctionId? drop_glue(self, qid.TypeId type_id) {
-        if (self.drop_glue_for_type.get(type_id) is .some(value)) {
-            FunctionId function_id = value$.get();
-            return function_id;
-        }
-        return null;
-    }
-
-    public Void bind_drop_glue(
-        Self&! self,
-        qid.TypeId type_id,
-        FunctionId function_id
-    ) {
-        self.drop_glue_for_type.set(type_id, function_id);
+        return self.generated_function(GeneratedKey(
+            .drop_glue,
+            identity_type: type_id
+        ));
     }
 
     public FunctionId reserve_generated_function(
         Self&! self,
         Storage& storage,
+        GeneratedKey key,
         GeneratedFunctionOrigin origin,
         types.GenericArg[]& args,
         token.Span span
     ) {
+        assert(self.generated_function(key) == null, "generated function already exists");
         FunctionId id = FunctionId.from_index(self.functions.len());
         types.GenericArg[]& stored_args = storage.generic_arg_array(args);
         LocalDecl[]& locals = storage.empty_locals();
@@ -332,6 +349,7 @@ public extend Program {
         self.pending_generated_function_count =
             self.pending_generated_function_count + 1;
         self.add_mono_item(generated_function_mono_item(id));
+        self.bind_generated_function(key, id);
         return id;
     }
 
@@ -381,32 +399,32 @@ public extend Program {
             return generated_function_mono_item(generated.id);
         }
         guard value.target is .source(function_def) else { return null; }
-        if (value.coroutine_start) {
+        if (value.variant is .coroutine_start) {
             guard self.async_start_function(function_def, value.args)
                 is .some(function_id) else { return null; }
             return generated_function_mono_item(function_id);
         }
-        if (value.coroutine_sync) {
+        if (value.variant is .coroutine_sync) {
             guard self.async_sync_function(function_def, value.args)
                 is .some(function_id) else { return null; }
             return generated_function_mono_item(function_id);
         }
-        if (value.coroutine_resume) {
+        if (value.variant is .coroutine_resume(mode)) {
             guard self.coroutine_resume_item(function_def, value.args)
                 is .some(item) else { return null; }
             if (item is .source_resume_instance(resume)) {
                 return source_resume_mono_item(
-                    resume.identity, value.coroutine_resume_mode
+                    resume.identity, mode
                 );
             }
             return item;
         }
-        if (value.coroutine_completion) {
-            if (value.coroutine_serial_completion) {
-                guard self.serial_completion_function(function_def, value.args)
-                    is .some(function_id) else { return null; }
-                return generated_function_mono_item(function_id);
-            }
+        if (value.variant is .coroutine_serial_completion) {
+            guard self.serial_completion_function(function_def, value.args)
+                is .some(function_id) else { return null; }
+            return generated_function_mono_item(function_id);
+        }
+        if (value.variant is .coroutine_completion) {
             guard self.coroutine_completion_function(function_def, value.args)
                 is .some(function_id) else { return null; }
             return generated_function_mono_item(function_id);
@@ -428,19 +446,6 @@ public extend Program {
         return item;
     }
 
-    public Void set_async_start_function(
-        Self&! self,
-        Storage& storage,
-        qid.DefId function_def,
-        types.GenericArg[]& args,
-        FunctionId function_id
-    ) {
-        Int identity = self.function_instance_identity(
-            storage, function_def, args
-        );
-        self.async_start_for_instance.set(identity, function_id);
-    }
-
     public FunctionId? async_start_function(
         self,
         qid.DefId function_def,
@@ -448,23 +453,10 @@ public extend Program {
     ) {
         guard self.existing_function_instance_identity(function_def, args)
             is .some(identity) else { return null; }
-        guard self.async_start_for_instance.get(identity) is .some(function_id) else {
-            return null;
-        }
-        return function_id$.get();
-    }
-
-    public Void set_async_sync_function(
-        Self&! self,
-        Storage& storage,
-        qid.DefId function_def,
-        types.GenericArg[]& args,
-        FunctionId function_id
-    ) {
-        Int identity = self.function_instance_identity(
-            storage, function_def, args
-        );
-        self.async_sync_for_instance.set(identity, function_id);
+        return self.generated_function(GeneratedKey(
+            .async_callable_start,
+            parent: source_instance_mono_item(identity)
+        ));
     }
 
     public FunctionId? async_sync_function(
@@ -474,20 +466,10 @@ public extend Program {
     ) {
         guard self.existing_function_instance_identity(function_def, args)
             is .some(identity) else { return null; }
-        guard self.async_sync_for_instance.get(identity) is .some(function_id) else {
-            return null;
-        }
-        return function_id$.get();
-    }
-
-    public Void set_coroutine_resume_function(
-        Self&! self,
-        MonoItem source,
-        MonoItem target
-    ) {
-        if (source is .source_instance(identity)) {
-            self.coroutine_resume_for_instance.set(identity, target);
-        }
+        return self.generated_function(GeneratedKey(
+            .async_callable_sync,
+            parent: source_instance_mono_item(identity)
+        ));
     }
 
     public MonoItem? coroutine_resume_item(
@@ -497,19 +479,8 @@ public extend Program {
     ) {
         guard self.existing_function_instance_identity(function_def, args)
             is .some(identity) else { return null; }
-        guard self.coroutine_resume_for_instance.get(identity)
-            is .some(item) else { return null; }
-        return item$.get();
-    }
-
-    public Void set_coroutine_completion_function(
-        Self&! self,
-        MonoItem source,
-        FunctionId function_id
-    ) {
-        if (source is .source_instance(identity)) {
-            self.coroutine_completion_for_instance.set(identity, function_id);
-        }
+        if (!self.coroutine_frame_for_instance.has(identity)) { return null; }
+        return source_resume_instance_mono_item(identity);
     }
 
     public FunctionId? coroutine_completion_function(
@@ -519,22 +490,10 @@ public extend Program {
     ) {
         guard self.existing_function_instance_identity(function_def, args)
             is .some(identity) else { return null; }
-        guard self.coroutine_completion_for_instance.get(identity)
-            is .some(function_id) else { return null; }
-        return function_id$.get();
-    }
-
-    public Void set_serial_completion_function(
-        Self&! self,
-        Storage& storage,
-        qid.DefId function_def,
-        types.GenericArg[]& args,
-        FunctionId function_id
-    ) {
-        Int identity = self.function_instance_identity(
-            storage, function_def, args
-        );
-        self.serial_completion_for_instance.set(identity, function_id);
+        return self.generated_function(GeneratedKey(
+            .coroutine_completion,
+            parent: source_instance_mono_item(identity)
+        ));
     }
 
     public FunctionId? serial_completion_function(
@@ -544,9 +503,10 @@ public extend Program {
     ) {
         guard self.existing_function_instance_identity(function_def, args)
             is .some(identity) else { return null; }
-        guard self.serial_completion_for_instance.get(identity)
-            is .some(function_id) else { return null; }
-        return function_id$.get();
+        return self.generated_function(GeneratedKey(
+            .serial_completion,
+            parent: source_instance_mono_item(identity)
+        ));
     }
 
     public Void set_instance_coroutine_frame(
@@ -654,35 +614,6 @@ public extend Program {
             id: id,
             provenance_def: origin.provenance_def
         );
-    }
-
-    public Void mark_shared_codegen_function(Self&! self, FunctionId function_id) {
-        self.shared_codegen_functions.set(function_id.to_index(), true);
-    }
-
-    public Void copy_mono_item_shared_codegen_status(
-        Self&! self,
-        MonoItem source,
-        FunctionId target
-    ) {
-        if (self.mono_item_is_shared_codegen(source)) {
-            self.mark_shared_codegen_function(target);
-        }
-    }
-
-    public Bool function_is_shared_codegen(self, FunctionId function_id) {
-        return self.shared_codegen_functions.has(function_id.to_index());
-    }
-
-    public Bool mono_item_is_shared_codegen(self, MonoItem item) {
-        if (item is .source_instance(identity)) {
-            return self.function_instance_at(identity).args.length > 0;
-        }
-        if (item is .source_resume_instance(resume)) {
-            return self.function_instance_at(resume.identity).args.length > 0;
-        }
-        guard item is .generated_function(function_id) else { return false; }
-        return self.function_is_shared_codegen(function_id);
     }
 
     public Void mark_borrow_check_exempt(Self&! self, FunctionId function_id) {
@@ -910,8 +841,7 @@ public extend Storage {
         return FunctionRef(
             target: .source(target_def),
             args: self.generic_arg_array(args),
-            coroutine_resume: resume,
-            coroutine_completion: !resume,
+            variant: coroutine_function_variant(resume),
             type_id: function_type
         );
     }
@@ -926,9 +856,7 @@ public extend Storage {
         return FunctionRef(
             target: .source(target_def),
             args: self.generic_arg_array(args),
-            coroutine_resume: false,
-            coroutine_completion: true,
-            coroutine_serial_completion: true,
+            variant: .coroutine_serial_completion(),
             type_id: function_type
         );
     }
