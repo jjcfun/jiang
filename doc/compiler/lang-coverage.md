@@ -28,14 +28,14 @@
 | tuple / Void type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
-| payload enum | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
+| payload enum | `nominal`, `control_flow`, `lifetime`, `ownership`, `package` | covered | 构造、模式、穷尽性、lifetime、drop、artifact 和跨 package |
 | trait / extend | `generic` | partial | type function requirement、move receiver trait object deferred |
 | block / tail expr | `function`, `control_flow` | covered | tail expr 与 defer/drop 组合 |
 | var / destructure stmt | `function`, `aggregate`, `control_flow` | covered | 递归 Tuple 与 ref binding 已覆盖 |
 | assignment stmt | `control_flow`, `type` | covered | compound assignment 与 overload deferred |
 | call stmt | `function` | covered | implicit call statement 的更多反例 |
 | extern declaration | `import` | covered | `@link_name` 不支持；ABI 非普通名字通过 extern escaped identifier |
-| if / switch | `control_flow` | covered | switch exhaustiveness deferred |
+| if / switch | `control_flow` | covered | enum/payload enum 穷尽性正反例已覆盖 |
 | guard | `control_flow` | covered | guard pattern deferred |
 | while / for | `control_flow` | partial | nested break/continue cleanup run 用例 |
 | try / catch / throw | `error_handling` | covered | nested catch 与 generic error type |

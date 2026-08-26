@@ -10,7 +10,7 @@ Database 是批处理编译器的同步求值机制，不是新的事实存储�
 - 每种查询保留自己的 key/value 类型和环语义；
 - 不为没有真实复用价值的线性阶段包装 query。
 
-0.5.2 不在 Database 中引入 task、job、single-flight 或并行调度。并行仍由 pipeline 外层负责。
+当前 Database 不引入 task、job、single-flight 或并行调度。并行仍由 pipeline 外层负责。
 
 ## 1. 所有权边界
 

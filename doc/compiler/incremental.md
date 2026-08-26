@@ -5,7 +5,7 @@
 
 ## 持久边界
 
-0.5.2 只持久化三类内容：
+当前只持久化三类内容：
 
 ```text
 cache/<context-key>/
@@ -21,7 +21,7 @@ cache/<context-key>/
 - release 使用 whole-package codegen，不保存细粒度 object 记录。
 
 不存在 `.jd`、`.jai`、每 object sidecar、逐泛型实例 object 或 object closure。源码改名会形成新的
-stable source identity；旧文件由显式 cache clean 清理，0.5.2 不实现自动 GC 或缓存数据库。
+stable source identity；旧文件由显式 cache clean 清理，当前不实现自动 GC 或缓存数据库。
 
 ## Context 与稳定身份
 

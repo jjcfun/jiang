@@ -24,7 +24,22 @@
 - [compiler/](compiler/)：各阶段的详细设计，包括 AST、resolve、Semantic Model、type check、JIL、
   borrow check、backend、incremental 和测试覆盖。
 
-## 0.5.2 自举链
+## 0.5.3 自举链
+
+0.5.3 release 使用以下可复现 transition chain：
+
+```text
+0.5.2 stable
+  -> bootstrap/0.5.3 next
+  -> release/0.5.3 next
+  -> release/0.5.3 stable
+```
+
+0.5.3 把普通 tagged union 迁移为 payload enum。bootstrap 只生成 next，不生成 stable；
+release next 必须直接由该 bootstrap next 编译。完整命令见
+[编译器开发流程](develop.md)。
+
+## 0.5.2 自举链（历史）
 
 0.5.2 release 使用以下可复现 transition chain：
 
@@ -40,7 +55,7 @@
 只负责生成下一阶段，不是 release。完整命令与严格验证边界见
 [编译器开发流程](develop.md)。
 
-## 0.5.0 自举链
+## 0.5.0 自举链（历史）
 
 0.5.0 release 使用以下可复现 transition chain：
 
@@ -53,5 +68,6 @@
 ```
 
 0.5.0 release 源码采用新的 Domain/Executor ABI，不能由 0.4.9 stable 直接编译。
-历史复现链和详细命令见 [编译器开发流程](develop.md)；发布后的常规开发使用 0.5.0 stable。
+历史复现链和详细命令见 [编译器开发流程](develop.md)；该版本发布后的常规开发
+使用 0.5.0 stable。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

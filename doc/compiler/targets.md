@@ -1,8 +1,8 @@
 # Targets
 
-0.5.1 将 Linux x86_64 hosted/libc 提升为正式 release host。Linux native compiler
+Linux x86_64 hosted/libc 是正式 release host。Linux native compiler
 使用系统 libc 和本机 LLVM/linker toolchain 完成自举与 executable 链接；macOS -> Linux
-hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属于 0.5.1 验收范围。
+hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属于当前 release。
 其他 target 先固定 target model、LLVM/object 输出和 executable 诊断边界。
 
 ## Supported Matrix
@@ -27,7 +27,7 @@ Linux release archive 内的 `ABI.txt` 从最终 `jiangc` ELF 的 GNU symbol ver
 计算最低 glibc 版本，并记录 program interpreter、`DT_NEEDED` 和 SHA-256。这个产物审计结果才是
 release 的最低 glibc 依据；Ubuntu runner 版本只定义验证环境，不自动成为兼容性声明。
 
-`src/system/os/provider.jiang` 是系统能力抽象入口。0.5.1 使用
+`src/system/os/provider.jiang` 是系统能力抽象入口。当前使用
 `src/system/os/linux.jiang` hosted provider；`src/system/os/linux/no_libc.jiang` 是独立的
 实验路线，不参与本版本 hosted 验收。
 
@@ -55,7 +55,7 @@ Linux hosted 文件读写必须处理 partial result，并在 `EINTR` 后重试�
 
 Linux hosted process 首版支持 stdout/stderr inherit、stdout pipe 和 stderr discard。glibc
 `posix_spawn_file_actions_t` 使用经 ABI probe 验证的 opaque storage；stderr pipe 需要双 pipe
-并发 drain，不在 0.5.1 首批 process capability 范围内。
+并发 drain，当前尚未开放。
 
 Linux hosted runtime 在启动时记录 main pthread，main-domain job 进入可由启动线程主动 pump
 的 FIFO queue。启动线程等待 runtime group 或 task word 时必须同时 pump，避免 main-domain

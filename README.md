@@ -67,46 +67,51 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.2 release 源码使用 `bootstrap/0.5.2-2` 产出的过渡编译器作为 bootstrap 输入。默认路径：
+当前 0.5.3 release 把普通 tagged union 迁移为 payload enum，0.5.2 stable 不能直接解析
+release 编译器源码。冷启动因此使用一个最小 `bootstrap/0.5.3` 过渡阶段：
 
 ```text
-../bootstrap-0.5.2-2/build/bin/jiangc.next
+0.5.2 stable
+  -> bootstrap/0.5.3 next
+  -> release/0.5.3 next
+  -> release/0.5.3 stable
 ```
 
-先构建 `bootstrap/0.5.2-2` 后可直接运行：
+先在 bootstrap worktree 中用已安装的 0.5.2 stable 只生成 next：
 
 ```bash
+cd ../bootstrap-0.5.3
 bash ./script/build_next.sh
 ```
 
-该脚本会依次构建：
+再在 release worktree 中用该 next 构建 release next：
 
-```text
-../bootstrap-0.5.2-2/build/bin/jiangc.next -> build/bin/jiangc.next
+```bash
+cd ../jiang
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+bash ./script/build_next.sh
 ```
 
-并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
+默认产出 `build/bin/jiangc.next` 并运行完整验证。需要进一步生成 release stable 时，使用：
 
-```text
-build/bin/jiangc.next
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_DEPTH=stable VERIFY=full \
+bash ./script/build_next.sh
 ```
 
 构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
-`build/bin/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。release 阶段需要完整
-两跳自举时，使用：
+`build/bin/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。
 
-```bash
-BOOTSTRAP_CHECK_MODE=audit BOOTSTRAP_DEPTH=stable VERIFY=full \
-  bash ./script/build_next.sh
-```
+破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。其中记录 0.5.3 的完整
+冷启动链、各阶段产物边界和历史版本复现流程。
 
-破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。Jiang 0.5.2 使用两阶段过渡
-编译器；完整链路和验证边界也在该文档中说明。
-
-Jiang 0.5.1 的正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
+正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
 glibc、pthread、dl 和 C++ runtime；安装包内的 `ABI.txt` 根据最终 ELF symbol version requirements
 记录最低 glibc 版本，不把 CI runner 版本直接当作兼容性承诺。Linux aarch64 暂不提供正式安装包。
 源码中另有 Linux aarch64、Wasm `wasm32-unknown-unknown`、WASI `wasm32-wasi` 和 Windows MSVC
@@ -207,7 +212,8 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
-- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)
+- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)（当前 release 分支）
+- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)（上一已发布版本）
 - [架构文档](doc/architecture.md)
 - [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)

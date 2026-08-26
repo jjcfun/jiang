@@ -33,7 +33,7 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 ## Domain 能力
 
 语言核心只认识抽象 capability，并提供 `main_domain`、`global_domain` 两个标准 binding；
-UI event loop、专用线程池等具体 Domain 仍由库和应用定义。0.5.0 的 `Domain` trait 同时声明
+UI event loop、专用线程池等具体 Domain 仍由库和应用定义。`Domain` trait 同时声明
 语言级执行语义和运行时 Executor 类型：
 
 ```jiang

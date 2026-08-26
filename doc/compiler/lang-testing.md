@@ -41,10 +41,10 @@ test/lang/<feature>/
 - `aggregate`：tuple、array、slice、struct 默认构造、enum constructor。
 - `function`：tail expr、call stmt、overload、default params、named args、constructor args。
 - `control_flow`：if/switch/guard/while/for/range/defer/break/continue/Never 合并。
-- `nominal`：struct/enum/init/deinit/type function/instance method/member namespace。
+- `nominal`：struct/enum、payload case、init/deinit、type function/instance method/member namespace。
 - `generic`：generic type/function、where bound、trait conformance、associated type、monomorph。
 - `ownership`：Copyable、默认 move、显式 move、`!Movable`、borrow reference、drop/defer cleanup。
-- `lifetime`：`@life` 语法、返回引用、字段引用、逃逸失败。
+- `lifetime`：`@life` 语法、返回引用、字段/payload/callable shape、逃逸失败。
 - `error_handling`：`Result<T, E>`、throw、try/catch、catch binding、未处理错误。
 - `import`：file import、public import re-export、visibility。
 - `package`：manifest dependency、package public surface、跨 package 访问、dependency cycle。

@@ -70,8 +70,8 @@ arguments，所以 `Box<Int>` 和 `Box<Bool>` 会得到不同 layout。
 - `T&` / `T^` / `T*` / `T*!` layout：pointer-sized scalar；raw pointer 不携带 length 或 sentinel
 - `T[]` / `T[:0]` 是 unsized array type，没有独立 by-value layout；`T[]&` / `T[:0]&` borrowed view layout 是 pointer + pointer-sized unsigned length，sentinel 不改变物理 layout，只改变类型语义
 - `T[]^` / `T[:0]^` owned unsized array handle 当前也使用 pointer + pointer-sized unsigned length，但它表达 buffer 所有权，drop 时需要析构元素并释放 allocation
-- enum layout：当前 enum 无 associated value，使用 enum underlying integer scalar
-- payload enum layout：使用 target int tag + max payload slot
+- 无 payload enum layout：使用 enum underlying integer scalar
+- payload enum layout：使用同一 underlying integer type 作为 tag，并为最大 payload 保留共享 storage
 - aggregate alignment policy
 
 不同 target 的 `LayoutKey` 查询结果不能复用。

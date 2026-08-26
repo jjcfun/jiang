@@ -422,6 +422,7 @@ struct_member_body
             <- deinit_decl
              / init_decl
              / assoc_type_impl
+             / nominal_decl
              / method_decl
              / field_decl
 
@@ -462,13 +463,15 @@ enum_payload
 enum_payload_field
             <- type name?
 
-enum_member <- member_modifier* method_decl
+enum_member <- member_modifier* (nominal_decl / method_decl)
 ```
 
 `enum [T]` 的 `T` 必须是具体整数类型；未写 `T` 时默认使用 `Int32`。
 旧的 `enum(T)` options 形式不再保留。
 未显式指定值的 enum case 从 `0` 开始递增；显式值目前只接受整数 literal，包括负整数字面量。
 带 payload 的 enum 是 tagged sum type，并保留整数底层类型、隐式递增值和显式 discriminant。
+enum 值通过目标整数类型构造表达式转换，例如 `Int(Mode.read)`。无 payload 整数 enum
+保留 `Type.init?(integer)`，并在整数不匹配任何 case 时返回 `.none`。
 `case(T)` 声明匿名 payload，`case(T name, U other)` 声明带契约名的复合 payload。
 variant annotation 可以使用 `@life` 把 payload 槽绑定到 nominal region。
 variant 必须写在成员之前；存在 method 或嵌套 nominal 成员时，用 `;` 分隔 variant 与成员。

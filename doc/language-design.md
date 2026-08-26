@@ -3,10 +3,10 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-Jiang 0.5.1 以 Jiang 0.5.0 stable 为自举基线，在既有泛型/trait、JIL/backend、所有权、Task 与
-Domain/Executor 基础上，聚焦 Linux hosted/libc、增量与并行编译。compiler service 保留为
-后续工具链的基础，但 LSP 延后到后续版本；本版本不扩张语言语法表面，
-也不包含 Linux no-libc。
+当前 release/0.5.3 在既有泛型/trait、JIL/backend、所有权、Task 与 Domain/Executor
+基础上，用 payload enum 统一表示普通代数数据类型，并保持既有 layout、lifetime、
+pattern 和 drop 规则。compiler service 保留为后续工具链的基础，LSP 与 Linux no-libc
+仍属于后续版本。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
@@ -878,6 +878,9 @@ T add<T>(T left, T right);
 - `Fn<Ret, Args...>^` 是 owned heap closure。`new { [captures] args => body }` 会直接构造
   heap closure object；移动 `Fn^` 只移动 owner handle，drop 时通过 closure vtable
   销毁 environment。
+- owned closure 只拥有 closure object 和 by-value capture；borrow capture 仍然受来源 lifetime
+  约束。所有 capture loans 合并到一个 callable environment lifetime slot，因此多个 borrow
+  capture 使 `Fn^` 受其中最短来源限制。
 - callable 类型可写成 `Fn<R result, A value, B fallback>` 或对应的 `RawFn` 形式。result 和参数
   可以按需命名，已提供的名称必须唯一；这些名称只为 lifetime contract、文档和诊断提供稳定引用，不参与 TypeId、
   ABI、重载或调用参数匹配。
@@ -1082,7 +1085,7 @@ contract。Domain 的 `.serial`
 同步临界区使用 `Mutex<T>.with_lock<R>(Fn<R, T&!>)`。Mutex 将 lock 与受保护值绑定，只在同步
 callback 期间提供 `T&!`，callback 返回后自动解锁。公开 API 不提供 guard，锁的作用域只能由
 `with_lock` callback 表达；callback 返回值受生命周期约束，不能让受保护值的引用活过锁。
-`Mutex<T>` 是 `!Movable`，当前不提供 poison 状态；0.5.1 也不提供公共 Channel/RwLock API。
+`Mutex<T>` 是 `!Movable`，当前不提供 poison 状态或公共 Channel/RwLock API。
 
 ## Struct 与 Enum
 
@@ -1097,7 +1100,7 @@ enum variant 的外部可见性由外层类型是否 public 控制。
 
 当前命名空间规则：
 
-- module/package/import alias 使用 namespace namespace。
+- module/package/import alias 使用 namespace domain。
 - 顶层类型、trait 和 associated type 使用 type namespace。
 - 函数、全局变量、builtin value 和普通方法使用 value namespace。
 - 字段和 enum case 使用 member namespace。
@@ -1116,13 +1119,14 @@ enum Value<T> {
     some(T) = 2,
     pair(T value, Bool enabled),
 }
-
 ```
 
 enum 使用 variant-first 语法，无 payload variant 不需要写 `Void`。case 必须位于成员之前；
 存在 method 或嵌套 nominal 成员时，用 `;` 分隔。
 payload variant 保留整数 enum 的 underlying type、隐式递增值和显式 discriminant；variant 上的
 `@life` 等语义注解使用统一的 lowering 和检查管线。
+值到整数的转换使用目标整数类型构造表达式；无 payload 整数 enum 保留
+`Type.init?(integer)` 查找已声明 case 的能力。
 
 ## Trait 和 Extend
 

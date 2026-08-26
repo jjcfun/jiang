@@ -649,7 +649,9 @@ callable contract 只能引用 result/参数的声明名；需要参与 contract
 参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明
 `callback.result: callback.value`。这条规则不同于普通函数的 signature elision。
 
-- `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
+- `T^` 是 owning pointer，拥有堆上 allocation 和其中的 `T`，并参与自动析构。
+  如果 `T` 内含 non-owning reference，`T^` 仍保留这些 reference 的 lifetime 要求，
+  不会延长它们的来源生命周期。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - runtime drop 由 ownership、字段和自定义 `deinit` 决定；`!Movable` 值仍会在原 place 正常析构。
@@ -1007,6 +1009,8 @@ lambda 规则：
 - `=>` 后可以写表达式或多条 block statement
 - `RawFn` 不携带 environment，因此只接受非捕获 lambda
 - `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
+- `Fn^` 拥有 closure object 和 by-value capture；borrow capture 仍是借用。所有 borrow capture
+  共同形成一个 callable environment lifetime 位置，闭包不能比其中最短的 borrow 存活更久
 - `FnOnce` 使用与 `Fn` 相同的表示，但调用会消费 callable；按值 capture 可以在闭包体中 move
 - `FnOnce&` 不能调用，已调用的 `FnOnce` 不能再次使用；async `FnOnce` 在启动时消费 callable
 - 可选 capture list 写在参数之前：`[name]` 按值 copy/move，`[ref name]` / `[ref! name]` 分别建立
@@ -1916,8 +1920,8 @@ Int a = 1, b = 2, c = 3;
 ```c
 // 定义枚举类型，枚举值默认从0开始，底层类型为Int32
 enum PetKind {
-	dog,
-  cat,
+    dog,
+    cat,
 }
 
 // 也可以指定部分值，其他的会自动递增
@@ -1942,30 +1946,26 @@ enum [Int] Value<T> {
     pair(T left, Bool right),
 }
 
-Value<Int> value = .pair(42, true)
-switch value {
-    .none => print("none")
-    .one(item) => print("%d", item)
-    .pair(left, enabled) => if enabled { print("%d", left) }
-}
+Value<Int> value = .pair(42, true);
+Int selected = switch value {
+    .none => 0,
+    .one(item) => item,
+    .pair(left, enabled) => if enabled { left } else { 0 },
+};
 
 // 获取枚举值
-print("enum value: %d", Int(PetKind.dog))
+print("enum value: %d", Int(PetKind.dog));
 
 // 初始化
-Priority priority = Priority.medium
+Priority priority = Priority.medium;
 
 // 从底层整数值尝试恢复 enum，失败时返回 null
-Priority? parsed = Priority.init?(2)
+Priority? parsed = Priority.init?(2);
 
 // 通过类型推导，可以省略枚举名
-HttpStatus status = .ok
+HttpStatus status = .ok;
 
-switch (priority) {
-	.low => print("priority value: %d", Int(priority))
-  .medium => print("priority value: %d", Int(priority))
-  .high => print("priority value: %d", Int(priority))
-}
+Int priority_value = Int(priority);
 ```
 
 payload enum 是安全的 tagged sum：每个值携带当前 variant 的 discriminant，只有 active variant

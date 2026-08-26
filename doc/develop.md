@@ -5,15 +5,20 @@
 
 ## 常规开发
 
-当前 0.5.2 release 源码默认使用第二阶段过渡编译器：
-
-```text
-../bootstrap-0.5.2-2/build/bin/jiangc.next
-```
-
-构建当前源码：
+当前 0.5.3 release 源码使用 `bootstrap/0.5.3` 产出的 next：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+bash ./script/build_next.sh
+```
+
+发布后的常规开发应改用已安装的 0.5.3 stable。在下一版分支更新默认
+bootstrap 版本前，显式指定：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN="${JIANG_HOME:-$HOME/.jiang}/versions/0.5.3/bin/jiangc" \
 bash ./script/build_next.sh
 ```
 
@@ -40,7 +45,8 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_CHECK_MODE=audit \
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
@@ -66,6 +72,28 @@ previous stable
 
 release 分支保留自己的线性提交历史；bootstrap 分支只提供编译下一阶段所需的过渡编译器。
 各阶段必须使用独立 build 目录，不混用编译产物。
+
+### 0.5.3 enum ADT 过渡
+
+0.5.3 用 payload enum 替代普通 tagged union。0.5.2 stable 不能直接解析迁移后的
+release 编译器源码，因此使用一个最小 bootstrap 阶段：
+
+```text
+Jiang 0.5.2 stable
+  -> bootstrap/0.5.3 next
+  -> release/0.5.3 next
+  -> release/0.5.3 stable
+```
+
+先在 `bootstrap/0.5.3` worktree 中直接使用已安装的 0.5.2 stable：
+
+```bash
+bash ./script/build_next.sh
+```
+
+bootstrap 只需生成 `build/bin/jiangc.next`，不生成 stable。随后在 release worktree 中显式把
+该 next 作为 `BOOTSTRAP_BIN`，按本文前述命令生成 release next 和 stable。不得跳过
+bootstrap 阶段，也不得从未记录身份的任意 `jiangc` 开始冷启动。
 
 ### 0.5.2 严格检查过渡模式
 
