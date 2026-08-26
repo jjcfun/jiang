@@ -16,7 +16,7 @@ BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
 BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.2}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
-DEFAULT_BOOTSTRAP_BIN="$ROOT_DIR/../bootstrap-0.5.2-2/build/bin/jiangc.next"
+DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
@@ -54,8 +54,8 @@ cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
 
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
-  echo "missing bootstrap/0.5.2-2 stage compiler: $BOOTSTRAP_BIN" >&2
-  echo "build ../bootstrap-0.5.2-2 first, or set BOOTSTRAP_BIN explicitly" >&2
+  echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION stable compiler: $BOOTSTRAP_BIN" >&2
+  echo "install Jiang $BOOTSTRAP_RELEASE_VERSION, or set BOOTSTRAP_BIN explicitly" >&2
   exit 2
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"

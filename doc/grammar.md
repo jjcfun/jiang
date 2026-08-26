@@ -450,15 +450,28 @@ field_init  <- name ("=" expr)?
 `public enum Color { ... }`。
 
 ```peg
-enum_decl   <- "enum" ("[" type "]")? name trait_list? "{" enum_member* "}"
+enum_decl   <- "enum" ("[" type "]")? name generic_params? trait_list? enum_body
+
+enum_body   <- "{" enum_variant ("," enum_variant)* ","? (";" enum_member*)? "}"
+
+enum_variant
+            <- annotation* member_modifier* name enum_payload? ("=" expr)?
+
+enum_payload
+            <- "(" enum_payload_field ("," enum_payload_field)* ")"
+
+enum_payload_field
+            <- type name?
 
 enum_member <- member_modifier* method_decl
-             / name ("=" expr)? ("," / ";")?
 ```
 
 `enum [T]` 的 `T` 必须是具体整数类型；未写 `T` 时默认使用 `Int32`。
 旧的 `enum(T)` options 形式不再保留。
 未显式指定值的 enum case 从 `0` 开始递增；显式值目前只接受整数 literal，包括负整数字面量。
+带 payload 的 enum 是 tagged sum type，并保留整数底层类型、隐式递增值和显式 discriminant。
+`case(T)` 声明匿名 payload，`case(T name, U other)` 声明带契约名的复合 payload。
+variant annotation 与 union variant 相同，例如使用 `@life` 把 payload 槽绑定到 nominal region。
 
 ## union
 
@@ -477,6 +490,9 @@ union_member
 union_variants
             <- type name ("," name)* ";"
 ```
+
+0.5.3 迁移期继续接受 union；新增代码优先使用 payload enum。enum 完整迁移验证结束后再移除
+union 语法。
 
 ## trait
 

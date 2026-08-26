@@ -1909,6 +1909,8 @@ Int a = 1, b = 2, c = 3;
 
 ### 枚举类型（Enum）
 
+`enum` 既可以表示整数枚举，也可以表示带 payload 的代数数据类型：
+
 ```c
 // 定义枚举类型，枚举值默认从0开始，底层类型为Int32
 enum PetKind {
@@ -1932,6 +1934,19 @@ enum [UInt16] HttpStatus {
     internal_error = 500,
 }
 
+enum [Int] Value<T> {
+    none,
+    one(T) = 2,
+    pair(T left, Bool right),
+}
+
+Value<Int> value = .pair(42, true)
+switch value {
+    .none => print("none")
+    .one(item) => print("%d", item)
+    .pair(left, enabled) => if enabled { print("%d", left) }
+}
+
 // 获取枚举值
 print("enum value: %d", Int(PetKind.dog))
 
@@ -1952,6 +1967,8 @@ switch (priority) {
 ```
 
 ### 联合类型（Union）
+
+0.5.3 迁移期仍支持旧 `union` 语法；新增 tagged sum type 优先使用上面的 payload enum。
 
 Jiang 的 `union` 是安全的 tagged union：每个值都会携带当前 variant 的 tag，并且每个 variant 可以有自己的 payload。它不是 C 风格的 untagged/raw union。
 

@@ -1089,9 +1089,11 @@ callback 期间提供 `T&!`，callback 返回后自动解锁。公开 API 不提
 
 `struct` 用于普通名义类型，支持类型函数、实例函数、`init` 和 `deinit`。
 
-`enum` 表示有限命名成员集合。
+`enum` 是统一的 nominal sum type。无 payload enum 表示有限命名整数集合；variant 可以写成
+`case(T)` 或 `case(T name, U other)` 并携带 payload。
 
-`union` 是 tagged union，也属于 sum type。Jiang 的 `union` 可以复用 enum-like tag，但语义上是带 tag 的 union。
+`union` 是 0.5.3 迁移期保留的旧 tagged-union 语法。payload enum 直接复用同一套 tagged-sum
+layout、move、borrow、drop、pattern 和 JIL 语义，不建立第二套实现。
 
 union variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
 
@@ -1113,14 +1115,22 @@ union variant 的外部可见性由外层类型是否 public 控制。
 示例：
 
 ```jiang
+enum Value<T> {
+    none,
+    some(T) = 2,
+    pair(T value, Bool enabled),
+}
+
 union Maybe<T> {
     T some;
     Void none;
 }
 ```
 
-union variant 声明按 grammar 使用字段式写法，所有 variant 必须写出 payload 类型。
-没有 payload 的 tag 使用 `Void`：`union Maybe<T> { T some; Void none; }`。
+新 enum 使用 variant-first 语法，无 payload variant 不需要写 `Void`。旧 union 仍按字段式 grammar
+声明，直到 enum 迁移和自举验证完成后再删除。
+payload variant 保留整数 enum 的 underlying type、隐式递增值和显式 discriminant；variant 上的
+`@life` 等语义注解与旧 union variant 使用同一条 lowering 和检查管线。
 
 ## Trait 和 Extend
 
