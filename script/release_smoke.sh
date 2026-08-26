@@ -10,6 +10,7 @@ INSTALL_PREFIX="$SMOKE_DIR/prefix"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 RELEASE_SMOKE_BUILD="${RELEASE_SMOKE_BUILD:-1}"
+COMPILER_BUILD_MODE="${COMPILER_BUILD_MODE:-release}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/bin/jiangc}"
 LINKER="${RELEASE_SMOKE_LINKER:-cc}"
 
@@ -126,7 +127,11 @@ printf 'LLVM %s at %s\n' "$LLVM_VERSION" "$LLVM_ROOT"
 
 if [ "$RELEASE_SMOKE_BUILD" = "1" ]; then
   printf '\n== release smoke: stable compiler ==\n'
-  BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
+  COMPILER_BUILD_MODE="$COMPILER_BUILD_MODE" \
+  BOOTSTRAP_CHECK_MODE=audit \
+  BOOTSTRAP_DEPTH=stable \
+  VERIFY=none \
+    bash ./script/build_next.sh
 fi
 check_binary_version "$JIANGC_BIN"
 check_dynamic_dependencies "$JIANGC_BIN"

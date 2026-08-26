@@ -40,7 +40,10 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
+BOOTSTRAP_CHECK_MODE=audit \
+BOOTSTRAP_DEPTH=stable \
+VERIFY=full \
+bash ./script/build_next.sh
 ```
 
 ## 破坏性升级
@@ -66,14 +69,15 @@ release 分支保留自己的线性提交历史；bootstrap 分支只提供编�
 
 ### 0.5.2 严格检查过渡模式
 
-0.5.2 的 mutable receiver/place 写能力规则始终执行同一套分析。过渡编译器默认以 strict
-模式编译普通源码；release 自举始终使用严格检查。audit 仅是 bootstrap 交接内部使用的
+0.5.2 的 mutable receiver/place 写能力规则始终执行同一套分析。bootstrap2 使用 audit 编译
+release next；生成的 next 随后以 strict 模式编译 stable。audit 仅是 bootstrap 交接内部使用的
 过渡能力，release 编译器不提供切换检查模式的命令行参数，也不能将 audit 结果作为验证证据。
 
 `BOOTSTRAP_DEPTH=stable` 以严格检查构建 self-host candidate；任意借用或 lifetime 诊断
 都会阻止候选生成。使用以下门槛验证：
 
 ```bash
+BOOTSTRAP_CHECK_MODE=audit \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh

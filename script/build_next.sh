@@ -150,17 +150,20 @@ clear_bootstrap_artifact_cache() {
 
 emit_next_from_bootstrap() {
   local output_bin="$1"
+  local build_mode="$COMPILER_BUILD_MODE"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ]; then
+    build_mode=debug
+    printf '== bootstrap audit output mode: %s ==\n' "$build_mode"
     "$BOOTSTRAP_BIN" --bootstrap-check-mode audit \
-      --mode "$COMPILER_BUILD_MODE" \
+      --mode "$build_mode" \
       --linker "$CLANG_BIN" \
       "${LLVM_LINK_ARGS[@]}" \
       -o "$output_bin" \
       src/jiangc.jiang
   else
     "$BOOTSTRAP_BIN" \
-      --mode "$COMPILER_BUILD_MODE" \
+      --mode "$build_mode" \
       --linker "$CLANG_BIN" \
       "${LLVM_LINK_ARGS[@]}" \
       -o "$output_bin" \
@@ -191,7 +194,7 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
-printf '== compiler build mode: %s ==\n' "$COMPILER_BUILD_MODE"
+printf '== stable compiler build mode: %s ==\n' "$COMPILER_BUILD_MODE"
 printf '== bootstrap cache: %s ==\n' "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
 printf '== current cache: %s ==\n' "$NEXT_ARTIFACT_CACHE_DIR"
 clear_bootstrap_artifact_cache

@@ -99,7 +99,8 @@ build/bin/jiangc.next
 两跳自举时，使用：
 
 ```bash
-BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
+BOOTSTRAP_CHECK_MODE=audit BOOTSTRAP_DEPTH=stable VERIFY=full \
+  bash ./script/build_next.sh
 ```
 
 破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。Jiang 0.5.2 使用两阶段过渡
@@ -206,6 +207,7 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
+- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)
 - [架构文档](doc/architecture.md)
 - [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)
