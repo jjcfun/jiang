@@ -1088,6 +1088,9 @@ jil.TerminatorKind copy_terminator_kind(jil.Storage& output, jil.TerminatorKind&
             task_handoff: call_term.task_handoff,
             async_start: call_term.async_start,
             deferred_async_direct: call_term.deferred_async_direct,
+            deferred_runtime_domain_lease: copy_runtime_domain_lease(
+                output, call_term.deferred_runtime_domain_lease
+            ),
             deferred_async_task: call_term.deferred_async_task,
             destination: copy_place(output, call_term.destination),
             target: call_term.target,
@@ -1251,6 +1254,15 @@ jil.Rvalue copy_rvalue(jil.Storage& output, jil.Rvalue& value) {
     }
     if (value is .domain_executor_value(domain_executor)) {
         return jil.domain_executor_rvalue(domain_executor);
+    }
+    if (value is .runtime_domain_executor_value(domain_executor)) {
+        return jil.runtime_domain_executor_rvalue(jil.RuntimeDomainExecutorRvalue (
+            operation: domain_executor.operation,
+            domain: copy_optional_place(output, domain_executor.domain),
+            owner: copy_operand(output, domain_executor.owner$.ref()),
+            domain_type: domain_executor.domain_type,
+            domain_kind: domain_executor.domain_kind
+        ));
     }
     if (value is .current_executor_value(current_executor)) {
         return jil.current_executor_rvalue(current_executor);
@@ -1418,6 +1430,19 @@ jil.Operand? copy_optional_operand(jil.Storage& output, jil.Operand? operand) {
         return copied;
     }
     return null;
+}
+
+@life(return: (output, output))
+jil.RuntimeDomainLease&? copy_runtime_domain_lease(
+    jil.Storage& output,
+    jil.RuntimeDomainLease&? lease
+) {
+    guard lease is .some(value) else { return null; }
+    return output.arena.create_ref(jil.RuntimeDomainLease(
+        executor: copy_operand(output, value.executor$.ref()),
+        domain_type: value.domain_type,
+        owns_lease: value.owns_lease
+    ));
 }
 
 @life(return: output)
@@ -1845,6 +1870,31 @@ Void instrument_drop_flag_statement(
     if (statement.kind is .assign_stmt(assign_stmt)) {
         push_move_flag_clears(ctx, output, flags, assign_stmt.value, statement.span, statements);
         statements.add(statement);
+        if (runtime_domain_initialized_place(assign_stmt)
+            is .some(initialized_place)) {
+            if (place_has_root_flag(initialized_place, flags)) {
+                push_root_drop_flags(
+                    ctx,
+                    output,
+                    flags,
+                    initialized_place.local_id,
+                    true,
+                    statement.span,
+                    statements
+                );
+            } else {
+                push_projection_drop_flags(
+                    ctx,
+                    output,
+                    flags,
+                    initialized_place,
+                    true,
+                    statement.span,
+                    statements
+                );
+            }
+            return;
+        }
         if (place_has_root_flag(assign_stmt.destination, flags)) {
             push_root_drop_flags(
                 ctx, output, flags, assign_stmt.destination.local_id, true, statement.span, statements
@@ -2035,6 +2085,7 @@ jil.Terminator call_terminator_with_target(
             task_handoff: call_term.task_handoff,
             async_start: call_term.async_start,
             deferred_async_direct: call_term.deferred_async_direct,
+            deferred_runtime_domain_lease: call_term.deferred_runtime_domain_lease,
             deferred_async_task: call_term.deferred_async_task,
             destination: call_term.destination,
             target: target,
@@ -3130,6 +3181,12 @@ DropExpansion append_owned_field_drop_chain(
     }
     jil.BlockId target! = next_target;
     Bool expanded! = false;
+    if (type_is_runtime_domain_owner(ctx, type_id)) {
+        target = append_runtime_domain_owner_release_block(
+            ctx, output, source_block, place, type_id, target, blocks
+        );
+        expanded = true;
+    }
     Int field_index! = layout_field_count(ctx, type_id) - 1;
     while (field_index >= 0) {
         layout.FieldLayout field = layout_field_at(ctx, type_id, field_index);
@@ -3149,6 +3206,52 @@ DropExpansion append_owned_field_drop_chain(
         field_index = field_index - 1;
     }
     return DropExpansion(target, expanded);
+}
+
+Bool type_is_runtime_domain_owner(DropContext&! ctx, qid.TypeId type_id) {
+    guard ctx.store.types.get(type_id).data is .named(named) else { return false; }
+    guard ctx.store.resolve.core_traits.domain_trait is .some(domain_trait) else {
+        return false;
+    }
+    return ctx.store.model.def_has_direct_trait(named.def_id, domain_trait);
+}
+
+jil.BlockId append_runtime_domain_owner_release_block(
+    DropContext&! ctx,
+    jil.Storage& output,
+    jil.Block source_block,
+    jil.Place place,
+    qid.TypeId type_id,
+    jil.BlockId next_target,
+    list.ArrayList<jil.Block>&! blocks
+) {
+    layout.TypeLayout type_layout = layout_for_type(ctx, type_id);
+    Int owner_index = type_layout.fields.length - 1;
+    layout.FieldLayout owner_layout = type_layout.fields[owner_index];
+    jil.Place owner = field_place(output, place, owner_layout, owner_index);
+    jil.Statement statement = jil.Statement (
+        span: source_block.terminator.span,
+        kind: jil.assign_statement_kind(jil.AssignStatement (
+            destination: owner,
+            value: jil.runtime_domain_executor_rvalue(jil.RuntimeDomainExecutorRvalue (
+                operation: .release_owner,
+                domain: place,
+                owner: copy_operand_for_place(owner),
+                domain_type: type_id,
+                domain_kind: 0
+            ))
+        ))
+    );
+    jil.BlockId id = jil.BlockId.from_index(blocks.len());
+    list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(1);
+    statements.add(statement);
+    blocks.add(jil.Block (
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: goto_terminator(source_block, next_target)
+    ));
+    return id;
 }
 
 Bool type_has_drop_expandable_fields(DropContext&! ctx, qid.TypeId type_id) {
@@ -3711,12 +3814,31 @@ Void collect_projection_move_flags(jil.Body body, DropFlagMap&! flags) {
 
 Void collect_statement_projection_move_flags(Int local_count, jil.Statement statement, DropFlagMap&! flags) {
     if (statement.kind is .assign_stmt(assign_stmt)) {
+        if (runtime_domain_initialized_place(assign_stmt)
+            is .some(initialized_place)) {
+            add_projection_move_flag(local_count, initialized_place, flags);
+        }
         collect_rvalue_projection_move_flags(local_count, assign_stmt.value, flags);
         return;
     }
     if (statement.kind is .forget_stmt(forget_stmt)) {
         add_projection_move_flag(local_count, forget_stmt.place, flags);
     }
+}
+
+@life(return: assign_stmt)
+jil.Place? runtime_domain_initialized_place(jil.AssignStatement assign_stmt) {
+    guard assign_stmt.value is .runtime_domain_executor_value(value) else {
+        return null;
+    }
+    if (value.operation != .create_owner) { return null; }
+    Int length = assign_stmt.destination.projection.length;
+    if (length == 0) { return null; }
+    return jil.Place(
+        base: assign_stmt.destination.base,
+        local_id: assign_stmt.destination.local_id,
+        projection: assign_stmt.destination.projection[0..length - 1]
+    );
 }
 
 Void collect_terminator_projection_move_flags(

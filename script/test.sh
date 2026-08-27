@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Jiang 统一测试 runner。
 #
-# 父进程只负责发现、调度和按发现顺序汇总结果；每个 case 使用独立 work/cache
+# 父进程负责发现、调度和按发现顺序实时输出结果；每个 case 使用独立 work/cache
 # 目录。并行 worker 不直接输出，避免完成顺序改变稳定日志。
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,6 +35,7 @@ RUN_ROOT=""
 QUEUE_DIR=""
 CLAIM_DIR=""
 RESULT_DIR=""
+WORKER_DONE_DIR=""
 FAIL_MARKER=""
 LINK_ARGS_FILE="${LINK_ARGS_FILE:-}"
 JIANG_LINK_ARGS_FILE="${JIANG_LINK_ARGS_FILE:-}"
@@ -632,10 +633,11 @@ prepare_run_root() {
   QUEUE_DIR="$RUN_ROOT/queue"
   CLAIM_DIR="$RUN_ROOT/claims"
   RESULT_DIR="$RUN_ROOT/results"
+  WORKER_DONE_DIR="$RUN_ROOT/workers-done"
   FAIL_MARKER="$RUN_ROOT/failure"
   LINK_ARGS_FILE="$RUN_ROOT/llvm-link-args"
   JIANG_LINK_ARGS_FILE="$RUN_ROOT/jiang-link-args"
-  mkdir -p "$QUEUE_DIR" "$CLAIM_DIR" "$RESULT_DIR" "$RUN_ROOT/cases"
+  mkdir -p "$QUEUE_DIR" "$CLAIM_DIR" "$RESULT_DIR" "$WORKER_DONE_DIR" "$RUN_ROOT/cases"
   write_arg_file "$LINK_ARGS_FILE" "${llvm_link_args[@]}"
   write_arg_file "$JIANG_LINK_ARGS_FILE" "${jiang_llvm_link_args[@]}"
 }
@@ -739,9 +741,11 @@ prepare_compiler_test_runner() {
 write_jobs() {
   local index=0
   local count="${#CASE_KINDS[@]}"
+  local job_name
   while [ "$index" -lt "$count" ]; do
+    printf -v job_name '%08d.job' "$index"
     printf '%s\n%s\n%s\n' "$index" "${CASE_KINDS[$index]}" "${CASE_SOURCES[$index]}" \
-      >"$QUEUE_DIR/$index.job"
+      >"$QUEUE_DIR/$job_name"
     index=$((index + 1))
   done
 }
@@ -833,21 +837,50 @@ run_workers() {
     worker_count="$count"
   fi
   while [ "$worker" -lt "$worker_count" ]; do
-    worker_loop "$worker" &
+    (
+      trap ': >"$WORKER_DONE_DIR/$worker.done"' EXIT
+      worker_loop "$worker"
+    ) &
     WORKER_PIDS+=("$!")
     worker=$((worker + 1))
   done
+  local status=0
+  if ! print_results_live "$worker_count"; then
+    status=1
+  fi
   for pid in "${WORKER_PIDS[@]}"; do
-    wait "$pid"
+    if ! wait "$pid"; then
+      status=1
+    fi
   done
+  return "$status"
 }
 
-print_results() {
+all_workers_done() {
+  local worker_count="$1"
+  local worker=0
+  while [ "$worker" -lt "$worker_count" ]; do
+    if [ ! -f "$WORKER_DONE_DIR/$worker.done" ]; then
+      return 1
+    fi
+    worker=$((worker + 1))
+  done
+  return 0
+}
+
+print_results_live() {
+  local worker_count="$1"
   local count="${#CASE_KINDS[@]}"
   local index=0
   local code
   local status=0
   while [ "$index" -lt "$count" ]; do
+    while [ ! -f "$RESULT_DIR/$index.status" ]; do
+      if all_workers_done "$worker_count"; then
+        break
+      fi
+      sleep 0.05
+    done
     if [ ! -f "$RESULT_DIR/$index.status" ]; then
       echo "SKIP ${CASE_KINDS[$index]} ${CASE_SOURCES[$index]} after earlier failure"
       index=$((index + 1))
@@ -860,7 +893,6 @@ print_results() {
     fi
     index=$((index + 1))
   done
-  timing_line "suite cases=$count jobs=$TEST_JOBS wall=$((SECONDS - SUITE_START))s"
   return "$status"
 }
 
@@ -907,10 +939,12 @@ run_suite() {
     return 1
   fi
 
-  if [ "${#CASE_KINDS[@]}" -gt 0 ]; then
-    run_workers
+  local status=0
+  if [ "${#CASE_KINDS[@]}" -gt 0 ] && ! run_workers; then
+    status=1
   fi
-  if print_results; then
+  timing_line "suite cases=${#CASE_KINDS[@]} jobs=$TEST_JOBS wall=$((SECONDS - SUITE_START))s"
+  if [ "$status" = "0" ]; then
     cleanup_success_run
     return 0
   fi

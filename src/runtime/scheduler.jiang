@@ -38,6 +38,9 @@ const Int task_lifetime_heap_completed_owner = 2;
 const Int task_lifetime_heap_running_ownerless = 3;
 const Int task_lifetime_heap_consumed_owner = 4;
 const Int task_lifetime_cleanup_claimed = 5;
+const Int task_lifetime_stack_owned = 6;
+const Int task_lifetime_heap_running_owner_owned = 7;
+const Int task_lifetime_heap_running_ownerless_owned = 8;
 
 const Int continuation_executor_word = 3;
 const Int continuation_context_word = 4;
@@ -70,7 +73,7 @@ public Bool initialize() {
         thread.shutdown();
         return false;
     }
-    if (!domain_executor.initialize()) {
+    if (!domain_executor.initialize(runtime_state.group)) {
         domain_executor.shutdown();
         thread.destroy_group(runtime_state.group);
         runtime_state.group = thread.Group(null);
@@ -78,6 +81,7 @@ public Bool initialize() {
         return false;
     }
     run_scheduled_continuation(null);
+    keep_static_task_abi_reachable(false);
     keep_local_task_abi_reachable(false);
     runtime_state.initialized = true;
     return true;
@@ -104,7 +108,7 @@ public Void request_domain(
     Void* callback
 ) {
     Void* executor = domain_executor.materialize_uncached(domain_id, domain_kind);
-    request(executor, raw_task, context, resume);
+    request_static(executor, raw_task, context, resume);
 }
 
 @link_symbol("__jiang_runtime_task_request")
@@ -120,7 +124,29 @@ public Void request(
         return;
     }
     UInt8* task = unsafe { raw_task$.as(UInt8*) };
-    request_task(task, executor, context, resume);
+    Int publishing = publish_request(task, executor, context, resume);
+    if (publishing >= 0) {
+        schedule_published(task, publishing, false);
+    }
+}
+
+@link_symbol("__jiang_runtime_task_request_static")
+public Void request_static(
+    Void* executor,
+    Void* raw_task,
+    Void* context,
+    Void* resume
+) {
+    assert(runtime_state.initialized);
+    if (raw_task == null) {
+        schedule_raw_static(executor, context, resume);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int publishing = publish_request(task, executor, context, resume);
+    if (publishing >= 0) {
+        schedule_published_static(task, publishing, false);
+    }
 }
 
 @link_symbol("__jiang_runtime_task_handoff")
@@ -137,10 +163,37 @@ public Void handoff(
     }
     UInt8* task = unsafe { raw_task$.as(UInt8*) };
     if (try_inline_handoff(task, executor, context, resume)) { return; }
+    Int publishing = publish_handoff(task, executor, context, resume);
+    if (publishing >= 0) {
+        schedule_published(task, publishing, true);
+    }
+}
+
+@link_symbol("__jiang_runtime_task_handoff_static")
+public Void handoff_static(
+    Void* executor,
+    Void* raw_task,
+    Void* context,
+    Void* resume
+) {
+    assert(runtime_state.initialized);
+    if (raw_task == null) {
+        schedule_raw_static(executor, context, resume);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    if (try_inline_handoff(task, executor, context, resume)) { return; }
+    Int publishing = publish_handoff(task, executor, context, resume);
+    if (publishing >= 0) {
+        schedule_published_static(task, publishing, true);
+    }
+}
+
+Int publish_handoff(UInt8* task, Void* executor, Void* context, Void* resume) {
     Int publishing = claim_handoff(task);
-    if (publishing < 0) { return; }
+    if (publishing < 0) { return publishing; }
     publish_target(task, executor, context, resume);
-    schedule_published(task, publishing, true);
+    return publishing;
 }
 
 Bool try_inline_handoff(UInt8* task, Void* executor, Void* context, Void* resume) {
@@ -235,6 +288,47 @@ public Void complete_task_owner(Void* raw_task) {
             invoke_task_cleanup(task);
             return;
         }
+        if (observed >= task_lifetime_stack_owned) {
+            complete_owned_task_owner(task, observed);
+            return;
+        }
+        assert(false);
+        return;
+    }
+}
+
+Void complete_owned_task_owner(UInt8* task, Int initial_state) {
+    atomic.Atomic<Int>& state = atomic_word(task, task_lifetime_state_word);
+    Int observed! = initial_state;
+    while (true) {
+        if (observed == task_lifetime_stack_owned) {
+            Void* executor = load_pointer(task, task_execution_executor_word);
+            if (!state.compare_and_set(observed, task_lifetime_stack)) {
+                observed = state.get();
+                continue;
+            }
+            domain_executor.release_callback(executor);
+            return;
+        }
+        if (observed == task_lifetime_heap_running_owner_owned) {
+            Void* executor = load_pointer(task, task_execution_executor_word);
+            if (!state.compare_and_set(observed, task_lifetime_heap_completed_owner)) {
+                observed = state.get();
+                continue;
+            }
+            domain_executor.release_callback(executor);
+            return;
+        }
+        if (observed == task_lifetime_heap_running_ownerless_owned) {
+            Void* executor = load_pointer(task, task_execution_executor_word);
+            if (!state.compare_and_set(observed, task_lifetime_cleanup_claimed)) {
+                observed = state.get();
+                continue;
+            }
+            domain_executor.release_callback(executor);
+            invoke_task_cleanup(task);
+            return;
+        }
         assert(false);
         return;
     }
@@ -268,6 +362,15 @@ public Void release_task_owner(Void* raw_task) {
         Int observed = state.get();
         if (observed == task_lifetime_heap_running_owner) {
             if (state.compare_and_set(observed, task_lifetime_heap_running_ownerless)) {
+                return;
+            }
+            continue;
+        }
+        if (observed == task_lifetime_heap_running_owner_owned) {
+            if (state.compare_and_set(
+                    observed,
+                    task_lifetime_heap_running_ownerless_owned
+                )) {
                 return;
             }
             continue;
@@ -421,6 +524,13 @@ Void keep_local_task_abi_reachable(Bool enabled) {
     handoff_local(null, null, null, null);
 }
 
+// backend 直接引用 static protocol symbol；不可执行锚点确保两个 wrapper 进入 JIL。
+Void keep_static_task_abi_reachable(Bool enabled) {
+    if (!enabled) { return; }
+    request_static(null, null, null, null);
+    handoff_static(null, null, null, null);
+}
+
 Void invoke_published_target(UInt8* task) {
     store_word(
         task,
@@ -445,7 +555,12 @@ Void run_scheduled_continuation(Void* raw_continuation) {
     );
 }
 
-Void request_task(UInt8* task, Void* executor, Void* context, Void* resume) {
+Int publish_request(
+    UInt8* task,
+    Void* executor,
+    Void* context,
+    Void* resume
+) {
     while (true) {
         atomic.Atomic<Int>& state = atomic_word(task, schedule_state_word);
         Int observed = state.get();
@@ -454,27 +569,27 @@ Void request_task(UInt8* task, Void* executor, Void* context, Void* resume) {
             Int publishing = schedule_next(observed, schedule_publishing_idle);
             if (!state.compare_and_set(observed, publishing)) { continue; }
             publish_target(task, executor, context, resume);
-            schedule_published(task, publishing, false);
-            return;
+            return publishing;
         }
         if (kind == schedule_running) {
             Int publishing = schedule_next(observed, schedule_publishing_pending);
             if (!state.compare_and_set(observed, publishing)) { continue; }
             publish_target(task, executor, context, resume);
             assert(state.compare_and_set(publishing, schedule_as(publishing, schedule_pending)));
-            return;
+            return -1;
         }
         if (kind == schedule_pending || kind == schedule_queued) {
             Bool matches = published_target_matches(task, executor, context, resume);
             if (!published_target_is_stable(task, observed)) { continue; }
             assert(matches);
-            return;
+            return -1;
         }
-        if (kind == schedule_completed) { return; }
+        if (kind == schedule_completed) { return -1; }
         // 先等待发布完成，再验证重复 wake 是否仍指向同一 continuation。
         if (schedule_is_publishing(kind)) { continue; }
         assert(false);
     }
+    return -1;
 }
 
 Int claim_handoff(UInt8* task) {
@@ -501,7 +616,21 @@ Int claim_handoff(UInt8* task) {
     return -1;
 }
 
-Void schedule_published(UInt8* task, Int expected, Bool handoff) {
+Void schedule_published(
+    UInt8* task,
+    Int expected,
+    Bool handoff
+) {
+    if (schedule_published_inline(task, expected, handoff)) { return; }
+    enqueue_task(task, load_pointer(task, schedule_executor_word));
+}
+
+Void schedule_published_static(UInt8* task, Int expected, Bool handoff) {
+    if (schedule_published_inline(task, expected, handoff)) { return; }
+    enqueue_task_static(task, load_pointer(task, schedule_executor_word));
+}
+
+Bool schedule_published_inline(UInt8* task, Int expected, Bool handoff) {
     Void* executor = load_pointer(task, schedule_executor_word);
     Void* context = load_pointer(task, schedule_context_word);
     Void* resume = load_pointer(task, schedule_resume_word);
@@ -512,15 +641,15 @@ Void schedule_published(UInt8* task, Int expected, Bool handoff) {
         store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
         invoke_resume(resume, context);
         leave_and_drain_inline(executor);
-        return;
+        return true;
     }
     if (can_inline && domain_executor.defer_inline(executor, context, resume)) {
         assert(state.compare_and_set(expected, schedule_as(expected, schedule_running)));
         store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
-        return;
+        return true;
     }
     assert(state.compare_and_set(expected, schedule_as(expected, schedule_queued)));
-    enqueue_task(task, executor);
+    return false;
 }
 
 Bool target_can_inline(UInt8* task, Void* executor, Void* context, Bool handoff) {
@@ -535,7 +664,31 @@ Bool target_can_inline(UInt8* task, Void* executor, Void* context, Bool handoff)
         && domain_executor.can_inline(executor, context);
 }
 
-Void schedule_raw(Void* executor, Void* context, Void* resume) {
+Void schedule_raw(
+    Void* executor,
+    Void* context,
+    Void* resume
+) {
+    if (executor == null) {
+        invoke_resume(resume, context);
+        return;
+    }
+    Bool can_inline = !domain_executor.is_concurrent(executor)
+        && domain_executor.can_inline(executor, context);
+    if (can_inline && domain_executor.try_enter_inline(executor)) {
+        domain_executor.retain_callback(executor);
+        invoke_resume(resume, context);
+        leave_and_drain_inline(executor);
+        domain_executor.release_callback(executor);
+        return;
+    }
+    if (can_inline && domain_executor.defer_inline(executor, context, resume)) {
+        return;
+    }
+    assert(domain_executor.enqueue(runtime_state.group, executor, context, resume));
+}
+
+Void schedule_raw_static(Void* executor, Void* context, Void* resume) {
     if (executor == null) {
         invoke_resume(resume, context);
         return;
@@ -550,13 +703,26 @@ Void schedule_raw(Void* executor, Void* context, Void* resume) {
     if (can_inline && domain_executor.defer_inline(executor, context, resume)) {
         return;
     }
-    assert(domain_executor.enqueue(runtime_state.group, executor, context, resume));
+    assert(domain_executor.enqueue_static(
+        runtime_state.group, executor, context, resume
+    ));
 }
 
 Void enqueue_task(UInt8* task, Void* executor) {
     assert(executor != null);
     RawFn<Void, Void*> callback = run_scheduled_task;
     assert(domain_executor.enqueue_task(
+        runtime_state.group,
+        executor,
+        task,
+        unsafe { callback$.as(Void*) }
+    ));
+}
+
+Void enqueue_task_static(UInt8* task, Void* executor) {
+    assert(executor != null);
+    RawFn<Void, Void*> callback = run_scheduled_task;
+    assert(domain_executor.enqueue_task_static(
         runtime_state.group,
         executor,
         task,

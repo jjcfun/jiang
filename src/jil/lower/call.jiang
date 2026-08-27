@@ -34,6 +34,7 @@ import suspend = "./suspend.jiang";
 import dispatch = "./dispatch.jiang";
 import builder = "./builder.jiang";
 import support = "./support.jiang";
+import runtime_domain = "./runtime_domain.jiang";
 
 public extend body_context.BodyLowerer {
     public Void lower_call(Self&! self, sem.NodeId node_id, sem.Call call, jil.Place destination) {
@@ -417,6 +418,7 @@ public extend body_context.BodyLowerer {
                 function_args.slice(),
                 self.lowerer.storage.operand_array(direct_args$.ref()),
                 destination,
+                null,
                 direct_span
             );
             return;
@@ -927,6 +929,9 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), self.lowerer.model_span(node_id));
         self.builder.start_block(next_block);
+        self.initialize_runtime_domain_owner(
+            node_id, self.type_for_node(node_id), destination
+        );
     }
 
     @life(return: destination)
@@ -1155,25 +1160,44 @@ public extend body_context.BodyLowerer {
         }
         token.Span span = self.lowerer.model_span(node_id);
         qid.DefId function_def = lambda.function_def;
+        jil.Operand? runtime_executor = self.runtime_domain_target_executor(node_id, false);
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
         args.add(self.lambda_env_operand(closure_id, lambda, span));
         list.ArrayList<types.GenericArg> function_args! =
             self.owned_generic_args(self.function_args.slice());
         if (!self.current_effects.has_async) {
+            if (runtime_executor is .some(executor)) { args.add(executor); }
             self.lower_symbolic_async_sync_call(
                 function_def,
                 function_args.slice(),
                 self.lowerer.storage.operand_array(args$.ref()),
                 destination,
-                span
+                span,
+                runtime_executor != null
             );
             return;
+        }
+        jil.RuntimeDomainLease&? runtime_lease! = null;
+        if (runtime_executor is .some(executor)) {
+            guard self.lowerer.typeck.task_domain_target(node_id)
+                is .some(target) else {
+                self.mark_unsupported(node_id);
+                return;
+            }
+            runtime_lease = self.lowerer.storage.arena.create_ref(
+                jil.RuntimeDomainLease(
+                    executor: executor,
+                    domain_type: target.domain_type,
+                    owns_lease: false
+                )
+            );
         }
         self.lower_async_direct_call(
             function_def,
             function_args.slice(),
             self.lowerer.storage.operand_array(args$.ref()),
             destination,
+            runtime_lease,
             span
         );
     }
@@ -1184,10 +1208,14 @@ public extend body_context.BodyLowerer {
         types.GenericArg[]& function_args,
         jil.Operand[]& args,
         jil.Place destination,
-        token.Span span
+        token.Span span,
+        Bool runtime_target
     ) {
-        qid.TypeId function_type = self.function_type_for_ref(
+        qid.TypeId source_type = self.function_type_for_ref(
             target_def, function_args
+        );
+        qid.TypeId function_type = self.async_sync_call_type(
+            source_type, span, runtime_target
         );
         jil.BlockId next_block = self.builder.reserve_block(span);
         self.builder.finish_block(jil.call_terminator_kind(jil.CallTerminator (
@@ -1210,6 +1238,36 @@ public extend body_context.BodyLowerer {
             cleanup: null
         )), span);
         self.builder.start_block(next_block);
+    }
+
+    qid.TypeId async_sync_call_type(
+        self,
+        qid.TypeId source_type,
+        token.Span span,
+        Bool runtime_target
+    ) {
+        if (!runtime_target) { return source_type; }
+        types.TypeInfo info = self.lowerer.store.types.get(source_type);
+        guard info.data is .function_type(function) else {
+            return self.lowerer.store.types.invalid_type();
+        }
+        list.ArrayList<qid.TypeId> params! =
+            list.ArrayList<qid.TypeId>(function.params.length + 1);
+        Int index! = 0;
+        while (index < function.params.length) {
+            params.add(function.params[index]);
+            index = index + 1;
+        }
+        params.add(self.lowerer.store.types.opaque_pointer_type(span));
+        return self.lowerer.store.types.function_type_with_kind_contract(
+            params,
+            function.result,
+            span,
+            types.EffectSet(),
+            function.kind,
+            function.lifetime_contract,
+            function.call_ownership == .consuming
+        );
     }
 
     public Void lower_raw_fn_to_fn(Self&! self, sem.NodeId node_id, sem.Call call, jil.Place destination) {
@@ -1963,6 +2021,23 @@ public extend body_context.BodyLowerer {
             return;
         }
         Int member_count = owner_model.members.len();
+        if (self.nominal_has_runtime_domain_field(
+            owner_def, substitutions$.ref()
+        )) {
+            guard self.lower_default_nominal_aggregate_init(
+                node_id,
+                owner_def,
+                member_count,
+                destination,
+                type_id,
+                substitutions$.ref()
+            ) else {
+                self.mark_unsupported(node_id);
+                return;
+            }
+            self.initialize_runtime_domain_owner(node_id, type_id, destination);
+            return;
+        }
         if (self.lowerer.typeck.ordered_call_args(node_id) is .some(_)) {
             self.lower_default_nominal_ordered_fields(
                 node_id,
@@ -1971,6 +2046,7 @@ public extend body_context.BodyLowerer {
                 destination,
                 substitutions$.ref()
             );
+            self.initialize_runtime_domain_owner(node_id, type_id, destination);
             return;
         }
         Int index! = 0;
@@ -1987,6 +2063,60 @@ public extend body_context.BodyLowerer {
             }
             index = index + 1;
         }
+        self.initialize_runtime_domain_owner(node_id, type_id, destination);
+    }
+
+    Bool lower_default_nominal_aggregate_init(
+        Self&! self,
+        sem.NodeId node_id,
+        qid.DefId owner_def,
+        Int member_count,
+        jil.Place destination,
+        qid.TypeId type_id,
+        generic_bindings.GenericBindings& substitutions
+    ) {
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>();
+        Bool ordered = self.lowerer.typeck.ordered_call_args(node_id) != null;
+        Int member_index! = 0;
+        Int field_index! = 0;
+        while (member_index < member_count) {
+            guard self.lowerer.model.def(owner_def) is .some(owner_model) else {
+                return false;
+            }
+            qid.DefId field_def = owner_model.members.get(member_index);
+            member_index = member_index + 1;
+            if (self.lowerer.store.defs.get(field_def).kind != .field_def) {
+                continue;
+            }
+            sem.NodeId? value! = self.default_constructor_field_value(
+                node_id, field_def
+            );
+            if (ordered) {
+                if (field_index >= self.lowerer.typeck.ordered_call_arg_count(node_id)) {
+                    return false;
+                }
+                value = self.lowerer.typeck.ordered_call_arg_at(node_id, field_index);
+            }
+            field_index = field_index + 1;
+            guard value is .some(field_value) else { return false; }
+            guard self.field_expected_type(field_def, substitutions)
+                is .some(field_type) else {
+                return false;
+            }
+            fields.add(self.lower_to_operand_as_type(field_value, field_type));
+        }
+        self.builder.push_assign(
+            destination,
+            jil.aggregate_rvalue(jil.AggregateRvalue (
+                kind: .struct_value,
+                def_id: owner_def,
+                type_id: type_id,
+                tag: null,
+                fields: self.lowerer.storage.operand_array(fields$.ref())
+            )),
+            self.lowerer.model_span(node_id)
+        );
+        return true;
     }
 
     public Void lower_default_nominal_ordered_fields(Self&! self,
@@ -2123,6 +2253,7 @@ public extend body_context.BodyLowerer {
                 async_function_args.slice(),
                 self.lowerer.storage.operand_array(args$.ref()),
                 destination,
+                null,
                 self.lowerer.model_span(node_id)
             );
             return;

@@ -20,6 +20,8 @@ import comptime_evaluator = "../comptime/evaluator.jiang";
 import drop_semantics = "../drop.jiang";
 import generic_bindings = "../generic/bindings.jiang";
 import intrinsic_selector = "../intrinsic/selector.jiang";
+import lifetime_shape = "../lifetime_shape.jiang";
+import lifetime_shape_query = "../lifetime_shape_query.jiang";
 
 enum LocalInitState {
     uninitialized,
@@ -499,7 +501,29 @@ public struct BodyCheck: Movable {
                     );
                 }
             }
+            self.check_runtime_domain_global_storage(def_id, root, expected);
         }
+    }
+
+    Void check_runtime_domain_global_storage(
+        Self&! self,
+        qid.DefId def_id,
+        sem.NodeId root,
+        qid.TypeId type_id
+    ) {
+        if (self.type_ops.state.ctx.store.model.def_is_const(def_id)) { return; }
+        guard self.type_ops.state.ctx.store.resolve.core_traits.domain_trait
+            is .some(domain_trait) else {
+            return;
+        }
+        if (!self.type_ops.type_contains_direct_trait(type_id, domain_trait)) {
+            return;
+        }
+        self.type_ops.add_node_error(
+            root,
+            "runtime Domain owner cannot use global storage",
+            "runtime_domain_global_storage_not_supported"
+        );
     }
 
     sem.NodeId body_result_value(self, sem.NodeId root) {
@@ -7730,7 +7754,7 @@ public struct BodyCheck: Movable {
         types.TypeInfo result_info = self.type_ops.state.ctx.store.types.get(result_type);
         guard result_info.data is .task_type(task) else { return false; }
         guard self.task_initializer_parts(node_id, call) is .some(parts) else { return true; }
-        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        types.DomainEffect? domain = self.task_initializer_domain(node_id, parts.domain);
         if (parts.domain == null && !self.current_effects.has_async
             && self.current_effects.domain == null) {
             self.type_ops.add_node_error(
@@ -7754,6 +7778,7 @@ public struct BodyCheck: Movable {
         if (!self.type_ops.is_invalid_type(lambda_type)) {
             self.bind_async_lambda_function(node_id, parts.closure);
         }
+        self.check_runtime_domain_lambda_captures(node_id, parts.closure);
         self.type_ops.state.ctx.store.typeck.mark_expr_lowering(node_id, .task_initializer);
         self.mark_observed_async_start_if_needed(node_id);
         return true;
@@ -7767,7 +7792,7 @@ public struct BodyCheck: Movable {
         guard self.task_initializer_parts(node_id, call) is .some(parts) else {
             return self.type_ops.state.ctx.store.types.invalid_type();
         }
-        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        types.DomainEffect? domain = self.task_initializer_domain(node_id, parts.domain);
         if (parts.domain == null && !self.current_effects.has_async
             && self.current_effects.domain == null) {
             self.type_ops.add_node_error(
@@ -7778,6 +7803,7 @@ public struct BodyCheck: Movable {
         }
         types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
         qid.TypeId result! = self.check_inferred_async_lambda(parts.closure, effects, null);
+        self.check_runtime_domain_lambda_captures(node_id, parts.closure);
         if (self.type_is_task(result)) {
             self.type_ops.add_node_error(
                 parts.closure,
@@ -7851,11 +7877,12 @@ public struct BodyCheck: Movable {
         guard self.coroutine_sync_parts(node_id, call) is .some(parts) else {
             return self.type_ops.state.ctx.store.types.invalid_type();
         }
-        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        types.DomainEffect? domain = self.task_initializer_domain(node_id, parts.domain);
         types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
         qid.TypeId result! = self.check_inferred_async_lambda(
             parts.closure, effects, expected_result
         );
+        self.check_runtime_domain_lambda_captures(node_id, parts.closure);
         if (self.type_is_task(result)) {
             self.type_ops.add_node_error(
                 parts.closure,
@@ -7952,15 +7979,158 @@ public struct BodyCheck: Movable {
         return TaskInitializerParts(domain: domain, closure: closure_id);
     }
 
-    types.DomainEffect? task_initializer_domain(Self&! self, sem.NodeId? domain) {
+    types.DomainEffect? task_initializer_domain(
+        Self&! self,
+        sem.NodeId call_id,
+        sem.NodeId? domain
+    ) {
         guard domain is .some(domain_id) else { return null; }
-        self.check_domain_effect_expr(domain_id);
-        guard self.type_ops.effect_domain_binding_def(domain_id)
-            is .some(binding_def) else { return null; }
-        return types.DomainEffect(
-            binding: binding_def,
-            domain_type: self.type_ops.type_for_def(binding_def)
+        if (self.type_ops.effect_domain_binding_def(domain_id)
+            is .some(binding_def)) {
+            qid.TypeId domain_type = self.type_ops.type_for_def(binding_def);
+            self.check_domain_effect_type(domain_id, domain_type);
+            self.type_ops.state.ctx.store.typeck.set_task_domain_target(
+                call_id,
+                typeck_store.TaskDomainTarget(
+                    kind: .static_domain,
+                    domain_expr: domain_id,
+                    binding: binding_def,
+                    domain_type: domain_type
+                )
+            );
+            return types.DomainEffect(
+                binding: binding_def,
+                domain_type: domain_type
+            );
+        }
+        qid.TypeId reference_type = self.check_node(domain_id);
+        guard self.runtime_domain_reference_type(domain_id, reference_type)
+            is .some(domain_type) else {
+            return null;
+        }
+        self.type_ops.state.ctx.store.typeck.set_task_domain_target(
+            call_id,
+            typeck_store.TaskDomainTarget(
+                kind: .runtime_domain,
+                domain_expr: domain_id,
+                binding: null,
+                domain_type: domain_type
+            )
         );
+        return null;
+    }
+
+    qid.TypeId? runtime_domain_reference_type(
+        Self&! self,
+        sem.NodeId domain_id,
+        qid.TypeId reference_type
+    ) {
+        if (self.type_ops.is_invalid_type(reference_type)) { return null; }
+        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(reference_type);
+        if (info.is_mutable) {
+            self.type_ops.add_node_error(
+                domain_id,
+                "runtime Domain target requires a shared reference",
+                "runtime_domain_requires_shared_reference"
+            );
+            return null;
+        }
+        guard info.data is .handle_type(handle) else {
+            self.type_ops.add_node_error(
+                domain_id,
+                "runtime Domain target must be passed as 'value&'",
+                "runtime_domain_requires_reference"
+            );
+            return null;
+        }
+        if (handle.kind != .reference) {
+            self.type_ops.add_node_error(
+                domain_id,
+                "runtime Domain target must be passed as 'value&'",
+                "runtime_domain_requires_reference"
+            );
+            return null;
+        }
+        qid.TypeId domain_type = handle.element;
+        guard self.type_ops.state.ctx.store.resolve.core_traits.domain_trait
+            is .some(domain_trait) else {
+            return null;
+        }
+        if (!self.type_satisfies_trait(domain_type, domain_trait, domain_id.owner_def)) {
+            self.type_ops.add_node_error(
+                domain_id,
+                "runtime domain target must reference a Domain value",
+                "runtime_domain_requires_domain"
+            );
+            return null;
+        }
+        if (self.type_ops.type_is_copyable(domain_type)) {
+            self.type_ops.add_node_error(
+                domain_id,
+                "runtime Domain value must be move-only",
+                "runtime_domain_must_be_move_only"
+            );
+            return null;
+        }
+        if (!self.runtime_domain_executor_is_self_contained(
+            domain_id, domain_type, domain_trait
+        )) {
+            return null;
+        }
+        return domain_type;
+    }
+
+    Bool runtime_domain_executor_is_self_contained(
+        Self&! self,
+        sem.NodeId domain_id,
+        qid.TypeId domain_type,
+        qid.DefId domain_trait
+    ) {
+        guard self.associated_type_for_trait(
+            domain_type, domain_trait, "ExecutorType"
+        ) is .some(executor_type) else {
+            return true;
+        }
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(
+                self.type_ops.state.ctx.store$.ref(),
+                self.type_ops.state.ctx.query.lifetime_shape$.mut_ref()
+            );
+        lifetime_shape.LifetimeShapeId shape =
+            query.lifetime_shape(executor_type);
+        lifetime_shape.LifetimeShapeClass shape_class = query.classify(shape);
+        if (shape_class != .non_empty) { return true; }
+        self.type_ops.add_node_error(
+            domain_id,
+            "runtime Domain ExecutorType must not contain external borrows",
+            "runtime_domain_executor_must_be_self_contained"
+        );
+        return false;
+    }
+
+    Void check_runtime_domain_lambda_captures(
+        Self&! self,
+        sem.NodeId call_id,
+        sem.NodeId closure_id
+    ) {
+        guard self.type_ops.state.ctx.store.typeck.task_domain_target(call_id)
+            is .some(target) else {
+            return;
+        }
+        if (target.kind != .runtime_domain) { return; }
+        if (self.type_ops.state.ctx.store.typeck.async_start_usage(call_id)
+            is .some(usage)) {
+            if (usage == .detached) {
+                self.type_ops.add_node_error(
+                    call_id,
+                    "runtime Domain Task must have an owner",
+                    "runtime_domain_detached_task"
+                );
+            }
+        }
+        sem.Node closure = self.type_ops.state.ctx.store.model.node(closure_id);
+        guard closure.data is .lambda_expr(lambda) else { return; }
+        self.check_lambda_captures_for_domain_transfer(closure_id, lambda.function_def);
     }
 
     Void bind_async_lambda_function(Self&! self, sem.NodeId call_id, sem.NodeId closure_id) {

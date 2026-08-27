@@ -78,8 +78,13 @@ public const WorkerPoolDomain worker_pool_domain = WorkerPoolDomain();
 
 - `current` 是语言内建特殊值，表示继承当前 async domain context。
 - `ui_domain`、`worker_pool_domain` 等不是语言魔法；它们是 import 后可见的命名 `const`。
-- `async [domain]` / `coroutine.sync(domain)` 中的 `domain` 必须是实现 `Domain` 的 canonical const
-  binding；编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
+- `async [domain]` 中的 `domain` 必须是实现 `Domain` 的 canonical `const` binding。
+- `Task(domain: ...)` 和 `coroutine.sync(...)` 既接受 canonical `const` binding，也接受
+  普通 Domain value 的共享引用。编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
+
+命名 `const` Domain 适合程序级长期共享 identity，调度开销低于普通 runtime Domain。普通 Domain
+value 适合页面、场景或会话等有限生存期资源，以少量动态开销换取独立 identity 和确定回收。选择时
+应先按资源所有权建模，不应为了快路径让本应及时释放的 Executor 常驻。
 
 `Domain.kind` 描述语言级串行性，`ExecutorType` 和 `make_executor` 选择排队策略。用户 Executor
 只处理一次性的 `ExecutorJob`，不接触 coroutine frame、TaskState 或 continuation ABI。
@@ -138,6 +143,15 @@ Task initializer 使用命名参数选择 execution domain：
 ```jiang
 Task(domain: app_runtime.ui_domain) {
     load_data();
+};
+```
+
+需要有限生存期的专用 Domain 时，创建普通 value 并传入共享引用：
+
+```jiang
+SceneDomain scene_domain = SceneDomain(config: config);
+Task(domain: scene_domain$.ref()) {
+    load_data()
 };
 ```
 
@@ -294,16 +308,18 @@ async Void foo(T&! x) {
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
 - `Task { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
-- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果 Domain binding `D` 不等于 current，
+- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果目标 identity 不等于 current，
   则是 domain 切换边界。
 - 普通同步函数中的最外层 `coroutine.sync(D) {}` 阻塞调用线程，进入 runtime 并等待 closure 完成。
 - async context 中的 `coroutine.sync(D) {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
   closure，完成后回到进入前的 domain；它不创建用户可见 Task，也不阻塞 worker thread。
+- 普通 Domain value 的共享引用在整个 `coroutine.sync(D&)` 调用期间保持有效；closure 及结构化
+  子协程完成后借用结束，结果不携带 Domain lifetime。
 - `task.await()` 不把 caller 留在 Task 的 execution domain；完成后 caller 回到等待方 current domain。
 
-async context 中若能静态证明 `D` 与 current domain 相同，`coroutine.sync(D)` 直接执行 closure；只有
-跨 Domain 时才 enqueue 和挂起。domain-neutral async 函数也允许使用静态 `coroutine.sync(D)`；当前可以
-保守 enqueue，后续再根据 frame 中的 current domain 增加运行时同 Domain fast path。
+async context 中若目标 identity 与 current domain 相同，`coroutine.sync(D)` 直接执行
+closure；只有跨 Domain 时才 enqueue 和挂起。canonical `const` Domain 可以直接识别，
+普通 Domain value 按运行时 identity 判断。
 
 跨 domain 时的能力检查：
 
@@ -507,10 +523,10 @@ move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃�
 - 外部只能发消息或调用 async 方法。
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
-初版不建议把 actor 纳入核心 domain 语法，因为每个 actor instance 的 domain 往往是运行时值，
-而当前 `async [D]` / `coroutine.sync(D)` 要求 `D` 是 canonical const Domain binding。可以先用库层
-`Actor<T>` 封装状态；
-未来如果需要语言级 actor，再单独设计 `self domain` 或 instance domain。
+初版不建议把 actor 纳入核心 domain 语法。每个 actor instance 可以拥有一个普通 serial
+Domain value，并通过 `Task(domain: actor.domain$.ref())` 或
+`coroutine.sync(actor.domain$.ref())` 调度工作。可以先用库层 `Actor<T>` 封装状态；
+未来如果需要让 actor method 自动携带 instance-bound effect，再单独设计 `self domain`。
 
 `isolate` 更适合表示隔离状态、独立 heap 或 actor-like container，不适合替代 `domain`。
 本文中的主概念是 execution domain。
@@ -566,7 +582,8 @@ Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠�
 
 ## 未决问题
 
-- `D` 当前必须是 canonical const Domain binding；未来是否允许 dependent / instance Domain。
+- `async [D]` 仍只接受 canonical `const` Domain binding；是否需要 `self domain` 一类
+  dependent effect，应由 actor method 等真实用例决定。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
 - 复杂循环和跨 suspend reborrow 的诊断如何进一步收紧。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。

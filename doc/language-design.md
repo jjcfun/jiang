@@ -1042,15 +1042,16 @@ Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T
 `coroutine.check_cancelled()` 建立显式检查点。普通 `await()` 发现 child 已取消且没有 result
 时，当前 parent 进入 cancellation cleanup，并取消、等待其余 sibling。
 
-`coroutine.sync(Domain) { ... }` 接受必填 Domain 和普通尾随 closure。在 async context 中，它挂起
+`coroutine.sync(Domain) { ... }` 接受必填 Domain 目标和普通尾随 closure。目标可以是命名
+`const` Domain，也可以是普通 Domain value 的共享引用。在 async context 中，它挂起
 当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain；它不创建用户可见 Task。普通同步函数
 用最外层 `coroutine.sync(Domain)` 进入 runtime 时，会阻塞当前线程等待 closure 完成。
 `Task { ... }` 可以继承已有 current Domain；`Task(domain: D) { ... }` 显式选择 execution Domain。
 
 `main_domain` 是绑定进程启动线程的标准串行 Domain，`global_domain`
 是进程共享的标准并发 Domain。
-Domain 是静态 effect identity；Executor 是该身份在运行时采用的排队策略。每个 canonical const
-Domain binding 恰好懒创建一个 Executor：
+Domain 是 execution identity；Executor 是该身份采用的排队策略。每个 canonical `const`
+Domain binding 恰好懒创建一个程序级共享 Executor：
 
 ```jiang
 struct InlineExecutor: Executor {
@@ -1069,6 +1070,33 @@ struct InlineDomain: Domain<kind = .serial> {
 
 const InlineDomain inline_domain = InlineDomain();
 ```
+
+普通 Domain value 则是拥有者管理的运行时身份。它与 `const` Domain 使用同一个 `Domain`
+trait、`Executor` contract、serial gate 和 Task ABI，不引入第二套协程模型。它支持 move、
+参数、返回值、字段和 generic 流转；Task 和 `coroutine.sync` 通过共享引用选择它：
+
+```jiang
+SceneDomain domain = SceneDomain(config: config);
+Task<Int> task = Task(domain: domain$.ref()) { load_scene() };
+Int value = coroutine.sync(domain$.ref()) { update_scene() };
+```
+
+`async [D]` 和 domain-bound callable type 的 `D` 是静态 effect identity，仍只接受 canonical
+`const` Domain binding。普通 Domain value 不进入函数类型，因此不需要 dependent effect 或把
+Domain 类型参数加入 `Task<T>`。
+
+普通 Domain owner drop 是 non-blocking 的，不广播取消已启动的 Task。每个已接受的 Task
+持有 execution lease：即使 Task 还没开始执行，Domain owner 也可以先离开作用域；Executor
+只在 owner 和最后一个 lease 都释放后销毁。Task 不因此携带 Domain value 的 borrow lifetime。
+`coroutine.sync(domain$.ref())` 则保持普通共享借用直到 closure 及其结构化子协程全部完成；
+调用返回后借用结束，结果不携带 Domain lifetime，也不需要为 Executor 建立 execution lease。
+`make_executor` 的结果必须自包含，不能保存对 Domain receiver 或其配置字段的引用。
+
+普通 Domain 当前可以放在 local、参数、返回值、aggregate 字段和 generic value 中，
+不能直接放入 global storage。长期全局身份应使用 canonical `const` Domain binding。
+命名 `const` Domain 具有稳定的程序级 identity，调度开销低于普通 runtime Domain；长期共享身份
+应优先使用它。普通 Domain value 为独立 identity 和确定资源生命周期支付少量动态开销，适合页面、
+场景或会话等有限生存期资源。选择应以所有权语义为主，而不是把需要及时释放的 Executor 改成常驻值。
 
 `Executor.enqueue` 是同步方法，但可以把 move-only `ExecutorJob` 放入自己的队列后再运行。
 它可能从多个线程并发调用，因此 Executor 的可变状态必须使用显式同步。

@@ -17,6 +17,7 @@ The benchmark warms executor and allocator state before measuring these paths:
 - `Task<T>^` allocation, parameter/return forwarding, and await;
 - cross-Domain enqueue and await;
 - `global_domain`, `main_domain`, and a minimal custom Executor enqueue;
+- a reused runtime inline Domain and per-operation runtime Domain/executor lifecycle;
 - immediate suspend/resume;
 - cancellation before a scoped task starts;
 - repeated work spread across eight serial Domains.
@@ -27,6 +28,38 @@ It is the structural Job-wrapper allocation count for each path, not allocator i
 standard/custom enqueue reuses TaskState storage. Compare repeated runs from the same compiler build and machine;
 the numbers are not a correctness gate. The synchronous leaf uses a no-allocation external optimization barrier so
 LLVM cannot fold the entire baseline loop into a constant.
+
+### 0.5.3 runtime Domain baseline
+
+2026-08-27 on arm64 macOS 26.5, Jiang 0.5.3/LLVM 22.1.8, five runs of 100,000 iterations for each binary produced
+these median values. The pre-runtime column uses the committed release HEAD built through the same 0.5.3 bootstrap
+chain; its benchmark source differs only by the current `Void` and explicit `@life()` spellings required to compile it.
+
+| Path | Pre-runtime ns/op | Runtime Domain ns/op | Job-wrapper allocations |
+| --- | ---: | ---: | ---: |
+| synchronous | 0.99 | 0.98 | 0 |
+| same-domain | 4.82 | 4.86 | 0 |
+| scoped-task | 12.71 | 12.93 | 0 |
+| heap-owner | 140.84 | 142.88 | 0 |
+| cross-domain serial | 3467.94 | 3546.42 | 0 |
+| global-enqueue | 3060.86 | 3143.27 | 0 |
+| main-enqueue | 4345.29 | 4636.47 | 0 |
+| custom inline enqueue | 85.92 | 84.35 | 0 |
+| reused runtime inline Domain | — | 127.31 | 0 |
+| runtime inline Domain lifecycle | — | 299.49 | 0 |
+| immediate-resume | 156.29 | 151.16 | 0 |
+| cancel-before-start | 13.14 | 13.20 | 0 |
+| eight serial Domains | 1760.21 | 1805.71 | 0 |
+
+Static and owned scheduling have separate request, handoff, and callback envelopes while sharing one scheduler state
+machine and Task ABI. Disassembly confirms that the static scoped-Task completion path has the same instruction shape
+as the pre-runtime binary: it performs no executor load, ownership check, lease refcount, or TLS operation. The shortest
+paths remain within measurement noise, while system-queue rows vary with host scheduling and are supporting evidence
+rather than a correctness gate.
+
+With the same inline Executor implementation, a reused runtime Domain costs 127.31 ns/op versus 84.35 ns/op for the
+canonical static Domain, an absolute dynamic-identity cost of 42.96 ns/op. Creating and destroying the runtime Domain
+and Executor on every operation costs 299.49 ns/op, a lifecycle increment of 172.18 ns/op over reuse.
 
 ### 0.5.0 development baseline
 

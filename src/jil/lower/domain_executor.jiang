@@ -1,6 +1,6 @@
 // Domain/Executor descriptor 与生命周期 shim lowering。
 //
-// 每个被使用的 canonical const Domain 生成一个只读 descriptor。create 直接把
+// canonical const Domain 和普通 Domain value 共用只读 descriptor。create 直接把
 // concrete Executor 初始化到 runtime 最终 storage；enqueue 构造 opaque
 // ExecutorJob；destroy 只销毁 concrete value，不释放 runtime 拥有的 storage。
 
@@ -10,10 +10,14 @@ import database = "../../db.jiang";
 import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import types = "../../sema/type.jiang";
+import lifetime_shape = "../../sema/lifetime_shape.jiang";
+import lifetime_shape_query = "../../sema/lifetime_shape_query.jiang";
+import generic_bindings = "../../sema/generic/bindings.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
 import jil = "../model.jiang";
+import jil_diagnostics = "../diagnostics.jiang";
 import drop_elaborate = "../drop_elaborate.jiang";
 import std;
 import body_context = "./body.jiang";
@@ -23,6 +27,7 @@ import trait_object = "./trait_object.jiang";
 import dispatch = "./dispatch.jiang";
 import type_support = "./type_support.jiang";
 import place = "./place.jiang";
+import builder = "./builder.jiang";
 
 public extend body_context.BodyLowerer {
     public Void ensure_domain_executor_descriptor(
@@ -73,6 +78,76 @@ public extend body_context.BodyLowerer {
         );
     }
 
+    public Void ensure_runtime_domain_executor_descriptor(
+        Self&! self,
+        qid.TypeId domain_type,
+        token.Span span
+    ) {
+        if (self.lowerer.program.has_errors()) { return; }
+        if (self.lowerer.program.runtime_domain_executor_descriptor(domain_type) != null) {
+            return;
+        }
+        types.TypeInfo info = self.lowerer.store.types.get(domain_type);
+        guard info.data is .named(named) else {
+            self.lowerer.program.mark_error();
+            return;
+        }
+        guard self.domain_descriptor_inputs_for_type(
+            named.def_id, domain_type
+        ) is .some(inputs) else {
+            self.lowerer.program.mark_error();
+            return;
+        }
+        if (!self.runtime_executor_is_self_contained(inputs)) { return; }
+        if (self.is_builtin_executor_type(inputs.executor_type)) { return; }
+        qid.TypeId create_type = self.domain_create_function_type(span);
+        qid.TypeId enqueue_type = self.domain_enqueue_function_type(span);
+        qid.TypeId destroy_type = self.domain_destroy_function_type(span);
+        jil.FunctionId create_id = self.add_domain_create_shim(inputs, span);
+        guard self.add_domain_enqueue_shim(inputs, span)
+            is .some(enqueue_id) else {
+            return;
+        }
+        jil.FunctionId destroy_id = self.add_domain_destroy_shim(inputs, span);
+        jil.FunctionRef create = self.domain_shim_ref(
+            create_id, inputs.domain_def, create_type, span
+        );
+        jil.FunctionRef enqueue = self.domain_shim_ref(
+            enqueue_id, inputs.domain_def, enqueue_type, span
+        );
+        jil.FunctionRef destroy = self.domain_shim_ref(
+            destroy_id, inputs.domain_def, destroy_type, span
+        );
+        jil.GlobalRef descriptor = self.add_domain_descriptor_global(
+            inputs, create, enqueue, destroy, span
+        );
+        self.lowerer.program.set_runtime_domain_executor_descriptor(
+            domain_type, descriptor
+        );
+    }
+
+    Bool runtime_executor_is_self_contained(
+        Self&! self,
+        DomainDescriptorInputs inputs
+    ) {
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(
+                self.lowerer.store,
+                self.lowerer.lifetime_shape_query$.mut_ref()
+            );
+        lifetime_shape.LifetimeShapeId shape =
+            query.lifetime_shape(inputs.executor_type);
+        lifetime_shape.LifetimeShapeClass shape_class = query.classify(shape);
+        if (shape_class == .empty) { return true; }
+        self.lowerer.program.mark_error();
+        jil_diagnostics.add_runtime_domain_executor_borrow(
+            self.lowerer.store,
+            self.lowerer.diagnostics$.mut_ref(),
+            inputs.domain_def
+        );
+        return false;
+    }
+
     Bool is_builtin_executor_type(self, qid.TypeId executor_type) {
         types.TypeInfo info = self.lowerer.store.types.get(executor_type);
         guard info.data is .named(named) else { return false; }
@@ -102,6 +177,16 @@ public extend body_context.BodyLowerer {
         guard self.lowerer.typeck.def_type(domain_def) is .some(domain_type) else {
             return null;
         }
+        return self.domain_descriptor_inputs_for_type(
+            domain_def, domain_type
+        );
+    }
+
+    DomainDescriptorInputs? domain_descriptor_inputs_for_type(
+        Self&! self,
+        qid.DefId domain_def,
+        qid.TypeId domain_type
+    ) {
         guard self.domain_executor_type(domain_type) is .some(executor_type) else {
             return null;
         }
@@ -133,7 +218,6 @@ public extend body_context.BodyLowerer {
         if (domain_kind < 0) { return null; }
         return DomainDescriptorInputs(
             domain_def: domain_def,
-            node_id: node_id,
             domain_type: domain_type,
             executor_type: executor_type,
             domain_kind: domain_kind,
@@ -142,7 +226,7 @@ public extend body_context.BodyLowerer {
         );
     }
 
-    Int descriptor_domain_kind_for_type(self, qid.TypeId domain_type) {
+    public Int descriptor_domain_kind_for_type(self, qid.TypeId domain_type) {
         guard self.lowerer.store.resolve.core_traits.domain_trait
             is .some(domain_trait) else {
             return -1;
@@ -192,6 +276,8 @@ public extend body_context.BodyLowerer {
         guard self.lowerer.model.def(named.def_id) is .some(domain_model) else {
             return null;
         }
+        generic_bindings.GenericBindings substitutions =
+            self.nominal_substitution_for_type(domain_type, named.def_id);
         Int index! = 0;
         guard self.lowerer.store.symbols.find("ExecutorType")
             is .some(executor_symbol) else {
@@ -207,14 +293,18 @@ public extend body_context.BodyLowerer {
             }
             if (!matches) { continue; }
             if (self.lowerer.typeck.def_type(member) is .some(executor_type)) {
-                return executor_type;
+                return self.lowerer.substitute_type(
+                    executor_type, substitutions$.ref()
+                );
             }
             guard self.lowerer.model.def(member) is .some(member_model) else {
                 return null;
             }
             guard member_model.decl.type_ref is .some(type_ref) else { return null; }
             if (self.lowerer.typeck.node_type(type_ref) is .some(executor_type)) {
-                return executor_type;
+                return self.lowerer.substitute_type(
+                    executor_type, substitutions$.ref()
+                );
             }
             return null;
         }
@@ -229,7 +319,9 @@ public extend body_context.BodyLowerer {
             guard self.lowerer.typeck.node_type(equal.value) is .some(raw_type) else {
                 return null;
             }
-            return raw_type;
+            return self.lowerer.substitute_type(
+                raw_type, substitutions$.ref()
+            );
         }
         return null;
     }
@@ -407,7 +499,8 @@ public extend body_context.BodyLowerer {
         self.lowerer.program.add_global(jil.Global(
             id: id,
             origin: .generated(self.generated_global_origin(
-                name.bytes(), .domain_descriptor, inputs.domain_def, null
+                name.bytes(), .domain_descriptor, inputs.domain_def,
+                inputs.domain_type
             )),
             type_id: descriptor_type,
             span: span,
@@ -465,7 +558,6 @@ public extend body_context.BodyLowerer {
 
 public struct DomainDescriptorInputs: Copyable {
     public qid.DefId domain_def;
-    public sem.NodeId node_id;
     public qid.TypeId domain_type;
     public qid.TypeId executor_type;
     public Int domain_kind;
@@ -519,8 +611,8 @@ public extend body_context.BodyLowerer {
         jil.Place destination = self.domain_deref_place(5);
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
         args.add(self.domain_copy_local(4));
-        jil.FunctionRef make_executor = self.trait_impl_function_ref(
-            inputs.node_id, inputs.domain_type, inputs.make_executor_def
+        jil.FunctionRef make_executor = self.trait_impl_function_ref_for_type(
+            inputs.domain_type, inputs.make_executor_def
         );
         list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
         blocks.add(self.domain_call_block(
@@ -593,8 +685,8 @@ public extend body_context.BodyLowerer {
         args.add(jil.move_operand_value(jil.MoveOperand(
             place: self.domain_local_place(7)
         )));
-        jil.FunctionRef enqueue = self.trait_impl_function_ref(
-            inputs.node_id, inputs.executor_type, inputs.enqueue_def
+        jil.FunctionRef enqueue = self.trait_impl_function_ref_for_type(
+            inputs.executor_type, inputs.enqueue_def
         );
         list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
         blocks.add(self.domain_call_block(

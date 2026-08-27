@@ -1184,8 +1184,8 @@ Task 的结构化清理完成后，借用随之结束。`Task<T>` 与 `Task<T>^`
 局部值并释放 parent frame。直接 `Task<T>` 的地址固定，不支持 `move()`、`forget()` 或重新赋值。
 `Task<T>^` owner 析构不阻塞、也不隐式取消；owner 与 coroutine 通过固定的双方原子交接决定最后回收者。
 
-Domain 是静态执行身份，Executor 是它在运行时采用的调度策略。
-需要接入自有事件循环时，实现 `Executor`，再由 Domain 的 `make_executor` 创建它：
+Domain 表示执行身份，Executor 是它采用的调度策略。需要接入自有事件循环时，
+实现 `Executor`，再由 Domain 的 `make_executor` 创建它：
 
 ```jiang
 struct InlineExecutor: Executor {
@@ -1205,7 +1205,45 @@ struct InlineDomain: Domain<kind = .serial> {
 const InlineDomain inline_domain = InlineDomain();
 ```
 
-每个命名 `const` Domain binding 都有独立身份，并且只懒创建一个 Executor 实例。
+Domain 不需要分成两种类型。它的使用方式由 binding 决定：
+
+- 命名 `const` Domain 是程序级共享身份，每个 binding 只懒创建一个 Executor。它可以出现在
+  `async [domain]` effect 中，也可以直接作为 Task 或 `coroutine.sync` 的目标。
+- 普通 Domain value 拥有自己的 Executor，适合页面、场景或一次会话等有明确生存期的
+  执行环境。它可以 move、作为参数或返回值，也可以存入 struct 字段和 generic value。
+  选择它时传入共享引用：
+
+```jiang
+SceneDomain scene_domain = SceneDomain(config: config);
+
+Task<Int> task = Task(domain: scene_domain$.ref()) {
+    load_scene()
+};
+
+Int value = coroutine.sync(scene_domain$.ref()) {
+    update_scene()
+};
+```
+
+`async [domain]` 是函数类型的静态 effect，因此只接受命名 `const` Domain；需要在运行时
+选择 Domain 时，使用 `Task(domain: value$.ref())`、`coroutine.sync(value$.ref())` 或在已有
+current Domain 中使用 `Task { ... }`。
+
+普通 Domain 离开作用域时不会隐式取消已创建的 Task，也不会阻塞等待它们。已启动的 Task
+保持完成执行所需的权利，最后一个 Task 退出后 Executor 才能被释放。如果业务需要取消，
+应保留 Task handle 并显式调用 `cancel()` 或 `cancel_and_await()`。Task 不长期借用 Domain
+value，但 `make_executor` 产生的 Executor 必须自包含，不能保存对 Domain 或其配置字段的借用。
+
+`coroutine.sync(scene_domain$.ref())` 是结构化调用：共享借用只持续到 closure 及其子协程
+全部完成，调用返回后 Domain 可以立即离开作用域，返回值也不携带 Domain 的 lifetime。
+
+普通 Domain 当前不能直接放入 global storage；程序级共享 Domain 使用命名 `const`，
+有限生存期的 Domain 放在 local 或 owner struct 字段中。
+
+命名 `const` Domain 的调度开销低于普通 runtime Domain，适合程序级长期共享身份。普通 Domain
+value 会支付少量动态生命周期开销，以换取独立 identity 和确定资源回收，适合页面、场景或会话。
+选择时应先看资源所有权，不应为了省开销而让本应及时释放的 Executor 常驻。
+
 `.serial` 保证同一 Domain 的 Job 不重叠；`.concurrent` 允许并行执行。`ExecutorJob` 是一次性值，
 `enqueue` 接收后必须最终调用一次 `run()`，不能复制、保存借用或静默丢弃。
 

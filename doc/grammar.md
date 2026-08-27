@@ -372,11 +372,14 @@ name        <- ident / "self"
 - 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`
   可用于函数声明，表示 domain-bound async function。
 - `coroutine.sync(domain) { ... }` 接受一个必填的 positional domain 和一个尾随 closure。
-  `domain` 是实现 `Domain` 的编译期 domain value；`main_domain` 和 `global_domain` 是标准 binding。
+  `domain` 可以是实现 `Domain` 的 canonical `const` binding，也可以是普通 Domain value
+  的共享引用；`main_domain` 和 `global_domain` 是标准 binding。
   自定义 Domain 必须提供
   `kind`、`ExecutorType` 和同步 `make_executor`；编译器通过 `Domain.kind` 区分
   serial/concurrent 语义。
 - 函数声明和 callable type 中的 `async [domain]` 只接受 canonical const Domain binding。
+- `Task(domain: domain) { ... }` 与 `new Task(domain: domain) { ... }` 的 domain 遵守相同规则：
+  canonical `const` binding 直接传入，普通 Domain value 使用 `value$.ref()`。
 - 无 domain 的 `Task { ... }` 只能在已有 current domain 的上下文中使用，并继承 current；
   `coroutine.sync` 始终要求显式 domain。
 - 普通同步函数中的最外层 `coroutine.sync(domain) {}` 阻塞进入 runtime；async context 中的

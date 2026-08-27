@@ -1,7 +1,7 @@
-// canonical const Domain binding 的 runtime-owned executor identity。
+// Domain executor identity 与 runtime owner 生命周期。
 //
-// 每个 canonical Domain 都有 compiler-generated slot。materialize 原子读取该 slot，
-// 只在首次使用时进入 binding table；后续调度直接消费得到的 opaque executor。
+// canonical const Domain 通过 compiler-generated slot 懒加载共享 executor；
+// 普通 Domain value 持有独立 owner，已接受的执行通过 lease 延长 executor 生命。
 
 import thread = "../system/thread.jiang";
 import atomic = "../core/atomic.jiang";
@@ -29,7 +29,11 @@ const Int executor_serial_mutex_word = executor_instance_word + 1;
 const Int executor_serial_active_word = executor_serial_mutex_word + 1;
 const Int executor_serial_head_word = executor_serial_active_word + 1;
 const Int executor_serial_tail_word = executor_serial_head_word + 1;
-const Int executor_word_count = executor_serial_tail_word + 1;
+const Int executor_owned_word = executor_serial_tail_word + 1;
+const Int executor_ref_count_word = executor_owned_word + 1;
+const Int executor_materialized_word = executor_ref_count_word + 1;
+const Int executor_owner_mutex_word = executor_materialized_word + 1;
+const Int executor_word_count = executor_owner_mutex_word + 1;
 const Int frame_header_size = 16;
 const Int frame_pool_min_size = 64;
 const Int custom_job_group_word = 0;
@@ -49,19 +53,28 @@ public struct InlineTarget: Copyable {
 }
 
 thread.Mutex executors_mutex! = thread.Mutex(null);
+thread.Group executor_reclamation_group! = thread.Group(null);
+thread.Queue executor_reclamation_queue! = thread.Queue(null);
 UInt8* executor_binding_ids! = null;
 UInt8* executor_handles! = null;
 Int executor_count! = 0;
 Int executor_capacity! = 0;
 
-public Bool initialize() {
+public Bool initialize(thread.Group reclamation_group) {
     executors_mutex = thread.create_mutex();
+    executor_reclamation_group = reclamation_group;
+    executor_reclamation_queue = thread.Queue(null);
     keep_resume_abi_reachable();
     return thread.mutex_valid(executors_mutex);
 }
 
 public Void shutdown() {
     free_executors();
+    if (thread.queue_handle(executor_reclamation_queue) != null) {
+        thread.destroy_queue(executor_reclamation_queue, false);
+    }
+    executor_reclamation_queue = thread.Queue(null);
+    executor_reclamation_group = thread.Group(null);
     thread.destroy(executors_mutex);
     executors_mutex = thread.Mutex(null);
 }
@@ -101,6 +114,45 @@ public Void* materialize_uncached(Int binding_id, Int domain_kind) {
     return executor;
 }
 
+@link_symbol("__jiang_runtime_owned_domain_create")
+public Void* create_owned(Int domain_kind, Void* descriptor) {
+    return create_executor(
+        domain_kind, normal_thread_executor, descriptor, null, true
+    );
+}
+
+@link_symbol("__jiang_runtime_owned_domain_acquire")
+public Void* acquire_owned(Void* executor, Void* domain_config) {
+    if (executor == null) { return null; }
+    thread.Mutex mutex = owned_mutex(executor);
+    thread.lock(mutex);
+    materialize_owned(executor, domain_config);
+    retain_owned(executor);
+    thread.unlock(mutex);
+    return executor;
+}
+
+@link_symbol("__jiang_runtime_owned_domain_borrow")
+public Void* borrow_owned(Void* executor, Void* domain_config) {
+    if (executor == null) { return null; }
+    thread.Mutex mutex = owned_mutex(executor);
+    thread.lock(mutex);
+    materialize_owned(executor, domain_config);
+    thread.unlock(mutex);
+    return executor;
+}
+
+Void materialize_owned(Void* executor, Void* domain_config) {
+    if (load_executor_word(executor, executor_materialized_word) != 0) { return; }
+    materialize_executor(executor, normal_thread_executor, domain_config);
+}
+
+@link_symbol("__jiang_runtime_owned_domain_release")
+public Void* release_owned_owner(Void* executor, Void* domain_config) {
+    release_owned(executor, false);
+    return null;
+}
+
 public thread.Queue queue(Void* executor) {
     Int handle = load_executor_word(executor, executor_queue_word);
     return thread.Queue(unsafe { handle$.as(Void*) });
@@ -120,22 +172,60 @@ public Bool enqueue(
     return thread.enqueue(group, queue(executor), context, callback);
 }
 
+public Bool enqueue_static(
+    thread.Group group,
+    Void* executor,
+    Void* context,
+    Void* callback
+) {
+    if (executor_descriptor(executor) != null) {
+        return enqueue_custom_static(group, executor, context, callback);
+    }
+    return thread.enqueue(group, queue(executor), context, callback);
+}
+
 Bool enqueue_custom(
     thread.Group group,
     Void* executor,
     Void* context,
     Void* callback
 ) {
-    UInt8* job = thread.allocate_storage(custom_job_word_count * Int$.size());
+    UInt8* job = prepare_allocated_custom_job(group, executor, context, callback);
     if (job == null) { return false; }
-    initialize_custom_job(
-        job, group, executor, context, callback, custom_job_allocated
-    );
     if (!submit_custom_job(group, executor, job)) {
         thread.deallocate_storage(job);
         return false;
     }
     return true;
+}
+
+Bool enqueue_custom_static(
+    thread.Group group,
+    Void* executor,
+    Void* context,
+    Void* callback
+) {
+    UInt8* job = prepare_allocated_custom_job(group, executor, context, callback);
+    if (job == null) { return false; }
+    if (!submit_custom_job_static(group, executor, job)) {
+        thread.deallocate_storage(job);
+        return false;
+    }
+    return true;
+}
+
+UInt8* prepare_allocated_custom_job(
+    thread.Group group,
+    Void* executor,
+    Void* context,
+    Void* callback
+) {
+    UInt8* job = thread.allocate_storage(custom_job_word_count * Int$.size());
+    if (job == null) { return null; }
+    initialize_custom_job(
+        job, group, executor, context, callback, custom_job_allocated
+    );
+    return job;
 }
 
 public Bool enqueue_task(
@@ -145,14 +235,46 @@ public Bool enqueue_task(
     Void* callback
 ) {
     if (executor_descriptor(executor) == null) {
-        return thread.enqueue_task(
-            group,
-            queue(executor),
-            task_custom_job(task),
-            unsafe { task$.as(Void*) },
-            callback
-        );
+        return enqueue_builtin_task(group, executor, task, callback);
     }
+    UInt8* job = prepare_task_custom_job(group, executor, task, callback);
+    return submit_custom_job(group, executor, job);
+}
+
+public Bool enqueue_task_static(
+    thread.Group group,
+    Void* executor,
+    UInt8* task,
+    Void* callback
+) {
+    if (executor_descriptor(executor) == null) {
+        return enqueue_builtin_task(group, executor, task, callback);
+    }
+    UInt8* job = prepare_task_custom_job(group, executor, task, callback);
+    return submit_custom_job_static(group, executor, job);
+}
+
+Bool enqueue_builtin_task(
+    thread.Group group,
+    Void* executor,
+    UInt8* task,
+    Void* callback
+) {
+    return thread.enqueue_task(
+        group,
+        queue(executor),
+        task_custom_job(task),
+        unsafe { task$.as(Void*) },
+        callback
+    );
+}
+
+UInt8* prepare_task_custom_job(
+    thread.Group group,
+    Void* executor,
+    UInt8* task,
+    Void* callback
+) {
     UInt8* job = task_custom_job(task);
     initialize_custom_job(
         job,
@@ -162,7 +284,7 @@ public Bool enqueue_task(
         callback,
         custom_job_task_backed
     );
-    return submit_custom_job(group, executor, job);
+    return job;
 }
 
 Void initialize_custom_job(
@@ -198,7 +320,36 @@ Bool submit_custom_job(
     RawFn<Void, Void*, Int, Int> submit = unsafe {
         descriptor.enqueue$.as(RawFn<Void, Void*, Int, Int>)
     };
+    // queued Job 在 callback 真正执行前独立保持 executor 存活；第二个引用保护
+    // 可能 inline 调用 callback 的用户 enqueue 栈。
+    retain_owned(executor);
+    retain_owned(executor);
     RawFn<Void, Int> run = run_custom_job;
+    submit(
+        instance,
+        unsafe { job$.as(Int) },
+        unsafe { run$.as(Int) }
+    );
+    release_owned(executor, false);
+    return true;
+}
+
+Bool submit_custom_job_static(
+    thread.Group group,
+    Void* executor,
+    UInt8* job
+) {
+    if (!thread.enter_group(group)) { return false; }
+    descriptor_model.DomainDescriptor& descriptor = unsafe {
+        executor_descriptor(executor)$.as(descriptor_model.DomainDescriptor&)
+    };
+    Void* instance = unsafe {
+        load_executor_word(executor, executor_instance_word)$.as(Void*)
+    };
+    RawFn<Void, Void*, Int, Int> submit = unsafe {
+        descriptor.enqueue$.as(RawFn<Void, Void*, Int, Int>)
+    };
+    RawFn<Void, Int> run = run_custom_job_static;
     submit(
         instance,
         unsafe { job$.as(Int) },
@@ -215,17 +366,48 @@ UInt8* task_custom_job(UInt8* task) {
 @life()
 Void run_custom_job(Int raw_job) {
     UInt8* job = unsafe { raw_job$.as(UInt8*) };
-    Void* executor = unsafe {
-        load_storage_word(job, custom_job_executor_word)$.as(Void*)
-    };
-    if (!is_concurrent(executor) && !claim_custom_serial_job(executor, job)) {
-        return;
+    Void* executor = begin_custom_drain(job);
+    if (executor == null) { return; }
+    retain_owned(executor);
+    Bool tracks_thread_identity =
+        load_executor_word(executor, executor_owned_word) != 0
+        && !is_concurrent(executor);
+    Void* previous_identity! = null;
+    if (tracks_thread_identity) {
+        previous_identity = thread.enter_thread_identity(executor);
     }
+    UInt8* current! = job;
+    while (current != null) {
+        run_claimed_custom_job(current);
+        release_owned(executor, false);
+        current = take_custom_serial_job(executor);
+    }
+    if (tracks_thread_identity) {
+        thread.leave_thread_identity(previous_identity);
+    }
+    release_owned(executor, true);
+}
+
+@life()
+Void run_custom_job_static(Int raw_job) {
+    UInt8* job = unsafe { raw_job$.as(UInt8*) };
+    Void* executor = begin_custom_drain(job);
+    if (executor == null) { return; }
     UInt8* current! = job;
     while (current != null) {
         run_claimed_custom_job(current);
         current = take_custom_serial_job(executor);
     }
+}
+
+Void* begin_custom_drain(UInt8* job) {
+    Void* executor = unsafe {
+        load_storage_word(job, custom_job_executor_word)$.as(Void*)
+    };
+    if (!is_concurrent(executor) && !claim_custom_serial_job(executor, job)) {
+        return null;
+    }
+    return executor;
 }
 
 Void run_claimed_custom_job(UInt8* job) {
@@ -304,7 +486,9 @@ public Bool is_concurrent(Void* executor) {
 
 public Bool is_current(Void* executor) {
     if (executor == null || is_concurrent(executor)) { return false; }
-    return thread.has_queue_identity(executor);
+    if (thread.has_queue_identity(executor)) { return true; }
+    if (load_executor_word(executor, executor_owned_word) == 0) { return false; }
+    return thread.has_thread_identity(executor);
 }
 
 public Bool can_inline(Void* executor, Void* context) {
@@ -453,25 +637,28 @@ Void* add_executor(
     Void* domain_config
 ) {
     ensure_executor_capacity();
+    Void* executor = create_executor(
+        domain_kind, thread_executor, descriptor, domain_config, false
+    );
+    UInt8* storage = unsafe { executor$.as(UInt8*) };
+    Int index = executor_count;
+    store_storage_word(executor_binding_ids, index, binding_id);
+    store_storage_word(executor_handles, index, unsafe { storage$.as(Int) });
+    executor_count = index + 1;
+    return executor;
+}
+
+Void* create_executor(
+    Int domain_kind,
+    Int thread_executor,
+    Void* descriptor,
+    Void* domain_config,
+    Bool owned
+) {
     UInt8* storage = thread.allocate_storage(executor_word_count * Int$.size());
     assert(storage != null);
-    thread.Queue target_queue! = thread.Queue(null);
-    if (descriptor == null) {
-        target_queue = thread.concurrent_queue();
-        if (thread_executor == main_thread_executor) {
-            target_queue = thread.main_queue();
-            thread.set_queue_identity(target_queue, unsafe { storage$.as(Void*) });
-        } else if (domain_kind != concurrent_domain_kind) {
-            target_queue = thread.serial_queue();
-            thread.set_queue_identity(target_queue, unsafe { storage$.as(Void*) });
-        }
-    }
     store_storage_word(storage, executor_kind_word, domain_kind);
-    store_storage_word(
-        storage,
-        executor_queue_word,
-        unsafe { thread.queue_handle(target_queue)$.as(Int) }
-    );
+    store_storage_word(storage, executor_queue_word, 0);
     store_storage_word(storage, executor_active_context_word, 0);
     store_storage_word(storage, executor_tracking_enabled_word, 0);
     store_storage_word(storage, executor_inline_depth_word, 0);
@@ -483,28 +670,150 @@ Void* add_executor(
         store_storage_word(storage, word_index, 0);
         word_index = word_index + 1;
     }
-    thread.AtomicStackArray shared_stacks =
-        thread.create_atomic_stack_array(frame_pool_class_count);
-    assert(thread.atomic_stack_array_valid(shared_stacks));
-    store_storage_word(
-        storage,
-        executor_shared_frame_pool_handle_word,
-        unsafe { thread.atomic_stack_array_handle(shared_stacks)$.as(Int) }
-    );
+    store_storage_word(storage, executor_shared_frame_pool_handle_word, 0);
     store_storage_word(storage, executor_descriptor_word, unsafe { descriptor$.as(Int) });
     store_storage_word(storage, executor_instance_word, 0);
     store_storage_word(storage, executor_serial_mutex_word, 0);
     store_storage_word(storage, executor_serial_active_word, 0);
     store_storage_word(storage, executor_serial_head_word, 0);
     store_storage_word(storage, executor_serial_tail_word, 0);
-    if (descriptor != null) {
-        initialize_custom_executor(storage, domain_kind, descriptor, domain_config);
+    store_storage_word(storage, executor_owned_word, if (owned) { 1 } else { 0 });
+    store_storage_word(storage, executor_ref_count_word, if (owned) { 1 } else { 0 });
+    store_storage_word(storage, executor_materialized_word, 0);
+    store_storage_word(storage, executor_owner_mutex_word, 0);
+    if (owned) {
+        thread.Mutex mutex = thread.create_mutex();
+        assert(thread.mutex_valid(mutex));
+        store_storage_word(
+            storage,
+            executor_owner_mutex_word,
+            unsafe { thread.mutex_handle(mutex)$.as(Int) }
+        );
+    } else {
+        materialize_executor(
+            unsafe { storage$.as(Void*) }, thread_executor, domain_config
+        );
     }
-    Int index = executor_count;
-    store_storage_word(executor_binding_ids, index, binding_id);
-    store_storage_word(executor_handles, index, unsafe { storage$.as(Int) });
-    executor_count = index + 1;
     return unsafe { storage$.as(Void*) };
+}
+
+Void materialize_executor(
+    Void* raw_executor,
+    Int thread_executor,
+    Void* domain_config
+) {
+    UInt8* executor = unsafe { raw_executor$.as(UInt8*) };
+    Int domain_kind = load_storage_word(executor, executor_kind_word);
+    Void* descriptor = unsafe {
+        load_storage_word(executor, executor_descriptor_word)$.as(Void*)
+    };
+    thread.Queue target_queue! = thread.Queue(null);
+    if (descriptor == null) {
+        target_queue = thread.concurrent_queue();
+        if (thread_executor == main_thread_executor) {
+            target_queue = thread.main_queue();
+            thread.set_queue_identity(target_queue, raw_executor);
+        } else if (domain_kind != concurrent_domain_kind) {
+            target_queue = thread.serial_queue();
+            thread.set_queue_identity(target_queue, raw_executor);
+        }
+    }
+    store_storage_word(
+        executor,
+        executor_queue_word,
+        unsafe { thread.queue_handle(target_queue)$.as(Int) }
+    );
+    thread.AtomicStackArray shared_stacks =
+        thread.create_atomic_stack_array(frame_pool_class_count);
+    assert(thread.atomic_stack_array_valid(shared_stacks));
+    store_storage_word(
+        executor,
+        executor_shared_frame_pool_handle_word,
+        unsafe { thread.atomic_stack_array_handle(shared_stacks)$.as(Int) }
+    );
+    if (descriptor != null) {
+        initialize_custom_executor(executor, domain_kind, descriptor, domain_config);
+    }
+    store_storage_word(executor, executor_materialized_word, 1);
+}
+
+Void retain_owned(Void* executor) {
+    if (!executor_is_owned(executor)) { return; }
+    atomic.Atomic<Int>& count = atomic_executor_word(
+        executor, executor_ref_count_word
+    );
+    while (true) {
+        Int observed = count.get();
+        assert(observed > 0);
+        if (count.compare_and_set(observed, observed + 1)) { return; }
+    }
+}
+
+Void release_owned(Void* executor, Bool defer_destroy) {
+    if (executor == null || !executor_is_owned(executor)) { return; }
+    atomic.Atomic<Int>& count = atomic_executor_word(
+        executor, executor_ref_count_word
+    );
+    while (true) {
+        Int observed = count.get();
+        assert(observed > 0);
+        if (!count.compare_and_set(observed, observed - 1)) { continue; }
+        if (observed == 1) {
+            if (defer_destroy) {
+                defer_executor_destroy(executor);
+            } else {
+                destroy_executor(executor);
+            }
+        }
+        return;
+    }
+}
+
+Void defer_executor_destroy(Void* executor) {
+    thread.Queue queue = executor_reclamation_queue_value();
+    RawFn<Void, Void*> callback = destroy_executor_callback;
+    assert(thread.enqueue(
+        executor_reclamation_group,
+        queue,
+        executor,
+        unsafe { callback$.as(Void*) }
+    ));
+}
+
+thread.Queue executor_reclamation_queue_value() {
+    thread.lock(executors_mutex);
+    if (thread.queue_handle(executor_reclamation_queue) == null) {
+        executor_reclamation_queue = thread.serial_queue();
+        assert(thread.queue_handle(executor_reclamation_queue) != null);
+    }
+    thread.Queue queue = executor_reclamation_queue;
+    thread.unlock(executors_mutex);
+    return queue;
+}
+
+@life()
+Void destroy_executor_callback(Void* executor) {
+    destroy_executor(executor);
+}
+
+Bool executor_is_owned(Void* executor) {
+    return executor != null
+        && load_executor_word(executor, executor_owned_word) != 0;
+}
+
+public Void retain_callback(Void* executor) {
+    retain_owned(executor);
+}
+
+public Void release_callback(Void* executor) {
+    release_owned(executor, true);
+}
+
+thread.Mutex owned_mutex(Void* executor) {
+    Void* handle = unsafe {
+        load_executor_word(executor, executor_owner_mutex_word)$.as(Void*)
+    };
+    return thread.mutex_from_handle(handle);
 }
 
 Void initialize_custom_executor(
@@ -708,13 +1017,7 @@ Void free_executors() {
     Int index! = 0;
     while (index < executor_count) {
         Void* executor = load_executor_handle(index);
-        free_executor_frame_pool(executor);
-        if (executor_descriptor(executor) == null) {
-            thread.destroy_queue(queue(executor), is_concurrent(executor));
-        } else {
-            destroy_custom_executor(executor);
-        }
-        thread.deallocate_storage(unsafe { executor$.as(UInt8*) });
+        destroy_executor(executor);
         index = index + 1;
     }
     free_storage(executor_binding_ids);
@@ -723,6 +1026,21 @@ Void free_executors() {
     executor_handles = null;
     executor_count = 0;
     executor_capacity = 0;
+}
+
+Void destroy_executor(Void* executor) {
+    if (load_executor_word(executor, executor_materialized_word) != 0) {
+        free_executor_frame_pool(executor);
+        if (executor_descriptor(executor) == null) {
+            thread.destroy_queue(queue(executor), is_concurrent(executor));
+        } else {
+            destroy_custom_executor(executor);
+        }
+    }
+    if (executor_is_owned(executor)) {
+        thread.destroy(owned_mutex(executor));
+    }
+    thread.deallocate_storage(unsafe { executor$.as(UInt8*) });
 }
 
 Void* executor_descriptor(Void* executor) {

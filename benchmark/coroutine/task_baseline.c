@@ -17,6 +17,8 @@ static const char *case_name(int64_t case_id) {
         case 8: return "immediate-resume";
         case 9: return "cancel-before-start";
         case 10: return "many-domains";
+        case 11: return "runtime-inline";
+        case 12: return "runtime-lifecycle";
         default: return "unknown";
     }
 }
