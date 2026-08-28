@@ -121,12 +121,14 @@ builtin provider 提供基础能力，但 freestanding runtime、target runtime 
 | `std.Vector<T>` | 高频连续 collection | 直接导出，同时存在于 `std.collection` |
 | `std.collection` | `Vector`、`HashMap`、`HashSet` | 稳定 namespace |
 | `std.fs`、`std.io`、`std.process` | hosted filesystem、stream 和 process | provisional error model |
+| `std.time` | monotonic/wall clock 与 `Duration` | checked hosted clock namespace |
 | `std.debug`、`std.panic` | debug output、trap 和不可恢复终止 | 稳定 namespace / 顶层函数 |
 | `std.jiang` | lang provider 使用的 Jiang syntax ABI | 稳定 namespace |
 | `std.build` | build target 查询 | provisional namespace |
 | `std.path` | 无 owner 的 path byte algorithms | 稳定 namespace |
 
-`std` 还直接导出 `Utf8Error`、`Formattable`、`Atomic<T>`、`AtomicValue`、`MemoryOrder`、`Mutex<T>`，
+`std` 还直接导出 `Utf8Error`、`Duration`、`Instant`、`SystemTime`、`Formattable`、`Atomic<T>`、
+`AtomicValue`、`MemoryOrder`、`Mutex<T>`，
 以及 `Integer`、`SignedInteger`、`UnsignedInteger`、`FloatingPoint`。语言 builtin 的 `Bool`、整数、浮点、
 `Char`、`Fn`、`FnOnce`、`Movable`、`Mutable`、`Equatable`、`Hashable`、`Iterator`、`Sequence` 和
 `Contiguous` 也由入口 re-export；optional、errorable、owner、reference、pointer、array 和 slice 只使用
@@ -148,6 +150,11 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 |  | `chars() / make_iterator() -> StringChars` | 借用 receiver，O(1) 创建 iterator |
 |  | `char_count() -> Int` | Unicode scalar count，O(n) |
 |  | `byte_length() -> Int` | O(1) |
+|  | `byte_index_of(bytes[, start]) -> Int?`、`contains(bytes)` | byte offset；朴素搜索 O(n*m) |
+|  | `starts_with(bytes)`、`ends_with(bytes)` | byte prefix/suffix，O(m) |
+|  | `appending(bytes) -> String` | 保留 receiver，验证并复制 UTF-8 suffix，O(n+m) |
+|  | `split(separator, omit_empty = true) -> Vector<String>` | eager copy；separator 必须是非空 UTF-8，O(n*m) |
+|  | `Hashable` | 按完整 UTF-8 byte sequence 写入调用方 hasher，O(n) |
 | `StringBuilder` | `append(String&)`、`append(Bool)`、整数/浮点 overload | 修改 receiver；数值格式化 O(输出长度) |
 |  | `append(UInt8[]&)` | 验证后追加，O(n)；非法 UTF-8 panic |
 |  | `append_utf8(UInt8[]&) -> Void@Utf8Error` | 失败不修改 receiver，O(n) |
@@ -188,6 +195,9 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 | `std.process` | `arguments() -> ProgramArguments`、`env(name) -> UInt8[:0]&?`、`find_executable(name) -> UInt8[]^?` | env 借用 process storage；find 返回 owned path |
 |  | `run(executable, String[]& arguments[, options]) -> ProcessResult` | 同步等待；stdout/stderr borrow provider result storage |
 |  | `StreamBehavior`、`RunOptions`、`ProcessResult` | `ProcessResult.ok()` 为 started 且 exit code 0 |
+| `std.time` | `nanoseconds/microseconds/milliseconds/seconds(UInt64) -> Duration` | 非负 duration；unit overflow assert |
+|  | `monotonic_now() -> Instant?` | 进程内 interval clock；不表示日期，provider 不支持或失败时为 null |
+|  | `wall_now() -> SystemTime?` | Unix epoch wall clock；可能受系统校时影响，失败时为 null |
 
 `RunOptions.stdout = .pipe` 在 hosted POSIX target 上捕获标准输出。`stderr = .pipe` 尚未实现；调用方当前应选择
 `.inherit` 或 `.discard`。
