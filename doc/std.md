@@ -41,9 +41,13 @@ namespace。
 - `String`：拥有所有权的 UTF-8 字符串。字面量使用 `String text = "hello";` 初始化；动态字节使用
   `String.from_utf8(bytes)` 检查并返回 `String@Utf8Error`，确定输入合法时可在 `unsafe` 中调用
   `String.from_utf8_unchecked(bytes)`。`bytes()` 返回借用字节视图。
-- `StringBuilder`：面向字符串构造的可增长 builder，支持追加字节切片、字符串、整数和浮点值；
-  `into_string()` 生成 `String`，`into_slice()` 生成拥有所有权的 `UInt8[]^`。
-- `Path` / `PathBuilder`：面向路径文本的 owned path 和 builder。`Path.text()` 返回借用视图，
+- `StringBuilder`：始终保持合法 UTF-8，支持追加字符串、字符串字面量、整数和浮点值；字面量兼容的
+  `append(bytes)` 会验证输入，失败时 panic。动态字节需要恢复错误时使用
+  `append_utf8(bytes)` 检查并返回 `Void@Utf8Error`；确定输入合法时可在 `unsafe` 中调用
+  `append_utf8_unchecked(bytes)`。失败的 checked append 不修改 builder，错误 offset 相对于输入切片。
+  `into_string()` 和 `into_slice()` 都会消耗 builder 并以 O(1) 转移 storage。
+- `Path` / `PathBuilder`：面向原始路径字节的 owned path 和 builder，不借用 `StringBuilder` 的 UTF-8
+  invariant。`Path.text()` 返回借用视图，
   `Path.into_slice()` 可转成拥有所有权的字节切片。路径算法仍保留在 `std.path` namespace 下。
 - 内建 primitive type 与 trait 的公开入口。optional、errorable、pointer、reference、array 和 slice
   只通过 `T?`、`T@E`、`T^`、`T&`、`T*`、`T[N]`、`T[]`、`T[:S]` 等表面语法表达，
