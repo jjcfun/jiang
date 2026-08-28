@@ -696,6 +696,18 @@ Pair replace_left(Pair pair!) {
 嵌套 stored field 使用同一规则，例如 `value.header.buffer`。离开作用域时只析构仍然有效的字段，
 已经移出的字段由取得它的新 owner 负责。
 
+### 进程级 panic
+
+`panic(message)` 是默认 prelude 提供的不可恢复错误入口。它向标准错误输出 `message` 与换行，
+随后立即 abort 当前进程；它不会 unwind，也不保证执行局部值的析构。需要由调用方处理的失败应使用
+`T@E` 等可恢复错误表示，Task cancellation 也保持为独立机制。
+
+```jiang
+if (!configuration_is_valid()) {
+    panic("invalid configuration");
+}
+```
+
 ### 切片（Slice）
 
 `T[]` 是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]`

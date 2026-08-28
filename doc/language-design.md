@@ -621,6 +621,10 @@ Int& take_second((Int& first, Int& second) value);
 位置式 lifetime path。源码中的具名位置会解析为稳定内部投影；array 的运行时下标不能建立
 彼此独立的 lifetime 身份，必须保守地与同一 array 的其他元素别名。
 
+`panic(message)` 是进程级不可恢复错误入口，而不是可捕获的 control flow。它先向标准错误输出
+消息与换行，再立即 abort；不执行 unwind，也不保证运行局部析构。可恢复失败继续使用 `T@E`，
+Task cancellation 不复用 panic。
+
 ## 隐式操作层
 
 `$` 用于进入值或类型的隐式操作层。

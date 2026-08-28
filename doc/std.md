@@ -19,14 +19,19 @@ namespace。
 - `fs`：文件读写、metadata、目录创建、复制、替换和删除。
 - `io`：标准输入输出能力。
 - `process`：进程参数、环境变量、可执行文件查找和子进程执行。
-- `debug`：调试输出、不可恢复错误和主动 trap。
+- `panic(message)`：向标准错误输出消息与换行后立即 abort；它不执行 unwind，也不保证运行析构。
+- `debug`：调试输出和主动 trap。
 - `collection`：`Vector<T>`、`HashMap<K, V>` 和 `HashSet<T>`。常用的 `Vector<T>` 也可以直接写成
   `std.Vector<T>`。
 - `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`ptr()` 和 `into_slice()`。
   `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；`length()` 表示已初始化元素数量，
   不包含 `capacity()`。`capacity()` 只表示 `Vector` 自己管理的 spare capacity，
-  不属于 `Contiguous` 语义。`truncate()`、`clear()` 和 `deinit` 会析构被移出已初始化区间的元素。
-  内部 `length` / `capacity` 字段不是公开接口。
+  不属于 `Contiguous` 语义。`append()`、`insert()` 和下标赋值会消耗传入元素；下标赋值会先析构
+  旧值。`remove()`、`swap_remove()`、`remove_last()` 和 `pop()` 把被移除元素的所有权交给调用者，
+  调用者忽略返回值时仍会在语句结束处析构。扩容只移动既有元素，不析构它们；`truncate()`、
+  `clear()` 和 `Vector` 自身析构只处理仍在已初始化区间内的元素。`into_slice()` 消耗 `Vector`，
+  以 O(1) 转移 storage 和全部元素的所有权；原 `Vector` 不再析构这些元素。内部 `length` / `capacity`
+  字段不是公开接口。
 - `HashMap<K, V>`：无序 key-value collection。key 必须满足 `Hashable`、`Equatable` 和 `Copyable`；
   value 可以是 move-only 类型。`insert()` 和 `remove()` 返回的 optional 拥有其中旧 value 的所有权，
   `get()` / `get_mut()` 返回与 map 绑定的借用。查询、插入和删除的平均复杂度为 O(1)，迭代顺序不稳定。
