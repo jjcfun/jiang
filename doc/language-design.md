@@ -1455,7 +1455,8 @@ Int x = {
 
 ### For-in、Sequence 和 Iterator
 
-`for pattern in expr` 优先使用 `Sequence`。`Sequence` 描述“某个值可以产生遍历器”，不会和真正保存遍历状态的 `Iterator` 混在一起。
+`for pattern in expr` 根据值提供的协议选择遍历方式。`Sequence` 产生按值元素，可以消费 iterator
+新产生的 move-only value；`Collection` 产生绑定到 collection 的共享借用，不会把元素移出 storage。
 
 当前内建 iterable：
 
@@ -1469,6 +1470,7 @@ Int x = {
 ```jiang
 trait Iterator {
     associated Element;
+    @life(return: self)
     Element? next();
 }
 
@@ -1477,10 +1479,17 @@ trait Sequence {
     associated Iter: Iterator<Element = Element>;
     Iter make_iterator();
 }
+
+trait Collection: Contiguous {
+    associated Iter: Iterator;
+    @life(return: self)
+    Iter make_iterator();
+}
 ```
 
 `Iterator` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
-`Sequence` 是容器或视图，`make_iterator()` 产生游标。`for pattern in expr` 的 type check
+`Sequence` 表示按值遍历，`Collection` 表示可重复的借用遍历；后者的 iterator element 必须是
+`Contiguous.Element&`，并且 iterator 不能活过 collection。`make_iterator()` 产生游标。`for pattern in expr` 的 type check
 负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Element`。JIL
 lowering 只消费这个 plan，不在 JIL 阶段重新做 trait lookup。
 

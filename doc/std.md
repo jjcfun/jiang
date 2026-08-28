@@ -164,8 +164,8 @@ builtin provider 提供基础能力，但 freestanding runtime、target runtime 
 `std` 还直接导出 `Utf8Error`、`Duration`、`Instant`、`SystemTime`、`Formattable`、`Atomic<T>`、
 `AtomicValue`、`MemoryOrder`、`Mutex<T>`，
 以及 `Integer`、`SignedInteger`、`UnsignedInteger`、`FloatingPoint`。语言 builtin 的 `Bool`、整数、浮点、
-`Char`、`Fn`、`FnOnce`、`Movable`、`Mutable`、`Equatable`、`Hashable`、`Iterator`、`Sequence` 和
-`Contiguous` 也由入口 re-export；optional、errorable、owner、reference、pointer、array 和 slice 只使用
+`Char`、`Fn`、`FnOnce`、`Movable`、`Mutable`、`Equatable`、`Hashable`、`Iterator`、`Sequence`、
+`Collection` 和 `Contiguous` 也由入口 re-export；optional、errorable、owner、reference、pointer、array 和 slice 只使用
 语言表面语法，不导出 compiler-owned constructor 名。
 
 ## 0.5.3 API snapshot
@@ -208,6 +208,7 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 | 类型 | public signature family | 所有权与复杂度 |
 | --- | --- | --- |
 | `Vector<T>` | `Vector(capacity = 0)`、`length`、`capacity`、`is_empty`、`first`、`last` | 查询 O(1)；`first` / `last` 返回 Copyable `T?` |
+|  | `make_iterator() -> SliceIterator<T>` | 借用 Vector；逐项返回 `T&`，iterator 不能活过 Vector |
 |  | `append(T)`、`reserve(additional)`、`remove_last()`、`pop()` | append 均摊 O(1)，其余 O(1)；value 发生 transfer |
 |  | `insert(index, T)`、`remove(index)`、`truncate(len)`、`clear()` | 保序操作 O(n)，精确 drop 已初始化元素 |
 |  | `swap_remove(index)` | 不保序 O(1)，返回被移除 value 的所有权 |

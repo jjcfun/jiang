@@ -1688,6 +1688,19 @@ for item in list {
 }
 ```
 
+`Vector<T>` 使用借用遍历，循环变量是 `T&`，不会把 move-only 元素移出 Vector：
+
+```c
+Vector<Resource> resources! = Vector<Resource>();
+for resource in resources {
+    resource$.get().use();
+}
+```
+
+自定义 `Sequence` 可以让 iterator 按值产生元素；这种循环会取得每个新 value 的所有权。
+`Collection` 则用于可重复的有限集合，iterator 的 lifetime 绑定到 collection，不能从局部 collection
+中逃逸。
+
 **3. 带索引的遍历 (Explicit Indexing)**
 Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，
 该方法会返回一个包含 `(Int, Item)` 元组的序列。
