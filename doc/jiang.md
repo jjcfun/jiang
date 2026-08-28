@@ -1701,6 +1701,18 @@ for resource in resources {
 `Collection` 则用于可重复的有限集合，iterator 的 lifetime 绑定到 collection，不能从局部 collection
 中逃逸。
 
+`Vector` 的基础算法直接执行，不产生 lazy adapter。`for_each`、`map`、`reduce` 和
+`contains_where` 借用 Vector；`filter` 消耗 Vector，把保留元素移动到结果并析构其余元素：
+
+```c
+Vector<Int> values! = Vector<Int>();
+values.append(1);
+values.append(2);
+Vector<Int> even! = values.filter({ value => value$.get() % 2 == 0 });
+```
+
+这里调用 `filter` 后 `values` 已被移动，不能继续使用。
+
 **3. 带索引的遍历 (Explicit Indexing)**
 Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，
 该方法会返回一个包含 `(Int, Item)` 元组的序列。

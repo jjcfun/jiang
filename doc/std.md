@@ -207,8 +207,10 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 
 | 类型 | public signature family | 所有权与复杂度 |
 | --- | --- | --- |
-| `Vector<T>` | `Vector(capacity = 0)`、`length`、`capacity`、`is_empty`、`first`、`last` | 查询 O(1)；`first` / `last` 返回 Copyable `T?` |
+| `Vector<T>` | `Vector(capacity = 0)`、`length`、`capacity`、`is_empty`、`first`、`last` | 查询 O(1)；`first` / `last` 借用并返回 `(T value)&?` |
 |  | `make_iterator() -> SliceIterator<T>` | 借用 Vector；逐项返回 `T&`，iterator 不能活过 Vector |
+|  | `for_each`、`map`、`reduce`、`contains_where` | 借用输入；线性 eager 算法，callback 按元素顺序执行 |
+|  | `filter(Self self!, predicate) -> Vector<T>` | 消耗输入；转移保留元素、析构其余元素，O(n) |
 |  | `append(T)`、`reserve(additional)`、`remove_last()`、`pop()` | append 均摊 O(1)，其余 O(1)；value 发生 transfer |
 |  | `insert(index, T)`、`remove(index)`、`truncate(len)`、`clear()` | 保序操作 O(n)，精确 drop 已初始化元素 |
 |  | `swap_remove(index)` | 不保序 O(1)，返回被移除 value 的所有权 |
@@ -217,6 +219,11 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 |  | `length`、`capacity`、`is_empty`、`contains(K)`、`get(K)`、`get_mut(K)` | 查询平均 O(1)；get 返回与 map 绑定的 borrow |
 |  | `insert(K,V) -> V?`、`remove(K) -> V?`、`reserve`、`clear` | 平均 O(1)；optional 返回旧 value 的所有权 |
 | `HashSet<K>` | 与 map 对应的 constructor、query、`insert(K) -> Bool`、`remove(K) -> Bool` | `K` 同 map 约束；平均 O(1) |
+
+0.5.3 的 collection 算法均为 eager operation：`map` 和 `filter` 直接产生新的 `Vector`，不建立
+lazy adapter graph。`filter` 为支持 move-only 元素而消耗 receiver；调用后原 Vector 已移动。
+`for_each`、`map`、`reduce` 和 `contains_where` 只借用 receiver，其中 `contains_where` 在首次匹配时
+提前结束。
 
 ### Hosted system surface
 
