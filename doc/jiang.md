@@ -1735,23 +1735,27 @@ struct 可以自定义 `init` 函数。
 `init` 具有以下语义：
 
 - `init` 是结构体内的特殊构造器入口
+- unnamed init 写作 `init(self, ...)`，通过 `Point(...)` / `new Point(...)` 调用
+- named init 写作 `init name(self, ...)`，通过 `Point.name(...)` / `new Point.name(...)` 调用
 - `init` 允许可见性修饰，例如 `public init(...)`
 - `init` 必须显式声明 `self` 参数
 - `init` 不声明返回类型，返回类型在语义上是 `Void`
 - `init` 只允许 `return;` / `return ();`
-- `Point(...)` / `new Point(...)` 是结构体构造语法
-- 如果类型定义了一个或多个 `init`，那么 `Point(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
+- named init 只参与同名构造调用；例如 `Point.polar(...)` 不会参与 `Point(...)` 的选择
+- named init 不是普通类型函数，不能脱离构造调用作为函数值使用
 - `init` 支持普通位置参数、命名参数和默认参数，规则与普通函数一致
 - 如果类型没有定义 `init`，默认构造器使用 `Point(field: value)`
-- 只要类型定义了 `init`，`Point(...)` 就只参与显式 `init` 的重载决议
+- 只要类型定义了 unnamed init，`Point(...)` 就只在这些 unnamed init 中选择
+- 泛型 named init 可以从目标类型推断类型参数，也可以写成 `Box<Int>.make(...)`
 - `new` 只接受构造形式，不支持任意表达式
 - 例如：
   - `new Int`
   - `new Int(123)`
   - `new Point(...)`
+  - `new Point.polar(...)`
   - `new .(...)`
   - `new [1, 2, 3]`
-- `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
+- `new Point(...)` 和 `new Point.name(...)` 直接初始化堆上的 `Point`，不会先产生临时值
 - `struct` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
 
 ```c
@@ -1768,6 +1772,11 @@ struct Point {
     self.x = value;
     self.y = value;
   }
+
+  public init offset(self, Int x, Int y = 0) {
+    self.x = x + 1;
+    self.y = y + 1;
+  }
 }
 ```
 
@@ -1775,6 +1784,8 @@ struct Point {
 Point p1 = Point(x: 1, y: 2);
 Point p2 = Point(3);
 Point^ p3 = new .(x: 4, y: 5);
+Point p4 = Point.offset(6);
+Point^ p5 = new Point.offset(y: 8, x: 7);
 ```
 
 #### deinit函数

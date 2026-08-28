@@ -447,6 +447,8 @@ field_decl  <- type field_init ("," field_init)* ";"
 field_init  <- name ("=" expr)?
 ```
 
+`init` 省略名称时通过 `Type(...)` 构造；提供名称时通过 `Type.name(...)` 构造。
+
 ## enum
 
 顶层可见性写在外层 `decl` 的 `decl_modifier` 中，例如

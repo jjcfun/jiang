@@ -847,6 +847,10 @@ public struct BodyCheck: Movable {
             self.type_ops.state.ctx.store.typeck.set_node_type(node_id, type_id);
             return type_id;
         }
+        if (self.check_named_init_call(node_id, call, expected_type) is .some(type_id)) {
+            self.type_ops.state.ctx.store.typeck.set_node_type(node_id, type_id);
+            return type_id;
+        }
         if (self.expected_type_constructor_callee(call.callee)
             || self.generic_constructor_uses_expected_type(call, expected_type)
         ) {
@@ -1802,9 +1806,7 @@ public struct BodyCheck: Movable {
         sem.Node node = self.type_ops.state.ctx.store.model.node(node_id);
         if (node.data is .name_ref(name_ref)) {
             guard name_ref is .def_ref(def_id) else { return null; }
-            if (!self.overloadable_call_kind(self.type_ops.state.ctx.store.defs.get(def_id).kind)) {
-                return null;
-            }
+            if (self.type_ops.state.ctx.store.defs.get(def_id).kind != .function_def) { return null; }
             return def_id;
         }
         if (node.data is .member_access(member_access)) {
@@ -2134,9 +2136,57 @@ public struct BodyCheck: Movable {
         return callee.data is .infer_type_ref;
     }
 
+    sem.NodeId? constructor_type_ref_for_callee(self, sem.NodeId callee_id) {
+        sem.Node callee = self.type_ops.state.ctx.store.model.node(callee_id);
+        if (callee.data is .named_type_ref(_)) { return callee_id; }
+        guard callee.data is .member_access(member) else { return null; }
+        if (self.named_init_owner_def(callee_id) == null) { return null; }
+        return member.base;
+    }
+
+    qid.DefId? named_init_owner_def(self, sem.NodeId callee_id) {
+        sem.Node callee = self.type_ops.state.ctx.store.model.node(callee_id);
+        if (callee.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(init_def) else { return null; }
+            if (self.type_ops.state.ctx.store.defs.get(init_def).kind != .init_def) { return null; }
+            return self.type_ops.state.ctx.store.defs.get(init_def).owner_def;
+        }
+        guard callee.data is .member_access(member) else { return null; }
+        if (!self.is_type_ref_node(member.base)) { return null; }
+        guard self.type_ops.state.ctx.store.model.named_type_ref_def(member.base)
+            is .some(raw_owner_def) else { return null; }
+        qid.DefId owner_def = self.type_ops.resolve_alias_target(raw_owner_def);
+        def.DefKind owner_kind = self.type_ops.state.ctx.store.defs.get(owner_def).kind;
+        if (owner_kind != .struct_def && owner_kind != .builtin_type_def) { return null; }
+        if (!self.owner_has_named_init(owner_def, member.member_symbol)) { return null; }
+        return owner_def;
+    }
+
+    Bool owner_has_named_init(self, qid.DefId owner_def, qid.SymbolId symbol) {
+        if (!self.type_ops.state.ctx.store.model.has_def(owner_def)) { return false; }
+        Int member_count = self.type_ops.state.ctx.store.model.def_member_count(owner_def);
+        Int index! = 0;
+        while (index < member_count) {
+            qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(owner_def, index);
+            def.DefRecord member = self.type_ops.state.ctx.store.defs.get(member_def);
+            if (member.kind == .init_def && member.name.symbol == symbol) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
     Bool generic_constructor_uses_expected_type(self, sem.Call call, qid.TypeId expected_type) {
         if (call.type_args.length != 0) { return false; }
-        sem.Node callee = self.type_ops.state.ctx.store.model.node(call.callee);
+        if (self.named_init_owner_def(call.callee) is .some(owner_def)) {
+            types.TypeInfo expected_info = self.type_ops.state.ctx.store.types.get(expected_type);
+            guard expected_info.data is .named(expected_named) else { return false; }
+            if (self.type_ops.state.ctx.store.model.def_generic_param_count(owner_def) == 0) { return false; }
+            return owner_def == self.type_ops.resolve_alias_target(expected_named.def_id);
+        }
+        guard self.constructor_type_ref_for_callee(call.callee) is .some(type_ref) else {
+            return false;
+        }
+        sem.Node callee = self.type_ops.state.ctx.store.model.node(type_ref);
         guard callee.data is .named_type_ref(named) else { return false; }
         if (named.args.length != 0) { return false; }
         guard self.type_ops.state.ctx.store.model.def(named.def_id) is .some(model_def) else { return false; }
@@ -4686,6 +4736,14 @@ public struct BodyCheck: Movable {
                 self.type_ops.add_node_error(node_id, "private definition is not accessible", "private_access");
                 return self.type_ops.state.ctx.store.types.invalid_type();
             }
+            if (self.type_ops.state.ctx.store.defs.get(def_id).kind == .init_def) {
+                self.type_ops.add_node_error(
+                    node_id,
+                    "named init can only be used as a constructor call",
+                    "member_not_value"
+                );
+                return self.type_ops.state.ctx.store.types.invalid_type();
+            }
             self.ensure_const_dependency_checked(def_id);
             self.type_ops.state.ctx.store.typeck.select_member(node_id, def_id);
             qid.TypeId type_id = self.type_ops.type_for_def(def_id);
@@ -4991,7 +5049,12 @@ public struct BodyCheck: Movable {
 
     Bool partial_initializer_matches_owner(self, sem.NodeId call_id, qid.DefId owner_def) {
         sem.NodeId callee = self.type_ops.state.ctx.store.model.call_callee(call_id);
-        guard self.type_ops.state.ctx.store.model.named_type_ref_def(callee)
+        if (self.named_init_owner_def(callee) is .some(named_owner)) {
+            return self.type_ops.resolve_alias_target(named_owner)
+                == self.type_ops.resolve_alias_target(owner_def);
+        }
+        guard self.constructor_type_ref_for_callee(callee) is .some(type_ref) else { return false; }
+        guard self.type_ops.state.ctx.store.model.named_type_ref_def(type_ref)
             is .some(raw_callee_def) else { return false; }
         qid.DefId callee_def = self.type_ops.resolve_alias_target(raw_callee_def);
         qid.DefId expected_def = self.type_ops.resolve_alias_target(owner_def);
@@ -5082,9 +5145,7 @@ public struct BodyCheck: Movable {
     qid.TypeId? infer_bare_generic_constructor_type(Self&! self, sem.NodeId call_id) {
         if (self.type_ops.state.ctx.store.model.call_type_arg_count(call_id) != 0) { return null; }
         sem.NodeId callee = self.type_ops.state.ctx.store.model.call_callee(call_id);
-        guard self.type_ops.state.ctx.store.model.named_type_ref_def(callee)
-            is .some(named_def) else { return null; }
-        if (self.type_ops.state.ctx.store.model.named_type_ref_arg_count(callee) != 0) { return null; }
+        guard self.bare_constructor_owner_def(callee) is .some(named_def) else { return null; }
         list.ArrayList<qid.DefId> param_defs = self.generic_param_defs(named_def);
         if (param_defs.len() == 0 || !self.partial_params_are_types(param_defs$.ref())) { return null; }
         guard self.matching_init_def_for_call(named_def, call_id) is .some(init_def) else { return null; }
@@ -5106,6 +5167,15 @@ public struct BodyCheck: Movable {
         }
         if (!self.inferred_type_args_complete(inferred$.ref())) { return null; }
         return self.type_ops.state.ctx.store.types.named_type_with_args(named_def, inferred, token.Span());
+    }
+
+    qid.DefId? bare_constructor_owner_def(self, sem.NodeId callee) {
+        if (self.named_init_owner_def(callee) is .some(init_owner)) { return init_owner; }
+        guard self.constructor_type_ref_for_callee(callee) is .some(type_ref) else { return null; }
+        guard self.type_ops.state.ctx.store.model.named_type_ref_def(type_ref)
+            is .some(type_def) else { return null; }
+        if (self.type_ops.state.ctx.store.model.named_type_ref_arg_count(type_ref) != 0) { return null; }
+        return type_def;
     }
 
     Bool partial_params_are_types(self, list.ArrayList<qid.DefId>& param_defs) {
@@ -5499,6 +5569,9 @@ public struct BodyCheck: Movable {
             return result_type;
         }
         if (self.check_enum_init_call(node_id, call) is .some(type_id)) {
+            return type_id;
+        }
+        if (self.check_named_init_call(node_id, call, expected_result) is .some(type_id)) {
             return type_id;
         }
         list.ArrayList<qid.TypeId> type_args! = self.preselect_call_type_args(call.type_args);
@@ -7651,6 +7724,81 @@ public struct BodyCheck: Movable {
         return self.check_type_constructor_call_with_result(node_id, call, result_type);
     }
 
+    qid.TypeId? check_named_init_call(
+        Self&! self,
+        sem.NodeId node_id,
+        sem.Call call,
+        qid.TypeId? expected_result
+    ) {
+        guard self.named_init_owner_def(call.callee) is .some(owner_def) else { return null; }
+        qid.SymbolId init_symbol = self.init_symbol_for_callee(call.callee);
+        if (call.type_args.length != 0) {
+            self.type_ops.check_type_args(call.type_args);
+            self.type_ops.add_node_error(
+                call.callee,
+                "named init generic arguments belong on the owner type",
+                "named_init_generic_args_not_allowed"
+            );
+            return self.type_ops.state.ctx.store.types.invalid_type();
+        }
+        qid.TypeId result_type = self.named_init_result_type(call.callee, owner_def, expected_result);
+        guard self.matching_init_def(owner_def, init_symbol, call)
+            is .some(init_def) else {
+            self.check_call_args(call);
+            self.type_ops.add_node_error(
+                node_id,
+                "named init arguments do not match any overload",
+                "type_constructor_arity_mismatch"
+            );
+            return self.type_ops.state.ctx.store.types.invalid_type();
+        }
+        if (!self.type_ops.def_accessible_from(init_def, node_id.owner_def)) {
+            self.type_ops.add_node_error(
+                node_id,
+                "private named init is not accessible",
+                "private_access"
+            );
+            return self.type_ops.state.ctx.store.types.invalid_type();
+        }
+        self.type_ops.state.ctx.store.typeck.select_member(call.callee, init_def);
+        self.type_ops.state.ctx.store.typeck.select_call_target(node_id, init_def);
+        self.record_constructor_instance(result_type, call, init_def);
+        self.check_constructor_args(node_id, result_type, call, init_def);
+        return result_type;
+    }
+
+    qid.TypeId named_init_result_type(
+        Self&! self,
+        sem.NodeId callee_id,
+        qid.DefId owner_def,
+        qid.TypeId? expected_result
+    ) {
+        if (self.constructor_type_ref_for_callee(callee_id) is .some(type_ref)) {
+            if (expected_result is .some(expected)
+                && self.bare_generic_type_ref_requires_context(type_ref)
+                && self.type_is_named_owner(expected, owner_def)) {
+                return expected;
+            }
+            if (!self.bare_generic_type_ref_requires_context(type_ref)) {
+                return self.type_ops.check_type_ref(type_ref);
+            }
+        } else if (self.type_ops.state.ctx.store.model.def_generic_param_count(owner_def) == 0) {
+            return self.type_ops.state.ctx.store.types.named_type(owner_def, token.Span());
+        } else if (expected_result is .some(expected)
+            && self.type_is_named_owner(expected, owner_def)) {
+            return expected;
+        }
+        if (self.type_ops.state.ctx.store.model.def_generic_param_count(owner_def) > 0) {
+            self.type_ops.add_node_error(
+                callee_id,
+                "generic named initializer requires an expected type or explicit owner arguments",
+                "generic_initializer_requires_context"
+            );
+            return self.type_ops.state.ctx.store.types.invalid_type();
+        }
+        return self.type_ops.state.ctx.store.types.named_type(owner_def, token.Span());
+    }
+
     qid.TypeId? check_bare_fn_constructor_call(Self&! self, sem.NodeId node_id, sem.Call call) {
         if (!self.call_callee_is_bare_fn_constructor(call)) { return null; }
         if (call.args.length != 1) {
@@ -7705,6 +7853,14 @@ public struct BodyCheck: Movable {
             return result_type;
         }
         if (self.type_constructor_init_def(result_type, call) is .some(init_def)) {
+            if (!self.type_ops.def_accessible_from(init_def, node_id.owner_def)) {
+                self.type_ops.add_node_error(
+                    node_id,
+                    "private init constructor is not accessible",
+                    "private_access"
+                );
+                return self.type_ops.state.ctx.store.types.invalid_type();
+            }
             self.type_ops.state.ctx.store.typeck.select_member(call.callee, init_def);
             self.type_ops.state.ctx.store.typeck.select_call_target(node_id, init_def);
             self.record_constructor_instance(result_type, call, init_def);
@@ -8302,9 +8458,14 @@ public struct BodyCheck: Movable {
     }
 
     Bool bare_generic_constructor_requires_context(self, sem.Call call) {
-        guard self.type_ops.state.ctx.store.model.named_type_ref_def(call.callee)
+        guard self.constructor_type_ref_for_callee(call.callee) is .some(type_ref) else { return false; }
+        return self.bare_generic_type_ref_requires_context(type_ref);
+    }
+
+    Bool bare_generic_type_ref_requires_context(self, sem.NodeId type_ref) {
+        guard self.type_ops.state.ctx.store.model.named_type_ref_def(type_ref)
             is .some(named_def) else { return false; }
-        if (self.type_ops.state.ctx.store.model.named_type_ref_arg_count(call.callee) != 0) { return false; }
+        if (self.type_ops.state.ctx.store.model.named_type_ref_arg_count(type_ref) != 0) { return false; }
         if (!self.type_ops.state.ctx.store.model.has_def(named_def)) { return false; }
         return self.type_ops.state.ctx.store.model.def_generic_param_count(named_def) > 0;
     }
@@ -8518,7 +8679,7 @@ public struct BodyCheck: Movable {
         if (!self.type_ops.state.ctx.store.model.has_def(owner_def)) {
             return null;
         }
-        return self.matching_init_def(owner_def, call);
+        return self.matching_init_def(owner_def, self.unnamed_init_symbol(), call);
     }
 
     qid.DefId? string_literal_constructor_init(Self&! self, sem.Literal literal, qid.TypeId result_type) {
@@ -8540,6 +8701,9 @@ public struct BodyCheck: Movable {
 
     Bool string_literal_init_matches(Self&! self, qid.DefId init_def, sem.Literal literal) {
         if (self.type_ops.state.ctx.store.defs.get(init_def).kind != .init_def) { return false; }
+        if (self.type_ops.state.ctx.store.defs.get(init_def).name.symbol != self.unnamed_init_symbol()) {
+            return false;
+        }
         if (!self.type_ops.state.ctx.store.model.has_function_signature(init_def)) { return false; }
         if (self.type_ops.state.ctx.store.model.function_signature_param_count(init_def) != 1) { return false; }
         sem.NodeId param_ref = self.type_ops.state.ctx.store.model.function_signature_param_at(init_def, 0);
@@ -8554,12 +8718,19 @@ public struct BodyCheck: Movable {
         return self.type_ops.state.ctx.store.model.named_type_ref_def(callee);
     }
 
-    qid.DefId? matching_init_def(Self&! self, qid.DefId owner_def, sem.Call call) {
+    qid.DefId? matching_init_def(
+        Self&! self,
+        qid.DefId owner_def,
+        qid.SymbolId init_symbol,
+        sem.Call call
+    ) {
         Int member_count = self.type_ops.state.ctx.store.model.def_member_count(owner_def);
         Int index! = 0;
         while (index < member_count) {
             qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(owner_def, index);
-            if (self.type_ops.state.ctx.store.defs.get(member_def).kind == .init_def
+            def.DefRecord member = self.type_ops.state.ctx.store.defs.get(member_def);
+            if (member.kind == .init_def
+                && member.name.symbol == init_symbol
                 && self.init_args_match(member_def, call)) {
                 return member_def;
             }
@@ -8571,7 +8742,28 @@ public struct BodyCheck: Movable {
     qid.DefId? matching_init_def_for_call(Self&! self, qid.DefId owner_def, sem.NodeId call_id) {
         sem.Node call_node = self.type_ops.state.ctx.store.model.node(call_id);
         guard call_node.data is .call(call) else { return null; }
-        return self.matching_init_def(owner_def, call);
+        qid.SymbolId init_symbol = self.init_symbol_for_callee(call.callee);
+        return self.matching_init_def(owner_def, init_symbol, call);
+    }
+
+    qid.SymbolId unnamed_init_symbol(Self&! self) {
+        return self.type_ops.state.ctx.store.symbols.intern("init");
+    }
+
+    qid.SymbolId init_symbol_for_callee(Self&! self, sem.NodeId callee_id) {
+        sem.Node callee = self.type_ops.state.ctx.store.model.node(callee_id);
+        if (callee.data is .name_ref(name_ref)) {
+            if (name_ref is .def_ref(init_def)) {
+                if (self.type_ops.state.ctx.store.defs.get(init_def).kind == .init_def) {
+                    return self.type_ops.state.ctx.store.defs.get(init_def).name.symbol;
+                }
+            }
+        }
+        if (callee.data is .member_access(member)
+            && self.named_init_owner_def(callee_id) != null) {
+            return member.member_symbol;
+        }
+        return self.unnamed_init_symbol();
     }
 
     Bool order_call_values_for_def(

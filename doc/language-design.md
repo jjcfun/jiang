@@ -1212,9 +1212,11 @@ trait Indexable {
 - 第一个参数是 `self` 的类型内部函数是 instance method，`self` 的类型为 `Self&`。
 - 第一个参数是 `Self self` 的类型内部函数是 move receiver method，调用会消耗 receiver。
 - 没有 receiver 参数的类型内部函数是类型函数，函数体中不能使用 `self`。
-- `init(self, ...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body
-  中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)`
-  调用，不作为普通函数值暴露。
+- `init(self, ...)` 是 unnamed constructor，通过 `Type(...)` / `new Type(...)` 调用；
+  `init name(self, ...)` 是 named constructor，通过 `Type.name(...)` / `new Type.name(...)`
+  调用。两者都拥有初始化中的 `self` 目标，直接写入调用方提供的 `Self` storage，不先产生临时值。
+  named init 只参与同名构造调用，不作为普通函数值暴露；泛型 owner 参数写在类型上，例如
+  `Box<Int>.make(...)`。
 - 字段能否被赋值由字段名后的 `!` 和访问路径的可写能力共同决定。修改 receiver 需要 `Self&! self`。
 - 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self`
   方法等价于传入 `value$.move()`，调用后原 receiver 失效。
