@@ -1701,7 +1701,7 @@ for resource in resources {
 `Collection` 则用于可重复的有限集合，iterator 的 lifetime 绑定到 collection，不能从局部 collection
 中逃逸。
 
-`Vector` 的基础算法直接执行，不产生 lazy adapter。`for_each`、`map`、`reduce` 和
+`Vector` 的基础算法直接执行，不产生 lazy adapter。`for_each`、`map`、`reduce`、`contains` 和
 `contains_where` 借用 Vector；`filter` 消耗 Vector，把保留元素移动到结果并析构其余元素：
 
 ```c
