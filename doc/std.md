@@ -19,6 +19,9 @@ namespace。
 - `fs`：文件读写、metadata、目录创建、复制、替换和删除。
 - `io`：标准输入输出能力。
 - `process`：进程参数、环境变量、可执行文件查找和子进程执行。
+- `time`：checked monotonic/wall clock 与不可为负的 `Duration`。
+- `random`：操作系统 entropy 与可复现实验用 `Generator`；后者不能用于密码学场景。
+- `Atomic<T>`、`MemoryOrder`、`Mutex<T>`：直接导出 core 同步原语，不建立 std wrapper。
 - `panic(message)`：向标准错误输出消息与换行后立即 abort；它不执行 unwind，也不保证运行析构。
 - `debug`：调试输出和主动 trap。
 - `collection`：`Vector<T>`、`HashMap<K, V>` 和 `HashSet<T>`。常用的 `Vector<T>` 也可以直接写成
@@ -76,6 +79,36 @@ std.collection.HashSet<Int> seen! = std.collection.HashSet<Int>();
 seen.insert(1);
 ```
 
+## 同步与异步边界
+
+`Atomic<T>` 是一个 move-only 原子 identity，只支持 `AtomicValue & Copyable` 的 lock-free 标量。
+默认 overload 使用 sequential order；显式 overload 会在运行时拒绝不适用于该 operation 的
+`MemoryOrder`。所有操作都是 O(1)，同一 Atomic 可以从多个线程并发访问：
+
+```jiang
+Atomic<Int> state = Atomic<Int>(0);
+state.set(1, .release);
+Int observed = state.get(.acquire);
+Bool changed = state.compare_and_set(
+    1, 2, MemoryOrder.acquire_release, MemoryOrder.acquire
+);
+```
+
+`Mutex<T>` 消耗并拥有受保护值，且本体是 `!Movable`。需要转移共享 handle 时使用 `Mutex<T>^`；
+`with_lock` 只在同步 callback 内提供唯一 `T&!`，callback 返回或错误 cleanup 时自动解锁，返回值不能
+携带从该引用派生的借用：
+
+```jiang
+Mutex<Int>^ count = new Mutex<Int>(0);
+Int next = count.with_lock { value =>
+    value$.set(value$.get() + 1);
+    value$.get()
+};
+```
+
+`Domain`、`Task`、`coroutine.sync` 和 `coroutine.suspend` 是语言 core 能力，std 不提供 wrapper、alias
+family 或第二套 scheduler/cancellation API。使用方式见[语言指南的异步函数章节](jiang.md#异步函数async)。
+
 ## std.jiang
 
 `std.jiang.syntax` 是 lang provider 的公共 syntax ABI。provider 通过
@@ -122,9 +155,10 @@ builtin provider 提供基础能力，但 freestanding runtime、target runtime 
 | `std.collection` | `Vector`、`HashMap`、`HashSet` | 稳定 namespace |
 | `std.fs`、`std.io`、`std.process` | hosted filesystem、stream 和 process | provisional error model |
 | `std.time` | monotonic/wall clock 与 `Duration` | checked hosted clock namespace |
+| `std.random` | OS entropy 与可复现实验用 generator | hosted entropy / portable generator |
 | `std.debug`、`std.panic` | debug output、trap 和不可恢复终止 | 稳定 namespace / 顶层函数 |
 | `std.jiang` | lang provider 使用的 Jiang syntax ABI | 稳定 namespace |
-| `std.build` | build target 查询 | provisional namespace |
+| `std.build` | build target 与 debug/release mode 查询 | stable compile-time namespace |
 | `std.path` | 无 owner 的 path byte algorithms | 稳定 namespace |
 
 `std` 还直接导出 `Utf8Error`、`Duration`、`Instant`、`SystemTime`、`Formattable`、`Atomic<T>`、
@@ -198,6 +232,8 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 | `std.time` | `nanoseconds/microseconds/milliseconds/seconds(UInt64) -> Duration` | 非负 duration；unit overflow assert |
 |  | `monotonic_now() -> Instant?` | 进程内 interval clock；不表示日期，provider 不支持或失败时为 null |
 |  | `wall_now() -> SystemTime?` | Unix epoch wall clock；可能受系统校时影响，失败时为 null |
+| `std.random` | `fill_entropy(UInt8[]&!) -> Bool` | OS entropy；失败不伪造数据，buffer 可能被部分修改，O(n) |
+|  | `Generator(seed)`、`next_u64()`、`fill(UInt8[]&!)` | 可复现、非密码学用途；算法不属于稳定 contract |
 
 `RunOptions.stdout = .pipe` 在 hosted POSIX target 上捕获标准输出。`stderr = .pipe` 尚未实现；调用方当前应选择
 `.inherit` 或 `.discard`。
@@ -206,10 +242,17 @@ interface fixture 固定其中的类型名、generic 参数和 lifetime contract
 
 | API | public signature family | contract |
 | --- | --- | --- |
-| `Atomic<T>` | `get`、`set`、`get_and_set`、`compare_and_set`，均有默认 sequential 和显式 order overload | `T: AtomicValue & Copyable`；操作 O(1)，非法 order 组合 assert |
-| `Mutex<T>` | `Mutex(T)`、`with_lock(FnOnce<R, T&!>) -> R` | `!Movable`；借用只存在于同步 callback；`T: Sendable` 时可跨 Domain |
-| `std.debug` | `write`、`write_line -> Bool`、`trap() -> Void` | hosted stderr；trap 不返回 |
+| `Atomic<T>` | `get`、`set`、`get_and_set`、`compare_and_set`，均有默认 sequential 和显式 order overload | move-only identity；`T: AtomicValue & Copyable`；操作 O(1)，非法 order 组合 assert |
+| `Mutex<T>` | `Mutex(T)`、`with_lock(FnOnce<R, T&!>) -> R` | `!Movable` owner；借用只存在于同步 callback；`T: Sendable` 时可跨 Domain |
+| `std.debug` | `write`、`write_line -> Bool`、`trap() -> Void` | hosted stderr；trap 立即 abort，不 unwind |
 | `std.panic` | `panic(UInt8[]&) -> Void` | stderr 输出后 abort，不 unwind、不保证 drop |
+
+`assert(condition[, message])` 在 debug 和 release mode 都保留。失败输出包含 source path、byte offset
+和可选 message，随后执行 LLVM trap；它不 unwind，也不保证析构。`std.build.mode` 是只读 compile-time
+`BuildMode`，可以在 comptime branch 中查询 `.debug` 或 `.release`，不能由普通代码改变。
+
+0.5.3 不公开 stack backtrace API：当前 hosted provider 没有稳定的 unwind 与 symbolization contract。
+返回永远 unavailable 的占位 API 不能提供有效能力，后续应在至少 macOS/Linux 都能明确报告可用性后再加入。
 
 ## Naming review
 

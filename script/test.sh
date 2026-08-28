@@ -370,6 +370,18 @@ exit_code_matches() {
   [ "$actual" = "$expected" ]
 }
 
+expected_output_matches() {
+  local source="$1"
+  local run_log="$2"
+  local pattern
+  while IFS= read -r pattern; do
+    if [ -n "$pattern" ] && ! grep -Fq -- "$pattern" "$run_log"; then
+      echo "missing expected output: $pattern"
+      return 1
+    fi
+  done < <(sed -n 's/^.*expected-output-contains:[[:space:]]*//p' "$source")
+}
+
 run_run_case() {
   local source="$1"
   local work_dir="$2"
@@ -430,7 +442,7 @@ run_run_case() {
   set -e
   run_time=$((SECONDS - run_started))
 
-  if exit_code_matches "$expected" "$code"; then
+  if exit_code_matches "$expected" "$code" && expected_output_matches "$source" "$run_log"; then
     rm -rf "$temp_dir"
     echo "PASS run $source"
     timing_line "run $source emit=${emit_time}s link=${link_time}s execute=${run_time}s"
@@ -467,7 +479,7 @@ run_compiler_case() {
     "$executable" "$case_name" >"$run_log" 2>&1
   code=$?
   set -e
-  if exit_code_matches "$expected" "$code"; then
+  if exit_code_matches "$expected" "$code" && expected_output_matches "$source" "$run_log"; then
     rm -rf "$temp_dir"
     echo "PASS $label $source"
     timing_line "$label $source execute=$((SECONDS - started))s"
@@ -535,7 +547,7 @@ run_release_case() {
   set -e
   run_time=$((SECONDS - run_started))
 
-  if exit_code_matches "$expected" "$code"; then
+  if exit_code_matches "$expected" "$code" && expected_output_matches "$source" "$run_log"; then
     rm -rf "$temp_dir"
     echo "PASS release-run $source"
     timing_line "release $source build=${build_time}s execute=${run_time}s"

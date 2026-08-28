@@ -696,6 +696,27 @@ Pair replace_left(Pair pair!) {
 嵌套 stored field 使用同一规则，例如 `value.header.buffer`。离开作用域时只析构仍然有效的字段，
 已经移出的字段由取得它的新 owner 负责。
 
+### 断言与构建模式
+
+`assert(condition)` 和 `assert(condition, message)` 在 debug 与 release 构建中都执行检查。失败时向
+标准错误输出 source path、byte offset 和可选 message，随后 trap；它不会 unwind，也不保证析构。
+
+`build.mode` 是编译器注入的只读 `BuildMode`，可以在 comptime 中选择 `.debug` 或 `.release` 分支：
+
+```jiang
+import build;
+
+comptime {
+    if (build.mode == .debug) {
+        Int validation_level() { 2 }
+    } else {
+        Int validation_level() { 1 }
+    }
+}
+```
+
+构建模式只能由 `jiangc --mode debug|release` 选择，程序不能在源码中修改它。
+
 ### 进程级 panic
 
 `panic(message)` 是默认 prelude 提供的不可恢复错误入口。它向标准错误输出 `message` 与换行，
