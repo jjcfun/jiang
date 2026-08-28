@@ -1,0 +1,306 @@
+// 标准库的开放寻址 HashMap。
+//
+// 每个 slot 使用一个 control byte 记录状态和七位 hash fingerprint；查找从 hash
+// 对应的 slot 开始线性探测。公开 API 不承诺哈希函数、探测顺序和迭代顺序。
+
+import hash = "./hash.jiang";
+import system_memory = "../../src/system/memory.jiang";
+
+Int initial_capacity() { return 8; }
+UInt8 empty_control() { return 0; }
+UInt8 deleted_control() { return 1; }
+UInt8 occupied_mask() { return 128; }
+
+enum Slot: Copyable {
+    found(Int),
+    vacant(Int),
+    full,
+}
+
+@region(k: K, v: V)
+@where(K: Hashable & Equatable & Copyable)
+public struct HashMap<K, V>: Movable {
+    UInt8*! controls!;
+
+    @life(k)
+    K*! keys!;
+
+    @life(v)
+    V*! values!;
+    Int bucket_capacity!;
+    Int item_count!;
+    Int deleted_count!;
+    Int load_percent!;
+    Int item_limit!;
+
+    // load_percent 是触发扩容的装载率百分比，有效范围为 1-99。
+    public init(self, Int capacity = 0, Int load_percent = 80) {
+        assert(load_percent > 0 && load_percent < 100);
+        self.controls = null;
+        self.keys = null;
+        self.values = null;
+        self.bucket_capacity = 0;
+        self.item_count = 0;
+        self.deleted_count = 0;
+        self.load_percent = load_percent;
+        self.item_limit = 0;
+        self.reserve(capacity);
+    }
+
+    public Int length(self) { return self.item_count; }
+    public Int capacity(self) { return self.item_limit; }
+    public Bool is_empty(self) { return self.item_count == 0; }
+
+    public Bool contains(self, K key) {
+        return unsafe { self.find_index(key) != null };
+    }
+
+    @life(return: self, return.v: self.v)
+    // 返回 key 对应 value 的共享借用；不存在时返回 null。平均复杂度为 O(1)。
+    public (V v)&? get(self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return null; }
+            return self.values[index]$.ref();
+        }
+    }
+
+    @life(return: self, return.v: self.v)
+    // 返回 key 对应 value 的可变借用；修改 map 会使已有借用失效。平均复杂度为 O(1)。
+    public (V v)&!? get_mut(Self&! self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return null; }
+            return self.values[index]$.mut_ref();
+        }
+    }
+
+    @life(self.k: key, self.v: value, return: self.v)
+    // 插入或替换 value，并转移返回旧 value 的所有权。平均复杂度为 O(1)。
+    public V? insert(Self&! self, K key, V value) {
+        unsafe {
+            UInt64 hash_value = self.key_hash(key);
+            Slot first = self.find_slot_with_hash(key, hash_value);
+            if (first is .found(index)) {
+                V previous = self.values[index];
+                self.values[index] = value;
+                return previous;
+            }
+            self.prepare_insert();
+            Slot slot = self.find_slot_with_hash(key, hash_value);
+            guard slot is .vacant(index) else { assert(false); return null; }
+            self.occupy_slot(index, self.fingerprint(hash_value), key, value);
+            return null;
+        }
+    }
+
+    @life(return: self.v)
+    // 删除 key 并转移返回 value 的所有权；不存在时返回 null。平均复杂度为 O(1)。
+    public V? remove(Self&! self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return null; }
+            V value = self.values[index];
+            self.mark_deleted(index);
+            return value;
+        }
+    }
+
+    public Void clear(Self&! self) {
+        unsafe {
+            Int index! = 0;
+            while (index < self.bucket_capacity) {
+                if (self.is_occupied(index)) {
+                    self.values[index]$.addr()$.destroy();
+                }
+                self.controls[index] = empty_control();
+                index = index + 1;
+            }
+            self.item_count = 0;
+            self.deleted_count = 0;
+        }
+    }
+
+    // 保证还能插入至少 additional 个元素而不扩容。
+    public Void reserve(Self&! self, Int additional) {
+        if (additional <= 0) { return; }
+        unsafe {
+            Int required = self.item_count + additional;
+            if (required > self.item_limit) {
+                self.rehash(self.capacity_for(required));
+            }
+        }
+    }
+
+    UInt64 key_hash(self, K key) {
+        hash.TableHasher hasher! = hash.TableHasher();
+        key.hash(hasher$.mut_ref());
+        return hasher.finish();
+    }
+
+    UInt8 fingerprint(self, UInt64 hash_value) {
+        return UInt8(hash_value >> 57);
+    }
+
+    UInt8 occupied_control(self, UInt64 hash_value) {
+        return occupied_mask() | self.fingerprint(hash_value);
+    }
+
+    Int max_items(self, Int capacity) {
+        return capacity * self.load_percent / 100;
+    }
+
+    Int capacity_for(self, Int min_items) {
+        Int result! = initial_capacity();
+        while (min_items > self.max_items(result)) {
+            result = result * 2;
+        }
+        return result;
+    }
+
+    unsafe Bool is_occupied(self, Int index) {
+        return self.controls[index] >= occupied_mask();
+    }
+
+    unsafe Slot find_slot_in(
+        self,
+        UInt8*! controls!,
+        K*! keys!,
+        Int capacity,
+        K key,
+        UInt64 hash_value
+    ) {
+        if (capacity == 0) { return .full(); }
+        UInt8 expected_control = self.occupied_control(hash_value);
+        Int index! = Int(hash_value % UInt64(capacity));
+        Int probe! = 0;
+        Int? first_deleted! = null;
+        while (probe < capacity) {
+            UInt8 control = controls[index];
+            if (control == empty_control()) {
+                if (first_deleted is .some(deleted)) { return .vacant(deleted); }
+                return .vacant(index);
+            }
+            if (control == deleted_control()) {
+                if (first_deleted == null) { first_deleted = index; }
+            } else if (control == expected_control && keys[index] == key) {
+                return .found(index);
+            }
+            probe = probe + 1;
+            index = (index + 1) % capacity;
+        }
+        if (first_deleted is .some(deleted)) { return .vacant(deleted); }
+        return .full();
+    }
+
+    unsafe Slot find_slot_with_hash(self, K key, UInt64 hash_value) {
+        return self.find_slot_in(
+            self.controls, self.keys, self.bucket_capacity, key, hash_value
+        );
+    }
+
+    unsafe Int? find_index(self, K key) {
+        Slot slot = self.find_slot_with_hash(key, self.key_hash(key));
+        if (slot is .found(index)) { return index; }
+        return null;
+    }
+
+    unsafe Void prepare_insert(Self&! self) {
+        Int required = self.item_count + 1;
+        if (required > self.item_limit) {
+            self.rehash(self.capacity_for(required));
+            return;
+        }
+        Int used = self.item_count + self.deleted_count + 1;
+        if (used > self.item_limit) {
+            self.rehash(self.bucket_capacity);
+        }
+    }
+
+    unsafe Void occupy_slot(Self&! self, Int index, UInt8 fingerprint, K key, V value) {
+        if (self.controls[index] == deleted_control()) {
+            self.deleted_count = self.deleted_count - 1;
+        }
+        self.keys[index] = key;
+        self.values[index] = value;
+        self.controls[index] = occupied_mask() | fingerprint;
+        self.item_count = self.item_count + 1;
+    }
+
+    unsafe Void mark_deleted(Self&! self, Int index) {
+        self.controls[index] = deleted_control();
+        self.item_count = self.item_count - 1;
+        self.deleted_count = self.deleted_count + 1;
+    }
+
+    unsafe Void move_entries_into(
+        Self&! self,
+        UInt8*! controls!,
+        K*! keys!,
+        V*! values!,
+        Int capacity
+    ) {
+        Int old_index! = 0;
+        while (old_index < self.bucket_capacity) {
+            if (self.is_occupied(old_index)) {
+                UInt64 hash_value = self.key_hash(self.keys[old_index]);
+                Slot slot = self.find_slot_in(
+                    controls, keys, capacity, self.keys[old_index], hash_value
+                );
+                guard slot is .vacant(index) else { assert(false); return; }
+                controls[index] = self.occupied_control(hash_value);
+                keys[index] = self.keys[old_index];
+                self.move_value(values, index, self.values, old_index);
+            }
+            old_index = old_index + 1;
+        }
+    }
+
+    unsafe Void move_value(self, V*! destination!, Int destination_index, V*! source!, Int source_index) {
+        system_memory.copy(
+            destination[destination_index]$.addr()$.as(UInt8*),
+            source[source_index]$.addr()$.as(UInt8*),
+            V$.size()
+        );
+    }
+
+    unsafe Void initialize_controls(self, UInt8*! controls!, Int capacity) {
+        Int index! = 0;
+        while (index < capacity) {
+            controls[index] = empty_control();
+            index = index + 1;
+        }
+    }
+
+    unsafe Void rehash(Self&! self, Int new_capacity) {
+        UInt8*! controls! = UInt8$.alloc(new_capacity);
+        K*! keys! = K$.alloc(new_capacity);
+        V*! values! = V$.alloc(new_capacity);
+        self.initialize_controls(controls, new_capacity);
+        self.move_entries_into(controls, keys, values, new_capacity);
+        self.free_storage();
+        self.controls = controls;
+        self.keys = keys;
+        self.values = values;
+        self.bucket_capacity = new_capacity;
+        self.deleted_count = 0;
+        self.item_limit = self.max_items(new_capacity);
+    }
+
+    unsafe Void free_storage(Self&! self) {
+        if (self.bucket_capacity == 0) { return; }
+        self.controls?$.dealloc();
+        self.keys?$.dealloc();
+        self.values?$.dealloc();
+    }
+
+    deinit(self) {
+        unsafe {
+            Int index! = 0;
+            while (index < self.bucket_capacity) {
+                if (self.is_occupied(index)) {
+                    self.values[index]$.addr()$.destroy();
+                }
+                index = index + 1;
+            }
+            self.free_storage();
+        }
+    }
+}

@@ -9,21 +9,30 @@
 import std;
 ```
 
-不要直接导入 `std/fs.jiang`、`std/io.jiang`、`std/process.jiang`、`std/vector.jiang`、
-`std/string.jiang` 这类内部文件。内部文件路径和模块划分仍可调整。
+不要直接导入标准库内部文件。内部文件路径和模块划分仍可调整，稳定入口是 `std` 及其公开
+namespace。
 
 ## 当前入口
 
 `std/std.jiang` 作为入口文件，负责 re-export 当前对外可见的标准库表面：
 
-- `fs`：文件读写和路径相关能力，当前主要 re-export `system/fs.jiang`。
-- `io`：标准输入输出能力，当前主要 re-export `system/io.jiang`。
-- `process`：进程参数、环境变量和可执行文件查找，当前主要 re-export `system/process.jiang`。
+- `fs`：文件读写、metadata、目录创建、复制、替换和删除。
+- `io`：标准输入输出能力。
+- `process`：进程参数、环境变量、可执行文件查找和子进程执行。
+- `debug`：调试输出、不可恢复错误和主动 trap。
+- `collection`：`Vector<T>`、`HashMap<K, V>` 和 `HashSet<T>`。常用的 `Vector<T>` 也可以直接写成
+  `std.Vector<T>`。
 - `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`ptr()` 和 `into_slice()`。
   `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；`length()` 表示已初始化元素数量，
   不包含 `capacity()`。`capacity()` 只表示 `Vector` 自己管理的 spare capacity，
   不属于 `Contiguous` 语义。`truncate()`、`clear()` 和 `deinit` 会析构被移出已初始化区间的元素。
   内部 `length` / `capacity` 字段不是公开接口。
+- `HashMap<K, V>`：无序 key-value collection。key 必须满足 `Hashable`、`Equatable` 和 `Copyable`；
+  value 可以是 move-only 类型。`insert()` 和 `remove()` 返回的 optional 拥有其中旧 value 的所有权，
+  `get()` / `get_mut()` 返回与 map 绑定的借用。查询、插入和删除的平均复杂度为 O(1)，迭代顺序不稳定。
+  `load_percent` 可在构造时设置为 1-99 的整数，默认为 `80`。
+- `HashSet<T>`：无序且不保存重复元素的 collection，元素约束、顺序规则和 `load_percent`
+  与 `HashMap` 一致。
 - `String`：UTF-8 字节字符串，`bytes()` 返回借用字节视图。
 - `StringBuilder`：面向字符串构造的可增长 builder，支持追加字节切片、字符串、整数和浮点值；
   `into_string()` 生成 `String`，`into_slice()` 生成拥有所有权的 `UInt8[]^`。
@@ -36,6 +45,24 @@ import std;
   `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。
   这些 API 供 compiler 和 lang provider 共享，避免 DSL 从零实现 Jiang-compatible token 和
   syntax tree。
+
+基础 collection 可以这样使用：
+
+```jiang
+import std;
+
+std.Vector<Int> values! = std.Vector<Int>();
+values.append(1);
+
+std.collection.HashMap<Int, String> names! = std.collection.HashMap<Int, String>();
+names.insert(1, String("one"));
+
+std.collection.HashMap<Int, String> sparse_names! =
+    std.collection.HashMap<Int, String>(load_percent: 50);
+
+std.collection.HashSet<Int> seen! = std.collection.HashSet<Int>();
+seen.insert(1);
+```
 
 ## std.jiang
 
