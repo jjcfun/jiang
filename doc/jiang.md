@@ -2344,7 +2344,10 @@ public trait SubscriptSet: SubscriptGet {
 - 子 trait 会继承父 trait 的关联类型，且当前不允许重新声明父 trait 的同名关联类型
 - 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item == UInt8)` 继续约束继承来的关联类型
 - `@where(...)` 中多个 trait 约束也支持 `&`，例如 `@where(T: Hashable & Equatable)`
-- `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[]& bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
+- `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供字面量转换所需的
+  `init(UInt8[]& bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`。标准库 `String`
+  的字面量也使用 `String text = "hello";`，不写成显式构造调用；运行期字节通过 UTF-8 decoding API
+  构造。
 - 若继承链中出现同名 requirement：
   - 同名且签名完全一致：允许合并
   - 同名但签名不同：编译报错

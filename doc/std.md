@@ -38,7 +38,9 @@ namespace。
   `load_percent` 可在构造时设置为 1-99 的整数，默认为 `80`。
 - `HashSet<T>`：无序且不保存重复元素的 collection，元素约束、顺序规则和 `load_percent`
   与 `HashMap` 一致。
-- `String`：UTF-8 字节字符串，`bytes()` 返回借用字节视图。
+- `String`：拥有所有权的 UTF-8 字符串。字面量使用 `String text = "hello";` 初始化；动态字节使用
+  `String.from_utf8(bytes)` 检查并返回 `String@Utf8Error`，确定输入合法时可在 `unsafe` 中调用
+  `String.from_utf8_unchecked(bytes)`。`bytes()` 返回借用字节视图。
 - `StringBuilder`：面向字符串构造的可增长 builder，支持追加字节切片、字符串、整数和浮点值；
   `into_string()` 生成 `String`，`into_slice()` 生成拥有所有权的 `UInt8[]^`。
 - `Path` / `PathBuilder`：面向路径文本的 owned path 和 builder。`Path.text()` 返回借用视图，
@@ -60,7 +62,8 @@ std.Vector<Int> values! = std.Vector<Int>();
 values.append(1);
 
 std.collection.HashMap<Int, String> names! = std.collection.HashMap<Int, String>();
-names.insert(1, String("one"));
+String one = "one";
+names.insert(1, one);
 
 std.collection.HashMap<Int, String> sparse_names! =
     std.collection.HashMap<Int, String>(load_percent: 50);
