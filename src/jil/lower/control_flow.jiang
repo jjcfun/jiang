@@ -1205,6 +1205,10 @@ public extend body_context.BodyLowerer {
         if (self.lower_null_handle_equal_binary(binary, compare_type, destination, span)) {
             return;
         }
+        if (self.has_optional_payload_equality_plan(node_id)) {
+            self.lower_optional_payload_equal_binary(node_id, binary, destination, span);
+            return;
+        }
         if (self.lower_trait_equal_binary(node_id, binary, compare_type, destination, span)) {
             return;
         }
@@ -1230,6 +1234,130 @@ public extend body_context.BodyLowerer {
             return;
         }
         self.lower_scalar_equal_binary(node_id, binary, destination);
+    }
+
+    public Void lower_optional_payload_equal_binary(
+        Self&! self,
+        sem.NodeId node_id,
+        sem.Binary binary,
+        jil.Place destination,
+        token.Span span
+    ) {
+        qid.TypeId left_type = self.receiver_expr_type(binary.left);
+        qid.TypeId right_type = self.receiver_expr_type(binary.right);
+        qid.TypeId left_value_type = self.member_lookup_value_type(left_type);
+        qid.TypeId right_value_type = self.member_lookup_value_type(right_type);
+        types.TypeInfo left_info = self.lowerer.store.types.get(left_value_type);
+        Bool optional_on_left = left_info.data is .optional(_);
+        qid.TypeId element_type! = left_value_type;
+        if (left_info.data is .optional(optional)) {
+            element_type = optional.element;
+        } else {
+            types.TypeInfo right_info = self.lowerer.store.types.get(right_value_type);
+            if (right_info.data is .optional(optional)) { element_type = optional.element; }
+        }
+        support.StablePlaceLocation left = self.lower_equality_location(
+            binary.left, left_type, left_value_type, span, true
+        );
+        support.StablePlaceLocation right = self.lower_equality_location(
+            binary.right, right_type, right_value_type, span, true
+        );
+        jil.Place optional_place! = self.stable_place(right$.ref());
+        if (optional_on_left) {
+            optional_place = self.stable_place(left$.ref());
+        }
+        self.lower_optional_payload_equal_blocks(
+            node_id,
+            optional_on_left,
+            optional_place,
+            self.stable_place(left$.ref()),
+            self.stable_place(right$.ref()),
+            element_type,
+            destination,
+            binary.op == .not_equal,
+            span
+        );
+    }
+
+    public Void lower_optional_payload_equal_blocks(
+        Self&! self,
+        sem.NodeId node_id,
+        Bool optional_on_left,
+        jil.Place optional_place,
+        jil.Place left,
+        jil.Place right,
+        qid.TypeId element_type,
+        jil.Place destination,
+        Bool invert,
+        token.Span span
+    ) {
+        jil.LocalId condition = self.add_temp(self.lowerer.store.types.bool_type(), span);
+        self.builder.push_assign(
+            self.place_for_local(condition),
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.is_some,
+                value: jil.copy_operand_value(jil.CopyOperand (place: optional_place))
+            )),
+            span
+        );
+        jil.BlockId some_block = self.builder.reserve_block(span);
+        jil.BlockId none_block = self.builder.reserve_block(span);
+        jil.BlockId join_block = self.builder.reserve_block(span);
+        self.builder.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: jil.copy_operand_value(jil.CopyOperand (
+                place: self.place_for_local(condition)
+            )),
+            then_target: some_block,
+            else_target: none_block
+        )), span);
+
+        self.builder.start_block(some_block);
+        jil.Place payload = self.project_constant_index(optional_place, 1);
+        jil.Place compare_left! = left;
+        jil.Place compare_right! = payload;
+        if (optional_on_left) {
+            compare_left = payload;
+            compare_right = right;
+        }
+        self.lower_optional_payload_value_equal(
+            node_id, compare_left, compare_right, element_type, destination, invert, span
+        );
+        self.builder.finish_block(self.goto_terminator(join_block), span);
+
+        self.builder.start_block(none_block);
+        self.builder.push_assign(destination, self.bool_rvalue(invert, span), span);
+        self.builder.finish_block(self.goto_terminator(join_block), span);
+        self.builder.start_block(join_block);
+    }
+
+    public Void lower_optional_payload_value_equal(
+        Self&! self,
+        sem.NodeId node_id,
+        jil.Place lhs,
+        jil.Place rhs,
+        qid.TypeId element_type,
+        jil.Place destination,
+        Bool invert,
+        token.Span span
+    ) {
+        if (self.lowerer.typeck.member_selection(node_id) is .some(trait_member)) {
+            if (self.equality_target(trait_member, element_type) is .some(target)) {
+                Bool mutable_reference =
+                    self.function_self_receiver_mode(target) == .mutable_ref_receiver;
+                list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
+                args.add(self.borrow_receiver_place(lhs, element_type, mutable_reference, span));
+                args.add(self.borrow_receiver_place(rhs, element_type, mutable_reference, span));
+                self.lower_trait_equal_call(
+                    node_id, target, args$.ref(), element_type, destination, invert, span
+                );
+                return;
+            }
+        }
+        if (self.type_has_aggregate_equality(element_type)) {
+            self.lower_equal_places(lhs, rhs, destination, invert, span);
+            return;
+        }
+        self.lower_scalar_equal_places(lhs, rhs, destination, invert, span);
     }
 
     public Bool lower_null_handle_equal_binary(Self&! self,
@@ -1349,35 +1477,56 @@ public extend body_context.BodyLowerer {
             return false;
         }
         qid.TypeId dispatch_type = self.member_lookup_value_type(compare_type);
-        qid.DefId target! = trait_member;
-        if (!self.type_contains_generic_param(dispatch_type)) {
-            guard self.concrete_member_for_type(trait_member, dispatch_type)
-                is .some(concrete_target) else {
-                return false;
-            }
-            target = concrete_target;
+        guard self.equality_target(trait_member, dispatch_type) is .some(target) else {
+            return false;
         }
         list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
         Bool mutable_reference =
             self.function_self_receiver_mode(target) == .mutable_ref_receiver;
         args.add(self.lower_receiver_operand(binary.left, mutable_reference));
         args.add(self.lower_receiver_operand(binary.right, mutable_reference));
-        if (binary.op == .equal) {
-            self.lower_direct_function_call(
-                node_id, target, args$.ref(), destination, dispatch_type
-            );
-            return true;
-        }
-        jil.LocalId result = self.add_temp(self.lowerer.store.types.bool_type(), span);
-        self.lower_direct_function_call(
+        self.lower_trait_equal_call(
             node_id,
             target,
             args$.ref(),
-            self.place_for_local(result),
-            dispatch_type
+            dispatch_type,
+            destination,
+            binary.op == .not_equal,
+            span
+        );
+        return true;
+    }
+
+    public qid.DefId? equality_target(
+        self,
+        qid.DefId trait_member,
+        qid.TypeId dispatch_type
+    ) {
+        if (self.type_contains_generic_param(dispatch_type)) { return trait_member; }
+        return self.concrete_member_for_type(trait_member, dispatch_type);
+    }
+
+    public Void lower_trait_equal_call(
+        Self&! self,
+        sem.NodeId node_id,
+        qid.DefId target,
+        list.ArrayList<jil.Operand>& args,
+        qid.TypeId dispatch_type,
+        jil.Place destination,
+        Bool invert,
+        token.Span span
+    ) {
+        if (!invert) {
+            self.lower_direct_function_call(
+                node_id, target, args, destination, dispatch_type
+            );
+            return;
+        }
+        jil.LocalId result = self.add_temp(self.lowerer.store.types.bool_type(), span);
+        self.lower_direct_function_call(
+            node_id, target, args, self.place_for_local(result), dispatch_type
         );
         self.finish_equal_places(result, destination, true, span);
-        return true;
     }
 
     public Bool lower_reference_equal_binary(Self&! self,
@@ -1482,6 +1631,13 @@ public extend body_context.BodyLowerer {
         return lowering == .aggregate_equality;
     }
 
+    public Bool has_optional_payload_equality_plan(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.expr_lowering(node_id) is .some(lowering) else {
+            return false;
+        }
+        return lowering == .optional_payload_equality;
+    }
+
     public Bool type_has_aggregate_equality(self, qid.TypeId type_id) {
         types.TypeInfo info = self.lowerer.store.types.get(type_id);
         if (info.data is .tuple_type(_)) { return true; }
@@ -1516,7 +1672,8 @@ public extend body_context.BodyLowerer {
         sem.NodeId node_id,
         qid.TypeId expression_type,
         qid.TypeId value_type,
-        token.Span span
+        token.Span span,
+        Bool preserve_place = false
     ) {
         if (self.reference_element_type(expression_type) != null) {
             if (self.place_for_expr(node_id) is .some(place)) {
@@ -1527,6 +1684,9 @@ public extend body_context.BodyLowerer {
             return self.stable_place_location(
                 self.project_deref(self.place_for_local(reference), false)
             );
+        }
+        if (preserve_place && self.place_for_expr(node_id) is .some(place)) {
+            return self.stable_place_location(place);
         }
         jil.LocalId local = self.lower_equality_operand(node_id, value_type, span);
         return self.stable_place_location(self.place_for_local(local));
