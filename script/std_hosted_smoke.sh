@@ -18,10 +18,15 @@ if [ ! -x "$JIANGC" ]; then
   exit 2
 fi
 
+test_timeout=0
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  test_timeout=120
+fi
+
 cd "$ROOT_DIR"
 TEST_ROOT=test/lang \
 TEST_LIST="$PROFILE" \
-TEST_TIMEOUT=120 \
+TEST_TIMEOUT="$test_timeout" \
 JIANGC="$JIANGC" \
 bash "$ROOT_DIR/script/test.sh"
 
