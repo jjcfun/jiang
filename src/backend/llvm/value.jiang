@@ -1549,16 +1549,56 @@ ffi.Value lower_alloc_array(
     }
     ffi.Type size_type = allocator_size_type(state);
     ffi.Value element_size = ffi.const_int(size_type, UInt64(llvm_type.layout_size(state, value.element_type)));
-    ffi.Value allocation_count! = owned_slice_allocation_count(state, result_type, count);
+    ffi.Value zero_count = ffi.const_int(
+        ffi.context_int_type(
+            state.llvm_context$.ref(),
+            state.ctx.query.layout.target().pointer_size * 8
+        ),
+        UInt64(0)
+    );
+    ffi.Value invalid_size! = ffi.builder_build_icmp(
+        state.builder$.ref(), 40, count, zero_count
+    );
+    ffi.Value allocation_count! = cast_allocator_size_value(state, count);
     if (!ffi.value_valid(allocation_count)) {
         return ffi.Value();
     }
-    allocation_count = cast_allocator_size_value(state, allocation_count);
-    if (!ffi.value_valid(allocation_count)) {
-        return ffi.Value();
+    if (owned_slice_has_sentinel(state, result_type)) {
+        ffi.Value add_result = checked_unsigned_binary(
+            state,
+            "llvm.uadd.with.overflow",
+            allocation_count,
+            ffi.const_int(size_type, UInt64(1))
+        );
+        if (!ffi.value_valid(add_result)) { return ffi.Value(); }
+        allocation_count = ffi.builder_build_extract_value(
+            state.builder$.ref(), add_result, 0
+        );
+        ffi.Value add_overflow = ffi.builder_build_extract_value(
+            state.builder$.ref(), add_result, 1
+        );
+        invalid_size = ffi.builder_build_binary(
+            state.builder$.ref(), .int_or, invalid_size, add_overflow
+        );
     }
-    ffi.Value bytes = ffi.builder_build_binary(state.builder$.ref(), .int_mul, allocation_count, element_size);
-    if (!ffi.value_valid(bytes)) {
+    ffi.Value multiply_result = checked_unsigned_binary(
+        state,
+        "llvm.umul.with.overflow",
+        allocation_count,
+        element_size
+    );
+    if (!ffi.value_valid(multiply_result)) { return ffi.Value(); }
+    ffi.Value bytes = ffi.builder_build_extract_value(
+        state.builder$.ref(), multiply_result, 0
+    );
+    ffi.Value multiply_overflow = ffi.builder_build_extract_value(
+        state.builder$.ref(), multiply_result, 1
+    );
+    invalid_size = ffi.builder_build_binary(
+        state.builder$.ref(), .int_or, invalid_size, multiply_overflow
+    );
+    if (!ffi.value_valid(invalid_size)) { return ffi.Value(); }
+    if (!trap_when(state, invalid_size, "alloc.size.fail", "alloc.size.continue")) {
         return ffi.Value();
     }
     ffi.Value malloc_fn = declare_malloc(state, output);
@@ -1570,10 +1610,12 @@ ffi.Value lower_alloc_array(
     ffi.Type malloc_type = ffi.function_type(ffi.context_pointer_type(state.llvm_context$.ref()), param_types$.ref());
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(1);
     args.add(bytes);
-    ffi.Value raw = ffi.builder_build_call(state.builder$.ref(), malloc_type, malloc_fn, args$.ref());
+    ffi.Value raw! = ffi.builder_build_call(state.builder$.ref(), malloc_type, malloc_fn, args$.ref());
     if (!ffi.value_valid(raw)) {
         return ffi.Value();
     }
+    raw = checked_allocation(state, raw, bytes);
+    if (!ffi.value_valid(raw)) { return ffi.Value(); }
     ffi.Type data_type = owned_array_data_type(state, result_type);
     ffi.Value data = ffi.builder_build_cast(
         state.builder$.ref(), 6, raw, data_type
@@ -1592,21 +1634,15 @@ ffi.Value lower_alloc_array(
     return data;
 }
 
-ffi.Value owned_slice_allocation_count(llvm_state.LowerState& state, qid.TypeId result_type, ffi.Value count) {
+Bool owned_slice_has_sentinel(llvm_state.LowerState& state, qid.TypeId result_type) {
     if (!llvm_type.type_is_owned_slice_value(state, result_type)) {
-        return count;
+        return false;
     }
     types.TypeInfo info = llvm_type.type_info(state, result_type);
-    guard info.data is .handle_type(handle) else { return count; }
+    guard info.data is .handle_type(handle) else { return false; }
     types.TypeInfo element_info = llvm_type.type_info(state, handle.element);
-    guard element_info.data is .slice_value_type(slice_value) else { return count; }
-    if (!types.sentinel_has(slice_value.sentinel)) {
-        return count;
-    }
-    Int pointer_bits = state.ctx.query.layout.target().pointer_size * 8;
-    ffi.Type int_type = ffi.context_int_type(state.llvm_context$.ref(), pointer_bits);
-    ffi.Value one = ffi.const_int(int_type, 1);
-    return ffi.builder_build_binary(state.builder$.ref(), .int_add, count, one);
+    guard element_info.data is .slice_value_type(slice_value) else { return false; }
+    return types.sentinel_has(slice_value.sentinel);
 }
 
 ffi.Type owned_array_data_type(llvm_state.LowerState& state, qid.TypeId result_type) {
@@ -1631,7 +1667,88 @@ ffi.Value malloc_bytes_for_type(llvm_state.LowerState& state, llvm_state.LowerOu
     ffi.Type malloc_type = ffi.function_type(ffi.context_pointer_type(state.llvm_context$.ref()), param_types$.ref());
     list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(1);
     args.add(bytes);
-    return ffi.builder_build_call(state.builder$.ref(), malloc_type, malloc_fn, args$.ref());
+    ffi.Value raw = ffi.builder_build_call(
+        state.builder$.ref(), malloc_type, malloc_fn, args$.ref()
+    );
+    if (!ffi.value_valid(raw)) { return ffi.Value(); }
+    return checked_allocation(state, raw, bytes);
+}
+
+ffi.Value checked_allocation(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    ffi.Value bytes
+) {
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context$.ref());
+    ffi.Value is_null = ffi.builder_build_icmp(
+        state.builder$.ref(), 32, pointer, ffi.const_null(pointer_type)
+    );
+    ffi.Value nonzero_size = ffi.builder_build_icmp(
+        state.builder$.ref(), 33, bytes, ffi.const_int(allocator_size_type(state), UInt64(0))
+    );
+    ffi.Value failed = ffi.builder_build_binary(
+        state.builder$.ref(), .int_and, is_null, nonzero_size
+    );
+    if (!ffi.value_valid(failed)) { return ffi.Value(); }
+    if (!trap_when(state, failed, "alloc.fail", "alloc.continue")) {
+        return ffi.Value();
+    }
+    return pointer;
+}
+
+ffi.Value checked_unsigned_binary(
+    llvm_state.LowerState& state,
+    UInt8[]& name,
+    ffi.Value left,
+    ffi.Value right
+) {
+    ffi.Value intrinsic = ffi.module_get_intrinsic_for_type(
+        state.module$.ref(), name, allocator_size_type(state)
+    );
+    if (!ffi.value_valid(intrinsic)) { return ffi.Value(); }
+    list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(2);
+    args.add(left);
+    args.add(right);
+    return ffi.builder_build_call(
+        state.builder$.ref(), ffi.global_value_type(intrinsic), intrinsic, args$.ref()
+    );
+}
+
+Bool trap_when(
+    llvm_state.LowerState& state,
+    ffi.Value condition,
+    UInt8[]& fail_name,
+    UInt8[]& continue_name
+) {
+    if (!ffi.value_valid(state.current_function)) { return false; }
+    ffi.BasicBlock fail_block = ffi.context_append_block(
+        state.llvm_context$.ref(), state.current_function, fail_name
+    );
+    ffi.BasicBlock continue_block = ffi.context_append_block(
+        state.llvm_context$.ref(), state.current_function, continue_name
+    );
+    if (!ffi.block_valid(fail_block) || !ffi.block_valid(continue_block)) {
+        return false;
+    }
+    if (!ffi.value_valid(ffi.builder_build_cond_br(
+        state.builder$.ref(), condition, fail_block, continue_block
+    ))) {
+        return false;
+    }
+    ffi.builder_position_at_end(state.builder$.ref(), fail_block);
+    ffi.Value trap = ffi.module_get_intrinsic(state.module$.ref(), "llvm.trap");
+    if (!ffi.value_valid(trap)) { return false; }
+    list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>();
+    if (!ffi.value_valid(ffi.builder_build_call(
+        state.builder$.ref(), ffi.global_value_type(trap), trap, args$.ref()
+    ))) {
+        return false;
+    }
+    if (!ffi.value_valid(ffi.builder_build_unreachable(state.builder$.ref()))) {
+        return false;
+    }
+    ffi.builder_position_at_end(state.builder$.ref(), continue_block);
+    return true;
 }
 
 ffi.Value nonnull_zero_sized_pointer(llvm_state.LowerState& state) {

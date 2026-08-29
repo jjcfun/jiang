@@ -654,6 +654,10 @@ offset 和可选 message 后 trap，不执行 unwind。`build.mode` 是 compiler
 - `Type$.alloc()`：分配一个未初始化元素，返回 `Type*!`。
 - `Type$.alloc(n)`：分配 `n` 个未初始化元素，返回 `Type*!`。
 
+`Type$.alloc(n)` 要求 `n >= 0`。元素数量、sentinel slot 或 byte size 计算溢出，以及底层 allocator 对
+非零大小返回 null，都会立即 trap。allocation failure 不可恢复，不执行 unwind，也不保证析构；需要
+可恢复资源上限的 API 必须在调用 allocation 前自行验证业务限制，而不能把 OOM 当作 errorable 结果。
+
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
 隐式操作层的低层操作会逐步接入 effect 检查。当前裸指针获取和显式释放需要放在 `unsafe`
@@ -1123,6 +1127,17 @@ callback 期间提供 `T&!`，callback 返回后自动解锁。公开 API 不提
 `with_lock` callback 表达；callback 返回值受生命周期约束，不能让受保护值的引用活过锁。
 `Mutex<T>` 是 `!Movable`，当前不提供 poison 状态或公共 Channel/RwLock API。
 
+后续最小 Channel 采用 unbounded async MPMC，而不是建立新的 Task 或 scheduler。Channel 本体地址固定，
+通过 owner handle 共享；同步 send 成功时转移 value，closed 时把未发送 value 交还调用方；async receive
+返回 optional，close 后先 drain buffer 再返回 null。receive 对 Channel 的 borrow 覆盖整个挂起期，
+因此仍有 waiter 时不能析构 Channel。pending receive 的取消与 send 在同一 lock 下线性化，保证 value
+和 waiter 都只被一方取得。实现使用 amortized O(1) ring buffer 和可 O(1) 移除的 FIFO waiter；不把
+Task queue 当作消息队列，也不引入第二套 cancellation。该设计尚未进入 0.5.3 public API。
+
+未来 async sleep 只由 `std.time` 提供 cancellable timer source；timer 到期后恢复 Continuation，runtime
+仍负责把 coroutine 调度回其 current Domain。timer 不拥有 Executor，也不建立专用 Task 或 scheduler。
+在 macOS/Linux provider 都能保证注册与取消竞态安全前，不公开阻塞线程或无法取消的占位 sleep。
+
 ## Struct 与 Enum
 
 `struct` 用于普通名义类型，支持类型函数、实例函数、`init` 和 `deinit`。
@@ -1455,8 +1470,9 @@ Int x = {
 
 ### For-in、Sequence 和 Iterator
 
-`for pattern in expr` 根据值提供的协议选择遍历方式。`Sequence` 产生按值元素，可以消费 iterator
-新产生的 move-only value；`Collection` 产生绑定到 collection 的共享借用，不会把元素移出 storage。
+`for pattern in expr` 根据值提供的协议选择遍历方式。`Sequence.Element` 是 iterator 实际产生的
+类型，既可以是新产生的 owned value，也可以是绑定 source 的 reference。`Collection` 继承
+`Sequence`，进一步表示有限、可重复遍历并可查询长度的集合。
 
 当前内建 iterable：
 
@@ -1480,18 +1496,33 @@ trait Sequence {
     Iter make_iterator();
 }
 
-trait Collection: Contiguous {
-    associated Iter: Iterator;
-    @life(return: self)
-    Iter make_iterator();
+trait Collection: Sequence {
+    Int length();
+    Bool is_empty() { return length() == 0; }
+}
+
+trait Contiguous {
+    associated Element;
+    Element* ptr();
+    Int length();
 }
 ```
 
 `Iterator` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
-`Sequence` 表示按值遍历，`Collection` 表示可重复的借用遍历；后者的 iterator element 必须是
-`Contiguous.Element&`，并且 iterator 不能活过 collection。`make_iterator()` 产生游标。`for pattern in expr` 的 type check
-负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Element`。JIL
-lowering 只消费这个 plan，不在 JIL 阶段重新做 trait lookup。
+`Sequence.make_iterator()` 产生游标，`Collection` 增加 `length()` 和默认 `is_empty()`。
+`Contiguous` 是正交的 storage capability，不是所有 collection 的前提；它的 `Element` 表示底层连续
+元素类型。`Vector<T>` 同时满足 `Collection` 和 `Contiguous`：前者继承的
+`Sequence.Element == T&`，后者的 `Contiguous.Element == T`。`HashMap` / `HashSet` 是
+`Collection`，但不是 `Contiguous`。type check 负责选择具体 iteration plan，并把 pattern 的 expected
+type 设为 iterator element；JIL lowering 只消费这个 plan，不重新做 trait lookup。
+
+HashMap 的 hash seed 属于实例内部状态，不进入 public identity、equality 或 artifact contract。有系统
+entropy 时，每个实际获得 storage 的 map 生成一次 seed，rehash 保持该 seed；lookup 热路径只做纯 hash
+计算。缺少 entropy 的 target 使用内部 fallback 保持 collection 可用，但不承诺抗恶意碰撞。
+
+`Path` 直接拥有 native byte slice；`PathBuilder.finish()`、lexical normalize 和 extension replacement
+都把已有 storage 转移给结果，不额外建立文本表示。0.5.3 只冻结 macOS/Linux POSIX separator 语义；
+Windows drive/UNC path grammar 留到对应 hosted provider 完成时统一设计，不让当前 API 假装跨平台等价。
 
 ## Pattern Matching
 

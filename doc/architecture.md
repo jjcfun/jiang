@@ -383,9 +383,13 @@ src/
   incremental/  cache key、fingerprint、依赖图、symbol store
   id.jiang      跨阶段共享的 session-local handle
   store.jiang   CompilerStore 入口
-  system/       host/target OS、filesystem、process、dynamic library、target info
+  system/       私有 host/target OS provider、startup、filesystem、process、target info
   support/      arena、list、hash、unicode 等通用工具
 ```
+
+`src/system/` 是 compiler、runtime 与 public `std` 共用的私有系统能力层，负责 host/target OS、
+filesystem、process、dynamic library 和 target info。它属于 compiler 源码布局，不是用户可直接导入的
+public package；面向用户的 OS 能力逐步迁入 `std`，并通过稳定 wrapper 暴露可移植语义。
 
 ## Support 容器
 

@@ -281,6 +281,9 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `Int$.alloc()`：分配一个未初始化的 `Int*!`，元素数为 `1`
 - `Int$.alloc(10)`：分配一个包含 `10` 个未初始化元素的 `Int*!`
 
+`Type$.alloc(n)` 要求非负元素数。数量或 byte size 溢出，以及非零 allocation 返回 null，都会立即
+trap；该失败不 unwind，也不保证析构。标准 collection 因而不返回 OOM error，容量溢出采用相同终止语义。
+
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
 隐式操作层中的一部分 primitive 能力由编译器 builtin 或标准库提供，例如：
@@ -728,6 +731,9 @@ if (!configuration_is_valid()) {
     panic("invalid configuration");
 }
 ```
+
+正常地以指定状态终止当前进程使用 `std.process.exit(code)`。它不会 unwind，也不保证当前 Jiang value
+析构；需要释放或刷新资源时，应在调用前显式完成。
 
 ### 切片（Slice）
 
@@ -1697,9 +1703,13 @@ for resource in resources {
 }
 ```
 
-自定义 `Sequence` 可以让 iterator 按值产生元素；这种循环会取得每个新 value 的所有权。
-`Collection` 则用于可重复的有限集合，iterator 的 lifetime 绑定到 collection，不能从局部 collection
-中逃逸。
+自定义 `Sequence` 的 `Element` 是 iterator 实际产生的类型：它可以是 owned value，也可以是绑定
+source 的 reference。`Collection` 继承 `Sequence`，用于有限、可重复遍历并可查询长度的集合。
+当 iterator 返回借用元素时，它的 lifetime 绑定 collection，不能从局部 collection 中逃逸。
+
+`Contiguous` 单独表示连续 storage，不是 `Collection` 的前提。`Vector<T>` 同时满足两者：
+`Vector.[Sequence].Element == T&`，而 `Vector.[Contiguous].Element == T`；HashMap 和 HashSet 是
+Collection，但不是 Contiguous。
 
 `Vector` 的基础算法直接执行，不产生 lazy adapter。`for_each`、`map`、`reduce`、`contains` 和
 `contains_where` 借用 Vector；`filter` 消耗 Vector，把保留元素移动到结果并析构其余元素：
@@ -1712,6 +1722,58 @@ Vector<Int> even! = values.filter({ value => value$.get() % 2 == 0 });
 ```
 
 这里调用 `filter` 后 `values` 已被移动，不能继续使用。
+
+`HashMap<K, V>` 的循环元素是 `(K&, V&)`，`HashSet<K>` 的循环元素是 `K&`。遍历只借用已有
+storage，不复制元素；iterator 存活期间不能修改容器，且哈希容器不承诺迭代顺序：
+
+```c
+HashMap<Int, String> names! = HashMap<Int, String>();
+names.insert(1, "one");
+for entry in names {
+    Int& key = entry[0];
+    String& value = entry[1];
+}
+```
+
+系统 entropy 可用时，每个真正分配 storage 的 HashMap 使用独立 hash seed。因此，即使插入相同元素，
+不同 map 或不同进程的遍历顺序也可能不同；需要稳定顺序时应显式排序，不要把当前 bucket 顺序持久化。
+不支持 entropy 的 target 仍能使用 HashMap，但不承诺抵抗恶意构造的碰撞输入。
+
+`Path` 拥有 native path bytes，`PathBuilder.finish()` 消耗 builder 并以 O(1) 转移 storage。0.5.3 的
+lexical path operation 面向 macOS/Linux 的 `/` separator；`normalize` 只处理重复 separator、`.` 和
+`..`，不会访问 filesystem 或解析 symlink。`with_extension(path, "txt")` 的 extension 不带 leading
+dot；传入空 extension 会删除现有 extension。
+
+`std.fs` 的读取结果拥有自己的 bytes，不借用临时文件 handle；离开作用域时会自动释放。可能失败的
+打开、读取、写入、metadata 和显式 close 使用 `T@FileError`，而不是用 null 或 false 丢失失败原因：
+
+```jiang
+UInt8[]^ contents = try std.fs.read_all("settings.json") catch FileError error {
+    return switch error {
+        .not_found => new "{}",
+        else => throw error,
+    };
+};
+```
+
+`File` 是 move-only handle owner。move 会转移唯一 handle；未显式关闭时由 deinit 自动关闭，重复
+`close()` 成功，关闭后的 read/write 返回 `.closed`。`exists`、`file_exists` 和 `dir_exists` 仅用于
+存在性探测，不存在或不可访问都返回 false；需要区分原因时应使用 `open` 或 `file_metadata`。
+
+异步函数可用 `std.fs.read_all_async(path)` 避免阻塞当前 Domain。regular-file provider call 在 std
+共享的并发 IO Domain 上执行；取消采用 cooperative 语义，已经开始的阻塞调用完成后才关闭 File、释放
+未交付结果并结束取消。这不是 kernel readiness API，也不会让 `File` 本身变成 `Sendable`。
+
+目录遍历使用 `list_dir`，它 eager 返回完整的 owned 子路径，不包含 `.` 和 `..`，并且不保证顺序：
+
+```jiang
+std.Vector<Path> entries = try std.fs.list_dir("assets") catch FileError error {
+    return 1;
+};
+for ref Path entry in entries.slice() {
+    // entry.bytes() 在 entry 的 lifetime 内有效。
+}
+```
 
 **3. 带索引的遍历 (Explicit Indexing)**
 Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，
