@@ -56,9 +56,12 @@ codegen summary。
 source 共用规范化路径和 `SourceId`，每次内容变化递增 revision；存在 overlay 时不读取旧 `.ji`
 header，也不发布新的 `.ji`。清除 overlay 后，下一轮重新读取磁盘并按内容 hash 正常失效。
 
-workspace 打开时先建立 `PackageHandle`，只解析 root path/package manifest 并保留稳定 root
-`SourceId`。后续 `compile_loaded` 复用这个入口身份，但每轮重新读取 SourceStore、执行 import discovery
-并重建 session-local ModuleGraph 和语义表；package 对象不缓存旧 `DefId` 或 `TypeId`。
+workspace 打开时先建立 `PackageHandle`，只解析 root path/package manifest。源码路径进入 module graph
+时由 `SourceStore` 建立或复用 `SourceInfo` 与 session-local `SourceId`；`.ji` header 命中不读取正文，
+cache miss 或 overlay 才 materialize 完整 `Source`。stable source identity 只由 stable package identity
+和规范化 source path 计算，不包含 `SourceId` 数值。后续 `compile_loaded` 复用规范化入口路径，
+但每轮重新读取 SourceStore、执行 import discovery 并重建 session-local ModuleGraph 和语义表；
+package 对象不缓存旧 `DefId` 或 `TypeId`。
 
 每轮 check 完成后，`CompilerQueries` 组合当前 `SourceMap`、Semantic Model 和 `TypeCheckStore`，
 按 source byte offset 提供 definition、type 和 span 查询。查询结果是本轮 session-local ID，

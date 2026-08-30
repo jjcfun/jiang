@@ -186,10 +186,14 @@ compiler service 可以直接查询 store 或使用 LSP sink，不把终端 I/O 
 
 `CompilerSession` 长期持有 `CompilerContext`，每轮 compilation 重建 session-local 语义表，
 同时保留 `SourceStore`、symbol interner、artifact 统计容器和 stable identity 映射。
-`PackageHandle` 只保存规范化 root path 和稳定 root `SourceId`。workspace/package 加载与
-`compile_loaded` 分离；后者每轮重新读取 SourceStore 并重建 ModuleGraph、Semantic Model 和类型事实。
+`PackageHandle` 只保存规范化 root path，不在读取正文前建立完整 `Source`。workspace/package 加载与
+`compile_loaded` 分离；后者每轮重新读取源码并重建 ModuleGraph、Semantic Model 和类型事实。
 `SourceStore` 是源码读取的统一入口：没有 overlay 时读取磁盘，IDE/LSP 设置 overlay 后优先读取
-未保存文本；root source、普通 import 和诊断位置转换不能绕过它直接读取源码文件。
+未保存文本；root source 和普通 import 不能绕过它直接读取源码文件。每个逻辑源码先由
+`SourceInfo` 保存稳定 `SourceId`、`SourceKey`、content hash 与 revision；只有实际读取正文时才建立
+完整 `Source`，其 text 非 optional。`.ji` header 命中只建立 `SourceInfo` 并跳过正文读取与 parser。
+源码诊断直接读取已载入的 `Source` 快照，不重新读取磁盘。
+`SourceKey` 使用 `.file(path)` / `.virtual(name)` payload enum 区分文件路径和虚拟名称。
 `CompilerQueries` 是只读 service facade：按 source byte offset 查询当前 compilation 的 `NodeId`、
 definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `SourceLoc`。definition 跳转范围使用
 `DefRecord.name.span`，声明主体范围仍由 `SourceMap.def_span` 表达。
@@ -197,8 +201,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 ### Store 规则
 
 - `CompilerStore` 是业务事实集合的生命周期所有者。
-- `SourceStore` 保存稳定 `SourceId`、content revision 和可选内存 overlay；overlay 跨 compilation
-  保留，但不进入 `.ji`、object 或 `.jbuild`。
+- `SourceStore` 以 `SourceInfo` 保存源码身份、hash 和 revision，以完整 `Source` 按需保存 owned text、
+  lazy `line_starts` 和 overlay 状态；overlay 跨 compilation 保留，但不进入 `.ji`、object 或 `.jbuild`。
 - `SourceMap` 保存 `NodeId` / `DefId` 的正向位置事实，并为 source byte offset 查询维护当前
   compilation 的反向 span 索引；索引随 session-local 语义表一起重建。
 - `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
