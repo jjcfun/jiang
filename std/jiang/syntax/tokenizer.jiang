@@ -1,0 +1,273 @@
+// Tokenizer<K> 为自定义语法提供 source cursor、trivia、连续 token storage 和回溯。
+// 它不解释 provider 定义的 K，也不决定 comment、literal 或关键字 grammar。
+
+import vector = "../../collection/vector.jiang";
+import ident = "../text/ident.jiang";
+import context = "context.jiang";
+import abi = "abi.jiang";
+import source = "source.jiang";
+import token = "token.jiang";
+
+// Checkpoint 只由 Tokenizer 产生；字段保持不可见，调用方只能交回 rewind。
+public struct TokenizerCheckpoint: Copyable {
+    Void* context_identity;
+    source.SourceId source_id;
+    source.Span bounds;
+    Int token_start;
+    Int current;
+    token.Trivia leading;
+    Int token_length;
+    Int diagnostic_mark;
+    Bool token_open;
+}
+
+@region(c, s, k: K)
+@where(K: Copyable & Equatable)
+public struct Tokenizer<K>: Movable {
+    @life(c)
+    context.SyntaxContext& context;
+
+    @life(s)
+    source.Source source;
+
+    source.Span bounds;
+    Int token_start!;
+    Int current!;
+    token.Trivia leading!;
+
+    @life(k)
+    vector.Vector<token.Token<K>> tokens!;
+
+    Bool token_open!;
+
+    public init(
+        self,
+        context.SyntaxContext& context,
+        source.Source source,
+        source.Span bounds
+    ) {
+        assert(bounds.start >= 0 && bounds.end() <= source.length());
+        self.context = context;
+        self.source = source;
+        self.bounds = bounds;
+        self.token_start = bounds.start;
+        self.current = bounds.start;
+        self.leading = token.Trivia();
+        self.tokens = vector.Vector<token.Token<K>>();
+        self.token_open = false;
+    }
+
+    @life(return.c: context, return.s: source)
+    public Tokenizer<K> from_source(context.SyntaxContext& context, source.Source source) {
+        return Tokenizer<K>(context, source, source.span());
+    }
+
+    // 开始一个 token；trivia 应在调用前扫描，emit 后才可开始下一个 token。
+    public Void begin_token(Self&! self) {
+        assert(!self.token_open && !self.at_end());
+        self.token_start = self.current;
+        self.token_open = true;
+    }
+
+    // 发送当前 token，并把已累计的 trivia 绑定到它。
+    @life(self.k: kind)
+    public Void emit(Self&! self, K kind) {
+        assert(self.token_open);
+        source.Span span = self.current_span();
+        self.tokens.append(token.Token<K>(kind, span, self.leading));
+        self.leading = token.Trivia();
+        self.token_open = false;
+    }
+
+    // 发送 EOF 并消耗 tokenizer，把连续 token Vector 交给调用方。
+    @life(return.a: self.k & eof_kind)
+    public vector.Vector<token.Token<K>> finish(Self self!, K eof_kind) {
+        assert(!self.token_open && self.at_end());
+        self.tokens.append(token.Token<K>(eof_kind, source.Span(self.current, 0), self.leading));
+        return self.tokens$.move();
+    }
+
+    public Bool at_end(self) {
+        return self.current >= self.bounds.end();
+    }
+
+    public Int position(self) {
+        return self.current;
+    }
+
+    public UInt8 peek(self) {
+        if (self.at_end()) { return 0; }
+        return self.source.bytes[self.current];
+    }
+
+    public UInt8 peek_next(self) {
+        return self.peek_at(1);
+    }
+
+    public UInt8 peek_at(self, Int offset) {
+        Int index = self.current + offset;
+        if (index < self.bounds.start || index >= self.bounds.end()) { return 0; }
+        return self.source.bytes[index];
+    }
+
+    public Void advance(Self&! self, Int count = 1) {
+        assert(count >= 0 && self.current + count <= self.bounds.end());
+        self.current = self.current + count;
+    }
+
+    public Bool match(Self&! self, UInt8 expected) {
+        if (self.at_end() || self.peek() != expected) { return false; }
+        self.advance();
+        return true;
+    }
+
+    // 跳过 ASCII whitespace，并记录给下一个 emit 的 trivia。
+    public Void skip_whitespace(Self&! self) {
+        assert(!self.token_open);
+        while (!self.at_end() && is_ascii_whitespace(self.peek())) {
+            self.leading.has_whitespace = true;
+            if (self.peek() == '\n' || self.peek() == '\r') {
+                self.leading.has_newline = true;
+            }
+            self.advance();
+        }
+    }
+
+    // 当前为 // 时跳过到换行前；其他 comment grammar 由 provider 自己实现。
+    public Bool skip_line_comment(Self&! self) {
+        assert(!self.token_open);
+        if (self.peek() != '/' || self.peek_next() != '/') { return false; }
+        self.leading.has_comment = true;
+        self.advance(2);
+        while (!self.at_end() && self.peek() != '\n' && self.peek() != '\r') {
+            self.advance();
+        }
+        return true;
+    }
+
+    // 从当前 token 起点扫描一个 XID identifier；失败时不前移 cursor。
+    public Bool scan_identifier(Self&! self) {
+        assert(self.token_open && self.current == self.token_start);
+        if (ident.is_ascii_ident_start(self.peek())) {
+            self.advance();
+        } else if (ident.is_utf8_ident_start_at(self.source.bytes, self.current)) {
+            self.advance(ident.utf8_len_at(self.source.bytes, self.current));
+        } else {
+            return false;
+        }
+        while (!self.at_end()) {
+            if (ident.is_ascii_ident_continue(self.peek())) {
+                self.advance();
+                continue;
+            }
+            if (ident.is_utf8_ident_continue_at(self.source.bytes, self.current)) {
+                self.advance(ident.utf8_len_at(self.source.bytes, self.current));
+                continue;
+            }
+            return true;
+        }
+        return true;
+    }
+
+    // 扫描至少一个 ASCII digit；失败时不前移 cursor。
+    public Bool scan_digits(Self&! self) {
+        assert(self.token_open && self.current == self.token_start);
+        if (!is_ascii_digit(self.peek())) { return false; }
+        while (!self.at_end() && is_ascii_digit(self.peek())) {
+            self.advance();
+        }
+        return true;
+    }
+
+    public Void invalid_character(Self&! self) {
+        abi.add_diagnostic(self.context, .invalid_character, self.diagnostic_span(), "");
+    }
+
+    public Void invalid_escape(Self&! self) {
+        abi.add_diagnostic(self.context, .invalid_escape, self.diagnostic_span(), "");
+    }
+
+    public Void unterminated_string(Self&! self) {
+        abi.add_diagnostic(self.context, .unterminated_string, self.diagnostic_span(), "");
+    }
+
+    public Void unterminated_comment(Self&! self) {
+        abi.add_diagnostic(self.context, .unterminated_comment, self.diagnostic_span(), "");
+    }
+
+    public Void invalid_number(Self&! self) {
+        abi.add_diagnostic(self.context, .invalid_number, self.diagnostic_span(), "");
+    }
+
+    public Void error(Self&! self) {
+        abi.add_diagnostic(self.context, .syntax_error, self.diagnostic_span(), "");
+    }
+
+    public Void error(Self&! self, UInt8[]& message) {
+        abi.add_diagnostic(self.context, .syntax_error, self.diagnostic_span(), message);
+    }
+
+    public Void error_at(Self&! self, source.Span span) {
+        abi.add_diagnostic(self.context, .syntax_error, span, "");
+    }
+
+    public Void error_at(Self&! self, source.Span span, UInt8[]& message) {
+        abi.add_diagnostic(self.context, .syntax_error, span, message);
+    }
+
+    public source.Span current_span(self) {
+        assert(self.token_open);
+        return source.Span(self.token_start, self.current - self.token_start);
+    }
+
+    @life(return: self.s)
+    public UInt8[]& current_text(self) {
+        assert(self.token_open);
+        return self.source.bytes[self.token_start..self.current];
+    }
+
+    @life(return: self.s)
+    public UInt8[]& token_text(self, token.Token<K> value) {
+        assert(value.span.start >= self.bounds.start && value.span.end() <= self.bounds.end());
+        return self.source.bytes[value.span.start..value.span.end()];
+    }
+
+    public TokenizerCheckpoint checkpoint(self) {
+        return TokenizerCheckpoint(
+            context_identity: unsafe { self.context$.ptr()$.as(Void*) },
+            source_id: self.source.source_id,
+            bounds: self.bounds,
+            token_start: self.token_start,
+            current: self.current,
+            leading: self.leading,
+            token_length: self.tokens.length(),
+            diagnostic_mark: abi.diagnostic_mark(self.context),
+            token_open: self.token_open
+        );
+    }
+
+    public Void rewind(Self&! self, TokenizerCheckpoint checkpoint) {
+        assert(checkpoint.context_identity == unsafe { self.context$.ptr()$.as(Void*) });
+        assert(checkpoint.source_id == self.source.source_id && checkpoint.bounds == self.bounds);
+        assert(checkpoint.token_length <= self.tokens.length());
+        self.tokens.truncate(checkpoint.token_length);
+        self.token_start = checkpoint.token_start;
+        self.current = checkpoint.current;
+        self.leading = checkpoint.leading;
+        abi.rewind_diagnostics(self.context, checkpoint.diagnostic_mark);
+        self.token_open = checkpoint.token_open;
+    }
+
+    source.Span diagnostic_span(self) {
+        if (self.token_open) { return self.current_span(); }
+        return source.Span(self.current, 0);
+    }
+}
+
+Bool is_ascii_whitespace(UInt8 byte) {
+    return byte == ' ' || byte == '\n' || byte == '\r' || byte == '\t';
+}
+
+Bool is_ascii_digit(UInt8 byte) {
+    return byte >= '0' && byte <= '9';
+}

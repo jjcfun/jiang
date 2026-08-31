@@ -26,8 +26,8 @@ driver/cli -> pipeline.compile
   工作目录内同一文件的绝对路径和相对路径归一为同一个 source identity。
 - `lang registry`：先按入口 source path 构建 provider registry，再按 module graph/package
   补全 package 级 registry。`#alias { ... }` 优先匹配 compiler builtin provider；否则调用
-  manifest dependency 中的 `type = lang` provider。provider 返回 public syntax tree，compiler
-  转换为内部 AST。
+  manifest dependency 中的 `type = lang` provider。provider 通过 typed syntax factory 直接生成
+  当前 compiler AST unit 的 expansion。
 - `Semantic Model`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
   source selection 在 resolve/Semantic Model lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
@@ -85,7 +85,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：source text、keyword store、lang registry。
   - 禁止：名字解析、类型判断、布局、codegen 语义。
 - `lang`
-  - 生产：lang provider registry、provider dynamic library handle、public syntax tree expansion。
+  - 生产：lang provider registry、provider dynamic library handle、typed syntax expansion。
   - 消费：package manifest、artifact cache、host dynamic library loader、`std.jiang.syntax.Provider`。
   - 禁止：生成 Semantic Model/JIL/backend IR、依赖普通 import/name resolve 查找 provider。
 - `resolve`

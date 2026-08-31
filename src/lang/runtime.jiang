@@ -9,12 +9,12 @@ import block = "./block.jiang";
 import dylib = "../system/dylib.jiang";
 import qid = "../id.jiang";
 import registry = "./registry.jiang";
+import source = "../source.jiang";
 import store = "../resolve/store.jiang";
 import store_api = "../store.jiang";
 import string_support = "../support/string.jiang";
 import syntax_builder = "../syntax/builder.jiang";
-import tree_converter = "../syntax/tree_converter.jiang";
-import tree_validator = "./tree_validator.jiang";
+import syntax_diagnostics = "../syntax/diagnostics.jiang";
 import std;
 
 public enum CallStatus {
@@ -77,6 +77,9 @@ public ScanBlockResult scan_block(
     guard compiler_store.resolve.package_ref(provider_id).lang_info_ref() is .some(info_ref) else {
         return ScanBlockResult.failure(.not_loaded, scan_error(fallback));
     }
+    if (info_ref.wrapper_version != abi.wrapper_version()) {
+        return ScanBlockResult.failure(.unsupported_version, scan_error(fallback));
+    }
     qid.SymbolId dylib_path = info_ref.dylib_path;
     if (!ensure_loaded(compiler_store, dependency, dylib_path, lang_block)) {
         return ScanBlockResult.failure(.not_loaded, scan_error(fallback));
@@ -86,12 +89,11 @@ public ScanBlockResult scan_block(
         return ScanBlockResult.failure(create_status, scan_error(fallback));
     }
     std.jiang.syntax.Provider.Any&! provider_ref = lang_block.provider$.mut_ref();
-    syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-        compiler_store,
-        lang_block.builder$.mut_ref()
-    );
-    std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-    std.jiang.syntax.ScanResult result = provider_ref.scan(lang_block.input, builder_ref);
+    syntax_builder.SyntaxInvocation&! invocation = lang_block.invocation$.mut_ref();
+    std.jiang.syntax.SyntaxContext&! syntax = lang_block.syntax_context$.mut_ref();
+    invocation.begin_scan(compiler_store, .lexer);
+    std.jiang.syntax.ScanResult result = provider_ref.scan(lang_block.input, syntax);
+    invocation.end_call();
     if (result.status == .error) {
         return ScanBlockResult.failure(.error, scan_error(result));
     }
@@ -110,49 +112,40 @@ public ParseIntoResult parse_into(
     if (lang_block.scan_result.status == .error) {
         return ParseIntoResult.failure(.invalid_request);
     }
+    if (lang_block.has_builtin_provider()) {
+        return parse_builtin_into(compiler_store, unit, lang_block);
+    }
     std.jiang.syntax.Provider.Any&! provider_ref = lang_block.provider$.mut_ref();
-    syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-        compiler_store,
-        lang_block.builder$.mut_ref()
-    );
-    std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-    std.jiang.syntax.NodeId root = provider_ref.parse(lang_block.input, lang_block.entry_kind, builder_ref);
-    if (!lang_block.builder.contains_node(root)) {
-        syntax_builder.add_error(
-            compiler_store,
-            lang_block.builder$.mut_ref(),
-            lang_block.full_span,
-            "lang_provider_invalid_root",
-            invalid_root_message(root).bytes()
-        );
-        return ParseIntoResult.failure(.invalid_request);
-    }
-    std.jiang.syntax.Tree tree = lang_block.builder.tree(root);
-    tree_validator.Result validation = tree_validator.validate(tree$.ref());
-    if (!validation.ok) {
-        syntax_builder.add_error(
-            compiler_store,
-            lang_block.builder$.mut_ref(),
-            lang_block.full_span,
-            "lang_provider_invalid_tree",
-            validation.message.bytes()
-        );
-        return ParseIntoResult.failure(.invalid_request);
-    }
-    std.jiang.syntax.NodeId node_id = node_for_entry(tree$.ref(), root);
-    return ParseIntoResult.ok(tree_converter.convert_into(unit, tree$.ref(), node_id));
+    syntax_builder.SyntaxInvocation&! invocation = lang_block.invocation$.mut_ref();
+    std.jiang.syntax.SyntaxContext&! syntax = lang_block.syntax_context$.mut_ref();
+    std.jiang.syntax.ExpansionKind expected = lang_block.entry_kind;
+    invocation.begin_parse(compiler_store, unit, .parser);
+    std.jiang.syntax.Expansion expansion = provider_ref.parse(lang_block.input, expected, syntax);
+    std.jiang.syntax.SyntaxContext& finish_context = lang_block.syntax_context$.ref();
+    Bool finished = std.jiang.syntax.finish_expansion(finish_context, expansion$.move(), expected);
+    ast.AstId? result = invocation.take_result();
+    invocation.end_call();
+    if (!finished) { return ParseIntoResult.failure(.invalid_request); }
+    guard result is .some(root) else { return ParseIntoResult.failure(.invalid_request); }
+    return ParseIntoResult.ok(root);
 }
 
-std.jiang.syntax.NodeId node_for_entry(
-    std.jiang.syntax.Tree& tree,
-    std.jiang.syntax.NodeId root
+ParseIntoResult parse_builtin_into(
+    store_api.CompilerStore&! compiler_store,
+    ast.AstUnit&! unit,
+    block.LangBlock&! lang_block
 ) {
-    std.jiang.syntax.Node& node = tree.node(root);
-    guard node.data is .root(provider_root) else {
-        return root;
+    source.SourceId source_id = syntax_builder.source_id_from_std(lang_block.input.source.source_id);
+    guard lang_block.builtin_provider.parse(
+        compiler_store,
+        source_id,
+        unit,
+        lang_block.input,
+        lang_block.entry_kind
+    ) is .some(root) else {
+        return ParseIntoResult.failure(.invalid_request);
     }
-    if (provider_root.nodes.length != 1) { return root; }
-    return tree.child_at(provider_root.nodes, 0);
+    return ParseIntoResult.ok(root);
 }
 
 Bool ensure_loaded(
@@ -200,9 +193,10 @@ Void report_dlopen_error(
         builder.append_valid_utf8(error);
     }
     std.String message = builder.into_string();
-    syntax_builder.add_error(
+    syntax_diagnostics.add_error(
         compiler_store,
-        lang_block.builder$.mut_ref(),
+        syntax_builder.source_id_from_std(lang_block.input.source.source_id),
+        .lexer,
         lang_block.full_span,
         "lang_provider_dlopen_failed",
         message.bytes()
@@ -226,9 +220,10 @@ Void report_dlsym_error(
         builder.append_valid_utf8(error);
     }
     std.String message = builder.into_string();
-    syntax_builder.add_error(
+    syntax_diagnostics.add_error(
         compiler_store,
-        lang_block.builder$.mut_ref(),
+        syntax_builder.source_id_from_std(lang_block.input.source.source_id),
+        .lexer,
         lang_block.full_span,
         "lang_provider_symbol_missing",
         message.bytes()
@@ -256,11 +251,4 @@ std.jiang.syntax.Provider.Any^ call_create_entry(Void* entry_pointer) {
         entry_pointer$.as(RawFn<std.jiang.syntax.Provider.Any^>)
     };
     return entry();
-}
-
-std.String invalid_root_message(std.jiang.syntax.NodeId root) {
-    std.StringBuilder builder! = std.StringBuilder();
-    builder.append("lang provider returned invalid root NodeId: ");
-    builder.append(root.to_index());
-    return builder.into_string();
 }

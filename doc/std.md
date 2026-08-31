@@ -60,9 +60,8 @@ namespace。
   只通过 `T?`、`T@E`、`T^`、`T&`、`T*`、`T[N]`、`T[]`、`T[:S]` 等表面语法表达，
   compiler-owned constructor 名称不从 `std` re-export。
 - `jiang`：Jiang 语言自身的词法和 syntax 辅助 API。当前包括 `std.jiang.syntax.*`、
-  `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。
-  这些 API 供 compiler 和 lang provider 共享，避免 DSL 从零实现 Jiang-compatible token 和
-  syntax tree。
+  `std.jiang.Token`、`std.jiang.TokenKind` 和 `std.jiang.ident`。通用 tokenizer/parser 通过
+  `std.jiang.syntax.Tokenizer<K>` / `Parser<K>` 使用，避免 DSL 从零实现 cursor、诊断和 Jiang syntax。
 
 基础 collection 可以这样使用：
 
@@ -117,18 +116,22 @@ family 或第二套 scheduler/cancellation API。使用方式见[语言指南的
 
 ## std.jiang
 
-`std.jiang.syntax` 是 lang provider 的公共 syntax ABI。provider 通过
-`std.jiang.syntax.Builder.Any&!` 构造 `NodeId` / `Tree`，并用 `std.jiang.syntax.Diagnostic`
-报告 syntax 阶段错误。compiler 可以复用这些结构，再在 lang expansion 后转换到内部 AST。
-`std.jiang.syntax.Provider` 是 `type = lang` package root `Lang` 需要实现的 trait；compiler
-为该类型生成 host dynamic library wrapper，普通用户代码不直接调用 wrapper 符号。
-builtin provider 也复用同一套 syntax ABI。当前 inline asm 由编译器内建 provider 实现，
-用户源码可写 `#asm { ... }`，需要稳定指向内建实现时可写 `#jiang.asm { ... }`。
+`std.jiang.syntax` 是 lang provider 的公共 syntax API。核心类型是 `Input`、opaque
+`SyntaxContext`、`Token<K>`、`Tokenizer<K>`、`Parser<K>`、typed syntax handle 和 `Expansion`。
+provider 通过 `Parser<K>` 的 typed method 生成 Jiang syntax，不公开 AST data、node index、child
+range 或 arena，也不允许用户手工组装 compiler AST。
 
-`std.jiang.Tokenizer` 是 Jiang 语言 tokenizer 的公共版本。它接受 `std.jiang.syntax.Source`，
-每次 `next(builder)` 返回一个 `Token`，并把 lexer 诊断写入传入的 builder。`Token` 不保存
-text 或 compiler 内部 symbol id；调用方按 `Token.span` 从 `Source.bytes` 取回文本，并在自己的
-symbol store 中 intern。
+`std.jiang.syntax.Provider` 是 `type = lang` package root `Lang` 需要实现的 trait。采用 Jiang 默认
+词法规则时只需实现 `parse`；默认 `scan` 会把连续 token storage 交给 `default_parser`。自定义词法
+规则可以使用 `Tokenizer<CustomKind>`，由 provider 自己保存并解释 custom kind。
+
+`Token<K>` 不复制 token text；调用方通过 `Token.span` 从 `Source.bytes` 读取。`Tokenizer<K>` 管理
+source cursor、trivia、连续 storage 和 `checkpoint/rewind`，但不理解 `K`。诊断由
+`Tokenizer.error*`、`Parser.expect*` 和 `Parser.error` 发出，message 通常可以省略。
+
+compiler 为 provider 生成 host dynamic library wrapper，普通用户代码不直接调用 wrapper 符号。
+当前 inline asm 由编译器内建 provider 实现；用户源码可写 `#asm { ... }`，需要稳定指向内建实现时
+可写 `#jiang.asm { ... }`。
 
 identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节；UTF-8 路径使用 Unicode
 `XID_Start` / `XID_Continue`。压缩 XID 表由 `script/gen_unicode_xid.js` 生成到

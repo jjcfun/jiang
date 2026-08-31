@@ -2830,8 +2830,8 @@ type = lang
 
 provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider`。编译器在 host 上
 把 lang package 编译成 dynamic library；lexer 调用 `scan` 决定 block 边界，parser 调用 `parse`
-取得 `std.jiang.syntax.Tree`，再转换成普通 Jiang AST。DSL 返回的节点继续走普通 resolve、
-type check、JIL 和 backend。
+取得 `Expansion`。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续
+走普通 resolve、type check、JIL 和 backend。
 
 当前限制：
 
@@ -2840,6 +2840,26 @@ type check、JIL 和 backend。
 - 一个 lang package 只提供一个默认 provider
 - provider 不能直接生成 Semantic Model/JIL/backend IR
 - dependency package 中的 `main` 不会成为当前 package 的 hosted entry wrapper
+
+采用 Jiang 默认词法规则时，provider 只需实现 `parse`：
+
+```jiang
+public struct Lang: std.jiang.syntax.Provider {
+    public std.jiang.syntax.Expansion parse(
+        Self&! self,
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.ExpansionKind expected,
+        std.jiang.syntax.SyntaxContext&! syntax
+    ) {
+        _ parser! = std.jiang.syntax.default_parser(syntax, input);
+        return .expression(parser.int_literal(input.name_span, "0"));
+    }
+}
+```
+
+需要自定义 token 时，可以在 `scan` 中使用 `Tokenizer<CustomKind>`，将 token 保存在 provider
+实例中，并在 `parse` 中移入 `Parser<CustomKind>`。`SyntaxContext` 由 compiler 传入，只能在当前
+调用期间借用，不能长期保存。
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 

@@ -5,6 +5,7 @@
 
 import ast = "./ast.jiang";
 import syntax_builder = "./builder.jiang";
+import lexer = "./lexer.jiang";
 import syntax_diagnostics = "./diagnostics.jiang";
 import lang_block = "../lang/block.jiang";
 import lang_runtime = "../lang/runtime.jiang";
@@ -39,7 +40,7 @@ struct ParsedContractName: Copyable {
 
 public ParseResult parse_tokens(
     store_api.CompilerStore&! store,
-    list.ArrayList<std.jiang.Token>& tokens,
+    list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>& tokens,
     lang_block.LangBlockStore&! blocks,
     UInt8[]& source_text,
     source.SourceId source_id
@@ -47,11 +48,42 @@ public ParseResult parse_tokens(
     ast.AstUnit unit! = ast.AstUnit(source_id);
     {
         Parser parser! = Parser(
-            store, tokens, blocks, unit$.mut_ref(), source_text, source_id
+            store, tokens.slice(), blocks, unit$.mut_ref(), source_text, source_id
         );
         parser.parse();
     }
     return ParseResult(unit);
+}
+
+public Int factory_parse_fragment(
+    Void* state,
+    std.jiang.syntax.ExpansionKind kind,
+    std.jiang.syntax.Source fragment_source,
+    std.jiang.Token<std.jiang.TokenKind>[]& tokens,
+    Int&! current
+) {
+    syntax_builder.SyntaxInvocation&! invocation = unsafe {
+        state$.as(syntax_builder.SyntaxInvocation&!)
+    };
+    assert(invocation.store != null && invocation.unit != null);
+    assert(fragment_source.source_id.to_index() == invocation.source_id.to_index());
+    assert(current$.get() >= 0 && current$.get() < tokens.length);
+    store_api.CompilerStore&! store = unsafe { invocation.store$.as(store_api.CompilerStore&!) };
+    ast.AstUnit&! unit = unsafe { invocation.unit$.as(ast.AstUnit&!) };
+    lang_block.LangBlockStore blocks! = lang_block.LangBlockStore();
+    Parser parser! = Parser(
+        store,
+        tokens,
+        blocks$.mut_ref(),
+        unit,
+        fragment_source.bytes,
+        invocation.source_id,
+        current$.get()
+    );
+    ast.AstId? result = parser.parse_fragment_kind(kind);
+    current$.set(parser.position());
+    guard result is .some(node) else { return -1; }
+    return node.to_index();
 }
 
 struct ParserMark: Copyable {
@@ -94,17 +126,17 @@ struct BindingType: Copyable {
     }
 }
 
-Bool token_is(std.jiang.Token tok, std.jiang.TokenTag tag) {
-    return tok.tag() == tag;
+Bool token_is(std.jiang.Token<std.jiang.TokenKind> tok, std.jiang.TokenKind kind) {
+    return tok.kind.same_case(kind);
 }
 
-std.jiang.Token make_token(
-    std.jiang.TokenTag tag,
+std.jiang.Token<std.jiang.TokenKind> make_token(
+    std.jiang.TokenKind kind,
     std.jiang.syntax.Span span,
     std.jiang.Trivia leading,
     std.jiang.TokenPresence presence
 ) {
-    return std.jiang.Token(std.jiang.token_kind(tag), span, leading, presence);
+    return std.jiang.Token<std.jiang.TokenKind>(kind, span, leading, presence);
 }
 
 @region(a, b, c, d, e)
@@ -113,7 +145,7 @@ public struct Parser: Movable {
     store_api.CompilerStore&! store;
 
     @life(b)
-    list.ArrayList<std.jiang.Token>& tokens;
+    std.jiang.Token<std.jiang.TokenKind>[]& tokens;
 
     @life(c)
     lang_block.LangBlockStore&! blocks!;
@@ -130,16 +162,17 @@ public struct Parser: Movable {
 
     public init(self,
         store_api.CompilerStore&! store,
-        list.ArrayList<std.jiang.Token>& tokens,
+        std.jiang.Token<std.jiang.TokenKind>[]& tokens,
         lang_block.LangBlockStore&! blocks,
         ast.AstUnit&! unit,
         UInt8[]& source_text,
-        source.SourceId source_id
+        source.SourceId source_id,
+        Int current = 0
     ) {
         self.store = store;
         self.tokens = tokens;
         self.blocks = blocks;
-        self.current = 0;
+        self.current = current;
         self.unit = unit;
         self.source_text = source_text;
         self.source_id = source_id;
@@ -149,6 +182,18 @@ public struct Parser: Movable {
 
     public Void parse(Self&! self) {
         self.parse_file();
+    }
+
+    public Int position(self) {
+        return self.current;
+    }
+
+    ast.AstId? parse_fragment_kind(Self&! self, std.jiang.syntax.ExpansionKind kind) {
+        if (kind == .expression) { return self.parse_expr(); }
+        if (kind == .statement) { return self.parse_stmt(); }
+        if (kind == .type_syntax) { return self.parse_type(); }
+        if (kind == .pattern) { return self.parse_pattern(); }
+        return self.parse_top_level_item();
     }
 
     Void parse_file(Self&! self) {
@@ -169,7 +214,7 @@ public struct Parser: Movable {
     // source_file <- top_level_item* EOF
     ast.AstId? parse_top_level_item(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.top_level_declaration);
+            return self.parse_lang_block_expr(.declarations);
         }
         if (self.check_compile_block_start()) {
             return self.parse_compile_block();
@@ -185,7 +230,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId? parse_extern_block(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_extern);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_extern);
         ast.ExternKind extern_kind = self.parse_extern_block_kind();
         self.expect(.left_brace);
         Int item_start = self.temp.len();
@@ -196,7 +241,7 @@ public struct Parser: Movable {
                 self.recover_member();
             }
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange items = self.take_children(item_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -217,7 +262,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId? parse_extern_item(Self&! self) {
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
         ast.AstId? body! = self.parse_extern_function_decl();
         if (body == null) {
@@ -237,12 +282,12 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_compile_block(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_comptime);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_comptime);
         return self.parse_compile_item_block_from_start(start.span);
     }
 
     ast.AstId parse_compile_item_block(Self&! self) {
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         return self.parse_compile_item_block_from_start(start.span);
     }
 
@@ -256,7 +301,7 @@ public struct Parser: Movable {
                 self.recover_top_level_item();
             }
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange items = self.take_children(item_start);
         return self.node(
             self.span_from(start_span, end.span),
@@ -272,7 +317,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_compile_if(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_if);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_if);
         ast.AstId condition = self.parse_expr_without_block();
         ast.AstId then_body = self.parse_compile_item_block();
         ast.AstId? else_body! = null;
@@ -332,7 +377,7 @@ public struct Parser: Movable {
         }
         ast.AstId? initializer! = null;
         if (self.match(.assign)) { initializer = self.parse_expr(); }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(self.unit.get(type_ref).span, end.span),
             .global_decl(ast.GlobalData (
@@ -346,7 +391,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId? parse_top_level_decl(Self&! self) {
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
         self.parse_annotations();
         ast.DeclModifiers modifiers = self.parse_decl_modifiers();
@@ -366,9 +411,9 @@ public struct Parser: Movable {
 
     ast.AstId? parse_member_decl(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.member_declaration);
+            return self.parse_lang_block_expr(.declarations);
         }
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
         self.parse_annotations();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
@@ -449,8 +494,8 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_inline_attribute(Self&! self) {
-        std.jiang.Token start = self.advance();
-        std.jiang.Token end! = start;
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> end! = start;
         if (self.match(.left_paren)) {
             self.parse_inline_mode();
             end = self.expect(.right_paren);
@@ -477,15 +522,15 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_naked_attribute(Self&! self) {
-        std.jiang.Token start = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
         return self.node(start.span, .naked_attribute(ast.NakedAttributeData()));
     }
 
     ast.AstId parse_link_symbol_attribute(Self&! self) {
-        std.jiang.Token start = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
         self.expect(.left_paren);
-        std.jiang.Token symbol_token = self.expect(.string_lit);
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> symbol_token = self.expect(.string_lit);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         qid.SymbolId? symbol! = null;
         if (self.token_symbol(symbol_token) is .some(symbol_id)) {
             symbol = symbol_id;
@@ -518,10 +563,10 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_self_attribute(Self&! self) {
-        std.jiang.Token start = self.previous();
+        std.jiang.Token<std.jiang.TokenKind> start = self.previous();
         self.expect(.left_paren);
         ast.SelfReceiverMode mode = self.parse_self_receiver_mode();
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         return self.node(
             self.span_from(start.span, end.span),
             .self_attribute(ast.SelfAttributeData(mode: mode))
@@ -560,10 +605,10 @@ public struct Parser: Movable {
     }
 
     Void parse_life_annotation(Self&! self) {
-        std.jiang.Token start = self.previous();
+        std.jiang.Token<std.jiang.TokenKind> start = self.previous();
         self.expect(.left_paren);
         if (self.check(.right_paren)) {
-            std.jiang.Token end = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> end = self.advance();
             std.jiang.syntax.Span span = self.span_from(start.span, end.span);
             ast.AstId attribute = self.node(
                 span,
@@ -575,7 +620,7 @@ public struct Parser: Movable {
         self.parse_canonical_life_annotation(start);
     }
 
-    Void parse_canonical_life_annotation(Self&! self, std.jiang.Token start) {
+    Void parse_canonical_life_annotation(Self&! self, std.jiang.Token<std.jiang.TokenKind> start) {
         Int clause_start = self.temp.len();
         while (!self.at_end() && !self.check(.right_paren)) {
             ast.AstId clause = self.parse_canonical_life_clause();
@@ -583,7 +628,7 @@ public struct Parser: Movable {
             if (!self.match(.comma)) { break; }
         }
         ast.AstRange clauses = self.take_children(clause_start);
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         std.jiang.syntax.Span span = self.span_from(start.span, end.span);
         ast.AstId attribute = self.node(
             span,
@@ -629,7 +674,7 @@ public struct Parser: Movable {
 
     ast.AstId parse_lifetime_expression_primary(Self&! self) {
         if (!self.match(.left_paren)) { return self.parse_life_name(); }
-        std.jiang.Token start = self.previous();
+        std.jiang.Token<std.jiang.TokenKind> start = self.previous();
         Int item_start = self.temp.len();
         if (self.match(.right_paren)) {
             return self.node(
@@ -648,7 +693,7 @@ public struct Parser: Movable {
             self.temp.add(item);
         }
         ast.AstRange items = self.take_children(item_start);
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         if (!product && items.length == 1) {
             return self.unit.child_at(items, 0);
         }
@@ -659,7 +704,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_region_annotation(Self&! self) {
-        std.jiang.Token start = self.previous();
+        std.jiang.Token<std.jiang.TokenKind> start = self.previous();
         self.expect(.left_paren);
         Int item_start = self.temp.len();
         while (!self.at_end() && !self.check(.right_paren)) {
@@ -686,7 +731,7 @@ public struct Parser: Movable {
             if (!self.match(.comma)) { break; }
         }
         ast.AstRange items = self.take_children(item_start);
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         return self.node(
             self.span_from(start.span, end.span),
             .region_attribute(ast.RegionAttributeData(items: items))
@@ -694,7 +739,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_life_name(Self&! self) {
-        std.jiang.Token root;
+        std.jiang.Token<std.jiang.TokenKind> root;
         ast.LifetimeNameKind kind;
         if (self.check_keyword(.kw_self)) {
             root = self.advance();
@@ -716,7 +761,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId invalid_lifetime_name(Self&! self) {
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.error_at_current("expected_name", .ident);
         if (!self.at_end()) {
             self.advance();
@@ -745,7 +790,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_lifetime_field_projection(Self&! self) {
-        std.jiang.Token field! = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> field! = self.peek();
         ast.LifetimeProjectionKind kind! = .field;
         if (self.can_start_name()) {
             field = self.advance();
@@ -759,8 +804,8 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_lifetime_tuple_projection(Self&! self) {
-        std.jiang.Token index = self.expect(.int_lit);
-        std.jiang.Token end = self.expect(.right_bracket);
+        std.jiang.Token<std.jiang.TokenKind> index = self.expect(.int_lit);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_bracket);
         return self.node(
             self.span_from(index.span, end.span),
             .lifetime_projection(ast.LifetimeProjectionData (
@@ -772,7 +817,7 @@ public struct Parser: Movable {
 
     ast.AstId lifetime_name_node(
         Self&! self,
-        std.jiang.Token root,
+        std.jiang.Token<std.jiang.TokenKind> root,
         ast.LifetimeNameKind kind,
         ast.AstRange projections
     ) {
@@ -801,7 +846,7 @@ public struct Parser: Movable {
     }
 
     Void reject_spacing(Self&! self) {
-        std.jiang.Token next = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> next = self.peek();
         if (next.leading.has_any()) {
             self.add_parse_error(next.span, "unexpected_trivia");
         }
@@ -952,7 +997,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_import_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_import);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_import);
         ast.AstId? alias_name! = null;
         Bool flatten! = false;
         ast.ImportKind kind! = ast.ImportKind.package_name;
@@ -970,7 +1015,7 @@ public struct Parser: Movable {
         } else {
             path = self.parse_name();
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start.span, end.span),
             .import_decl(ast.ImportData (kind: kind, flatten: flatten, alias_name: alias_name, path: path))
@@ -978,13 +1023,13 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_alias_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_alias);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_alias);
         ast.AstId name = self.parse_name();
         ast.AstId? target! = null;
         if (self.match(.assign)) {
             target = self.parse_alias_target();
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start.span, end.span),
             .alias_decl(ast.AliasData (name: name, target: target))
@@ -1005,7 +1050,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_struct_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_struct);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_struct);
         ast.NominalLayoutOptions layout_options = self.parse_struct_layout_options();
         ast.AstId name = self.parse_name();
         ast.AstId? generics! = null;
@@ -1069,7 +1114,7 @@ public struct Parser: Movable {
         Self&! self,
         ast.NominalLayoutOptions options
     ) {
-        std.jiang.Token option = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> option = self.peek();
         self.advance();
         if (options.packed) {
             self.add_parse_error_message(
@@ -1085,7 +1130,7 @@ public struct Parser: Movable {
         Self&! self,
         ast.NominalLayoutOptions options
     ) {
-        std.jiang.Token option = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> option = self.peek();
         self.advance();
         if (options.align != 0) {
             self.add_parse_error_message(
@@ -1099,11 +1144,11 @@ public struct Parser: Movable {
     }
 
     Int parse_struct_align_value(Self&! self) {
-        std.jiang.Token value = self.expect(.int_lit);
+        std.jiang.Token<std.jiang.TokenKind> value = self.expect(.int_lit);
         return self.decimal_int_token_value(value);
     }
 
-    Int decimal_int_token_value(Self&! self, std.jiang.Token token) {
+    Int decimal_int_token_value(Self&! self, std.jiang.Token<std.jiang.TokenKind> token) {
         Int value! = 0;
         Int index! = token.span.start;
         Bool ok! = true;
@@ -1132,7 +1177,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_enum_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_enum);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_enum);
         ast.AstId? underlying_type! = null;
         if (self.match(.left_bracket)) {
             underlying_type = self.parse_type();
@@ -1207,7 +1252,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_enum_case_member(Self&! self) {
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
         self.parse_annotations();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
@@ -1228,7 +1273,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_trait_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_trait);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_trait);
         ast.AstId name = self.parse_name();
         ast.AstId? generics! = null;
         if (self.check(.lt)) { generics = self.parse_generic_params(); }
@@ -1266,7 +1311,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_extend_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_extend);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_extend);
         ast.AstId? generics! = null;
         if (self.check(.lt)) { generics = self.parse_generic_params(); }
         ast.AstId target = self.parse_result_type();
@@ -1293,7 +1338,7 @@ public struct Parser: Movable {
                 self.recover_member();
             }
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange members = self.take_children(member_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -1353,7 +1398,7 @@ public struct Parser: Movable {
             return null;
         }
         ast.AstId initializer = self.parse_expr();
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         std.jiang.syntax.Span span = self.span_from(self.unit.get(pattern).span, end.span);
         self.error_at_span("global_destructure_not_supported", span);
         return self.node(
@@ -1398,7 +1443,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_generic_params(Self&! self) {
-        std.jiang.Token start = self.expect(.lt);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.lt);
         Int type_param_start = self.temp.len();
         if (!self.check(.gt)) {
             ast.AstId first_param = self.parse_generic_param();
@@ -1409,7 +1454,7 @@ public struct Parser: Movable {
                 self.temp.add(param);
             }
         }
-        std.jiang.Token end = self.expect(.gt);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.gt);
         ast.AstRange type_params = self.take_children(type_param_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -1494,9 +1539,9 @@ public struct Parser: Movable {
 
     ast.AstId? parse_struct_member(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.member_declaration);
+            return self.parse_lang_block_expr(.declarations);
         }
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
         self.parse_annotations();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
@@ -1557,7 +1602,7 @@ public struct Parser: Movable {
             ast.AstId field = self.parse_field_declarator();
             self.temp.add(field);
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         ast.AstRange fields = self.take_children(field_start);
         return self.node(
             self.span_from(self.unit.get(type_ref).span, end.span),
@@ -1583,7 +1628,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_deinit_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_deinit);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_deinit);
         self.expect(.left_paren);
         self.expect_keyword(.kw_self);
         self.expect(.right_paren);
@@ -1595,7 +1640,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_init_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_init);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_init);
         Bool failable = self.match(.question);
         ast.AstId? name! = null;
         if (self.can_start_name() && token_is(self.peek_next(), .left_paren)) {
@@ -1617,7 +1662,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_assoc_type_impl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_associated);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_associated);
         ast.AstId name = self.parse_path();
         self.expect(.assign);
         ast.AstId? value! = null;
@@ -1627,7 +1672,7 @@ public struct Parser: Movable {
         } else {
             value = self.parse_type();
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start.span, end.span),
             .assoc_type(ast.AssocTypeData (
@@ -1656,7 +1701,7 @@ public struct Parser: Movable {
         ast.AstId name = self.parse_name();
         ast.AstId? payload_type! = null;
         if (self.match(.left_paren)) {
-            std.jiang.Token start = self.previous();
+            std.jiang.Token<std.jiang.TokenKind> start = self.previous();
             payload_type = self.parse_enum_payload_type(start);
         }
         ast.AstId? value! = null;
@@ -1671,7 +1716,7 @@ public struct Parser: Movable {
         );
     }
 
-    ast.AstId parse_enum_payload_type(Self&! self, std.jiang.Token start) {
+    ast.AstId parse_enum_payload_type(Self&! self, std.jiang.Token<std.jiang.TokenKind> start) {
         ast.AstId payload = self.parse_paren_type(start);
         if (self.unit.get(payload).data is .tuple_type(_)) { return payload; }
         return self.node(
@@ -1685,7 +1730,7 @@ public struct Parser: Movable {
 
     ast.AstId? parse_enum_member(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.member_declaration);
+            return self.parse_lang_block_expr(.declarations);
         }
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
         if (self.parse_nominal_member(modifiers) is .some(member)) { return member; }
@@ -1723,9 +1768,9 @@ public struct Parser: Movable {
 
     ast.AstId? parse_trait_member(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.member_declaration);
+            return self.parse_lang_block_expr(.declarations);
         }
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
         self.parse_annotations();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
@@ -1750,14 +1795,14 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_associated_type_decl(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_associated);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_associated);
         ast.AstId name = self.parse_name();
         if (self.match(.assign)) {
             return self.finish_associated_default(start, name);
         }
         Int constraint_start = self.temp.len();
         ast.AstId? type_ref = self.parse_associated_type_constraint();
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         ast.AstRange constraints = self.take_children(constraint_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -1772,7 +1817,7 @@ public struct Parser: Movable {
         );
     }
 
-    ast.AstId finish_associated_default(Self&! self, std.jiang.Token start, ast.AstId name) {
+    ast.AstId finish_associated_default(Self&! self, std.jiang.Token<std.jiang.TokenKind> start, ast.AstId name) {
         ast.AstId? value! = null;
         ast.AstId? const_value! = null;
         if (self.can_start_associated_const_value()) {
@@ -1780,7 +1825,7 @@ public struct Parser: Movable {
         } else {
             value = self.parse_type();
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start.span, end.span),
             .assoc_type(ast.AssocTypeData (
@@ -1809,7 +1854,7 @@ public struct Parser: Movable {
         return self.parse_member_decl();
     }
 
-    ast.AstRange parse_param_list_until(Self&! self, std.jiang.TokenTag end_kind) {
+    ast.AstRange parse_param_list_until(Self&! self, std.jiang.TokenKind end_kind) {
         Int param_start = self.temp.len();
         if (!self.check(end_kind)) {
             ast.AstId first_param = self.parse_param();
@@ -1825,7 +1870,7 @@ public struct Parser: Movable {
 
     ast.AstId parse_param(Self&! self) {
         if (self.match_keyword(.kw_self)) {
-            std.jiang.Token self_token = self.previous();
+            std.jiang.Token<std.jiang.TokenKind> self_token = self.previous();
             ast.AstId name = self.name_node_from_token(self_token);
             return self.node(
                 self_token.span,
@@ -2077,7 +2122,7 @@ public struct Parser: Movable {
     }
 
     Void add_type_postfix_error(Self&! self, UInt8[]& code, UInt8[]& message, UInt8[]& help) {
-        std.jiang.Token actual = self.previous();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.previous();
         self.add_parse_error_message(actual.span, code, message);
     }
 
@@ -2085,7 +2130,7 @@ public struct Parser: Movable {
         return self.parse_type();
     }
 
-    Bool match_type_postfix(Self&! self, std.jiang.TokenTag kind) {
+    Bool match_type_postfix(Self&! self, std.jiang.TokenKind kind) {
         if (!self.check(kind)) { return false; }
         self.reject_spacing();
         self.advance();
@@ -2134,7 +2179,7 @@ public struct Parser: Movable {
             );
         }
         if (self.check(.ident)) {
-            std.jiang.Token sentinel_name = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> sentinel_name = self.advance();
             return ast.SentinelTypeSyntax (
                 kind: ast.TypeSentinelKind.const_name,
                 span: sentinel_name.span,
@@ -2142,14 +2187,14 @@ public struct Parser: Movable {
             );
         }
         if (self.check(.char_lit)) {
-            std.jiang.Token sentinel = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> sentinel = self.advance();
             return ast.SentinelTypeSyntax (
                 kind: ast.TypeSentinelKind.char_value,
                 span: sentinel.span,
                 symbol_id: self.token_symbol_id(sentinel)
             );
         }
-        std.jiang.Token sentinel = self.expect(.int_lit);
+        std.jiang.Token<std.jiang.TokenKind> sentinel = self.expect(.int_lit);
         return ast.SentinelTypeSyntax (
             kind: ast.TypeSentinelKind.value,
             span: sentinel.span,
@@ -2196,15 +2241,15 @@ public struct Parser: Movable {
         qid.SymbolId? count_symbol_id! = null;
         if (self.check(.underscore)) {
             kind = ast.ArrayCountKind.inferred;
-            std.jiang.Token count = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> count = self.advance();
             count_span = count.span;
         } else if (self.check(.ident)) {
             kind = ast.ArrayCountKind.const_name;
-            std.jiang.Token count = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> count = self.advance();
             count_span = count.span;
             count_symbol_id = self.token_symbol_id(count);
         } else {
-            std.jiang.Token count = self.expect(.int_lit);
+            std.jiang.Token<std.jiang.TokenKind> count = self.expect(.int_lit);
             count_span = count.span;
             count_symbol_id = self.token_symbol_id(count);
         }
@@ -2232,13 +2277,13 @@ public struct Parser: Movable {
         );
     }
 
-    qid.SymbolId? token_symbol_id(self, std.jiang.Token value) {
+    qid.SymbolId? token_symbol_id(self, std.jiang.Token<std.jiang.TokenKind> value) {
         return self.token_symbol(value);
     }
 
     ast.AstId parse_type_primary(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.type_reference);
+            return self.parse_lang_block_expr(.type_syntax);
         }
         if (self.match(.left_paren)) {
             return self.parse_paren_type(self.previous());
@@ -2248,7 +2293,7 @@ public struct Parser: Movable {
 
     ast.AstId parse_named_or_infer_type_primary(Self&! self) {
         if (self.check(.underscore)) {
-            std.jiang.Token current_token = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> current_token = self.advance();
             return self.node(current_token.span, .infer_type);
         }
         if (self.check(.ident)) {
@@ -2276,11 +2321,11 @@ public struct Parser: Movable {
             )));
         }
         self.error_at_current_kind("expected_type");
-        std.jiang.Token current_token = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> current_token = self.advance();
         return self.unit_node(current_token.span);
     }
 
-    ast.AstId parse_paren_type(Self&! self, std.jiang.Token start) {
+    ast.AstId parse_paren_type(Self&! self, std.jiang.Token<std.jiang.TokenKind> start) {
         if (self.match(.right_paren)) {
             std.jiang.syntax.Span span = self.span_from(start.span, self.previous().span);
             self.error_at_span("void_type_requires_void_keyword", span);
@@ -2289,7 +2334,7 @@ public struct Parser: Movable {
         ast.AstId first = self.parse_type();
         ParsedContractName first_name = self.parse_optional_contract_name(first);
         if (!self.match(.comma)) {
-            std.jiang.Token end = self.expect(.right_paren);
+            std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
             if (first_name.present) {
                 return self.single_named_tuple_type(start, end, first, first_name.name);
             }
@@ -2300,8 +2345,8 @@ public struct Parser: Movable {
 
     ast.AstId single_named_tuple_type(
         Self&! self,
-        std.jiang.Token start,
-        std.jiang.Token end,
+        std.jiang.Token<std.jiang.TokenKind> start,
+        std.jiang.Token<std.jiang.TokenKind> end,
         ast.AstId item,
         ast.AstId name
     ) {
@@ -2316,7 +2361,7 @@ public struct Parser: Movable {
 
     ast.AstId finish_tuple_type(
         Self&! self,
-        std.jiang.Token start,
+        std.jiang.Token<std.jiang.TokenKind> start,
         ast.AstId first,
         ParsedContractName first_name
     ) {
@@ -2342,7 +2387,7 @@ public struct Parser: Movable {
                 has_contract_name = has_contract_name || name.present;
             }
         }
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         ast.AstRange items = self.take_children(item_start);
         ast.AstRange contract_names! = self.empty_range();
         if (has_contract_name) {
@@ -2485,7 +2530,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_do_block(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_do);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_do);
         self.add_parse_error_message(
             start.span,
             "do_effect_block_removed",
@@ -2514,7 +2559,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_removed_async_task_expr(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_async);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_async);
         self.add_parse_error_message(
             start.span,
             "async_task_syntax_removed",
@@ -2628,13 +2673,13 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_block_with_effects(Self&! self, ast.EffectSet effects) {
-        std.jiang.Token start = self.expect(.left_brace);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_brace);
         return self.finish_block_with_effects(start, effects);
     }
 
     ast.AstId finish_block_with_effects(
         Self&! self,
-        std.jiang.Token start,
+        std.jiang.Token<std.jiang.TokenKind> start,
         ast.EffectSet effects
     ) {
         Int stmt_start = self.temp.len();
@@ -2665,7 +2710,7 @@ public struct Parser: Movable {
                 self.recover_stmt();
             }
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange statements = self.take_children(stmt_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -2721,7 +2766,7 @@ public struct Parser: Movable {
         if (self.assign_op_from_current() is .some(op)) {
             self.advance();
             ast.AstId value = self.parse_expr();
-            std.jiang.Token end = self.expect(.semicolon);
+            std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
             return self.node(
                 self.span_from(self.unit.get(expr).span, end.span),
                 .assign_stmt(ast.AssignData (op: op, target: expr, value: value))
@@ -2743,7 +2788,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_lang_block_stmt(Self&! self) {
-        ast.AstId parsed = self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.statement);
+        ast.AstId parsed = self.parse_lang_block_expr(.statement);
         if (!self.expr_can_stand_as_stmt(parsed)) { return parsed; }
         return self.node(self.unit.get(parsed).span, .stmt(ast.StmtData(value: parsed)));
     }
@@ -2765,14 +2810,14 @@ public struct Parser: Movable {
 
 
     ast.AstId parse_control_stmt(Self&! self, ast.ControlStmtKind kind) {
-        std.jiang.Token start = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
         ast.AstId? value! = null;
         if (kind == ast.ControlStmtKind.return_value) {
             if (!self.check(.semicolon)) { value = self.parse_expr(); }
         } else if (kind == ast.ControlStmtKind.throw_value) {
             value = self.parse_expr();
         }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start.span, end.span),
             .control_stmt(ast.ControlStmtData (kind: kind, value: value))
@@ -2780,7 +2825,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_defer_stmt(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_defer);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_defer);
         ast.AstId value! = self.unit_node(start.span);
         std.jiang.syntax.Span end! = start.span;
         if (self.check(.left_brace)) {
@@ -2788,14 +2833,14 @@ public struct Parser: Movable {
             end = self.unit.get(value).span;
         } else {
             value = self.parse_expr();
-            std.jiang.Token semicolon = self.expect(.semicolon);
+            std.jiang.Token<std.jiang.TokenKind> semicolon = self.expect(.semicolon);
             end = semicolon.span;
         }
         return self.node(self.span_from(start.span, end), .defer_stmt(ast.StmtData (value: value)));
     }
 
     ast.AstId parse_guard_stmt(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_guard);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_guard);
         ast.AstId condition = self.parse_condition_list_without_block();
         self.expect_keyword(.kw_else);
         ast.AstId else_body = self.parse_block();
@@ -2863,7 +2908,7 @@ public struct Parser: Movable {
         self.parse_decl_name();
         self.match_binding_mutability_suffix();
         if (self.match(.assign)) { self.parse_expr(); }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         std.jiang.syntax.Span span = self.span_from(start, end.span);
         self.add_parse_error_message(
             span,
@@ -2883,7 +2928,7 @@ public struct Parser: Movable {
         Bool mutable_binding = self.match_binding_mutability_suffix();
         ast.AstId? initializer! = null;
         if (self.match(.assign)) { initializer = self.parse_expr(); }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(self.unit.get(type_ref).span, end.span),
             .let_stmt(ast.LetData (
@@ -2901,7 +2946,7 @@ public struct Parser: Movable {
         ast.InferredBinding parsed = self.parse_inferred_binding();
         ast.AstId? initializer! = null;
         if (self.match(.assign)) { initializer = self.parse_expr(); }
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(start, end.span),
             .let_stmt(ast.LetData (
@@ -2924,7 +2969,7 @@ public struct Parser: Movable {
         ast.AstId pattern = self.parse_destructure_tuple_pattern();
         if (!self.match(.assign)) { return null; }
         ast.AstId initializer = self.parse_expr();
-        std.jiang.Token end = self.expect(.semicolon);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.semicolon);
         return self.node(
             self.span_from(self.unit.get(pattern).span, end.span),
             .destructure_stmt(ast.DestructureData (
@@ -2935,7 +2980,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_while_stmt(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_while);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_while);
         ast.AstId cond = self.parse_condition_list_without_block();
         ast.AstId body = self.parse_block();
         return self.node(
@@ -2950,7 +2995,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_for_stmt(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_for);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_for);
         ast.AstId pattern = self.parse_binding_pattern();
         self.expect_keyword(.kw_in);
         ast.AstId iterable = self.parse_expr_without_block();
@@ -3039,7 +3084,7 @@ public struct Parser: Movable {
 
     ast.AstId parse_unary_expr(Self&! self, Bool allow_with_block) {
         if (self.unary_op_from_current() is .some(op)) {
-            std.jiang.Token start = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> start = self.advance();
             ast.AstId value = self.parse_unary_expr(allow_with_block);
             return self.node(
                 self.span_from(start.span, self.unit.get(value).span),
@@ -3050,7 +3095,7 @@ public struct Parser: Movable {
             if (self.check_new_interpolated_string()) {
                 return self.new_interpolated_string_block(self.advance());
             }
-            std.jiang.Token start = self.previous();
+            std.jiang.Token<std.jiang.TokenKind> start = self.previous();
             ast.AstId value! = ast.AstId(0);
             if (self.starts_lambda_expr()) {
                 value = self.parse_lambda_expr();
@@ -3151,7 +3196,7 @@ public struct Parser: Movable {
         if (self.starts_lambda_expr()) {
             return self.parse_lambda_expr();
         }
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         ast.AstId body = self.parse_block();
         return self.node(
             self.span_from(start.span, self.unit.get(body).span),
@@ -3334,7 +3379,7 @@ public struct Parser: Movable {
         return self.probe_lambda_params_end(offset, .fat_arrow) != null;
     }
 
-    Int? probe_lambda_params_end(self, Int start, std.jiang.TokenTag terminator) {
+    Int? probe_lambda_params_end(self, Int start, std.jiang.TokenKind terminator) {
         Int offset! = start;
         while (self.token_can_start_lambda_param(self.peek_offset(offset))) {
             offset = offset + 1;
@@ -3350,7 +3395,7 @@ public struct Parser: Movable {
         return null;
     }
 
-    Bool token_can_start_lambda_param(self, std.jiang.Token current_token) {
+    Bool token_can_start_lambda_param(self, std.jiang.Token<std.jiang.TokenKind> current_token) {
         if (token_is(current_token, .underscore)) { return true; }
         if (!token_is(current_token, .ident)) { return false; }
         guard self.token_keyword(current_token) is .some(current_keyword) else { return true; }
@@ -3364,13 +3409,13 @@ public struct Parser: Movable {
         Int bracket_depth! = 1;
         Int offset! = start + 1;
         while (!self.token_at_offset_is_eof(offset)) {
-            std.jiang.TokenTag current_tag = std.jiang.token_tag(self.peek_offset(offset).kind);
-            if (current_tag == .left_paren) { paren_depth = paren_depth + 1; }
-            if (current_tag == .right_paren) { paren_depth = paren_depth - 1; }
-            if (current_tag == .left_brace) { brace_depth = brace_depth + 1; }
-            if (current_tag == .right_brace) { brace_depth = brace_depth - 1; }
-            if (current_tag == .left_bracket) { bracket_depth = bracket_depth + 1; }
-            if (current_tag == .right_bracket) { bracket_depth = bracket_depth - 1; }
+            std.jiang.TokenKind current_kind = self.peek_offset(offset).kind;
+            if (current_kind is .left_paren) { paren_depth = paren_depth + 1; }
+            if (current_kind is .right_paren) { paren_depth = paren_depth - 1; }
+            if (current_kind is .left_brace) { brace_depth = brace_depth + 1; }
+            if (current_kind is .right_brace) { brace_depth = brace_depth - 1; }
+            if (current_kind is .left_bracket) { bracket_depth = bracket_depth + 1; }
+            if (current_kind is .right_bracket) { bracket_depth = bracket_depth - 1; }
             if (paren_depth < 0 || brace_depth < 0 || bracket_depth < 0) { return null; }
             if (bracket_depth == 0) {
                 if (paren_depth != 0 || brace_depth != 0) { return null; }
@@ -3382,7 +3427,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_removed_lambda_expr(Self&! self, Bool allow_with_block) {
-        std.jiang.Token start = self.expect(.left_paren);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_paren);
         self.parse_lambda_param_list();
         self.expect(.right_paren);
         if (self.check(.left_bracket)) {
@@ -3396,7 +3441,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_lambda_expr(Self&! self) {
-        std.jiang.Token start = self.expect(.left_brace);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_brace);
         ast.AstRange captures! = self.empty_range();
         if (self.check(.left_bracket)) {
             captures = self.parse_lambda_capture_list();
@@ -3503,10 +3548,10 @@ public struct Parser: Movable {
     ast.AstId name_expr_from_name(Self&! self, ast.AstId name) {
         ast.AstNode name_node = self.unit.get(name);
         guard name_node.data is .name(name_data) else {
-            return self.name_expr_from_token(std.jiang.Token.missing(.ident, name_node.span));
+            return self.name_expr_from_token(std.jiang.missing_token(.ident, name_node.span));
         }
         guard name_data.symbol_id is .some(symbol) else {
-            return self.name_expr_from_token(std.jiang.Token.missing(.ident, name_node.span));
+            return self.name_expr_from_token(std.jiang.missing_token(.ident, name_node.span));
         }
         return self.name_expr_from_symbol(symbol, name_node.span);
     }
@@ -3614,7 +3659,7 @@ public struct Parser: Movable {
             return self.field_expr_node(base, name, false);
         }
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.expression);
+            return self.parse_lang_block_expr(.expression);
         }
         if (self.starts_type_implicit_expr()) {
             return self.parse_type_implicit_call_expr();
@@ -3645,7 +3690,7 @@ public struct Parser: Movable {
             return self.node_from_child(path, .name_expr(ast.StmtData (value: path)));
         }
         self.error_at_current_kind("expected_expression");
-        std.jiang.Token current_token = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> current_token = self.advance();
         return self.unit_node(current_token.span);
     }
 
@@ -3679,7 +3724,7 @@ public struct Parser: Movable {
         Int depth! = 0;
         Int cursor! = offset;
         while (!self.token_at_offset_is_eof(cursor)) {
-            std.jiang.Token current_token = self.peek_offset(cursor);
+            std.jiang.Token<std.jiang.TokenKind> current_token = self.peek_offset(cursor);
             if (token_is(current_token, .left_bracket)) {
                 depth = depth + 1;
                 cursor = cursor + 1;
@@ -3700,16 +3745,16 @@ public struct Parser: Movable {
         return false;
     }
 
-    ast.AstId parse_lang_block_expr(Self&! self, std.jiang.syntax.Root.Kind entry_kind) {
-        std.jiang.Token raw_block = self.expect(.raw_block);
+    ast.AstId parse_lang_block_expr(Self&! self, std.jiang.syntax.ExpansionKind entry_kind) {
+        std.jiang.Token<std.jiang.TokenKind> raw_block = self.expect(.raw_block);
         return self.parse_lang_block(raw_block, entry_kind);
     }
 
     ast.AstId parse_lang_block(Self&! self,
-        std.jiang.Token raw_block,
-        std.jiang.syntax.Root.Kind entry_kind
+        std.jiang.Token<std.jiang.TokenKind> raw_block,
+        std.jiang.syntax.ExpansionKind entry_kind
     ) {
-        guard raw_block.raw_block_id() is .some(block_index) else {
+        guard raw_block.kind.block_id() is .some(block_index) else {
             self.error_at_span("lang_block_missing_id", raw_block.span);
             return self.unit_node(raw_block.span);
         }
@@ -3727,12 +3772,19 @@ public struct Parser: Movable {
         if (block.scan_result.status == .error) {
             return self.unit_node(raw_block.span);
         }
-        block.use_parser_diagnostics();
+        {
+            syntax_builder.SyntaxInvocation&! invocation = block.invocation$.mut_ref();
+            invocation.set_fragment_parser(factory_parse_fragment);
+        }
         lang_runtime.ParseIntoResult parsed = lang_runtime.parse_into(
             self.store$.mut_ref(),
             self.unit$.mut_ref(),
             block
         );
+        {
+            syntax_builder.SyntaxInvocation&! invocation = block.invocation$.mut_ref();
+            invocation.clear_fragment_parser();
+        }
         if (parsed.status == .ok) {
             guard parsed.root is .some(root) else {
                 self.error_at_span("lang_provider_parse_missing_root", raw_block.span);
@@ -3764,7 +3816,7 @@ public struct Parser: Movable {
         return "lang_provider_parse_failed";
     }
 
-    ast.AstId parse_expected_type_constructor_call(Self&! self, std.jiang.Token dot) {
+    ast.AstId parse_expected_type_constructor_call(Self&! self, std.jiang.Token<std.jiang.TokenKind> dot) {
         ast.AstId callee = self.node(dot.span, .infer_type);
         ast.AstRange args = self.parse_call_parens();
         return self.call_expr_node(callee, self.empty_range(), args);
@@ -3789,7 +3841,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_paren_expr(Self&! self) {
-        std.jiang.Token start = self.expect(.left_paren);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_paren);
         if (self.match(.right_paren)) {
             return self.node(self.span_from(start.span, self.previous().span), .tuple_expr(self.empty_range()));
         }
@@ -3808,7 +3860,7 @@ public struct Parser: Movable {
                     self.temp.add(item);
                 }
             }
-            std.jiang.Token end = self.expect(.right_paren);
+            std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
             ast.AstRange items = self.take_children(item_start);
             return self.node(self.span_from(start.span, end.span), .tuple_expr(items));
         }
@@ -3817,7 +3869,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_array_expr(Self&! self) {
-        std.jiang.Token start = self.expect(.left_bracket);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_bracket);
         Int item_start = self.temp.len();
         if (!self.check(.right_bracket)) {
             ast.AstId first_item = self.parse_expr();
@@ -3828,13 +3880,13 @@ public struct Parser: Movable {
                 self.temp.add(item);
             }
         }
-        std.jiang.Token end = self.expect(.right_bracket);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_bracket);
         ast.AstRange items = self.take_children(item_start);
         return self.node(self.span_from(start.span, end.span), .array_expr(items));
     }
 
     ast.AstId parse_struct_literal(Self&! self, ast.AstId type_ref, ast.AstRange type_args) {
-        std.jiang.Token start = self.expect(.left_brace);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_brace);
         Int field_start = self.temp.len();
         if (!self.check(.right_brace)) {
             ast.AstId first_field = self.parse_field_init_expr();
@@ -3845,7 +3897,7 @@ public struct Parser: Movable {
                 self.temp.add(field);
             }
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange fields = self.take_children(field_start);
         return self.node(
             self.span_from(self.unit.get(type_ref).span, end.span),
@@ -3865,7 +3917,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_if_expr(Self&! self, Bool statement_mode) {
-        std.jiang.Token start = self.expect_keyword(.kw_if);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_if);
         ast.AstId condition = self.parse_condition_list_without_block();
         ast.AstId then_body = self.parse_block();
         ast.AstId? else_body! = null;
@@ -3888,7 +3940,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_switch_expr(Self&! self, Bool statement_mode) {
-        std.jiang.Token start = self.expect_keyword(.kw_switch);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_switch);
         ast.AstId value = self.parse_expr_without_block();
         self.expect(.left_brace);
         Int case_start = self.temp.len();
@@ -3896,7 +3948,7 @@ public struct Parser: Movable {
             ast.AstId switch_case = self.parse_switch_case();
             self.temp.add(switch_case);
         }
-        std.jiang.Token end = self.expect(.right_brace);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_brace);
         ast.AstRange cases = self.take_children(case_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -3935,7 +3987,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_try_catch_expr(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_try);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_try);
         ast.AstId value = self.parse_expr();
         ast.AstId catch_clause = self.parse_catch_clause();
         return self.node(
@@ -3945,7 +3997,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_catch_clause(Self&! self) {
-        std.jiang.Token start = self.expect_keyword(.kw_catch);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_catch);
         ast.AstId? pattern! = null;
         if (self.match(.left_paren)) {
             if (!self.check(.right_paren)) {
@@ -3985,7 +4037,7 @@ public struct Parser: Movable {
 
     ast.AstId parse_pattern(Self&! self) {
         if (self.check(.raw_block)) {
-            return self.parse_lang_block_expr(std.jiang.syntax.Root.Kind.pattern);
+            return self.parse_lang_block_expr(.pattern);
         }
         if (self.check(.underscore) && !self.underscore_starts_partial_type()) {
             return self.parse_wildcard_binding_pattern();
@@ -4171,7 +4223,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_inferred_ref_binding_pattern(Self&! self) {
-        std.jiang.Token start = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         BindingMode mode = self.parse_ref_binding_mode();
         ast.AstId name = self.parse_name();
         Bool mutable_binding = self.match_binding_mutability_suffix();
@@ -4192,7 +4244,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_wildcard_binding_pattern(Self&! self) {
-        std.jiang.Token start = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
         ast.AstId? name! = null;
         Bool mutable_binding! = false;
         Bool borrow_binding! = false;
@@ -4264,7 +4316,7 @@ public struct Parser: Movable {
         if (token_is(self.peek_offset(offset), .bang)) {
             offset = offset + 1;
         }
-        std.jiang.Token after_mode = self.peek_offset(offset);
+        std.jiang.Token<std.jiang.TokenKind> after_mode = self.peek_offset(offset);
         if (token_is(after_mode, .underscore)) { return true; }
         if (token_is(after_mode, .left_paren)) { return true; }
         if (!token_is(after_mode, .ident)) { return false; }
@@ -4279,7 +4331,7 @@ public struct Parser: Movable {
         if (!token_is(self.peek_offset(offset + 1), .dot)) { return false; }
         Int current_offset! = offset + 2;
         while (true) {
-            std.jiang.Token segment = self.peek_offset(current_offset);
+            std.jiang.Token<std.jiang.TokenKind> segment = self.peek_offset(current_offset);
             if (!token_is(segment, .ident)) { return false; }
             if (self.token_starts_uppercase_name(segment)) { return true; }
             if (!token_is(self.peek_offset(current_offset + 1), .dot)) { return false; }
@@ -4312,10 +4364,10 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_tuple_pattern(Self&! self) {
-        std.jiang.Token start = self.expect(.left_paren);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_paren);
         Int item_start = self.temp.len();
         self.parse_pattern_list_until_right_paren();
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         ast.AstRange payload = self.take_children(item_start);
         std.jiang.syntax.Span span = self.span_from(start.span, end.span);
         return self.node(
@@ -4334,7 +4386,7 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_destructure_tuple_pattern(Self&! self) {
-        std.jiang.Token start = self.expect(.left_paren);
+        std.jiang.Token<std.jiang.TokenKind> start = self.expect(.left_paren);
         Int item_start = self.temp.len();
         if (!self.check(.right_paren)) {
             ast.AstId first_pattern = self.parse_destructure_binding();
@@ -4345,7 +4397,7 @@ public struct Parser: Movable {
                 self.temp.add(pattern);
             }
         }
-        std.jiang.Token end = self.expect(.right_paren);
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
         ast.AstRange payload = self.take_children(item_start);
         return self.node(
             self.span_from(start.span, end.span),
@@ -4399,7 +4451,7 @@ public struct Parser: Movable {
         if (!token_is(self.peek_next(), .dot)) { return false; }
         Int offset! = 2;
         while (true) {
-            std.jiang.Token segment = self.peek_offset(offset);
+            std.jiang.Token<std.jiang.TokenKind> segment = self.peek_offset(offset);
             if (!token_is(segment, .ident)) { return false; }
             if (self.token_starts_uppercase_name(segment)) { return true; }
             if (!token_is(self.peek_offset(offset + 1), .dot)) { return false; }
@@ -4408,7 +4460,7 @@ public struct Parser: Movable {
         return false;
     }
 
-    Bool token_starts_uppercase_name(self, std.jiang.Token current_token) {
+    Bool token_starts_uppercase_name(self, std.jiang.Token<std.jiang.TokenKind> current_token) {
         if (!token_is(current_token, .ident)) {
             return false;
         }
@@ -4525,14 +4577,14 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_string_literal_expr(Self&! self) {
-        std.jiang.Token tok = self.advance();
+        std.jiang.Token<std.jiang.TokenKind> tok = self.advance();
         if (!self.string_token_has_interpolation(tok)) {
             return self.literal_node(tok, ast.LiteralKind.string_lit);
         }
         return self.interpolated_string_block(tok);
     }
 
-    Bool string_token_has_interpolation(self, std.jiang.Token tok) {
+    Bool string_token_has_interpolation(self, std.jiang.Token<std.jiang.TokenKind> tok) {
         Int index! = tok.span.start + 1;
         Int end = tok.span.end() - 1;
         while (index < end) {
@@ -4549,17 +4601,17 @@ public struct Parser: Movable {
         return self.string_token_has_interpolation(self.peek());
     }
 
-    ast.AstId interpolated_string_block(Self&! self, std.jiang.Token tok) {
+    ast.AstId interpolated_string_block(Self&! self, std.jiang.Token<std.jiang.TokenKind> tok) {
         return self.interpolated_string_block_with_tail(tok, "into_string");
     }
 
-    ast.AstId new_interpolated_string_block(Self&! self, std.jiang.Token tok) {
+    ast.AstId new_interpolated_string_block(Self&! self, std.jiang.Token<std.jiang.TokenKind> tok) {
         return self.interpolated_string_block_with_tail(tok, "into_slice");
     }
 
     ast.AstId interpolated_string_block_with_tail(
         Self&! self,
-        std.jiang.Token tok,
+        std.jiang.Token<std.jiang.TokenKind> tok,
         UInt8[]& tail_method
     ) {
         qid.SymbolId builder_symbol = self.store.symbols.intern("__jiang_interpolation_builder");
@@ -4650,10 +4702,11 @@ public struct Parser: Movable {
     }
 
     ast.AstRange parse_interpolation_args(Self&! self, Int open_paren, Int close_paren) {
-        list.ArrayList<std.jiang.Token> tokens! = self.tokenize_interpolation_args(open_paren, close_paren);
+        list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> tokens! =
+            self.tokenize_interpolation_args(open_paren, close_paren);
         Parser parser! = Parser(
             self.store$.mut_ref(),
-            tokens$.ref(),
+            tokens.slice(),
             self.blocks$.mut_ref(),
             self.unit$.mut_ref(),
             self.source_text,
@@ -4662,28 +4715,25 @@ public struct Parser: Movable {
         return parser.parse_call_parens();
     }
 
-    list.ArrayList<std.jiang.Token> tokenize_interpolation_args(Self&! self, Int open_paren, Int close_paren) {
+    list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> tokenize_interpolation_args(
+        Self&! self,
+        Int open_paren,
+        Int close_paren
+    ) {
         std.jiang.syntax.SourceId std_source_id = std.jiang.syntax.SourceId(self.source_id.to_index());
         std.jiang.syntax.Source std_source = std.jiang.syntax.Source(std_source_id, self.source_text);
-        std.jiang.Tokenizer tokenizer! = std.jiang.Tokenizer(std_source, std.jiang.syntax.Span(
-            open_paren,
-            close_paren - open_paren + 1
-        ));
-        syntax_builder.SyntaxBuilder builder! = syntax_builder.SyntaxBuilder(
+        lexer.Tokenizer tokenizer! = lexer.Tokenizer(
             self.source_id,
-            self.source_text,
-            .parser
+            .parser,
+            std_source,
+            std.jiang.syntax.Span(open_paren, close_paren - open_paren + 1)
         );
-        syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-            self.store$.mut_ref(),
-            builder$.mut_ref()
-        );
-        std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-        list.ArrayList<std.jiang.Token> result! = list.ArrayList<std.jiang.Token>();
+        list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> result! =
+            list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>();
         while (true) {
-            std.jiang.Token token = tokenizer.next(builder_ref);
+            std.jiang.Token<std.jiang.TokenKind> token = tokenizer.next(self.store);
             result.add(token);
-            if (token.tag() == .eof) {
+            if (token.kind is .eof) {
                 break;
             }
         }
@@ -4786,7 +4836,7 @@ public struct Parser: Movable {
         return self.call_expr_node(callee, self.empty_range(), self.empty_range());
     }
 
-    ast.AstId literal_node(Self&! self, std.jiang.Token tok, ast.LiteralKind kind) {
+    ast.AstId literal_node(Self&! self, std.jiang.Token<std.jiang.TokenKind> tok, ast.LiteralKind kind) {
         if (self.token_symbol(tok) is .some(symbol_id)) {
             return self.node(tok.span, .literal(ast.LiteralData (
                 kind: kind,
@@ -4801,12 +4851,12 @@ public struct Parser: Movable {
         )));
     }
 
-    ast.AstId name_expr_from_token(Self&! self, std.jiang.Token tok) {
+    ast.AstId name_expr_from_token(Self&! self, std.jiang.Token<std.jiang.TokenKind> tok) {
         ast.AstId name = self.name_node_from_token(tok);
         return self.node(tok.span, .name_expr(ast.StmtData (value: name)));
     }
 
-    ast.AstId name_node_from_token(Self&! self, std.jiang.Token tok) {
+    ast.AstId name_node_from_token(Self&! self, std.jiang.Token<std.jiang.TokenKind> tok) {
         qid.SymbolId? symbol! = null;
         if (self.token_symbol(tok) is .some(symbol_id)) {
             symbol = symbol_id;
@@ -4822,7 +4872,7 @@ public struct Parser: Movable {
         if (self.can_start_name()) {
             return self.name_node_from_token(self.advance());
         }
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         if (self.current_token_is_reserved_keyword()) {
             self.add_parse_error_message(
                 actual.span,
@@ -4837,7 +4887,7 @@ public struct Parser: Movable {
         if (!self.at_end()) {
             self.advance();
         }
-        return self.name_node_from_token(std.jiang.Token.missing(.ident, actual.span));
+        return self.name_node_from_token(std.jiang.missing_token(.ident, actual.span));
     }
 
     ast.AstId parse_symbol_name(Self&! self, Bool allow_escaped_name) {
@@ -4858,7 +4908,7 @@ public struct Parser: Movable {
         if (self.can_start_decl_name()) {
             return self.name_node_from_token(self.advance());
         }
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         if (self.current_token_is_reserved_keyword()) {
             self.add_parse_error_message(
                 actual.span,
@@ -4871,44 +4921,44 @@ public struct Parser: Movable {
         if (!self.at_end()) {
             self.advance();
         }
-        return self.name_node_from_token(std.jiang.Token.missing(.ident, actual.span));
+        return self.name_node_from_token(std.jiang.missing_token(.ident, actual.span));
     }
 
     ast.AstId parse_escaped_symbol_name(Self&! self) {
         if (self.check(.escaped_ident)) {
             return self.name_node_from_token(self.advance());
         }
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.error_at_current("expected_name", .escaped_ident);
         if (!self.at_end()) {
             self.advance();
         }
-        return self.name_node_from_token(std.jiang.Token.missing(.escaped_ident, actual.span));
+        return self.name_node_from_token(std.jiang.missing_token(.escaped_ident, actual.span));
     }
 
     ast.AstId parse_member_name(Self&! self) {
         // `value$.some()` 这类隐式操作名需要按成员名解析；
         // 声明名继续走 parse_name，保持关键字保护。
         if (self.check_keyword(.kw_new)) {
-            std.jiang.Token name = self.advance();
+            std.jiang.Token<std.jiang.TokenKind> name = self.advance();
             qid.SymbolId symbol = self.store.symbols.intern("new");
             return self.name_node_from_symbol(symbol, name.span);
         }
         if (self.check(.ident)) {
             if (self.check_symbol_text("init") && token_is(self.peek_next(), .question)) {
-                std.jiang.Token name = self.advance();
-                std.jiang.Token question = self.advance();
+                std.jiang.Token<std.jiang.TokenKind> name = self.advance();
+                std.jiang.Token<std.jiang.TokenKind> question = self.advance();
                 qid.SymbolId symbol = self.store.symbols.intern("init?");
                 return self.name_node_from_symbol(symbol, self.span_from(name.span, question.span));
             }
             return self.name_node_from_token(self.advance());
         }
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.error_at_current("expected_name", .ident);
         if (!self.at_end()) {
             self.advance();
         }
-        return self.name_node_from_token(std.jiang.Token.missing(.ident, actual.span));
+        return self.name_node_from_token(std.jiang.missing_token(.ident, actual.span));
     }
 
     ast.AstId parse_path(Self&! self) {
@@ -5002,26 +5052,26 @@ public struct Parser: Movable {
         Int paren_depth! = 0;
         Int bracket_depth! = 0;
         Int offset! = 0;
-        while (!self.type_arg_probe_stops(std.jiang.token_tag(self.peek_offset(offset).kind))) {
-            std.jiang.TokenTag kind = std.jiang.token_tag(self.peek_offset(offset).kind);
-            if (kind == .left_paren) { paren_depth = paren_depth + 1; }
-            else if (kind == .right_paren) {
+        while (!self.type_arg_probe_stops(self.peek_offset(offset).kind)) {
+            std.jiang.TokenKind kind = self.peek_offset(offset).kind;
+            if (kind is .left_paren) { paren_depth = paren_depth + 1; }
+            else if (kind is .right_paren) {
                 if (paren_depth == 0) { return false; }
                 paren_depth = paren_depth - 1;
-            } else if (kind == .left_bracket) {
+            } else if (kind is .left_bracket) {
                 bracket_depth = bracket_depth + 1;
-            } else if (kind == .right_bracket) {
+            } else if (kind is .right_bracket) {
                 if (bracket_depth == 0) { return false; }
                 bracket_depth = bracket_depth - 1;
-            } else if (kind == .lt && paren_depth == 0 && bracket_depth == 0) {
+            } else if (kind is .lt && paren_depth == 0 && bracket_depth == 0) {
                 angle_depth = angle_depth + 1;
-            } else if (kind == .gt_gt && paren_depth == 0 && bracket_depth == 0) {
+            } else if (kind is .gt_gt && paren_depth == 0 && bracket_depth == 0) {
                 angle_depth = angle_depth - 2;
                 if (angle_depth == 0) {
                     return self.token_follows_type_args_for_call(offset + 1, allow_trailing_closure);
                 }
                 if (angle_depth < 0) { return false; }
-            } else if (kind == .gt && paren_depth == 0 && bracket_depth == 0) {
+            } else if (kind is .gt && paren_depth == 0 && bracket_depth == 0) {
                 angle_depth = angle_depth - 1;
                 if (angle_depth == 0) {
                     return self.token_follows_type_args_for_call(offset + 1, allow_trailing_closure);
@@ -5038,8 +5088,8 @@ public struct Parser: Movable {
         return allow_trailing_closure && token_is(self.peek_offset(offset), .left_brace);
     }
 
-    Bool type_arg_probe_stops(self, std.jiang.TokenTag kind) {
-        return kind == .eof || kind == .semicolon || kind == .right_brace;
+    Bool type_arg_probe_stops(self, std.jiang.TokenKind kind) {
+        return kind is .eof || kind is .semicolon || kind is .right_brace;
     }
 
     Bool starts_type_member_expr(Self&! self) {
@@ -5063,7 +5113,7 @@ public struct Parser: Movable {
     }
 
     Bool current_token_starts_type_name(self) {
-        std.jiang.Token current_token = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> current_token = self.peek();
         if (token_is(current_token, .ident)) {
             if (self.token_keyword(current_token) is .some(keyword)) {
                 return keyword == .kw_self_type;
@@ -5159,39 +5209,39 @@ public struct Parser: Movable {
     }
 
     Bool at_end(self) {
-        return self.peek_kind() == .eof;
+        return self.peek_kind() is .eof;
     }
 
-    Bool check(self, std.jiang.TokenTag expected) {
-        return self.peek_kind() == expected;
+    Bool check(self, std.jiang.TokenKind expected) {
+        return self.peek_kind().same_case(expected);
     }
 
-    Bool match(Self&! self, std.jiang.TokenTag expected) {
+    Bool match(Self&! self, std.jiang.TokenKind expected) {
         if (!self.check(expected)) { return false; }
         self.advance();
         return true;
     }
 
-    std.jiang.Token expect(Self&! self, std.jiang.TokenTag expected) {
+    std.jiang.Token<std.jiang.TokenKind> expect(Self&! self, std.jiang.TokenKind expected) {
         if (self.check(expected)) { return self.advance(); }
         self.error_at_current("expected_token", expected);
-        return std.jiang.Token.missing(expected, self.peek().span);
+        return std.jiang.missing_token(expected, self.peek().span);
     }
 
     Bool check_type_arg_gt(self) {
         return self.check(.gt) || self.check(.gt_gt);
     }
 
-    std.jiang.Token expect_type_arg_gt(Self&! self) {
+    std.jiang.Token<std.jiang.TokenKind> expect_type_arg_gt(Self&! self) {
         if (self.check(.gt)) { return self.advance(); }
         if (self.check(.gt_gt)) { return self.split_gt_gt_token(); }
         self.error_at_current("expected_token", .gt);
-        return std.jiang.Token.missing(.gt, self.peek().span);
+        return std.jiang.missing_token(.gt, self.peek().span);
     }
 
-    std.jiang.Token split_gt_gt_token(Self&! self) {
-        std.jiang.Token current_token = self.peek();
-        std.jiang.Token first = make_token(
+    std.jiang.Token<std.jiang.TokenKind> split_gt_gt_token(Self&! self) {
+        std.jiang.Token<std.jiang.TokenKind> current_token = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> first = make_token(
             .gt,
             std.jiang.syntax.Span(current_token.span.start, 1),
             current_token.leading,
@@ -5202,14 +5252,14 @@ public struct Parser: Movable {
         return first;
     }
 
-    qid.SymbolId? token_symbol(self, std.jiang.Token tok) {
-        if (tok.symbol_id() is .some(symbol)) {
+    qid.SymbolId? token_symbol(self, std.jiang.Token<std.jiang.TokenKind> tok) {
+        if (tok.kind.symbol() is .some(symbol)) {
             return symbol;
         }
         return null;
     }
 
-    keyword.Keyword? token_keyword(self, std.jiang.Token tok) {
+    keyword.Keyword? token_keyword(self, std.jiang.Token<std.jiang.TokenKind> tok) {
         guard self.token_symbol(tok) is .some(symbol) else {
             return null;
         }
@@ -5227,7 +5277,7 @@ public struct Parser: Movable {
     }
 
     Bool check_keyword_at(self, Int offset, keyword.Keyword keyword) {
-        std.jiang.Token tok = self.peek_offset(offset);
+        std.jiang.Token<std.jiang.TokenKind> tok = self.peek_offset(offset);
         if (!token_is(tok, .ident)) { return false; }
         if (self.token_keyword(tok) is .some(actual)) {
             return actual == keyword;
@@ -5246,7 +5296,7 @@ public struct Parser: Movable {
         return self.token_text_equal(self.peek(), expected);
     }
 
-    Bool token_text_equal(self, std.jiang.Token tok, UInt8[]& expected) {
+    Bool token_text_equal(self, std.jiang.Token<std.jiang.TokenKind> tok, UInt8[]& expected) {
         if (!token_is(tok, .ident)) {
             return false;
         }
@@ -5271,14 +5321,14 @@ public struct Parser: Movable {
         return true;
     }
 
-    std.jiang.Token expect_keyword(Self&! self, keyword.Keyword keyword) {
+    std.jiang.Token<std.jiang.TokenKind> expect_keyword(Self&! self, keyword.Keyword keyword) {
         if (self.check_keyword(keyword)) { return self.advance(); }
         self.error_at_current_keyword(keyword);
-        return std.jiang.Token.missing(.ident, self.peek().span);
+        return std.jiang.missing_token(.ident, self.peek().span);
     }
 
-    std.jiang.Token advance(Self&! self) {
-        std.jiang.Token current_token = self.peek();
+    std.jiang.Token<std.jiang.TokenKind> advance(Self&! self) {
+        std.jiang.Token<std.jiang.TokenKind> current_token = self.peek();
         if (self.has_pending_gt()) {
             self.pending_gt_start = -1;
             return current_token;
@@ -5287,7 +5337,7 @@ public struct Parser: Movable {
         return current_token;
     }
 
-    std.jiang.Token peek(self) {
+    std.jiang.Token<std.jiang.TokenKind> peek(self) {
         if (self.has_pending_gt()) {
             return make_token(
                 .gt,
@@ -5296,23 +5346,23 @@ public struct Parser: Movable {
                 .present
             );
         }
-        return self.tokens.get(self.current);
+        return self.tokens[self.current];
     }
 
-    std.jiang.TokenTag peek_kind(self) {
-        return std.jiang.token_tag(self.peek().kind);
+    std.jiang.TokenKind peek_kind(self) {
+        return self.peek().kind;
     }
 
-    std.jiang.Token peek_next(self) {
+    std.jiang.Token<std.jiang.TokenKind> peek_next(self) {
         if (self.has_pending_gt()) {
-            if (self.current >= self.tokens.len()) { return self.tokens.get(self.tokens.len() - 1); }
-            return self.tokens.get(self.current);
+            if (self.current >= self.tokens.length) { return self.tokens[self.tokens.length - 1]; }
+            return self.tokens[self.current];
         }
-        if (self.current + 1 >= self.tokens.len()) { return self.tokens.get(self.current); }
-        return self.tokens.get(self.current + 1);
+        if (self.current + 1 >= self.tokens.length) { return self.tokens[self.current]; }
+        return self.tokens[self.current + 1];
     }
 
-    std.jiang.Token peek_offset(self, Int offset) {
+    std.jiang.Token<std.jiang.TokenKind> peek_offset(self, Int offset) {
         Int effective_offset! = offset;
         if (self.has_pending_gt()) {
             if (effective_offset == 0) {
@@ -5326,8 +5376,8 @@ public struct Parser: Movable {
             effective_offset = effective_offset - 1;
         }
         Int index = self.current + effective_offset;
-        if (index >= self.tokens.len()) { return self.tokens.get(self.tokens.len() - 1); }
-        return self.tokens.get(index);
+        if (index >= self.tokens.length) { return self.tokens[self.tokens.length - 1]; }
+        return self.tokens[index];
     }
 
     Bool token_at_offset_is_eof(self, Int offset) {
@@ -5338,23 +5388,23 @@ public struct Parser: Movable {
         return self.pending_gt_start >= 0;
     }
 
-    std.jiang.Token previous(self) {
-        if (self.current == 0) { return self.tokens.get(0); }
-        return self.tokens.get(self.current - 1);
+    std.jiang.Token<std.jiang.TokenKind> previous(self) {
+        if (self.current == 0) { return self.tokens[0]; }
+        return self.tokens[self.current - 1];
     }
 
-    Void error_at_current(Self&! self, UInt8[]& code, std.jiang.TokenTag expected) {
-        std.jiang.Token actual = self.peek();
+    Void error_at_current(Self&! self, UInt8[]& code, std.jiang.TokenKind expected) {
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.add_parse_error(actual.span, code);
     }
 
     Void error_at_current_keyword(Self&! self, keyword.Keyword expected) {
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.add_parse_error(actual.span, "expected_keyword");
     }
 
     Void error_at_current_kind(Self&! self, UInt8[]& code) {
-        std.jiang.Token actual = self.peek();
+        std.jiang.Token<std.jiang.TokenKind> actual = self.peek();
         self.add_parse_error(actual.span, code);
     }
 

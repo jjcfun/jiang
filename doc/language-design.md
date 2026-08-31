@@ -114,22 +114,23 @@ lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang
 - 当前不支持 `#alias(...)`。
 - 当前不支持源码内声明多个 parser 入口。
 - 一个 lang package 只提供一个默认 provider。
-- provider 输出必须是 `std.jiang.syntax.Tree`。当前支持 expression 和 statement 位置，因此
-  root kind 必须匹配 `Input.entry_kind`；其他 root kind 是 public syntax tree 为后续扩展保留的结构。
+- provider 返回 `Expansion`，其 case 必须匹配 compiler 传入的 `ExpansionKind`。当前支持
+  expression、statement、declaration/member、type 和 pattern 位置。
 - provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
 - DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
 
 provider 有两个阶段：
 
 ```text
-scan(input, builder) -> ScanResult
-parse(input, builder) -> NodeId
+scan(input, syntax) -> ScanResult
+parse(input, expected, syntax) -> Expansion
 ```
 
 lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`scan` 负责判断 DSL block
 边界，并可把私有 token/cache 保存在 provider 实例字段中。parser 后续读到 `raw_block` token 时
-调用同一实例的 `parse`，得到 public syntax tree，再由 compiler 转换成内部 AST。编译器内建
-provider 当前包括 inline asm：`#asm { ... }` 是短名，`#jiang.asm { ... }` 是完整内建路径。
+调用同一实例的 `parse`。provider 通过 `Parser<K>` 的 typed factory 直接生成普通 Jiang syntax，
+不公开 compiler AST data，也不建立 mirror tree。编译器内建 provider 当前包括 inline asm：
+`#asm { ... }` 是短名，`#jiang.asm { ... }` 是完整内建路径。
 
 这种机制的目标不是把 Jiang 变成文本宏语言，而是让不同领域可以使用更适合的表面语法，例如
 SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态化和 backend 仍由 Jiang 编译器统一处理。

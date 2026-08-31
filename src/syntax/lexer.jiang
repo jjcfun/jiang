@@ -1,23 +1,646 @@
+// Jiang lexer：完成基础 token 扫描，并在同一条词法路径上处理自定义语法块。
+
 import std;
+import diagnostic = "../diagnostic.jiang";
 import syntax_builder = "./builder.jiang";
 import syntax_diagnostics = "./diagnostics.jiang";
 import lang_block = "../lang/block.jiang";
 import lang_registry = "../lang/registry.jiang";
 import lang_runtime = "../lang/runtime.jiang";
-import inline_asm = "../lang/inline_asm.jiang";
 import list = "../support/list.jiang";
 import store_api = "../store.jiang";
 import source = "../source.jiang";
 import string = "../support/string.jiang";
+import unicode = "../support/unicode.jiang";
+
+// 基础 Tokenizer 负责 Jiang token 的字节扫描；Lexer 在其上识别 #lang。
+@region(a)
+public struct Tokenizer: Movable {
+    source.SourceId source_id;
+    diagnostic.DiagnosticCategory diagnostic_category;
+
+    @life(a)
+    public std.jiang.syntax.Source source;
+    public std.jiang.syntax.Span span;
+    Int start!;
+    Int current!;
+    std.jiang.Trivia leading!;
+
+    public init(
+        self,
+        source.SourceId source_id,
+        diagnostic.DiagnosticCategory diagnostic_category,
+        std.jiang.syntax.Source source,
+        std.jiang.syntax.Span span
+    ) {
+        self.source_id = source_id;
+        self.diagnostic_category = diagnostic_category;
+        self.source = source;
+        self.span = span;
+        self.start = span.start;
+        self.current = span.start;
+        self.leading = std.jiang.Trivia();
+    }
+
+    @life(return: source)
+    public Tokenizer from_source(
+        source.SourceId source_id,
+        diagnostic.DiagnosticCategory diagnostic_category,
+        std.jiang.syntax.Source source
+    ) {
+        return Tokenizer(source_id, diagnostic_category, source, source.span());
+    }
+
+    public std.jiang.Token<std.jiang.TokenKind> next(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        self.leading = self.skip_trivia();
+        self.start = self.current;
+
+        if (self.at_end()) { return self.make(.eof()); }
+
+        UInt8 byte = self.peek();
+        self.advance(1);
+        if (byte == '`') { return self.escaped_identifier(store); }
+        if (byte == '"') { return self.string_literal(store); }
+        if (byte == '\'') { return self.char_literal(store); }
+        if (byte == '(') { return self.make(.left_paren()); }
+        if (byte == ')') { return self.make(.right_paren()); }
+        if (byte == '{') { return self.make(.left_brace()); }
+        if (byte == '}') { return self.make(.right_brace()); }
+        if (byte == '[') { return self.make(.left_bracket()); }
+        if (byte == ']') { return self.make(.right_bracket()); }
+        if (byte == '@') { return self.make(.at()); }
+        if (byte == '#') { return self.hash_token(); }
+        if (byte == ',') { return self.make(.comma()); }
+        if (byte == ':') { return self.make(.colon()); }
+        if (byte == ';') { return self.make(.semicolon()); }
+        if (byte == '$') { return self.make(.dollar()); }
+        if (byte == '_' && !self.ident_continue_at_current()) { return self.make(.underscore()); }
+        if (byte == '~') { return self.make(.tilde()); }
+        if (byte == '?') { return self.question_operator(); }
+        if (byte == '+') { return self.plus_operator(); }
+        if (byte == '-') { return self.minus_operator(); }
+        if (byte == '*') { return self.star_operator(); }
+        if (byte == '/') { return self.slash_operator(); }
+        if (byte == '%') { return self.percent_operator(); }
+        if (byte == '&') { return self.amp_operator(); }
+        if (byte == '|') { return self.pipe_operator(); }
+        if (byte == '^') { return self.caret_operator(); }
+        if (byte == '.') { return self.dot_operator(); }
+        if (byte == '=') { return self.equal_operator(); }
+        if (byte == '!') { return self.bang_operator(); }
+        if (byte == '<') { return self.less_operator(); }
+        if (byte == '>') { return self.greater_operator(); }
+        return self.identifier_number_or_error(store, byte);
+    }
+
+    public UInt8[]& token_text(self, std.jiang.Token<std.jiang.TokenKind> value) {
+        return self.source.bytes[value.span.start..value.span.end()];
+    }
+
+    Bool at_end(self) {
+        return self.current >= self.span.end();
+    }
+
+    UInt8 peek(self) {
+        if (self.at_end()) { return 0; }
+        return self.source.bytes[self.current];
+    }
+
+    UInt8 peek_next(self) {
+        if (self.current + 1 >= self.span.end()) { return 0; }
+        return self.source.bytes[self.current + 1];
+    }
+
+    Void advance(Self&! self, Int offset) {
+        self.current = self.current + offset;
+    }
+
+    Bool match(Self&! self, UInt8 expected) {
+        if (self.at_end()) { return false; }
+        if (self.source.bytes[self.current] != expected) { return false; }
+        self.advance(1);
+        return true;
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> make(self, std.jiang.TokenKind kind) {
+        return std.jiang.Token<std.jiang.TokenKind>(
+            kind, self.current_span(), self.leading, .present
+        );
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> make_error(self) {
+        return std.jiang.Token<std.jiang.TokenKind>(.error(), self.current_span(), self.leading, .present);
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> make_error_code(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        UInt8[]& code
+    ) {
+        self.add_error(store, self.current_span(), code);
+        return self.make_error();
+    }
+
+    std.jiang.syntax.SymbolId intern_symbol(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        Bool delimited = false
+    ) {
+        UInt8[]& text = self.current_text();
+        if (delimited) { return store.symbols.intern(self.delimited_body(text)); }
+        return store.symbols.intern(text);
+    }
+
+    std.jiang.syntax.SymbolId intern_literal(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        UInt8[]& body = self.delimited_body(self.current_text());
+        return store.symbols.intern(self.unescaped_literal_text(body));
+    }
+
+    @life(return: text)
+    UInt8[]& delimited_body(self, UInt8[]& text) {
+        if (text.length < 2) { return text[0..0]; }
+        return text[1..text.length - 1];
+    }
+
+    @life(return: text)
+    UInt8[]& unescaped_literal_text(self, UInt8[]& text) {
+        return std.jiang.literal.unescape(text);
+    }
+
+    std.jiang.syntax.Span current_span(self) {
+        return std.jiang.syntax.Span(self.start, self.current - self.start);
+    }
+
+    UInt8[]& current_text(self) {
+        return self.source.bytes[self.start..self.current];
+    }
+
+    std.jiang.Trivia skip_trivia(Self&! self) {
+        std.jiang.Trivia trivia! = std.jiang.Trivia();
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            if (self.is_space(byte)) {
+                trivia.has_whitespace = true;
+                if (byte == '\n' || byte == '\r') { trivia.has_newline = true; }
+                self.advance(1);
+                continue;
+            }
+            if (byte == '/' && self.peek_next() == '/') {
+                trivia.has_comment = true;
+                self.skip_line_comment();
+                continue;
+            }
+            return trivia;
+        }
+        return trivia;
+    }
+
+    Void skip_line_comment(Self&! self) {
+        self.advance(2);
+        while (!self.at_end() && self.peek() != '\n') {
+            self.advance(1);
+        }
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> identifier(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        while (!self.at_end()) {
+            if (std.jiang.ident.is_ascii_ident_continue(self.peek())) {
+                self.advance(1);
+                continue;
+            }
+            if (std.jiang.ident.is_utf8_ident_continue_at(self.source.bytes, self.current)) {
+                self.advance(std.jiang.ident.utf8_len_at(self.source.bytes, self.current));
+                continue;
+            }
+            return self.make_ident(store);
+        }
+        return self.make_ident(store);
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> make_ident(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        return self.make(.ident(self.intern_symbol(store)));
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> hash_token(self) {
+        return self.make(.hash());
+    }
+
+    public Int position(self) {
+        return self.current;
+    }
+
+    public Void set_position(Self&! self, Int position) {
+        assert(position >= self.span.start && position <= self.span.end());
+        self.current = position;
+    }
+
+    public std.jiang.Token<std.jiang.TokenKind> raw_block_token(self, Int block_id, std.jiang.syntax.Span span) {
+        return std.jiang.Token<std.jiang.TokenKind>(
+            .raw_block(block_id),
+            span,
+            self.leading,
+            .present
+        );
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> escaped_identifier(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        while (!self.at_end() && self.peek() != '`') {
+            self.advance(1);
+        }
+        if (!self.match('`')) {
+            return self.make_error_code(store, "unterminated_escaped_identifier");
+        }
+        return self.make(.escaped_ident(self.intern_symbol(store, true)));
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> string_literal(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        Bool escaped! = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) {
+                if (byte == '\n') {
+                    escaped = false;
+                    continue;
+                }
+                if (byte == '\r') {
+                    if (self.peek() == '\n') { self.advance(1); }
+                    escaped = false;
+                    continue;
+                }
+                if (byte == 'u' && self.consume_unicode_escape_tail()) {
+                    escaped = false;
+                    continue;
+                }
+                if (byte != '(' && !self.valid_escape_byte(byte)) {
+                    return self.invalid_escape(store, '"');
+                }
+                escaped = false;
+                continue;
+            }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '"') { return self.make(.string_lit(self.intern_literal(store))); }
+        }
+        return self.make_error_code(store, "unterminated_string");
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> char_literal(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        Bool escaped! = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) {
+                if (byte == 'u' && self.consume_unicode_escape_tail()) {
+                    escaped = false;
+                    continue;
+                }
+                if (!self.valid_escape_byte(byte)) {
+                    return self.invalid_escape(store, '\'');
+                }
+                escaped = false;
+                continue;
+            }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '\'') { return self.make(.char_lit(self.intern_literal(store))); }
+        }
+        return self.make_error_code(store, "unterminated_char");
+    }
+
+    Bool consume_unicode_escape_tail(Self&! self) {
+        if (!self.match('{')) { return false; }
+        Int digits! = 0;
+        Int scalar! = 0;
+        while (!self.at_end() && self.peek() != '}') {
+            Int hex = std.jiang.literal.hex_value(self.peek());
+            if (hex < 0 || digits >= 8) { return false; }
+            scalar = (scalar << 4) + hex;
+            digits = digits + 1;
+            self.advance(1);
+        }
+        if (!self.match('}')) { return false; }
+        if (digits == 0) { return false; }
+        return std.jiang.literal.valid_unicode_scalar(scalar);
+    }
+
+    Bool valid_escape_byte(self, UInt8 byte) {
+        if (byte == 'n') { return true; }
+        if (byte == 'r') { return true; }
+        if (byte == 't') { return true; }
+        if (byte == '0') { return true; }
+        if (byte == '"') { return true; }
+        if (byte == '\'') { return true; }
+        return byte == '\\';
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> invalid_escape(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        UInt8 delimiter
+    ) {
+        self.add_error(store, std.jiang.syntax.Span(self.current - 2, 2), "invalid_escape");
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (byte == delimiter) {
+                break;
+            }
+        }
+        return self.make_error();
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> identifier_number_or_error(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        UInt8 byte
+    ) {
+        if (std.jiang.ident.is_ascii_ident_start(byte)) { return self.identifier(store); }
+        if (self.is_digit(byte)) { return self.number(store); }
+        if (unicode.is_utf8_lead(byte)) { return self.unicode_identifier_or_error(store); }
+        return self.make_error_code(store, "unexpected_character");
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> unicode_identifier_or_error(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        if (std.jiang.ident.is_utf8_ident_start_at(self.source.bytes, self.start)) {
+            self.advance(std.jiang.ident.utf8_len_at(self.source.bytes, self.start) - 1);
+            return self.identifier(store);
+        }
+        if (unicode.is_valid_utf8_at(self.source.bytes, self.start)) {
+            self.advance(unicode.utf8_len_at(self.source.bytes, self.start) - 1);
+        }
+        return self.make_error_code(store, "unicode_punctuation");
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> number(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        if (self.current_text_starts_with_zero()) {
+            Int base = self.consume_integer_base_prefix();
+            if (base != 0) { return self.based_number(store, base); }
+        }
+        return self.decimal_number(store);
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> based_number(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        Int base
+    ) {
+        if (!self.consume_based_digits(base)) {
+            self.add_empty_based_literal_error(store, base);
+            return self.make_error();
+        }
+        return self.make(.int_lit(self.intern_symbol(store)));
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> decimal_number(
+        Self&! self,
+        store_api.CompilerStore&! store
+    ) {
+        self.consume_decimal_digits();
+        Bool is_float! = false;
+        if (self.peek() == '.' && self.peek_next() != '.') {
+            is_float = true;
+            self.advance(1);
+            self.consume_decimal_digits();
+        }
+        if (self.consume_exponent()) {
+            is_float = true;
+        }
+        if (!is_float) { return self.make(.int_lit(self.intern_symbol(store))); }
+        return self.make(.float_lit(self.intern_symbol(store)));
+    }
+
+    Bool current_text_starts_with_zero(self) {
+        return self.start < self.current && self.source.bytes[self.start] == '0';
+    }
+
+    Int consume_integer_base_prefix(Self&! self) {
+        UInt8 byte = self.peek();
+        if (byte == 'b' || byte == 'B') { self.advance(1); return 2; }
+        if (byte == 'o' || byte == 'O') { self.advance(1); return 8; }
+        if (byte == 'x' || byte == 'X') { self.advance(1); return 16; }
+        return 0;
+    }
+
+    Bool consume_based_digits(Self&! self, Int base) {
+        Bool has_digit! = false;
+        while (!self.at_end()) {
+            Int digit = self.digit_value_for_base(self.peek(), base);
+            if (self.peek() == '_') { self.advance(1); continue; }
+            if (digit < 0) { return has_digit; }
+            has_digit = true;
+            self.advance(1);
+        }
+        return has_digit;
+    }
+
+    Void add_empty_based_literal_error(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        Int base
+    ) {
+        if (base == 2) {
+            self.add_error(store, self.current_span(), "empty_binary_literal");
+        }
+        if (base == 8) {
+            self.add_error(store, self.current_span(), "empty_octal_literal");
+        }
+        if (base == 16) {
+            self.add_error(store, self.current_span(), "empty_hex_literal");
+        }
+    }
+
+    Void add_error(
+        Self&! self,
+        store_api.CompilerStore&! store,
+        std.jiang.syntax.Span span,
+        UInt8[]& code
+    ) {
+        syntax_diagnostics.add_error(
+            store,
+            self.source_id,
+            self.diagnostic_category,
+            span,
+            code,
+            code
+        );
+    }
+
+    Int digit_value_for_base(self, UInt8 byte, Int base) {
+        if (byte >= '0' && byte <= '9') {
+            Int digit = Int(byte - '0');
+            if (digit < base) { return digit; }
+            return -1;
+        }
+        if (byte >= 'a' && byte <= 'f' && base == 16) { return Int(byte - 'a') + 10; }
+        if (byte >= 'A' && byte <= 'F' && base == 16) { return Int(byte - 'A') + 10; }
+        return -1;
+    }
+
+    Void consume_decimal_digits(Self&! self) {
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            if (byte == '_' || self.is_digit(byte)) {
+                self.advance(1);
+                continue;
+            }
+            return;
+        }
+    }
+
+    Bool consume_exponent(Self&! self) {
+        UInt8 byte = self.peek();
+        if (byte != 'e' && byte != 'E') { return false; }
+        if (!self.exponent_has_digits()) { return false; }
+        self.advance(1);
+        if (self.peek() == '+' || self.peek() == '-') {
+            self.advance(1);
+        }
+        self.consume_decimal_digits();
+        return true;
+    }
+
+    Bool exponent_has_digits(self) {
+        Int offset! = 1;
+        UInt8 byte = self.peek_at(offset);
+        if (byte == '+' || byte == '-') {
+            offset = offset + 1;
+        }
+        return self.is_digit(self.peek_at(offset));
+    }
+
+    UInt8 peek_at(self, Int offset) {
+        Int index = self.current + offset;
+        if (index >= self.span.end()) { return 0; }
+        return self.source.bytes[index];
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> question_operator(Self&! self) {
+        if (self.match('.')) { return self.make(.question_dot()); }
+        if (self.match('?')) { return self.make(.question_question()); }
+        return self.make(.question());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> plus_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.plus_assign()); }
+        return self.make(.plus());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> minus_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.minus_assign()); }
+        return self.make(.minus());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> star_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.star_assign()); }
+        return self.make(.star());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> slash_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.slash_assign()); }
+        return self.make(.slash());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> percent_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.percent_assign()); }
+        return self.make(.percent());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> amp_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.amp_assign()); }
+        if (self.match('&')) { return self.make(.amp_amp()); }
+        return self.make(.amp());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> pipe_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.pipe_assign()); }
+        if (self.match('|')) { return self.make(.pipe_pipe()); }
+        return self.make(.pipe());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> caret_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.caret_assign()); }
+        return self.make(.caret());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> dot_operator(Self&! self) {
+        if (self.match('.')) { return self.make(.dot_dot()); }
+        return self.make(.dot());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> equal_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.eq_eq()); }
+        if (self.match('>')) { return self.make(.fat_arrow()); }
+        return self.make(.assign());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> bang_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.bang_eq()); }
+        return self.make(.bang());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> less_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.lt_eq()); }
+        if (!self.match('<')) { return self.make(.lt()); }
+        if (self.match('=')) { return self.make(.lt_lt_assign()); }
+        return self.make(.lt_lt());
+    }
+
+    std.jiang.Token<std.jiang.TokenKind> greater_operator(Self&! self) {
+        if (self.match('=')) { return self.make(.gt_eq()); }
+        if (!self.match('>')) { return self.make(.gt()); }
+        if (self.match('=')) { return self.make(.gt_gt_assign()); }
+        return self.make(.gt_gt());
+    }
+
+    Bool is_space(self, UInt8 byte) {
+        return byte == ' ' || byte == '\n' || byte == '\r' || byte == '\t';
+    }
+
+    Bool is_digit(self, UInt8 byte) {
+        return byte >= '0' && byte <= '9';
+    }
+
+    Bool ident_continue_at_current(self) {
+        if (self.at_end()) { return false; }
+        if (std.jiang.ident.is_ascii_ident_continue(self.peek())) { return true; }
+        return std.jiang.ident.is_utf8_ident_continue_at(self.source.bytes, self.current);
+    }
+}
 
 public struct LexResult: Movable {
-    public list.ArrayList<std.jiang.Token> tokens!;
+    public list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> tokens!;
 
-    public init(self, list.ArrayList<std.jiang.Token> tokens) {
+    public init(self, list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> tokens) {
         self.tokens = tokens;
     }
 
-    public list.ArrayList<std.jiang.Token> take_tokens(Self&! self) {
+    public list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> take_tokens(Self&! self) {
         return self.tokens.take();
     }
 }
@@ -67,17 +690,14 @@ public struct Lexer: Movable {
     UInt8[]& source_text;
 
     @life(b)
-    std.jiang.Tokenizer tokenizer!;
-
-    @life(b)
-    syntax_builder.SyntaxBuilder builder!;
+    Tokenizer tokenizer!;
 
     @life(c)
     lang_registry.Registry&! registry;
 
     @life(d)
     lang_block.LangBlockStore&! blocks;
-    list.ArrayList<std.jiang.Token> pending_tokens!;
+    list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> pending_tokens!;
     Int pending_token_index!;
 
     public init(self,
@@ -92,25 +712,23 @@ public struct Lexer: Movable {
         self.store = store;
         self.source_id = source_id;
         self.source_text = text;
-        self.tokenizer = std.jiang.Tokenizer.from_source(std_source);
-        self.builder = syntax_builder.SyntaxBuilder(source_id, text, .lexer);
+        self.tokenizer = Tokenizer.from_source(
+            source_id,
+            .lexer,
+            std_source
+        );
         self.registry = registry;
         self.blocks = blocks;
-        self.pending_tokens = list.ArrayList<std.jiang.Token>();
+        self.pending_tokens = list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>();
         self.pending_token_index = 0;
     }
 
-    public std.jiang.Token next(Self&! self) {
+    public std.jiang.Token<std.jiang.TokenKind> next(Self&! self) {
         if (self.has_pending_token()) {
             return self.next_pending_token();
         }
-        syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-            self.store$.mut_ref(),
-            self.builder$.mut_ref()
-        );
-        std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-        std.jiang.Token tok = self.tokenizer.next(builder_ref);
-        if (std.jiang.token_kind_is(tok.kind, .hash)) {
+        std.jiang.Token<std.jiang.TokenKind> tok = self.tokenizer.next(self.store);
+        if (tok.kind is .hash) {
             return self.lex_hash_or_lang_block(tok);
         }
         return tok;
@@ -120,8 +738,8 @@ public struct Lexer: Movable {
         return self.pending_token_index < self.pending_tokens.len();
     }
 
-    std.jiang.Token next_pending_token(Self&! self) {
-        std.jiang.Token tok = self.pending_tokens.get(self.pending_token_index);
+    std.jiang.Token<std.jiang.TokenKind> next_pending_token(Self&! self) {
+        std.jiang.Token<std.jiang.TokenKind> tok = self.pending_tokens.get(self.pending_token_index);
         self.pending_token_index = self.pending_token_index + 1;
         if (self.pending_token_index >= self.pending_tokens.len()) {
             self.pending_tokens.clear();
@@ -130,18 +748,12 @@ public struct Lexer: Movable {
         return tok;
     }
 
-    std.jiang.Token lex_hash_or_lang_block(Self&! self, std.jiang.Token hash) {
-        syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-            self.store$.mut_ref(),
-            self.builder$.mut_ref()
-        );
-        std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-        std.jiang.Token first = self.tokenizer.next(builder_ref);
-        if (!std.jiang.token_kind_is(first.kind, .ident)) {
-            self.pending_tokens.add(first);
-            return hash;
-        }
-        guard first.symbol_id() is .some(first_symbol) else {
+    std.jiang.Token<std.jiang.TokenKind> lex_hash_or_lang_block(
+        Self&! self,
+        std.jiang.Token<std.jiang.TokenKind> hash
+    ) {
+        std.jiang.Token<std.jiang.TokenKind> first = self.tokenizer.next(self.store);
+        guard first.kind is .ident(first_symbol) else {
             self.pending_tokens.add(first);
             return hash;
         }
@@ -149,24 +761,18 @@ public struct Lexer: Movable {
         LangProviderPath path! = LangProviderPath(first_symbol, first.span);
 
         while (true) {
-            std.jiang.Token next_token = self.tokenizer.next(builder_ref);
-            if (std.jiang.token_kind_is(next_token.kind, .left_brace)) {
+            std.jiang.Token<std.jiang.TokenKind> next_token = self.tokenizer.next(self.store);
+            if (next_token.kind is .left_brace) {
                 return self.lex_lang_block(path$.ref(), hash.span, next_token);
             }
-            if (!std.jiang.token_kind_is(next_token.kind, .dot)) {
+            if (!(next_token.kind is .dot)) {
                 self.pending_tokens.add(first);
                 self.pending_tokens.add(next_token);
                 return hash;
             }
 
-            std.jiang.Token segment = self.tokenizer.next(builder_ref);
-            if (!std.jiang.token_kind_is(segment.kind, .ident)) {
-                self.pending_tokens.add(first);
-                self.pending_tokens.add(next_token);
-                self.pending_tokens.add(segment);
-                return hash;
-            }
-            guard segment.symbol_id() is .some(segment_symbol) else {
+            std.jiang.Token<std.jiang.TokenKind> segment = self.tokenizer.next(self.store);
+            guard segment.kind is .ident(segment_symbol) else {
                 self.pending_tokens.add(first);
                 self.pending_tokens.add(next_token);
                 self.pending_tokens.add(segment);
@@ -177,16 +783,16 @@ public struct Lexer: Movable {
         return hash;
     }
 
-    std.jiang.Token lex_lang_block(Self&! self,
+    std.jiang.Token<std.jiang.TokenKind> lex_lang_block(Self&! self,
         LangProviderPath& path,
         std.jiang.syntax.Span hash_span,
-        std.jiang.Token left_brace
+        std.jiang.Token<std.jiang.TokenKind> left_brace
     ) {
         lang_block.LangBlockId block_id = self.create_lang_block(path, hash_span, left_brace);
         Bool provider_found = self.blocks.ref_at(block_id).provider_found;
         if (!provider_found) {
             std.jiang.syntax.Span span = self.blocks.ref_at(block_id).full_span;
-            return std.jiang.Token(.error(), span, std.jiang.Trivia(), .present);
+            return std.jiang.Token<std.jiang.TokenKind>(.error(), span, std.jiang.Trivia(), .present);
         }
         self.scan_lang_block(block_id, self.provider_path_text(path));
         lang_block.LangBlock&! block = self.blocks.mut_ref_at(block_id);
@@ -198,7 +804,7 @@ public struct Lexer: Movable {
     lang_block.LangBlockId create_lang_block(Self&! self,
         LangProviderPath& path,
         std.jiang.syntax.Span hash_span,
-        std.jiang.Token left_brace
+        std.jiang.Token<std.jiang.TokenKind> left_brace
     ) {
         std.jiang.syntax.Span initial_full_span = std.jiang.syntax.Span(hash_span.start, 0);
         std.jiang.syntax.ScanResult scan_result = std.jiang.syntax.ScanResult.ok(
@@ -212,11 +818,6 @@ public struct Lexer: Movable {
         lang_registry.Registry& providers = self.registry$.ref();
         if (providers.find_ref(path_text) is .some(_)) {
             provider_found = true;
-            syntax_builder.SyntaxBuilder builder! = syntax_builder.SyntaxBuilder(
-                self.source_id,
-                self.source_text,
-                .lexer
-            );
             std.jiang.syntax.Source syntax_source = std.jiang.syntax.Source(
                 std.jiang.syntax.SourceId(self.source_id.to_index()),
                 self.source_text
@@ -229,7 +830,6 @@ public struct Lexer: Movable {
             );
             return self.blocks.add(lang_block.LangBlock(
                 provider_found,
-                builder,
                 input,
                 initial_full_span,
                 scan_result
@@ -279,15 +879,10 @@ public struct Lexer: Movable {
 
     lang_block.LangBlockId builtin_inline_asm_block(Self&! self,
         LangProviderPath& path,
-        std.jiang.Token left_brace,
+        std.jiang.Token<std.jiang.TokenKind> left_brace,
         std.jiang.syntax.Span initial_full_span,
         std.jiang.syntax.ScanResult scan_result
     ) {
-        syntax_builder.SyntaxBuilder builder! = syntax_builder.SyntaxBuilder(
-            self.source_id,
-            self.source_text,
-            .lexer
-        );
         std.jiang.syntax.Source syntax_source = std.jiang.syntax.Source(
             std.jiang.syntax.SourceId(self.source_id.to_index()),
             self.source_text
@@ -300,36 +895,29 @@ public struct Lexer: Movable {
         );
         lang_block.LangBlock block! = lang_block.LangBlock(
             true,
-            builder,
             input,
             initial_full_span,
             scan_result
         );
-        block.set_provider(std.jiang.syntax.Provider$.new(inline_asm.Provider()));
+        block.set_builtin_provider();
         return self.blocks.add(block);
     }
 
     lang_block.LangBlockId missing_provider_block(Self&! self,
         UInt8[]& alias_text,
         std.jiang.syntax.Span alias_span,
-        std.jiang.Token left_brace,
+        std.jiang.Token<std.jiang.TokenKind> left_brace,
         std.jiang.syntax.ScanResult scan_result,
         UInt8[]& code
     ) {
         syntax_diagnostics.add_lexer_error(self.store$.mut_ref(), self.source_id, alias_span, code);
         std.jiang.syntax.ScanResult error_result = std.jiang.syntax.ScanResult.error(scan_result.body_span);
-        syntax_builder.SyntaxBuilder builder! = syntax_builder.SyntaxBuilder(
-            self.source_id,
-            self.source_text,
-            .lexer
-        );
         std.jiang.syntax.Source syntax_source = std.jiang.syntax.Source(
             std.jiang.syntax.SourceId(self.source_id.to_index()),
             self.source_text
         );
         return self.blocks.add(lang_block.LangBlock(
             false,
-            builder,
             std.jiang.syntax.Input(
                 syntax_source,
                 alias_span,
@@ -346,7 +934,7 @@ public struct Lexer: Movable {
         if (block.scan_result.status == .error) {
             return;
         }
-        if (block.has_provider_instance()) {
+        if (block.has_builtin_provider() || block.has_provider_instance()) {
             Bool failed = Lexer.scan_local_lang_block(self.store$.mut_ref(), block);
             std.jiang.syntax.Span span = block.full_span;
             if (failed) { self.report_lang_runtime_error(.error, span); }
@@ -375,13 +963,21 @@ public struct Lexer: Movable {
         store_api.CompilerStore&! store,
         lang_block.LangBlock&! block
     ) {
+        if (block.has_builtin_provider()) {
+            std.jiang.syntax.ScanResult result = block.builtin_provider.scan(
+                store,
+                source.SourceId(block.input.source.source_id.to_index()),
+                block.input
+            );
+            block.set_scan_result(result);
+            return result.status == .error;
+        }
         std.jiang.syntax.Provider.Any&! provider_ref = block.provider$.mut_ref();
-        syntax_builder.SyntaxBuilderAdapter adapter! = syntax_builder.SyntaxBuilderAdapter(
-            store,
-            block.builder$.mut_ref()
-        );
-        std.jiang.syntax.Builder.Any&! builder_ref = std.jiang.syntax.Builder$.mut_ref(adapter);
-        std.jiang.syntax.ScanResult result = provider_ref.scan(block.input, builder_ref);
+        syntax_builder.SyntaxInvocation&! invocation = block.invocation$.mut_ref();
+        std.jiang.syntax.SyntaxContext&! syntax = block.syntax_context$.mut_ref();
+        invocation.begin_scan(store, .lexer);
+        std.jiang.syntax.ScanResult result = provider_ref.scan(block.input, syntax);
+        invocation.end_call();
         block.set_scan_result(result);
         return result.status == .error;
     }
@@ -420,11 +1016,12 @@ public struct Lexer: Movable {
     }
 
     public LexResult tokenize(Self&! self) {
-        list.ArrayList<std.jiang.Token> buffer! = list.ArrayList<std.jiang.Token>();
+        list.ArrayList<std.jiang.Token<std.jiang.TokenKind>> buffer! =
+            list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>();
         while (true) {
-            std.jiang.Token tok = self.next();
+            std.jiang.Token<std.jiang.TokenKind> tok = self.next();
             buffer.add(tok);
-            if (std.jiang.token_kind_is(tok.kind, .eof)) {
+            if (tok.kind is .eof) {
                 return LexResult(buffer);
             }
         }
