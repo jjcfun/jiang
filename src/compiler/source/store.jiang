@@ -1,0 +1,271 @@
+// 长驻编译会话的 source identity 与按需文本入口。
+//
+// 工作目录内的绝对路径与相对路径统一成同一个 key，避免同一文件形成两个
+// module、package 或稳定定义身份；内存 overlay 优先于同路径磁盘文本。
+// SourceInfo 始终存在；Source 只在正文被读取或设置 overlay 后 materialize。
+
+import table = "../support/table.jiang";
+import map = "../support/map.jiang";
+import arena = "../support/arena.jiang";
+import list = "../support/list.jiang";
+import source = "../source.jiang";
+import env = "../system/env.jiang";
+import fs = "../system/fs.jiang";
+import std;
+
+public struct SourceStore: Movable {
+    table.ArrayTable<source.SourceId, source.SourceInfo> entries!;
+    table.SideTable<source.SourceId, source.Source> sources!;
+    map.WyHashMap<source.SourceKey, source.SourceId> by_key!;
+    arena.Arena text_arena!;
+
+    public init(self) {
+        self.entries = table.ArrayTable<source.SourceId, source.SourceInfo>();
+        self.sources = table.SideTable<source.SourceId, source.Source>();
+        self.by_key = map.WyHashMap<source.SourceKey, source.SourceId>();
+        self.text_arena = arena.Arena();
+    }
+
+    public Int len(self) {
+        return self.entries.len();
+    }
+
+    public Bool empty(self) {
+        return self.entries.empty();
+    }
+
+    public source.SourceId add_anonymous(Self&! self, UInt8[]& text) {
+        source.SourceId id = self.entries.next_id();
+        self.entries.append(source.SourceInfo (
+            id: id,
+            key: .virtual(""),
+            content_hash: source.content_hash(text),
+            revision: 0,
+        ));
+        self.sources.set(id, source.Source (
+            id: id,
+            text: copy_owned(text),
+            line_starts: list.ArrayList<Int>(),
+            overlay: false,
+        ));
+        return id;
+    }
+
+    public source.SourceId intern_path(Self&! self, UInt8[]& path, UInt8[]& text) {
+        Path canonical = canonical_file_path(path);
+        return self.intern_key(.file(canonical.bytes()), text);
+    }
+
+    public source.SourceId reserve_path(Self&! self, UInt8[]& path) {
+        Path canonical = canonical_file_path(path);
+        source.SourceKey key = .file(canonical.bytes());
+        if (lookup_source_id(self.by_key$.ref(), key) is .some(id)) { return id; }
+        return self.add_entry(key);
+    }
+
+    public Void record_content_hash(Self&! self, source.SourceId id, UInt64 content_hash) {
+        source.SourceInfo&! entry = self.entries.mut_ref_at(id);
+        if (entry.content_hash is .some(previous) && previous != content_hash) {
+            entry.revision = entry.revision + 1;
+        }
+        entry.content_hash = content_hash;
+    }
+
+    public source.SourceId intern_virtual(Self&! self, UInt8[]& name, UInt8[]& text) {
+        return self.intern_key(.virtual(name), text);
+    }
+
+    public source.SourceId set_overlay(Self&! self, UInt8[]& path, UInt8[]& text) {
+        source.SourceId id = self.intern_path(path, text);
+        self.sources.mut_ref_at(id).overlay = true;
+        return id;
+    }
+
+    public Bool clear_overlay(Self&! self, UInt8[]& path) {
+        guard self.find(.file(path)) is .some(id) else { return false; }
+        guard self.sources.has(id) else { return false; }
+        source.Source&! loaded = self.sources.mut_ref_at(id);
+        if (!loaded.overlay) { return false; }
+        loaded.overlay = false;
+        return true;
+    }
+
+    public Bool has_overlay(self, source.SourceId id) {
+        return self.sources.has(id) && self.sources.ref_at(id).overlay;
+    }
+
+    public Bool has_overlay_path(self, UInt8[]& path) {
+        guard self.find(.file(path)) is .some(id) else { return false; }
+        return self.has_overlay(id);
+    }
+
+    public UInt8[]^? load_path_text(Self&! self, UInt8[]& path) {
+        if (self.find(.file(path)) is .some(id) && self.has_overlay(id)) {
+            return copy_owned(self.sources.ref_at(id).text$.ref());
+        }
+        return fs.read_all_owned(path);
+    }
+
+    source.SourceId intern_key(Self&! self, source.SourceKey key, UInt8[]& text) {
+        UInt64 content_hash = source.content_hash(text);
+        if (lookup_source_id(self.by_key$.ref(), key) is .some(id)) {
+            source.SourceInfo&! entry = self.entries.mut_ref_at(id);
+            Bool changed = entry.content_hash == null || entry.content_hash$.some() != content_hash;
+            if (changed && entry.content_hash != null) {
+                entry.revision = entry.revision + 1;
+            }
+            entry.content_hash = content_hash;
+            if (changed || !self.sources.has(id)) {
+                Bool overlay! = false;
+                if (self.sources.has(id)) { overlay = self.sources.ref_at(id).overlay; }
+                self.sources.set(id, source.Source (
+                    id: id,
+                    text: copy_owned(text),
+                    line_starts: list.ArrayList<Int>(),
+                    overlay: overlay,
+                ));
+            }
+            return id;
+        }
+
+        source.SourceId id = self.add_entry(key);
+        self.entries.mut_ref_at(id).content_hash = content_hash;
+        self.sources.set(id, source.Source (
+            id: id,
+            text: copy_owned(text),
+            line_starts: list.ArrayList<Int>(),
+            overlay: false,
+        ));
+        return id;
+    }
+
+    source.SourceId add_entry(Self&! self, source.SourceKey key) {
+        source.SourceId id = self.entries.next_id();
+        source.SourceKey owned_key = copy_key(self.text_arena$.mut_ref(), key);
+        self.entries.append(source.SourceInfo (
+            id: id,
+            key: owned_key,
+            content_hash: null,
+            revision: 0,
+        ));
+        self.by_key.set(owned_key, id);
+        return id;
+    }
+
+    public Bool has(self, source.SourceId id) {
+        return self.entries.has(id);
+    }
+
+    public Bool has_source(self, source.SourceId id) {
+        return self.sources.has(id);
+    }
+
+    // 仅在诊断等确实需要正文的路径上补载 file source；cache 命中本身仍只保留 SourceInfo。
+    public Bool ensure_source(Self&! self, source.SourceId id) {
+        if (self.sources.has(id)) { return true; }
+        source.SourceInfo& source_info = self.entries.ref_at(id);
+        guard source_info.key is .file(_ path) else { return false; }
+        guard self.load_path_text(path) is .some(text) else { return false; }
+        source.SourceId loaded = self.intern_path(path, text[..]);
+        return loaded == id && self.sources.has(id);
+    }
+
+    public source.SourceInfo& entry(self, source.SourceId id) {
+        return self.entries.ref_at(id);
+    }
+
+    public UInt64 content_hash(self, source.SourceId id) {
+        return self.entries.ref_at(id).content_hash$.some();
+    }
+
+    public Int revision(self, source.SourceId id) {
+        return self.entries.ref_at(id).revision;
+    }
+
+    public source.Source& get(self, source.SourceId id) {
+        return self.sources.ref_at(id);
+    }
+
+    public source.Source&! mut_ref_at(Self&! self, source.SourceId id) {
+        return self.sources.mut_ref_at(id);
+    }
+
+    public Void ensure_line_starts(Self&! self, source.SourceId id) {
+        self.sources.mut_ref_at(id).ensure_line_starts();
+    }
+
+    public source.SourceId? find(self, source.SourceKey key) {
+        if (key is .file(_ path)) {
+            Path canonical = canonical_file_path(path);
+            source.SourceKey canonical_key = .file(canonical.bytes());
+            guard self.by_key.get(canonical_key) is .some(id) else { return null; }
+            return id$.get();
+        }
+        guard self.by_key.get(key) is .some(id) else { return null; }
+        return id$.get();
+    }
+
+}
+
+@life(return: text_arena)
+source.SourceKey copy_key(arena.Arena&! text_arena, source.SourceKey key) {
+    return switch key {
+        .file(_ path) => .file(copy_text(text_arena, path)),
+        .virtual(_ name) => .virtual(copy_text(text_arena, name)),
+    };
+}
+
+UInt8[]^ copy_owned(UInt8[]& bytes) {
+    std.Vector<UInt8> result! = std.Vector<UInt8>(bytes.length);
+    Int index! = 0;
+    while (index < bytes.length) {
+        result.append(bytes[index]);
+        index = index + 1;
+    }
+    return result.into_slice();
+}
+
+source.SourceId? lookup_source_id(
+    map.WyHashMap<source.SourceKey, source.SourceId>& by_key,
+    source.SourceKey key
+) {
+    guard by_key.get(key) is .some(id) else { return null; }
+    return id$.get();
+}
+
+@life(return: text_arena)
+UInt8[]& copy_text(arena.Arena&! text_arena, UInt8[]& text) {
+    unsafe {
+        UInt8*! bytes = text_arena.alloc_array<UInt8>(text.length + 1);
+        Int index! = 0;
+        while (index < text.length) {
+            bytes[index] = text[index];
+            index = index + 1;
+        }
+        bytes[text.length] = 0;
+        UInt8* frozen = bytes$.as(UInt8*);
+        return frozen[0..text.length];
+    }
+}
+
+Path canonical_file_path(UInt8[]& path) {
+    Path normalized = std.path.normalize(path);
+    if (!normalized.is_absolute()) { return normalized; }
+    guard env.get("PWD") is .some(cwd) else { return normalized; }
+    Path normalized_cwd = std.path.normalize(cwd[..]);
+    if (!path_is_inside(normalized.bytes(), normalized_cwd.bytes())) {
+        return normalized;
+    }
+    return Path(normalized.bytes()[normalized_cwd.bytes().length + 1..normalized.bytes().length]);
+}
+
+Bool path_is_inside(UInt8[]& path, UInt8[]& directory) {
+    if (directory.length == 0 || path.length <= directory.length) { return false; }
+    if (path[directory.length] != UInt8(47)) { return false; }
+    Int index! = 0;
+    while (index < directory.length) {
+        if (path[index] != directory[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
+}

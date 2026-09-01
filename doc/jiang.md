@@ -2275,7 +2275,7 @@ MutableBox<Int*!> a = MutableBox<Int*!>(value: null);
 trait Numeric;
 ```
 
-编译器 core 会内建一组最小 trait，并把它们导出到默认 prelude。`std/prelude.jiang`
+编译器 core 会内建一组最小 trait，并把它们导出到默认 prelude。`src/std/prelude.jiang`
 会继续导出标准库层的便利 API，但 `Hashable`、`Equatable` 这类 core trait
 不依赖 std package 本身；后续 no-std 模式关闭 std prelude 时，这些 core trait
 仍然有效。
@@ -2289,7 +2289,7 @@ trait Numeric;
 
 其中 `Hashable` 和 `Equatable` 来自 compiler core，并通过 prelude 以普通 trait
 DefId 暴露，所以可以直接用于 `@where(...)`。标准库 trait 也可以由
-`std/prelude.jiang` 继续导出。
+`src/std/prelude.jiang` 继续导出。
 
 若一个 `public trait` 被 `public` 类型显式实现，那么模块外可以通过该 trait requirement 调用对应方法。  
 若 trait 本身不是 `public`，则类型本身仍然可以对外可见，但外部不能通过该 private trait requirement 调用这些方法。
@@ -2833,16 +2833,19 @@ public struct Vector<T> {
 换行合并。短名 `#doc` 被 lang dependency alias 占用时，可以用 `#jiang.doc` 显式选择
 内建文档语法。
 
-使用 compiler 生成 Markdown API 文档：
+使用独立 `jiangdoc` 生成 API 文档：
 
 ```bash
-jiangc --doc path/to/package
-jiangc --doc -o build/doc/custom path/to/package
+jiangdoc path/to/package
+jiangdoc -o build/doc/custom path/to/package
+jiangdoc --markdown path/to/package
 ```
 
-默认入口为 `build/doc/<package>/index.md`。生成结果只包含 Markdown，可以直接使用
-VS Code Markdown Preview、GitHub 或网站现有的 Markdown 构建链预览。compiler 不内置
-HTML renderer 或 HTTP server。
+默认生成 HTML，入口为 `build/doc/<package>/index.html`；传入 `--markdown` 时改为生成 Markdown，入口为
+`index.md`。package 和 module 使用
+`index` 页面，公开类型与函数使用 `struct.Name`、`enum.Name`、`trait.Name`、`fn.name` 等页面；
+field、case、method 和 extension 留在 owner 类型页面内。浏览器可直接打开静态 HTML；Markdown
+仍可交给 VS Code、GitHub 或网站构建链。compiler 不包含 renderer 或 HTTP server。
 
 #### Lang Package / 自定义语法
 

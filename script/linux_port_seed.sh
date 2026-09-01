@@ -96,7 +96,7 @@ emit_object() {
     --target "$TARGET" \
     --emit-obj \
     -o "$SEED_OBJECT" \
-    src/jiangc.jiang
+    src/compiler/jiangc.jiang
   test -s "$SEED_OBJECT"
   file "$SEED_OBJECT" | grep -Eq 'ELF 64-bit.*x86-64'
   {
@@ -106,7 +106,7 @@ emit_object() {
     printf 'bootstrap_version=%s\n' "$BOOTSTRAP_RELEASE_VERSION"
     printf 'bootstrap_sha256=%s\n' "$(sha256_digest "$BOOTSTRAP_BIN")"
     printf 'compiler_build_mode=%s\n' "$COMPILER_BUILD_MODE"
-    printf 'emit_command=jiangc --mode %s --target %s --emit-obj src/jiangc.jiang\n' \
+    printf 'emit_command=jiangc --mode %s --target %s --emit-obj src/compiler/jiangc.jiang\n' \
       "$COMPILER_BUILD_MODE" "$TARGET"
     printf 'object_sha256=%s\n' "$(sha256_digest "$SEED_OBJECT")"
   } >"$SEED_MANIFEST"

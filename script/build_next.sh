@@ -160,14 +160,14 @@ emit_next_from_bootstrap() {
       --linker "$CLANG_BIN" \
       "${LLVM_LINK_ARGS[@]}" \
       -o "$output_bin" \
-      src/jiangc.jiang
+      src/compiler/jiangc.jiang
   else
     "$BOOTSTRAP_BIN" \
       --mode "$build_mode" \
       --linker "$CLANG_BIN" \
       "${LLVM_LINK_ARGS[@]}" \
       -o "$output_bin" \
-      src/jiangc.jiang
+      src/compiler/jiangc.jiang
   fi
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
@@ -185,7 +185,7 @@ emit_compiler_with_compiler() {
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
     -o "$output_bin" \
-    src/jiangc.jiang
+    src/compiler/jiangc.jiang
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"

@@ -49,7 +49,7 @@ LLVM module 必须同时设置 target triple 和 target data layout。data layou
 - 默认 linker driver 和 sysroot 发现策略。
 - target 是否有 hosted libc/CRT。
 
-`src/system/startup.jiang` 固定 backend 和 startup object 共享的内部启动符号约定。平台入口可以是
+`src/compiler/system/startup.jiang` 固定 backend 和 startup object 共享的内部启动符号约定。平台入口可以是
 hosted `main(argc, argv)`、no-libc `_start` 或 Wasm/Windows 的专用入口，但语言层入口统一是
 `__jiang_main`。平台入口负责初始化 `__jiang_startup_state`，然后调用 `__jiang_main`。
 `StartupState` 只保存启动瞬间由平台入口交给语言运行时的初始事实；当前包含
@@ -64,14 +64,14 @@ hosted `main(argc, argv)`、no-libc `_start` 或 Wasm/Windows 的专用入口，
 `libc`、`libSystem` 和 POSIX/C ABI 都不是 Jiang 语言语义的一部分。它们只属于 hosted
 compatibility provider：
 
-- `src/system/os/macos.jiang` 是 macOS hosted target provider，可以依赖 libSystem。
-- `src/system/os/linux.jiang` 是 Linux hosted target provider，可以依赖 libc。
-- `src/system/os/macos/libc.jiang` 和 `src/system/os/linux/libc.jiang` 是 hosted C ABI 边界。
-- `src/system/*.jiang` 只 import `./os/provider.jiang`。该文件通过 `comptime` 根据 `build.target`
+- `src/compiler/system/os/macos.jiang` 是 macOS hosted target provider，可以依赖 libSystem。
+- `src/compiler/system/os/linux.jiang` 是 Linux hosted target provider，可以依赖 libc。
+- `src/compiler/system/os/macos/libc.jiang` 和 `src/compiler/system/os/linux/libc.jiang` 是 hosted C ABI 边界。
+- `src/compiler/system/*.jiang` 只 import `./os/provider.jiang`。该文件通过 `comptime` 根据 `build.target`
   选择具体 OS provider；resolver 不再对 system provider 做路径重写。
-- `src/system/os/unsupported.jiang` 保持 type-check/object 输出路径可用；executable 是否支持仍由
+- `src/compiler/system/os/unsupported.jiang` 保持 type-check/object 输出路径可用；executable 是否支持仍由
   target/link plan 诊断决定。
-- 当前不保留可 import 的 `src/system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
+- 当前不保留可 import 的 `src/compiler/system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
   避免把 POSIX 固定成 hosted libc。
 - no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler
   intrinsic、inline asm、Wasm host import 或 target runtime object。inline asm 基础链路已经通过

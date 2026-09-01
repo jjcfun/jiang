@@ -145,15 +145,22 @@ test -s "$PACKAGE_ARCHIVE"
 
 unpack_archive
 test -x "$PACKAGE_DIR/bin/jiangc"
+test -x "$PACKAGE_DIR/bin/jiangdoc"
 check_binary_version "$PACKAGE_DIR/bin/jiangc"
 check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangc"
+"$PACKAGE_DIR/bin/jiangdoc" --help >/dev/null
+check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangdoc"
 
 printf '\n== release smoke: isolated install ==\n'
 PREFIX="$INSTALL_PREFIX" "$PACKAGE_DIR/install.sh" >/dev/null
 test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiangc"
+test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiangdoc"
 test -L "$INSTALL_PREFIX/bin/jiangc"
+test -L "$INSTALL_PREFIX/bin/jiangdoc"
 check_binary_version "$INSTALL_PREFIX/bin/jiangc"
 check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiangc"
+"$INSTALL_PREFIX/bin/jiangdoc" --help >/dev/null
+check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiangdoc"
 compile_and_run_samples "$INSTALL_PREFIX/bin/jiangc"
 
 printf '\nOK release smoke: %s\n' "$PACKAGE_ARCHIVE"

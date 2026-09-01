@@ -67,12 +67,13 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.3 release 把普通 tagged union 迁移为 payload enum，0.5.2 stable 不能直接解析
-release 编译器源码。冷启动因此使用一个最小 `bootstrap/0.5.3` 过渡阶段：
+当前 0.5.3 release 把普通 tagged union 迁移为 payload enum，并在 compiler 源码中使用 builtin
+`#doc`。0.5.2 stable 不能直接解析 release 编译器源码，因此冷启动使用两个最小过渡阶段：
 
 ```text
 0.5.2 stable
   -> bootstrap/0.5.3 next
+  -> bootstrap/0.5.3-api-doc next
   -> release/0.5.3 next
   -> release/0.5.3 stable
 ```
@@ -84,12 +85,21 @@ cd ../bootstrap-0.5.3
 bash ./script/build_next.sh
 ```
 
-再在 release worktree 中用该 next 构建 release next：
+再由该 next 构建支持 builtin `#doc`、但源码尚未使用 `#doc` 的第二阶段：
+
+```bash
+cd ../bootstrap-api-doc-0.5.3
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+bash ./script/build_next.sh
+```
+
+最后在 release worktree 中用第二阶段 next 构建 release next：
 
 ```bash
 cd ../jiang
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
 bash ./script/build_next.sh
 ```
 
@@ -97,7 +107,7 @@ bash ./script/build_next.sh
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
@@ -132,9 +142,17 @@ bash ./script/install_wasi.sh
 DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
 syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
 
-API 文档使用 builtin `#doc` 编写 Markdown，并用 `jiangc --doc path/to/package`
-生成 `build/doc/<package>/index.md`。语法、module 文档和预览方式见
-[语言指南](doc/jiang.md#api-文档)。compiler 只生成 Markdown，不内置 HTML 或浏览器服务。
+API 文档使用 builtin `#doc` 编写 Markdown。先构建独立工具，再生成文档：
+
+```bash
+JIANGC=./build/bin/jiangc.next bash ./script/build_doc.sh
+./build/bin/jiangdoc path/to/package
+./build/bin/jiangdoc --markdown path/to/package
+```
+
+默认入口为 `build/doc/<package>/index.html`；需要 Markdown 页面树时显式传入 `--markdown`。语法、module 文档和
+预览方式见[语言指南](doc/jiang.md#api-文档)。Markdown/HTML renderer 位于 `src/tool/doc`，
+不进入普通 compiler pipeline。
 
 
 

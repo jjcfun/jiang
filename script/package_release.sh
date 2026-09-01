@@ -8,6 +8,7 @@ PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/bin/jiangc}"
+JIANGDOC_BIN="${JIANGDOC_BIN:-$BUILD_DIR/bin/jiangdoc}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -88,8 +89,9 @@ rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
 cp "$ROOT_DIR/package.ini" "$VERSION_DIR/package.ini"
 cp "$ROOT_DIR/package.ini" "$PREFIX/package.ini"
-chmod +x "$VERSION_DIR/bin/jiangc"
+chmod +x "$VERSION_DIR/bin/jiangc" "$VERSION_DIR/bin/jiangdoc"
 ln -sfn "../versions/$VERSION/bin/jiangc" "$PREFIX/bin/jiangc"
+ln -sfn "../versions/$VERSION/bin/jiangdoc" "$PREFIX/bin/jiangdoc"
 
 echo "Installed Jiang $VERSION to $VERSION_DIR"
 echo
@@ -98,6 +100,7 @@ echo "  export PATH=\"$PREFIX/bin:\$PATH\""
 echo
 echo "Test:"
 echo "  jiangc --version"
+echo "  jiangdoc --help"
 INSTALL_SH
   chmod +x "$PACKAGE_DIR/install.sh"
 }
@@ -109,6 +112,7 @@ write_package_readme() {
 
 This package statically links LLVM into \`jiangc\`; users do not need an LLVM runtime.
 A hosted C linker driver named \`cc\` must be available when building executables.
+The package also installs \`jiangdoc\` for static Markdown/HTML API documentation.
 
 Install Jiang:
 
@@ -165,18 +169,23 @@ if [ "$actual_version" != "jiang $VERSION" ]; then
   exit 2
 fi
 
+JIANGC="$JIANGC_BIN" OUTPUT="$JIANGDOC_BIN" bash "$ROOT_DIR/script/build_doc.sh"
+
 rm -rf "$PACKAGE_DIR" "$PACKAGE_ARCHIVE"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiangc"
 cp "$JIANGC_BIN.build-id" "$PACKAGE_DIR/bin/jiangc.build-id"
+cp "$JIANGDOC_BIN" "$PACKAGE_DIR/bin/jiangdoc"
 cp "$ROOT_DIR/package.ini" "$PACKAGE_DIR/package.ini"
 cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
-chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm.sh"
+chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/bin/jiangdoc" "$PACKAGE_DIR/script/install_llvm.sh"
 
 write_install_script
 write_package_readme "$("$LLVM_CONFIG" --version)"
 "$PACKAGE_DIR/bin/jiangc" --version >/dev/null
+"$PACKAGE_DIR/bin/jiangdoc" --help >/dev/null
 check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangc"
+check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangdoc"
 if [ "$TARGET" = "linux-x86_64" ]; then
   bash "$ROOT_DIR/script/linux_release_abi_audit.sh" \
     "$PACKAGE_DIR/bin/jiangc" >"$PACKAGE_DIR/ABI.txt"

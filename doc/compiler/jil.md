@@ -93,17 +93,17 @@ analysis 失效，并在 pass 后复用同一个 verifier。
 阶段入口按职责组织：
 
 ```text
-src/jil.jiang             JIL 阶段稳定入口
-src/jil/model.jiang       数据模型入口
-src/jil/model/            ID、Place、Value、CFG、Program、Store
-src/jil/lower.jiang       Semantic Model -> JIL lowering 入口
-src/jil/lower/            package 入口、body lowering、阶段内模型与共享 support
-src/jil/instance_reader.jiang generic body 的实例读取视图
-src/jil/references.jiang  实例视图中的直接函数引用收集
-src/jil/analysis.jiang    dataflow analysis 入口
-src/jil/analysis/         provenance 与参数属性证明
-src/jil/optimize.jiang    优化编排入口
-src/jil/optimize/         安全尾递归等具体 transform
+src/compiler/jil.jiang             JIL 阶段稳定入口
+src/compiler/jil/model.jiang       数据模型入口
+src/compiler/jil/model/            ID、Place、Value、CFG、Program、Store
+src/compiler/jil/lower.jiang       Semantic Model -> JIL lowering 入口
+src/compiler/jil/lower/            package 入口、body lowering、阶段内模型与共享 support
+src/compiler/jil/instance_reader.jiang generic body 的实例读取视图
+src/compiler/jil/references.jiang  实例视图中的直接函数引用收集
+src/compiler/jil/analysis.jiang    dataflow analysis 入口
+src/compiler/jil/analysis/         provenance 与参数属性证明
+src/compiler/jil/optimize.jiang    优化编排入口
+src/compiler/jil/optimize/         安全尾递归等具体 transform
 ```
 
 `jil.jiang` 和各同名入口文件只提供稳定模块边界；模型、lowering、analysis 和 transform

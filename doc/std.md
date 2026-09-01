@@ -1,6 +1,6 @@
 # 标准库孵化文档
 
-顶层 `std/` 是 Jiang 当前的标准库孵化 package。它还不是完整标准库，主要用于把已经稳定下来的
+`src/std/` 是 Jiang 当前的标准库孵化 package。它还不是完整标准库，主要用于把已经稳定下来的
 系统能力、内建类型别名和基础容器先放到统一入口下，让编译器源码和语言测试以接近最终用户的方式使用。
 
 普通代码优先导入入口 package：
@@ -14,7 +14,7 @@ namespace。
 
 ## 当前入口
 
-`std/std.jiang` 作为入口文件，负责 re-export 当前对外可见的标准库表面：
+`src/std/std.jiang` 作为入口文件，负责 re-export 当前对外可见的标准库表面：
 
 - `fs`：文件读写、metadata、目录创建、复制、替换和删除。
 - `io`：标准输入输出能力。
@@ -136,7 +136,7 @@ compiler 为 provider 生成 host dynamic library wrapper，普通用户代码�
 
 identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节；UTF-8 路径使用 Unicode
 `XID_Start` / `XID_Continue`。压缩 XID 表由 `script/gen_unicode_xid.js` 生成到
-`std/jiang/text/generated/xid.jiang`，当前以 global array 保存，依赖 JIL 对 global array
+`src/std/jiang/text/generated/xid.jiang`，当前以 global array 保存，依赖 JIL 对 global array
 动态下标访问的支持。
 
 ## 稳定性边界
@@ -156,7 +156,8 @@ builtin provider 提供基础能力，但 freestanding runtime、target runtime 
 
 ## Public module hierarchy
 
-用户只依赖下列入口；`std/*.jiang`、`std/collection/*.jiang` 和 `src/system/*` 都不是可导入的稳定路径。
+用户只依赖下列入口；`src/std/*.jiang`、`src/std/collection/*.jiang` 和
+`src/compiler/system/*` 都不是可导入的稳定路径。
 
 | 调用入口 | 角色 | 0.5.3 状态 |
 | --- | --- | --- |

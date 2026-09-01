@@ -85,7 +85,7 @@ code；compiler 根据内建 diagnostic kind 生成 stable code。raw message �
 message catalog。
 
 identifier 判定使用 ASCII fast path 和 Unicode `XID_Start` / `XID_Continue`。压缩表由
-`script/gen_unicode_xid.js` 生成到 `std/jiang/text/generated/xid.jiang`。
+`script/gen_unicode_xid.js` 生成到 `src/std/jiang/text/generated/xid.jiang`。
 
 ## Compiler Boundary
 

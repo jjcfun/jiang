@@ -188,7 +188,7 @@ AST 不进入 Database。`SourceId -> ModuleId` 是 `ResolveStore` 的索引，m
 
 | 位置 | 职责 |
 | --- | --- |
-| `src/db.jiang` | Database 对外模块入口 |
-| `src/db/query_engine.jiang` | `QueryEngine` 与窄 facade |
-| `src/db/query_cache.jiang` | 通用同步 memo 原语 |
-| `src/db/*_query.jiang` 及其他 typed query 文件 | wrapper 与业务求值语义 |
+| `src/compiler/db.jiang` | Database 对外模块入口 |
+| `src/compiler/db/query_engine.jiang` | `QueryEngine` 与窄 facade |
+| `src/compiler/db/query_cache.jiang` | 通用同步 memo 原语 |
+| `src/compiler/db/*_query.jiang` 及其他 typed query 文件 | wrapper 与业务求值语义 |

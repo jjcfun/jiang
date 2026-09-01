@@ -62,7 +62,7 @@ do
 done
 
 printf '== self-host smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
-"$COMPILER_UNDER_TEST" --linker "$clang_bin" "${llvm_link_args[@]}" -o "$compiler_bin" src/jiangc.jiang
+"$COMPILER_UNDER_TEST" --linker "$clang_bin" "${llvm_link_args[@]}" -o "$compiler_bin" src/compiler/jiangc.jiang
 
 if [[ -n "${STAGE2_SELF_HOST_SOURCES:-}" ]]; then
   read -r -a sources <<<"$STAGE2_SELF_HOST_SOURCES"

@@ -1,0 +1,1928 @@
+// 从当前 session 的 Def/Semantic Model facts 构造可落盘 ModuleInterface。
+//
+// Interface 保存 public 语义事实和 private 声明壳。
+//
+// public declaration 需要完整签名，供依赖方继续 type check；private 声明只保存
+// name/kind/owner/visibility，让跨模块访问能稳定报 private_access，而不是退化成
+// unresolved。复杂 type ref 如果暂时不能稳定编码，宁可写成 invalid_type，也不能把
+// session-local TypeId/NodeId 写入 artifact。
+
+import context = "../context.jiang";
+import diagnostic = "../diagnostic.jiang";
+import database = "../db.jiang";
+import sem = "../sema/model.jiang";
+import model_template = "./model_template.jiang";
+import qid = "../id.jiang";
+import qkey = "../incremental/key.jiang";
+import def = "../resolve/def.jiang";
+import diagnostics = "../resolve/diagnostics.jiang";
+import store = "../resolve/store.jiang";
+import source = "../source.jiang";
+import source_map = "../source/source_map.jiang";
+import source_artifact = "./source.jiang";
+import source_fingerprint = "./source_fingerprint.jiang";
+import source_ji = "./source_ji.jiang";
+import comptime_value = "../sema/comptime/value.jiang";
+import string = "../support/string.jiang";
+import list = "../support/list.jiang";
+import std;
+import token = "../syntax/token.jiang";
+
+public Bool store_module_interface(context.CompilerContext&! ctx, qid.ModuleId module_id) {
+    guard build_module_interface(ctx, module_id) is .some(module_interface) else {
+        return false;
+    }
+    source.SourceId source_id = module_interface.source_id;
+    ctx.store.artifacts.store_interface(source_id, module_interface);
+    if (source_ji.source_identity_for_module(ctx, module_id) is .some(identity)) {
+        database.publish_module_interface(
+            ctx.query$.ref(),
+            identity,
+            source_id
+        );
+    }
+    return true;
+}
+
+public source_artifact.ModuleInterface? build_module_interface(
+    context.CompilerContext&! ctx,
+    qid.ModuleId module_id
+) {
+    diagnostic.DiagnosticStore diagnostics_store! = diagnostic.DiagnosticStore();
+    source_artifact.ModuleInterface? result = build_module_interface_into(
+        ctx, diagnostics_store$.mut_ref(), module_id
+    );
+    ctx.store.diagnostics.append(diagnostics_store$.move());
+    return result;
+}
+
+@life()
+source_artifact.ModuleInterface? build_module_interface_into(
+    context.CompilerContext&! ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.ModuleId module_id
+) {
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    store.PackageRecord& package_record = ctx.store.resolve.package_ref(module.package_id);
+    source.SourceInfo& source_record = ctx.store.sources.entry(module.source_id);
+    source_artifact.ModuleInterface module_interface! = source_artifact.ModuleInterface(
+        module.source_id,
+        ctx.store.sources.content_hash(module.source_id),
+        package_record.name,
+        module.path_symbol
+    );
+
+    Bool validate_surface = module_is_package_root(ctx, module);
+    add_public_imports(ctx, module_interface$.mut_ref(), module);
+    add_public_members(
+        ctx,
+        module_interface$.mut_ref(),
+        module_id,
+        module.def_id,
+        validate_surface,
+        diagnostics_store
+    );
+    if (!add_extension_groups(
+        ctx, module_interface$.mut_ref(), module_id, validate_surface, diagnostics_store
+    )) {
+        return null;
+    }
+    module_interface.interface_hash = source_fingerprint.module_interface_fingerprint(
+        ctx,
+        module_interface$.ref()
+    );
+    module_interface.public_interface_hash =
+        source_fingerprint.module_public_interface_fingerprint(ctx, module_interface$.ref());
+    module_interface.public_extension_hash =
+        source_fingerprint.module_public_extension_fingerprint(ctx, module_interface$.ref());
+    return module_interface;
+}
+
+Bool add_extension_groups(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    Int index! = 0;
+    while (index < ctx.store.model.extension_group_len()) {
+        sem.ExtensionGroup& group = ctx.store.model.extension_group_ref(index);
+        if (group.module_id == module_id) {
+            if (!add_extension_group(
+                ctx,
+                module_interface,
+                module_id,
+                group,
+                validate_surface,
+                diagnostics_store
+            )) {
+                return false;
+            }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool add_extension_group(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    sem.ExtensionGroup& group,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    guard ctx.store.incremental.stable_id_for_def(group.target_owner_def)
+        is .some(target_owner) else {
+        return false;
+    }
+    guard ctx.store.incremental.stable_id_for_def(group.binding_owner_def)
+        is .some(binding_owner) else {
+        return false;
+    }
+    if (group.binding_owner_def != group.target_owner_def) {
+        add_public_member(
+            ctx, module_interface, module_id, group.binding_owner_def, false, diagnostics_store
+        );
+    }
+    source_artifact.InterfaceExtensionGroup encoded! =
+        source_artifact.InterfaceExtensionGroup(target_owner, binding_owner, group.public_flag);
+    add_extension_trait_ref(ctx, encoded$.mut_ref(), group);
+    add_extension_where_predicates(ctx, module_interface, encoded$.mut_ref(), group);
+    if (!add_extension_constraints(ctx, encoded$.mut_ref(), group)) { return false; }
+    if (!add_extension_members(
+        ctx,
+        module_interface,
+        module_id,
+        encoded$.mut_ref(),
+        group,
+        validate_surface,
+        diagnostics_store
+    )) {
+        return false;
+    }
+    module_interface.add_extension_group(encoded);
+    return true;
+}
+
+Void add_extension_trait_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceExtensionGroup&! encoded,
+    sem.ExtensionGroup& group
+) {
+    guard group.trait_ref is .some(trait_ref) else { return; }
+    encoded.trait_ref = interface_type_ref(ctx, trait_ref);
+}
+
+Void add_extension_where_predicates(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    source_artifact.InterfaceExtensionGroup&! encoded,
+    sem.ExtensionGroup& group
+) {
+    Int index! = 0;
+    while (index < group.where_predicates.len()) {
+        encoded.where_predicates.add(interface_where_predicate(
+            module_interface,
+            ctx,
+            encoded.binding_owner,
+            group.where_predicates.get(index)
+        ));
+        index = index + 1;
+    }
+}
+
+Bool add_extension_constraints(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceExtensionGroup&! encoded,
+    sem.ExtensionGroup& group
+) {
+    Int index! = 0;
+    while (index < group.generic_constraints.len()) {
+        sem.ExtensionGenericConstraint constraint = group.generic_constraints.get(index);
+        guard ctx.store.incremental.stable_id_for_def(constraint.param_def)
+            is .some(param_stable_id) else {
+            return false;
+        }
+        encoded.generic_constraints.add(source_artifact.InterfaceExtensionConstraint(
+            param_stable_id,
+            interface_type_ref(ctx, constraint.type_ref)
+        ));
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool add_extension_members(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    source_artifact.InterfaceExtensionGroup&! encoded,
+    sem.ExtensionGroup& group,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    Int index! = 0;
+    while (index < group.members.len()) {
+        qid.DefId member_def = group.members.get(index);
+        guard ctx.store.incremental.stable_id_for_def(member_def) is .some(member_stable) else {
+            return false;
+        }
+        add_public_member(
+            ctx,
+            module_interface,
+            module_id,
+            member_def,
+            group.public_flag && validate_surface,
+            diagnostics_store
+        );
+        encoded.members.add(member_stable);
+        index = index + 1;
+    }
+    return true;
+}
+
+Void add_public_imports(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    store.ModuleRecord& module
+) {
+    Int index! = 0;
+    while (index < module.imports.len()) {
+        store.ImportRecord import_record = module.imports.get(index);
+        add_public_import(ctx, module_interface, import_record);
+        index = index + 1;
+    }
+}
+
+Void add_public_import(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    store.ImportRecord import_record
+) {
+    if (import_record.visibility != .public_visibility) {
+        return;
+    }
+    module_interface.add_public_import(source_artifact.ImportSummaryEntry(
+        import_record.kind,
+        import_record.visibility,
+        import_record.flatten,
+        import_record.path_symbol,
+        import_record.alias_symbol
+    ));
+    add_public_import_alias(ctx, module_interface, import_record);
+}
+
+Void add_public_import_alias(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    store.ImportRecord import_record
+) {
+    guard import_record.alias_def is .some(alias_def) else { return; }
+    guard import_record.target_module is .some(target_module) else { return; }
+    store.ModuleRecord& target = ctx.store.resolve.module_ref(target_module);
+    guard ctx.store.incremental.stable_id_for_def(target.def_id) is .some(target_stable_id) else { return; }
+    def.DefRecord alias_record = ctx.store.defs.get(alias_def);
+    module_interface.add_public_alias(source_artifact.AliasExportSummary(
+        alias_record.name.symbol,
+        target_stable_id
+    ));
+}
+
+Void add_public_members(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    qid.DefId owner_def,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    Int member_count = ctx.store.model.def_member_count(owner_def);
+    Int index! = 0;
+    while (index < member_count) {
+        qid.DefId member_def = ctx.store.model.def_member_at(owner_def, index);
+        add_public_member(
+            ctx, module_interface, module_id, member_def, validate_surface, diagnostics_store
+        );
+        index = index + 1;
+    }
+}
+
+Void add_public_member(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    qid.DefId member_def,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    def.DefRecord def_record = ctx.store.defs.get(member_def);
+    guard def_record.module_id is .some(declaring_module) else { return; }
+    if (declaring_module != module_id) { return; }
+    if (!encode_public_member(
+        ctx,
+        module_interface,
+        member_def,
+        def_record,
+        validate_surface,
+        diagnostics_store
+    )) { return; }
+    Bool is_public = def_record.visibility == .public_visibility;
+    add_generic_params(
+        ctx,
+        module_interface,
+        module_id,
+        member_def,
+        is_public && validate_surface,
+        diagnostics_store
+    );
+    if (!is_public && !private_nominal_requires_members(def_record.kind)) { return; }
+    add_public_members(
+        ctx, module_interface, module_id, member_def, validate_surface, diagnostics_store
+    );
+}
+
+Bool encode_public_member(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.DefId member_def,
+    def.DefRecord def_record,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    guard ctx.store.model.def(member_def) is .some(model_def) else { return false; }
+    if (model_def.decl.alias_target != null) {
+        if (def_record.visibility != .public_visibility) { return false; }
+        if (validate_surface) {
+            validate_public_alias_target(ctx, diagnostics_store, member_def, model_def);
+        }
+        add_symbol_alias(ctx, module_interface, def_record, model_def);
+        return false;
+    }
+    guard ctx.store.incremental.stable_id_for_def(member_def) is .some(stable_id) else { return false; }
+    if (module_interface.has_declaration(stable_id)) { return false; }
+    source_artifact.InterfaceDeclSummary summary! = source_artifact.InterfaceDeclSummary(
+        stable_id,
+        def_record.kind,
+        def_record.domain,
+        def_record.visibility,
+        def_record.name.symbol,
+        stable_owner(ctx, def_record.owner_def)
+    );
+    summary.disambiguator = ctx.store.incremental.disambiguator_for_def(member_def);
+    summary.signature_fingerprint = ctx.query.def_signature(
+        stable_id,
+        { [ref ctx, stable_id] =>
+            ctx.store.incremental.signature_fingerprint(stable_id)
+        }
+    );
+    summary.body_fingerprint = ctx.query.def_body(
+        stable_id,
+        { [ref ctx, stable_id] =>
+            ctx.store.incremental.body_fingerprint(stable_id)
+        }
+    );
+    summary.mutable_binding = model_def.decl.mutable_binding;
+    summary.is_const = model_def.decl.is_const;
+    summary.is_failable_init = model_def.decl.is_failable_init;
+    summary.is_external = model_def.decl.is_external;
+    summary.extern_kind = Int(model_def.decl.extern_kind);
+    summary.inline_mode = Int(model_def.decl.inline_mode);
+    summary.naked = model_def.decl.naked;
+    summary.link_symbol = model_def.decl.link_symbol;
+    summary.has_explicit_empty_lifetime_contract = model_def.has_explicit_empty_lifetime_contract;
+    summary.enum_has_payload_variants = model_def.enum_has_payload_variants;
+    module_interface.add_declaration(summary);
+    // private 声明不会成为 public API，但依赖方仍需要它们的类型事实来完成
+    // public nominal 的成员检查和 public generic template 的按需 type check。
+    add_decl_type_ref(ctx, module_interface, stable_id, model_def);
+    add_trait_refs(ctx, module_interface, stable_id, model_def);
+    add_where_predicates(ctx, module_interface, stable_id, model_def);
+    add_lifetime_constraints(ctx, module_interface, stable_id, model_def);
+    add_region_schema(module_interface, stable_id, model_def);
+    add_life_clauses(ctx, module_interface, stable_id, model_def);
+    add_function_signature(ctx, module_interface, stable_id, model_def);
+    Bool field_default_encoded = add_field_default(ctx, module_interface, stable_id, model_def);
+    add_const_value(ctx, module_interface, stable_id, member_def, model_def);
+    Bool is_public = def_record.visibility == .public_visibility;
+    if (is_public && validate_surface) {
+        validate_public_member(ctx, diagnostics_store, member_def, model_def);
+    }
+    Bool generic_template_encoded = add_generic_template(
+        ctx,
+        module_interface,
+        stable_id,
+        model_def
+    );
+    if (!field_default_encoded || !generic_template_encoded) {
+        add_template_encode_error(diagnostics_store);
+    }
+    return true;
+}
+
+Bool private_nominal_requires_members(def.DefKind kind) {
+    if (kind == .struct_def) { return true; }
+    if (kind == .enum_def) { return true; }
+    return kind == .trait_def;
+}
+
+Bool add_field_default(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    guard model_def.decl.field_default is .some(value) else { return true; }
+    UInt8[]& payload = model_template.encode_expression(ctx, model_def, value);
+    if (payload.length == 0) { return false; }
+    module_interface.set_field_default(stable_id, payload);
+    return true;
+}
+
+Void add_generic_params(
+    context.CompilerContext&! ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qid.ModuleId module_id,
+    qid.DefId owner_def,
+    Bool validate_surface,
+    diagnostic.DiagnosticStore&! diagnostics_store
+) {
+    Int index! = 0;
+    while (index < ctx.store.model.def_ref(owner_def).generic_params.len()) {
+        qid.DefId generic_param =
+            ctx.store.model.def_ref(owner_def).generic_params.get(index);
+        add_public_member(
+            ctx,
+            module_interface,
+            module_id,
+            generic_param,
+            validate_surface,
+            diagnostics_store
+        );
+        index = index + 1;
+    }
+}
+
+Bool module_is_package_root(context.CompilerContext& ctx, store.ModuleRecord& module) {
+    store.PackageRecord& package_record = ctx.store.resolve.package_ref(module.package_id);
+    if (module.path_symbol == package_record.root_path) { return true; }
+    UInt8[]& module_path = ctx.store.symbols.text(module.path_symbol);
+    UInt8[]& root_path = ctx.store.symbols.text(package_record.root_path);
+    return string.equal(module_path, root_path);
+}
+
+Void validate_public_member(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId member_def,
+    sem.Def& model_def
+) {
+    validate_public_decl_type_ref(ctx, diagnostics_store, member_def, model_def);
+    validate_public_trait_refs(ctx, diagnostics_store, member_def, model_def);
+    validate_public_where_predicates(ctx, diagnostics_store, member_def, model_def);
+    validate_public_function_signature(ctx, diagnostics_store, member_def, model_def);
+    validate_public_alias_target(ctx, diagnostics_store, member_def, model_def);
+}
+
+Void validate_public_decl_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.Def& model_def
+) {
+    guard model_def.decl.type_ref is .some(type_ref) else { return; }
+    validate_public_type_ref(ctx, diagnostics_store, api_def, type_ref);
+}
+
+Void validate_public_trait_refs(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.trait_refs.len()) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, model_def.trait_refs.get(index));
+        index = index + 1;
+    }
+    index = 0;
+    while (index < model_def.negative_trait_refs.len()) {
+        validate_public_type_ref(
+            ctx, diagnostics_store, api_def, model_def.negative_trait_refs.get(index)
+        );
+        index = index + 1;
+    }
+}
+
+Void validate_public_where_predicates(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.where_predicates.len()) {
+        validate_public_where_predicate(
+            ctx, diagnostics_store, api_def, model_def.where_predicates.get(index)
+        );
+        index = index + 1;
+    }
+}
+
+Void validate_public_where_predicate(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.WherePredicate predicate
+) {
+    if (predicate is .const_type(constraint)) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, constraint.type_ref);
+        return;
+    }
+    if (predicate is .type_bound(bound)) {
+        validate_public_type_bound(ctx, diagnostics_store, api_def, bound);
+        return;
+    }
+    if (predicate is .negative_type_bound(bound)) {
+        validate_public_type_bound(ctx, diagnostics_store, api_def, bound);
+        return;
+    }
+    if (predicate is .equal(equal)) {
+        validate_public_type_equal(ctx, diagnostics_store, api_def, equal);
+        return;
+    }
+    if (predicate is .not_equal(equal)) {
+        validate_public_type_equal(ctx, diagnostics_store, api_def, equal);
+        return;
+    }
+    guard predicate is .projection_equal(projection) else { return; }
+    validate_public_type_ref(ctx, diagnostics_store, api_def, projection.subject);
+    validate_public_type_ref(ctx, diagnostics_store, api_def, projection.trait_ref);
+    validate_public_type_ref(ctx, diagnostics_store, api_def, projection.value);
+}
+
+Void validate_public_type_bound(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.WhereTypeBound bound
+) {
+    validate_public_type_ref(ctx, diagnostics_store, api_def, bound.subject);
+    validate_public_type_ref(ctx, diagnostics_store, api_def, bound.bound);
+}
+
+Void validate_public_type_equal(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.WhereEqual equal
+) {
+    validate_public_type_ref(ctx, diagnostics_store, api_def, equal.subject);
+    validate_public_type_ref(ctx, diagnostics_store, api_def, equal.value);
+}
+
+Void validate_public_function_signature(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.Def& model_def
+) {
+    guard model_def.decl.function_signature is .some(signature) else { return; }
+    validate_public_type_ref(ctx, diagnostics_store, api_def, signature.result);
+    Int index! = 0;
+    while (index < signature.params.length) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, signature.params[index]);
+        index = index + 1;
+    }
+}
+
+Void validate_public_alias_target(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.Def& model_def
+) {
+    guard model_def.decl.alias_target is .some(target_def) else { return; }
+    qid.DefId resolved = resolve_alias_target(ctx, target_def);
+    validate_public_type_def(ctx, diagnostics_store, api_def, resolved);
+    guard resolved.to_index() != api_def.to_index() else { return; }
+    guard ctx.store.model.def(resolved) is .some(target_model) else { return; }
+    validate_public_member(ctx, diagnostics_store, resolved, target_model);
+}
+
+Void validate_public_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.NodeId type_ref
+) {
+    sem.Node node = ctx.store.model.node(type_ref);
+    if (node.data is .named_type_ref(named)) {
+        validate_public_named_type_ref(ctx, diagnostics_store, api_def, named);
+        return;
+    }
+    if (node.data is .trait_companion_type_ref(companion)) {
+        validate_public_type_def(ctx, diagnostics_store, api_def, companion.trait_def);
+        return;
+    }
+    if (node.data is .self_type_ref(self_def)) {
+        validate_public_type_def(ctx, diagnostics_store, api_def, self_def);
+        return;
+    }
+    validate_public_composite_type_ref(ctx, diagnostics_store, api_def, node.data);
+}
+
+Void validate_public_named_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.NamedTypeRef named
+) {
+    if (validate_public_named_trait_companion_type_ref(
+        ctx, diagnostics_store, api_def, named.def_id
+    )) {
+        return;
+    }
+    validate_public_type_def(ctx, diagnostics_store, api_def, named.def_id);
+    Int index! = 0;
+    while (index < named.args.length) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, named.args[index]);
+        index = index + 1;
+    }
+}
+
+Bool validate_public_named_trait_companion_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    qid.DefId def_id
+) {
+    def.DefRecord record = ctx.store.defs.get(def_id);
+    guard record.kind == .trait_companion_type_def else { return false; }
+    guard record.trait_companion is .some(companion) else { return false; }
+    validate_public_type_def(ctx, diagnostics_store, api_def, companion.trait_def);
+    return true;
+}
+
+Void validate_public_composite_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.NodeData data
+) {
+    if (data is .layered_type_ref(layered)) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, layered.element);
+        return;
+    }
+    if (data is .array_type_ref(array)) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, array.element);
+        return;
+    }
+    if (data is .errorable_type_ref(errorable)) {
+        validate_public_errorable_type_ref(ctx, diagnostics_store, api_def, errorable);
+        return;
+    }
+    validate_public_callable_or_tuple_type_ref(ctx, diagnostics_store, api_def, data);
+}
+
+Void validate_public_errorable_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.ErrorableTypeRef errorable
+) {
+    validate_public_type_ref(ctx, diagnostics_store, api_def, errorable.value_type);
+    guard errorable.error_type is .some(error_type) else { return; }
+    validate_public_type_ref(ctx, diagnostics_store, api_def, error_type);
+}
+
+Void validate_public_callable_or_tuple_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.NodeData data
+) {
+    if (data is .function_type_ref(function_type)) {
+        validate_public_function_type_ref(ctx, diagnostics_store, api_def, function_type);
+        return;
+    }
+    guard data is .tuple_type_ref(tuple) else { return; }
+    Int index! = 0;
+    while (index < tuple.items.length) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, tuple.items[index]);
+        index = index + 1;
+    }
+}
+
+Void validate_public_function_type_ref(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    sem.FunctionTypeRef function_type
+) {
+    Int index! = 0;
+    while (index < function_type.params.length) {
+        validate_public_type_ref(ctx, diagnostics_store, api_def, function_type.params[index]);
+        index = index + 1;
+    }
+    validate_public_type_ref(ctx, diagnostics_store, api_def, function_type.result);
+}
+
+Void validate_public_type_def(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    qid.DefId type_def
+) {
+    qid.DefId resolved = resolve_alias_target(ctx, type_def);
+    if (!same_package_def(ctx, api_def, resolved)) { return; }
+    if (type_def_is_scoped_api_local(ctx, resolved)) { return; }
+    if (public_type_has_package_path(ctx, resolved)) { return; }
+    add_unexported_public_type_diagnostic(ctx, diagnostics_store, api_def, resolved);
+}
+
+Bool same_package_def(context.CompilerContext& ctx, qid.DefId lhs, qid.DefId rhs) {
+    guard ctx.store.defs.get(lhs).module_id is .some(lhs_module) else { return false; }
+    guard ctx.store.defs.get(rhs).module_id is .some(rhs_module) else { return false; }
+    store.ModuleRecord& lhs_record = ctx.store.resolve.module_ref(lhs_module);
+    store.ModuleRecord& rhs_record = ctx.store.resolve.module_ref(rhs_module);
+    store.PackageRecord& package_record = ctx.store.resolve.package_ref(lhs_record.package_id);
+    if (package_record.kind == .core) { return false; }
+    if (ctx.store.symbols.text(package_record.name) == "__main_package") { return false; }
+    if (ctx.store.symbols.text(package_record.name) == "jiang") { return false; }
+    return lhs_record.package_id.to_index() == rhs_record.package_id.to_index();
+}
+
+Bool type_def_is_scoped_api_local(context.CompilerContext& ctx, qid.DefId type_def) {
+    def.DefRecord record = ctx.store.defs.get(type_def);
+    if (record.kind == .generic_param_def) { return true; }
+    if (def_source_is_compiler_core(ctx, type_def)) { return true; }
+    return record.kind == .associated_type_def;
+}
+
+Bool def_source_is_compiler_core(context.CompilerContext& ctx, qid.DefId def_id) {
+    guard ctx.store.source_map.def_span(def_id) is .some(loc) else { return false; }
+    guard loc.source_id is .some(source_id) else { return false; }
+    source.SourceInfo& record = ctx.store.sources.entry(source_id);
+    return contains_bytes(record.name(), "src/compiler/core/");
+}
+
+Bool contains_bytes(UInt8[]& text, UInt8[]& pattern) {
+    if (pattern.length == 0) { return true; }
+    if (text.length < pattern.length) { return false; }
+    Int index! = 0;
+    while (index + pattern.length <= text.length) {
+        if (bytes_at(text, pattern, index)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool bytes_at(UInt8[]& text, UInt8[]& pattern, Int offset) {
+    Int index! = 0;
+    while (index < pattern.length) {
+        if (text[offset + index] != pattern[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool public_type_has_package_path(context.CompilerContext& ctx, qid.DefId type_def) {
+    if (public_nested_type_has_owner_path(ctx, type_def)) { return true; }
+    guard ctx.store.defs.get(type_def).module_id is .some(module_id) else { return true; }
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    guard root_module_for_package(ctx, module.package_id) is .some(root_module) else { return true; }
+    if (module_exports_type(ctx, root_module, type_def)) { return true; }
+    return public_import_exports_type(ctx, root_module, type_def);
+}
+
+Bool public_nested_type_has_owner_path(context.CompilerContext& ctx, qid.DefId type_def) {
+    def.DefRecord record = ctx.store.defs.get(type_def);
+    if (record.visibility != .public_visibility) { return false; }
+    guard record.owner_def is .some(owner_def) else { return false; }
+    if (ctx.store.defs.get(owner_def).kind == .module_def) { return false; }
+    return public_type_has_package_path(ctx, owner_def);
+}
+
+qid.ModuleId? root_module_for_package(context.CompilerContext& ctx, qid.PackageId package_id) {
+    store.PackageRecord& package_record = ctx.store.resolve.package_ref(package_id);
+    Int index! = 0;
+    while (index < package_record.modules.len()) {
+        qid.ModuleId module_id = package_record.modules.get(index);
+        store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+        if (module.path_symbol == package_record.root_path) { return module_id; }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool public_import_exports_type(context.CompilerContext& ctx, qid.ModuleId root_module, qid.DefId type_def) {
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(root_module);
+    Int index! = 0;
+    while (index < module.imports.len()) {
+        if (public_import_at_exports_type(ctx, module.imports.get(index), type_def)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool public_import_at_exports_type(context.CompilerContext& ctx, store.ImportRecord import_record, qid.DefId type_def) {
+    if (import_record.visibility != .public_visibility) { return false; }
+    guard import_record.target_module is .some(target_module) else { return false; }
+    return module_exports_type(ctx, target_module, type_def);
+}
+
+Bool module_exports_type(context.CompilerContext& ctx, qid.ModuleId module_id, qid.DefId type_def) {
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    guard ctx.store.model.def(module.def_id) is .some(module_model) else { return false; }
+    Int index! = 0;
+    while (index < module_model.members.len()) {
+        if (public_member_exports_type(ctx, module_model.members.get(index), type_def)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool public_member_exports_type(context.CompilerContext& ctx, qid.DefId member_def, qid.DefId type_def) {
+    def.DefRecord member = ctx.store.defs.get(member_def);
+    if (member.visibility != .public_visibility) { return false; }
+    if (member_def.to_index() == type_def.to_index()) { return true; }
+    guard member.kind == .alias_def else { return false; }
+    guard ctx.store.model.def(member_def) is .some(model_def) else { return false; }
+    guard model_def.decl.alias_target is .some(target_def) else { return false; }
+    qid.DefId target = resolve_alias_target(ctx, target_def);
+    return target.to_index() == type_def.to_index();
+}
+
+qid.DefId resolve_alias_target(context.CompilerContext& ctx, qid.DefId def_id) {
+    qid.DefId current! = def_id;
+    Int depth! = 0;
+    while (depth < 64) {
+        if (ctx.store.defs.get(current).kind != .alias_def) { return current; }
+        guard ctx.store.model.def(current) is .some(model_def) else { return current; }
+        guard model_def.decl.alias_target is .some(target_def) else { return current; }
+        current = target_def;
+        depth = depth + 1;
+    }
+    return current;
+}
+
+Void add_unexported_public_type_diagnostic(
+    context.CompilerContext& ctx,
+    diagnostic.DiagnosticStore&! diagnostics_store,
+    qid.DefId api_def,
+    qid.DefId type_def
+) {
+    source_map.SourceLoc loc = public_api_diag_loc(ctx, api_def, type_def);
+    guard loc.source_id is .some(source_id) else { return; }
+    std.String message = unexported_public_type_message(ctx, type_def);
+    diagnostics.add_error(
+        diagnostics_store,
+        source_id,
+        loc.span,
+        message.bytes(),
+        "public_api_unexported_type"
+    );
+}
+
+source_map.SourceLoc public_api_diag_loc(context.CompilerContext& ctx, qid.DefId api_def, qid.DefId type_def) {
+    if (ctx.store.source_map.def_span(api_def) is .some(loc)) { return loc; }
+    if (ctx.store.source_map.def_span(type_def) is .some(loc)) { return loc; }
+    return source_map.SourceLoc(token.Span());
+}
+
+std.String unexported_public_type_message(context.CompilerContext& ctx, qid.DefId type_def) {
+    def.DefRecord record = ctx.store.defs.get(type_def);
+    UInt8[]& name = ctx.store.symbols.text(record.name.symbol);
+    std.StringBuilder builder! = std.StringBuilder();
+    builder.append("public API exposes type that is not exported from package root: ");
+    builder.append_valid_utf8(name);
+    return builder.into_string();
+}
+
+Void add_const_value(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    qid.DefId def_id,
+    sem.Def& model_def
+) {
+    if (model_def.decl.kind != .global_decl || !model_def.decl.is_const) {
+        return;
+    }
+    if (ctx.store.comptime_store.const_value(def_id) is .some(value)) {
+        module_interface.set_const_value(stable_id, interface_const_value(ctx, value));
+    }
+}
+
+@life()
+source_artifact.InterfaceConstValue interface_const_value(
+    context.CompilerContext& ctx,
+    comptime_value.ComptimeValue value
+) {
+    if (value.data is .unit_value) {
+        return source_artifact.InterfaceConstValue(data: .unit_value());
+    }
+    if (value.data is .bool_value(bool_value)) {
+        return source_artifact.InterfaceConstValue(data: .bool_value(bool_value));
+    }
+    if (value.data is .int_value(int_value)) {
+        return source_artifact.InterfaceConstValue(data: .int_value(int_value));
+    }
+    if (value.data is .uint_value(uint_value)) {
+        return source_artifact.InterfaceConstValue(data: .uint_value(uint_value));
+    }
+    if (value.data is .char_value(char_value)) {
+        return source_artifact.InterfaceConstValue(data: .char_value(char_value));
+    }
+    if (value.data is .float_bits(float_bits)) {
+        return source_artifact.InterfaceConstValue(data: .float_bits(float_bits));
+    }
+    if (value.data is .string_value(string_value)) {
+        return source_artifact.InterfaceConstValue(data: .string_value(string_value));
+    }
+    if (value.data is .symbol_value(symbol_value)) {
+        return source_artifact.InterfaceConstValue(data: .symbol_value(symbol_value));
+    }
+    if (value.data is .enum_case_value(case_def)) {
+        guard ctx.store.incremental.stable_id_for_def(case_def) is .some(stable_id) else {
+            return source_artifact.InterfaceConstValue(data: .invalid());
+        }
+        return source_artifact.InterfaceConstValue(data: .enum_case_value(stable_id));
+    }
+    if (value.data is .struct_value(aggregate)) {
+        return source_artifact.InterfaceConstValue(
+            data: .struct_value(interface_const_fields(ctx, aggregate))
+        );
+    }
+    if (value.data is .tuple_value(aggregate)) {
+        return source_artifact.InterfaceConstValue(
+            data: .tuple_value(interface_const_values(ctx, aggregate))
+        );
+    }
+    if (value.data is .array_value(aggregate)) {
+        return source_artifact.InterfaceConstValue(
+            data: .array_value(interface_const_values(ctx, aggregate))
+        );
+    }
+    return source_artifact.InterfaceConstValue(data: .invalid());
+}
+
+@life()
+source_artifact.InterfaceConstFieldValue[]& interface_const_fields(
+    context.CompilerContext& ctx,
+    comptime_value.ComptimeAggregateId aggregate
+) {
+    unsafe {
+        Int count = ctx.store.comptime_store.field_count(aggregate);
+        source_artifact.InterfaceConstFieldValue*! values = unsafe {
+            source_artifact.InterfaceConstFieldValue$.alloc(count)
+        };
+        Int index! = 0;
+        while (index < count) {
+            comptime_value.ComptimeAggregateField field =
+                ctx.store.comptime_store.field_at(aggregate, index);
+            qkey.StableSymbolId stable_id! = qkey.StableSymbolId(0, 0);
+            if (ctx.store.incremental.stable_id_for_def(field.field_def) is .some(field_stable_id)) {
+                stable_id = field_stable_id;
+            }
+            values[index] = source_artifact.InterfaceConstFieldValue(
+                field_stable_id: stable_id,
+                value: interface_const_value(ctx, field.value)
+            );
+            index = index + 1;
+        }
+        return values[0..count];
+    }
+}
+
+@life()
+source_artifact.InterfaceConstValue[]& interface_const_values(
+    context.CompilerContext& ctx,
+    comptime_value.ComptimeAggregateId aggregate
+) {
+    unsafe {
+        Int count = ctx.store.comptime_store.item_count(aggregate);
+        source_artifact.InterfaceConstValue*! values = unsafe {
+            source_artifact.InterfaceConstValue$.alloc(count)
+        };
+        Int index! = 0;
+        while (index < count) {
+            comptime_value.ComptimeValue item = ctx.store.comptime_store.item_at(aggregate, index);
+            values[index] = interface_const_value(ctx, item);
+            index = index + 1;
+        }
+        return values[0..count];
+    }
+}
+
+
+Void add_symbol_alias(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    def.DefRecord def_record,
+    sem.Def& model_def
+) {
+    guard model_def.decl.alias_target is .some(target_def) else { return; }
+    qid.DefId resolved_target = resolve_alias_target(ctx, target_def);
+    guard ctx.store.incremental.stable_id_for_def(resolved_target) is .some(target_stable_id) else { return; }
+    module_interface.add_public_alias(source_artifact.AliasExportSummary(
+        def_record.name.symbol,
+        target_stable_id
+    ));
+}
+
+qkey.StableSymbolId? stable_owner(context.CompilerContext& ctx, qid.DefId? owner_def) {
+    guard owner_def is .some(owner) else { return null; }
+    return ctx.store.incremental.stable_id_for_def(owner);
+}
+
+Void add_decl_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    guard model_def.decl.type_ref is .some(type_ref) else { return; }
+    module_interface.set_decl_type_ref(stable_id, interface_type_ref(ctx, type_ref));
+}
+
+Void add_trait_refs(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.trait_refs.len()) {
+        sem.NodeId trait_ref = model_def.trait_refs.get(index);
+        module_interface.add_trait_ref(stable_id, interface_type_ref(ctx, trait_ref));
+        index = index + 1;
+    }
+    index = 0;
+    while (index < model_def.negative_trait_refs.len()) {
+        module_interface.add_negative_trait_ref(
+            stable_id,
+            interface_type_ref(ctx, model_def.negative_trait_refs.get(index))
+        );
+        index = index + 1;
+    }
+}
+
+Void add_where_predicates(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.where_predicates.len()) {
+        module_interface.add_where_predicate(
+            stable_id,
+            interface_where_predicate(
+                module_interface,
+                ctx,
+                stable_id,
+                model_def.where_predicates.get(index)
+            )
+        );
+        index = index + 1;
+    }
+}
+
+source_artifact.InterfaceWherePredicate interface_where_predicate(
+    source_artifact.ModuleInterface&! module_interface,
+    context.CompilerContext& ctx,
+    qkey.StableSymbolId stable_id,
+    sem.WherePredicate predicate
+) {
+    if (predicate is .const_type(constraint)) {
+        return interface_where_predicate_parts(
+            module_interface,
+            .const_type,
+            const_constraint_subject_type_ref(ctx, constraint.param_def),
+            interface_type_ref(ctx, constraint.type_ref),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+    }
+    if (predicate is .type_bound(bound)) {
+        return interface_type_bound(module_interface, ctx, .type_bound, bound);
+    }
+    if (predicate is .negative_type_bound(bound)) {
+        return interface_type_bound(module_interface, ctx, .negative_type_bound, bound);
+    }
+    if (predicate is .equal(equal)) {
+        return interface_where_predicate_parts(
+            module_interface,
+            .type_equal,
+            interface_type_ref(ctx, equal.subject),
+            interface_type_ref(ctx, equal.value),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+    }
+    if (predicate is .not_equal(equal)) {
+        return interface_where_predicate_parts(
+            module_interface,
+            .type_not_equal,
+            interface_type_ref(ctx, equal.subject),
+            interface_type_ref(ctx, equal.value),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+    }
+    guard predicate is .projection_equal(projection) else {
+        return interface_where_predicate_parts(
+            module_interface,
+            .type_bound,
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+    }
+    return interface_where_predicate_parts(
+        module_interface,
+        .projection_equal,
+        interface_type_ref(ctx, projection.subject),
+        interface_projection_value_ref(ctx, stable_id, projection),
+        interface_type_ref(ctx, projection.trait_ref),
+        projection.assoc_symbol
+    );
+}
+
+source_artifact.InterfaceTypeRef interface_projection_value_ref(
+    context.CompilerContext& ctx,
+    qkey.StableSymbolId owner_stable_id,
+    sem.WhereProjectionEqual projection
+) {
+    guard ctx.store.incremental.current_def_for_stable(owner_stable_id) is .some(owner_def) else {
+        return interface_type_ref(ctx, projection.value);
+    }
+    sem.Def& owner = ctx.store.model.def_ref(owner_def);
+    Int index! = 0;
+    while (index < owner.members.len()) {
+        qid.DefId member_def = owner.members.get(index);
+        def.DefRecord member = ctx.store.defs.get(member_def);
+        if (associated_member_matches(ctx, member, projection.assoc_symbol)) {
+            if (ctx.store.comptime_store.const_value(member_def) is .some(value)) {
+                return interface_const_expression_ref(ctx, value);
+            }
+        }
+        index = index + 1;
+    }
+    return interface_type_ref(ctx, projection.value);
+}
+
+Bool associated_member_matches(
+    context.CompilerContext& ctx,
+    def.DefRecord member,
+    qid.SymbolId assoc_symbol
+) {
+    guard member.associated_trait_member is .some(trait_member) else { return false; }
+    return ctx.store.defs.get(trait_member).name.symbol == assoc_symbol;
+}
+
+source_artifact.InterfaceTypeRef interface_const_expression_ref(
+    context.CompilerContext& ctx,
+    comptime_value.ComptimeValue value
+) {
+    source_artifact.InterfaceTypeRef result! = source_artifact.InterfaceTypeRef.invalid_type();
+    reset_interface_type_ref(result$.mut_ref(), 10);
+    if (value.data is .enum_case_value(case_def)) {
+        fill_interface_def_ref(ctx, result$.mut_ref(), case_def);
+        return result;
+    }
+    if (value.data is .int_value(int_value)) {
+        set_interface_int_expression(result$.mut_ref(), UInt64(int_value), true);
+        return result;
+    }
+    if (value.data is .uint_value(uint_value)) {
+        set_interface_int_expression(result$.mut_ref(), uint_value, false);
+        return result;
+    }
+    if (value.data is .bool_value(bool_value)) {
+        result.count_kind = 3;
+        result.count_value = if (bool_value) { 1 } else { 0 };
+        return result;
+    }
+    if (value.data is .char_value(char_value)) {
+        result.count_kind = 5;
+        result.count_value = char_value;
+        return result;
+    }
+    if (value.data is .float_bits(float_bits)) {
+        result.count_kind = 2;
+        result.count_value = float_bits;
+        return result;
+    }
+    if (value.data is .string_value(symbol)) {
+        result.count_kind = 4;
+        result.add_contract_name(ctx.store.symbols.text(symbol));
+        return result;
+    }
+    if (value.data is .unit_value) { result.count_kind = 7; return result; }
+    return source_artifact.InterfaceTypeRef.invalid_type();
+}
+
+Void set_interface_int_expression(
+    source_artifact.InterfaceTypeRef&! result,
+    UInt64 bits,
+    Bool signed_value
+) {
+    result.count_kind = 1;
+    result.count_value = bits;
+    result.sentinel_kind = if (signed_value) { 1 } else { 0 };
+}
+
+source_artifact.InterfaceTypeRef const_constraint_subject_type_ref(
+    context.CompilerContext& ctx,
+    qid.DefId param_def
+) {
+    guard ctx.store.incremental.stable_id_for_def(param_def) is .some(stable_id) else {
+        return source_artifact.InterfaceTypeRef.invalid_type();
+    }
+    return source_artifact.InterfaceTypeRef.named_type(stable_id.low, stable_id.high);
+}
+
+source_artifact.InterfaceWherePredicate interface_type_bound(
+    source_artifact.ModuleInterface&! module_interface,
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceWherePredicateKind kind,
+    sem.WhereTypeBound bound
+) {
+    return interface_where_predicate_parts(
+        module_interface,
+        kind,
+        interface_type_ref(ctx, bound.subject),
+        interface_type_ref(ctx, bound.bound),
+        source_artifact.InterfaceTypeRef.invalid_type(),
+        null
+    );
+}
+
+source_artifact.InterfaceWherePredicate interface_where_predicate_parts(
+    source_artifact.ModuleInterface&! module_interface,
+    source_artifact.InterfaceWherePredicateKind kind,
+    source_artifact.InterfaceTypeRef subject,
+    source_artifact.InterfaceTypeRef bound_or_value,
+    source_artifact.InterfaceTypeRef trait_ref,
+    qid.SymbolId? assoc_symbol
+) {
+    source_artifact.InterfaceWherePredicate result! =
+        source_artifact.InterfaceWherePredicate(kind);
+    result.subject_index = module_interface.add_where_type_ref(subject);
+    result.bound_or_value_index = module_interface.add_where_type_ref(bound_or_value);
+    result.trait_ref_index = module_interface.add_where_type_ref(trait_ref);
+    result.assoc_symbol = assoc_symbol;
+    return result;
+}
+
+Void add_lifetime_constraints(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.lifetime_constraints.len()) {
+        sem.LifetimeConstraint constraint = model_def.lifetime_constraints.get(index);
+        module_interface.add_lifetime_constraint(source_artifact.InterfaceLifetimeConstraint(
+            stable_id,
+            interface_lifetime_name(ctx, module_interface, constraint.longer),
+            interface_lifetime_name(ctx, module_interface, constraint.shorter),
+            Int(constraint.relation)
+        ));
+        index = index + 1;
+    }
+}
+
+Void add_region_schema(
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.region_params.len()) {
+        sem.RegionParam param = model_def.region_params.get(index);
+        module_interface.add_region_name(source_artifact.InterfaceRegionName (
+            owner_stable_id: stable_id,
+            symbol: param.name,
+            shape_source: param.shape_source,
+            default_source: param.default_source
+        ));
+        index = index + 1;
+    }
+    index = 0;
+    while (index < model_def.region_constraints.len()) {
+        sem.RegionConstraint constraint = model_def.region_constraints.get(index);
+        module_interface.add_region_constraint(source_artifact.InterfaceRegionConstraint (
+            owner_stable_id: stable_id,
+            target: constraint.target,
+            source: constraint.source
+        ));
+        index = index + 1;
+    }
+}
+
+Void add_life_clauses(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    Int index! = 0;
+    while (index < model_def.life_clauses.len()) {
+        sem.LifeClause clause = model_def.life_clauses.get(index);
+        source_artifact.InterfaceLifetimeName? target! = null;
+        if (clause.target is .some(target_name)) {
+            target = interface_lifetime_name(ctx, module_interface, target_name);
+        }
+        Int source_expression! = 0;
+        if (clause.source_expression is .some(expression)) {
+            source_expression = interface_lifetime_expression(
+                ctx,
+                module_interface,
+                expression
+            );
+        }
+        module_interface.add_life_clause(source_artifact.InterfaceLifeClause (
+            owner_stable_id: stable_id,
+            target: target,
+            source: interface_lifetime_name(ctx, module_interface, clause.source),
+            source_expression: source_expression
+        ));
+        index = index + 1;
+    }
+}
+
+Int interface_lifetime_expression(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    sem.LifetimeExpressionId expression_id
+) {
+    sem.LifetimeExpression expression =
+        ctx.store.model.lifetime_expression(expression_id);
+    if (expression.data is .empty) {
+        return module_interface.add_lifetime_expression(
+            source_artifact.InterfaceLifetimeExpression (
+                kind: 3,
+                name: source_artifact.InterfaceLifetimeName(0, null),
+                left: 0,
+                right: 0
+            )
+        );
+    }
+    if (expression.data is .name(name)) {
+        return module_interface.add_lifetime_expression(
+            source_artifact.InterfaceLifetimeExpression (
+                kind: 0,
+                name: interface_lifetime_name(ctx, module_interface, name),
+                left: 0,
+                right: 0
+            )
+        );
+    }
+    sem.LifetimeExpressionBinary binary!;
+    Int kind! = 1;
+    if (expression.data is .product(product)) {
+        binary = product;
+    } else {
+        guard expression.data is .meet(meet) else { return 0; }
+        binary = meet;
+        kind = 2;
+    }
+    Int left = interface_lifetime_expression(ctx, module_interface, binary.left);
+    Int right = interface_lifetime_expression(ctx, module_interface, binary.right);
+    return module_interface.add_lifetime_expression(
+        source_artifact.InterfaceLifetimeExpression (
+            kind: kind,
+            name: source_artifact.InterfaceLifetimeName(0, null),
+            left: left,
+            right: right
+        )
+    );
+}
+
+source_artifact.InterfaceLifetimeName interface_lifetime_name(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    sem.LifetimeName name
+) {
+    Int projection_path! = 0;
+    if (name.projection_path is .some(path_id)) {
+        projection_path = interface_lifetime_path(ctx, module_interface, path_id);
+    }
+    return source_artifact.InterfaceLifetimeName(
+        Int(name.kind),
+        name.symbol,
+        projection_path
+    );
+}
+
+Int interface_lifetime_path(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    sem.LifetimePathId path_id
+) {
+    sem.LifetimePathNode node = ctx.store.model.lifetime_path_node(path_id);
+    Int parent! = 0;
+    if (node.parent is .some(parent_id)) {
+        parent = interface_lifetime_path(ctx, module_interface, parent_id);
+    }
+    return module_interface.add_lifetime_path_node(source_artifact.InterfaceLifetimePathNode (
+        parent: parent,
+        kind: Int(node.projection.kind),
+        symbol: node.projection.symbol,
+        field_stable_id: interface_lifetime_field_stable_id(ctx, node.projection),
+        tuple_index: node.projection.tuple_index
+    ));
+}
+
+qkey.StableSymbolId? interface_lifetime_field_stable_id(
+    context.CompilerContext& ctx,
+    sem.LifetimeProjection projection
+) {
+    guard projection.field_def is .some(field_def) else { return null; }
+    return ctx.store.incremental.stable_id_for_def(field_def);
+}
+
+Void add_function_signature(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    guard model_def.decl.function_signature is .some(signature) else { return; }
+    source_artifact.InterfaceFunctionSignature iface_signature! =
+        source_artifact.InterfaceFunctionSignature.empty(signature.has_receiver);
+    iface_signature.receiver_mode = Int(signature.receiver_mode);
+    set_interface_signature_effects(ctx, iface_signature$.mut_ref(), signature.effects);
+    Int exclusive_index! = 0;
+    while (exclusive_index < signature.exclusive_symbols.length) {
+        iface_signature.exclusive_symbols.add(signature.exclusive_symbols[exclusive_index]);
+        exclusive_index = exclusive_index + 1;
+    }
+    source_artifact.InterfaceTypeRef result_ref! = source_artifact.InterfaceTypeRef.invalid_type();
+    fill_interface_type_ref(ctx, result_ref$.mut_ref(), signature.result);
+    iface_signature.set_result_ref(result_ref$.ref());
+    Int index! = 0;
+    while (index < signature.params.length) {
+        iface_signature.add_param(source_artifact.InterfaceParamSummary(
+            signature.param_symbols[index],
+            interface_type_ref(ctx, signature.params[index])
+        ));
+        index = index + 1;
+    }
+    add_param_defaults(ctx, iface_signature$.mut_ref(), signature);
+    module_interface.set_function_signature(stable_id, iface_signature);
+}
+
+Void fill_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.NodeId type_ref
+) {
+    sem.Node node = ctx.store.model.node(type_ref);
+    if (node.data is .unit_type_ref) {
+        reset_interface_type_ref(result, 1);
+        return;
+    }
+    if (node.data is .named_type_ref(named)) {
+        fill_named_interface_type_ref(ctx, result, named);
+        return;
+    }
+    if (node.data is .name_ref(name_ref)) {
+        if (name_ref is .def_ref(def_id)) {
+            fill_interface_def_ref(ctx, result, def_id);
+            return;
+        }
+    }
+    if (node.data is .member_access(_)) {
+        if (ctx.store.typeck.member_selection(type_ref) is .some(def_id)) {
+            fill_interface_def_ref(ctx, result, def_id);
+            return;
+        }
+    }
+    if (node.data is .literal(literal)) {
+        fill_interface_literal_ref(ctx, result, literal);
+        return;
+    }
+    if (node.data is .trait_companion_type_ref(companion)) {
+        fill_trait_companion_interface_type_ref(ctx, result, companion);
+        return;
+    }
+    if (node.data is .self_type_ref(self_def)) {
+        fill_self_interface_type_ref(ctx, result, self_def);
+        return;
+    }
+    if (node.data is .layered_type_ref(layered)) {
+        reset_interface_type_ref(result, 3);
+        result.count_kind = Int(layered.kind);
+        result.sentinel_kind = Int(layered.sentinel_kind);
+        result.sentinel_value = layered.sentinel_value;
+        add_interface_type_ref_arg(ctx, result, layered.element);
+        add_interface_sentinel_name(ctx, result, layered.sentinel_kind, layered.sentinel_value);
+        return;
+    }
+    if (node.data is .array_type_ref(array)) {
+        reset_interface_type_ref(result, 4);
+        result.count_kind = Int(array.count_kind);
+        result.count_value = array.count_value;
+        result.sentinel_kind = Int(array.sentinel_kind);
+        result.sentinel_value = array.sentinel_value;
+        add_interface_type_ref_arg(ctx, result, array.element);
+        if (array.count_kind == .const_name) {
+            result.add_contract_name(ctx.store.symbols.text(qid.SymbolId(Int(array.count_value))));
+        }
+        add_interface_sentinel_name(ctx, result, array.sentinel_kind, array.sentinel_value);
+        return;
+    }
+    if (node.data is .errorable_type_ref(errorable)) {
+        reset_interface_type_ref(result, 5);
+        add_interface_type_ref_arg(ctx, result, errorable.value_type);
+        if (errorable.error_type is .some(error_ref)) {
+            add_interface_type_ref_arg(ctx, result, error_ref);
+        }
+        return;
+    }
+    if (node.data is .function_type_ref(function_type)) {
+        reset_interface_type_ref(result, 6);
+        set_interface_type_ref_effects(ctx, result, function_type.effects);
+        Int index! = 0;
+        while (index < function_type.params.length) {
+            add_interface_type_ref_arg(ctx, result, function_type.params[index]);
+            index = index + 1;
+        }
+        add_interface_type_ref_arg(ctx, result, function_type.result);
+        return;
+    }
+    if (node.data is .effect_type_ref(effect_type)) {
+        reset_interface_type_ref(result, 11);
+        set_interface_type_ref_effects(ctx, result, effect_type.effects);
+        add_interface_type_ref_arg(ctx, result, effect_type.base);
+        return;
+    }
+    if (node.data is .tuple_type_ref(tuple)) {
+        reset_interface_type_ref(result, 7);
+        Int index! = 0;
+        while (index < tuple.items.length) {
+            add_interface_type_ref_arg(ctx, result, tuple.items[index]);
+            index = index + 1;
+        }
+        add_type_contract_names(ctx, result, tuple.contract_names);
+        return;
+    }
+    if (node.data is .infer_type_ref) {
+        reset_interface_type_ref(result, 8);
+        return;
+    }
+    reset_interface_type_ref(result, 0);
+}
+
+Void add_interface_sentinel_name(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.SentinelKind kind,
+    UInt64 value
+) {
+    if (kind != .const_name) { return; }
+    result.add_contract_name(ctx.store.symbols.text(qid.SymbolId(Int(value))));
+}
+
+Void fill_interface_def_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    qid.DefId def_id
+) {
+    guard ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id) else {
+        reset_interface_type_ref(result, 0);
+        return;
+    }
+    reset_interface_type_ref(result, 2);
+    result.has_stable_def = true;
+    result.stable_def_low = stable_id.low;
+    result.stable_def_high = stable_id.high;
+}
+
+Void fill_interface_literal_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.Literal literal
+) {
+    reset_interface_type_ref(result, 10);
+    if (literal.value is .int_value(value)) {
+        result.count_kind = 1;
+        result.count_value = value.bits;
+        result.sentinel_kind = if (value.signed_value) { 1 } else { 0 };
+        return;
+    }
+    if (literal.value is .float_value(value)) {
+        result.count_kind = 2;
+        result.count_value = float64_interface_bits(value.value);
+        return;
+    }
+    if (literal.value is .bool_value(value)) {
+        result.count_kind = 3;
+        result.count_value = if (value) { 1 } else { 0 };
+        return;
+    }
+    if (literal.value is .string_value(symbol)) {
+        result.count_kind = 4;
+        result.add_contract_name(ctx.store.symbols.text(symbol));
+        return;
+    }
+    if (literal.value is .char_value(value)) {
+        result.count_kind = 5;
+        result.count_value = UInt64(value);
+        return;
+    }
+    if (literal.value is .null_value) { result.count_kind = 6; return; }
+    if (literal.value is .unit_value) { result.count_kind = 7; return; }
+    reset_interface_type_ref(result, 0);
+}
+
+UInt64 float64_interface_bits(Float64 value) {
+    unsafe {
+        return value$.ptr()$.as(UInt64*)$.get();
+    }
+}
+
+Void reset_interface_type_ref(source_artifact.InterfaceTypeRef&! result, Int kind_tag) {
+    result.kind_tag = kind_tag;
+    result.has_stable_def = false;
+    result.stable_def_low = 0;
+    result.stable_def_high = 0;
+    result.count_kind = 0;
+    result.count_value = 0;
+    result.sentinel_kind = 0;
+    result.sentinel_value = 0;
+    result.args.clear();
+    result.contract_names.clear();
+}
+
+Void fill_trait_companion_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.TraitCompanionTypeRef companion
+) {
+    guard ctx.store.incremental.stable_id_for_def(companion.trait_def) is .some(stable_id) else {
+        reset_interface_type_ref(result, 0);
+        return;
+    }
+    reset_interface_type_ref(result, 9);
+    result.has_stable_def = true;
+    result.stable_def_low = stable_id.low;
+    result.stable_def_high = stable_id.high;
+    result.count_kind = Int(companion.kind);
+}
+
+Void fill_self_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    qid.DefId self_def
+) {
+    guard ctx.store.incremental.stable_id_for_def(self_def) is .some(stable_id) else {
+        reset_interface_type_ref(result, 0);
+        return;
+    }
+    reset_interface_type_ref(result, 12);
+    result.has_stable_def = true;
+    result.stable_def_low = stable_id.low;
+    result.stable_def_high = stable_id.high;
+}
+
+Void fill_named_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.NamedTypeRef named
+) {
+    if (fill_named_trait_companion_interface_type_ref(ctx, result, named.def_id)) {
+        return;
+    }
+    guard ctx.store.incremental.stable_id_for_def(named.def_id) is .some(stable_id) else {
+        reset_interface_type_ref(result, 0);
+        return;
+    }
+    reset_interface_type_ref(result, 2);
+    result.has_stable_def = true;
+    result.stable_def_low = stable_id.low;
+    result.stable_def_high = stable_id.high;
+    Int index! = 0;
+    while (index < named.args.length) {
+        add_interface_type_ref_arg(ctx, result, named.args[index]);
+        index = index + 1;
+    }
+    add_type_contract_names(ctx, result, named.contract_names);
+}
+
+Void add_type_contract_names(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    qid.SymbolId[]&? contract_names
+) {
+    guard contract_names is .some(names) else { return; }
+    Int index! = 0;
+    while (index < names.length) {
+        result.add_contract_name(ctx.store.symbols.text(names[index]));
+        index = index + 1;
+    }
+}
+
+Bool fill_named_trait_companion_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    qid.DefId def_id
+) {
+    def.DefRecord record = ctx.store.defs.get(def_id);
+    guard record.kind == .trait_companion_type_def else { return false; }
+    guard record.trait_companion is .some(companion) else { return false; }
+    sem.TraitCompanionTypeRef type_ref = sem.TraitCompanionTypeRef (
+        trait_def: companion.trait_def,
+        kind: model_trait_companion_kind(companion.kind)
+    );
+    fill_trait_companion_interface_type_ref(ctx, result, type_ref);
+    return true;
+}
+
+sem.TraitCompanionKind model_trait_companion_kind(def.TraitCompanionKind kind) {
+    if (kind == .vtable) {
+        return .vtable;
+    }
+    if (kind == .receiver) {
+        return .receiver;
+    }
+    return .any;
+}
+
+Void add_interface_type_ref_arg(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! result,
+    sem.NodeId arg
+) {
+    source_artifact.InterfaceTypeRef arg_ref! = source_artifact.InterfaceTypeRef.invalid_type();
+    fill_interface_type_ref(ctx, arg_ref$.mut_ref(), arg);
+    result.add_arg(arg_ref);
+}
+
+Bool add_generic_template(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface&! module_interface,
+    qkey.StableSymbolId stable_id,
+    sem.Def& model_def
+) {
+    if (model_def.body == null) { return true; }
+    if (!body_requires_interface_template(ctx, model_def.def_id)) { return true; }
+    UInt8[]& payload = model_template.encode_body(ctx, model_def);
+    if (payload.length == 0) {
+        return false;
+    }
+    module_interface.add_generic_template(source_artifact.GenericTemplate(
+        stable_id,
+        ctx.query.def_body(
+            stable_id,
+            { [ref ctx, stable_id] =>
+                ctx.store.incremental.body_fingerprint(stable_id)
+            }
+        ),
+        payload
+    ));
+    return true;
+}
+
+Void add_template_encode_error(diagnostic.DiagnosticStore&! diagnostics_store) {
+    diagnostics_store.add(
+        diagnostic.Diagnostic(
+            .error,
+            .incremental,
+            diagnostic.DiagnosticCode("model_template_encode_failed"),
+            diagnostic.SourceRange(),
+            "failed to encode generic Semantic Model template"
+        )
+    );
+}
+
+Bool body_requires_interface_template(context.CompilerContext& ctx, qid.DefId def_id) {
+    if (generic_param_count(ctx, def_id) > 0) { return true; }
+    guard ctx.store.defs.get(def_id).owner_def is .some(owner_def) else { return false; }
+    // trait 默认实现隐含依赖 Self，即使没有显式泛型参数，也必须作为
+    // Semantic Model template 保存，供增量类型检查和调用方 codegen 恢复。
+    return ctx.store.defs.get(owner_def).kind == .trait_def;
+}
+
+Int generic_param_count(context.CompilerContext& ctx, qid.DefId def_id) {
+    Int count! = 0;
+    qid.DefId? current! = def_id;
+    while (current is .some(current_def)) {
+        count = count + ctx.store.model.def_ref(current_def).generic_params.len();
+        current = ctx.store.defs.get(current_def).owner_def;
+    }
+    return count;
+}
+
+Void add_param_defaults(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceFunctionSignature&! iface_signature,
+    sem.FunctionSignature signature
+) {
+    Int index! = 0;
+    while (index < signature.param_defaults.length) {
+        sem.ParamDefault param_default = signature.param_defaults[index];
+        iface_signature.add_param_default(source_artifact.InterfaceParamDefault(
+            param_default.param_index,
+            interface_default_literal(ctx, param_default.value)
+        ));
+        index = index + 1;
+    }
+}
+
+source_artifact.InterfaceLiteral interface_default_literal(context.CompilerContext& ctx, sem.NodeId value) {
+    sem.Node node = ctx.store.model.node(value);
+    guard node.data is .literal(literal) else {
+        return source_artifact.InterfaceLiteral(.invalid_literal);
+    }
+    return interface_literal(literal);
+}
+
+source_artifact.InterfaceLiteral interface_literal(sem.Literal literal) {
+    if (literal.value is .int_value(int_value)) {
+        source_artifact.InterfaceLiteral result! = source_artifact.InterfaceLiteral(.int_value);
+        result.int_bits = int_value.bits;
+        result.signed_int = int_value.signed_value;
+        return result;
+    }
+    if (literal.value is .bool_value(bool_value)) {
+        source_artifact.InterfaceLiteral result! = source_artifact.InterfaceLiteral(.bool_value);
+        result.bool_value = bool_value;
+        return result;
+    }
+    if (literal.value is .float_value(float_value)) {
+        source_artifact.InterfaceLiteral result! = source_artifact.InterfaceLiteral(.float_value);
+        result.float_value = float_value.value;
+        return result;
+    }
+    if (literal.value is .string_value(symbol)) {
+        source_artifact.InterfaceLiteral result! = source_artifact.InterfaceLiteral(.string_value);
+        result.string_symbol = symbol;
+        return result;
+    }
+    if (literal.value is .char_value(char_value)) {
+        source_artifact.InterfaceLiteral result! = source_artifact.InterfaceLiteral(.char_value);
+        result.char_value = char_value;
+        return result;
+    }
+    if (literal.value is .null_value) {
+        return source_artifact.InterfaceLiteral(.null_value);
+    }
+    if (literal.value is .unit_value) {
+        return source_artifact.InterfaceLiteral(.unit_value);
+    }
+    return source_artifact.InterfaceLiteral(.invalid_literal);
+}
+
+source_artifact.InterfaceTypeRef interface_type_ref(
+    context.CompilerContext& ctx,
+    sem.NodeId type_ref
+) {
+    source_artifact.InterfaceTypeRef result! = source_artifact.InterfaceTypeRef.invalid_type();
+    fill_interface_type_ref(ctx, result$.mut_ref(), type_ref);
+    return result;
+}
+
+Void set_interface_signature_effects(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceFunctionSignature&! signature,
+    sem.EffectSet effects
+) {
+    signature.has_unsafe = effects.has_unsafe;
+    signature.has_async = effects.has_async;
+    signature.domain_stable_id = interface_effect_domain_stable_id(ctx, effects);
+}
+
+Void set_interface_type_ref_effects(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef&! type_ref,
+    sem.EffectSet effects
+) {
+    type_ref.set_function_effects(
+        effects.has_unsafe,
+        effects.has_async,
+        interface_effect_domain_stable_id(ctx, effects)
+    );
+}
+
+qkey.StableSymbolId? interface_effect_domain_stable_id(context.CompilerContext& ctx, sem.EffectSet effects) {
+    guard effects.domain is .some(domain) else { return null; }
+    guard effect_domain_binding_def(ctx, domain) is .some(def_id) else { return null; }
+    return ctx.store.incremental.stable_id_for_def(def_id);
+}
+
+qid.DefId? effect_domain_binding_def(context.CompilerContext& ctx, sem.NodeId domain) {
+    sem.Node node = ctx.store.model.node(domain);
+    if (node.data is .name_ref(name_ref)) {
+        if (name_ref is .def_ref(def_id)) { return resolve_alias_target(ctx, def_id); }
+    }
+    return null;
+}

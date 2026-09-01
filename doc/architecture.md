@@ -49,7 +49,7 @@ Domain 只提供调度能力，不持有 `CompilerStore`，也不隐式保证 co
 必须在提交 Job 前明确共享状态边界。编译器不复用 `main_domain`，避免把 CLI 调度绑定到进程启动线程
 和 main queue pump。
 
-当前 root module 加载前会先加载 `src/core.jiang`。core 源码声明 compiler-known
+当前 root module 加载前会先加载 `src/compiler/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 
@@ -215,7 +215,7 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
   public interface artifact 和 Semantic Model->JIL lowering；JIL 之后的阶段只能看 `jil.Const`、
   `jil.Global` 和 `jil.StaticValue`。
-- `src/core.jiang` 是 compiler-known 源码入口，`src/core/` 保存它导入的实现文件。core
+- `src/compiler/core.jiang` 是 compiler-known 源码入口，`src/compiler/core/` 保存它导入的实现文件。core
   不作为用户可 import package；其中的
   body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
   type check / JIL / layout 的 compiler-known facts 承接。
@@ -342,58 +342,30 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 
 ```text
 src/
-  source.jiang  source 模块稳定入口
-  driver/       CLI 参数和命令入口
-  source/       package、source file、source manager、source map
-  syntax.jiang  syntax 阶段稳定入口
-  syntax/       token、lexer、parser、flat AST
-  lang.jiang    lang provider 稳定入口
-  lang/         lang package registry、wrapper dylib、provider runtime bridge
-  artifact/     source .ji、object key、package artifact key/path、fingerprint
-  db.jiang      查询层入口；db/ 查询层实现（QueryEngine、per-query caches、
-                 typed 查询函数、layout 查询）
-  diagnostic.jiang  诊断数据模型入口
-  diagnostic/   diagnostic、reporter
-  builtin.jiang compiler-known builtin 初始化入口
-  builtin/      compiler-known builtin type、trait 和 intrinsic 初始化
-  core.jiang    compiler-known core 源码入口
-  core/         builtin trait/type 外壳、intrinsic 声明
-  resolve/      symbol store、keyword store、import/module/name resolver
-  sema/         type store、trait、generic、overload、type check、comptime
-    model.jiang Semantic Model 稳定入口
-    model/      Semantic Model store
-    comptime/   source selection、const value evaluator/interpreter、ComptimeStore
-    generic/    generic substitution 和实例化辅助
-    type_check/ type check 主体、类型事实和调用/模式/表达式 side table
-  jil.jiang     JIL 阶段稳定入口
-  jil/
-    model.jiang JIL 数据模型入口
-    model/      ID、Place、Value、CFG、Program 和 Store
-    lower.jiang Semantic Model -> JIL lowering 入口
-    lower/      package lowering 和共享 support
-    instance_reader.jiang generic JIL 的实例读取视图
-    analysis.jiang  JIL dataflow analysis 入口
-    analysis/   provenance、escape 和参数属性证明
-    optimize.jiang JIL 优化编排入口
-    optimize/   安全尾递归等目标无关 transform
-  layout.jiang  concrete type layout 数据模型入口
-  layout/       concrete type layout 查询层
-  borrow_check.jiang  borrow check 阶段入口
-  borrow_check/ ownership、loan、lifetime 和 drop safety 检查
-  backend.jiang 后端输出编排入口
-  backend/      target、output、codegen unit、link plan 和后端入口
-    llvm.jiang  LLVM backend 入口
-    llvm/       LLVM IR/object emission
-  incremental/  cache key、fingerprint、依赖图、symbol store
-  id.jiang      跨阶段共享的 session-local handle
-  store.jiang   CompilerStore 入口
-  system/       私有 host/target OS provider、startup、filesystem、process、target info
-  support/      arena、list、hash、unicode 等通用工具
+  compiler/     编译器、runtime 与私有 system/support
+    source/     package、source file、source manager、source map
+    syntax/     token、lexer、parser、flat AST
+    lang/       provider registry、wrapper dylib 与 runtime bridge
+    artifact/   source .ji、object key、package artifact key/path、fingerprint
+    db/         QueryEngine、per-query cache 与 typed query
+    diagnostic/ diagnostic model、source map、reporter
+    resolve/    symbol store、import/module/name resolve
+    sema/       Semantic Model、type check、generic、trait、comptime
+    jil/        JIL model、lower、analysis 与 optimize
+    backend/    target、codegen unit、LLVM emission 与 link
+    system/     私有 host/target OS provider、startup、filesystem、process
+    support/    arena、list、hash、unicode 等通用工具
+  std/          用户可导入的标准库 package
+  lang/         随发行版提供的 builtin/custom language provider
+  tool/         jiangdoc 等独立工具
 ```
 
-`src/system/` 是 compiler、runtime 与 public `std` 共用的私有系统能力层，负责 host/target OS、
-filesystem、process、dynamic library 和 target info。它属于 compiler 源码布局，不是用户可直接导入的
-public package；面向用户的 OS 能力逐步迁入 `std`，并通过稳定 wrapper 暴露可移植语义。
+`src/compiler/system/` 是 compiler、runtime 与 public `std` 共用的私有系统能力层，负责 host/target
+OS、filesystem、process、dynamic library 和 target info。它不是用户可直接导入的 public package；
+面向用户的 OS 能力由 `std` wrapper 暴露可移植语义。
+
+`compiler`、`lang`、`std` 可以按实际 ownership 和启动需求直接复用彼此；不为制造形式上的单向图
+增加 adapter 或复制结构。唯一硬边界是三者都不能依赖 `tool`。`tool` 是最外层，可以依赖前三者。
 
 ## Support 容器
 
@@ -454,8 +426,8 @@ public trait Indexable {
 
 ## 导入纪律
 
-优先保持单向 import。如果两个模块互相需要，应把共享数据结构抽到更底层的
-所有者里，而不是引入循环依赖。
+阶段内部仍优先避免无意义的循环 import；源码层不强制 `compiler`、`lang`、`std` 单向分层。
+`src/tool` 只能作为依赖发起方，不能成为前三层的依赖。
 
 ## 测试目录
 

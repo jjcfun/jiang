@@ -1,0 +1,402 @@
+// src/compiler/system 私有层的 hosted POSIX process provider。
+//
+// 这里承载 macOS / Linux hosted target 共享的进程执行逻辑。OS provider
+// 只负责选择是否使用这一层；no-libc 和 Windows 不应该依赖这里。
+
+import build;
+import c_string = "../../support/c_string.jiang";
+import list = "../../support/list.jiang";
+
+// glibc x86_64 的 posix_spawn_file_actions_t 当前为 80 bytes / 8-byte aligned。
+// macOS 只使用其中第一个 pointer slot；统一 storage 避免在共享流程中泄漏平台形状。
+const Int spawn_file_actions_word_count = 10;
+const Int32 fcntl_set_fd = 2;
+const Int32 fd_close_on_exec = 1;
+const Int errno_interrupted = 4;
+
+comptime {
+    if (build.target.os == .macos) {
+        import c = "./macos/libc.jiang";
+    } else {
+        import c = "./linux/libc.jiang";
+    }
+}
+
+@region(a)
+public struct SpawnResult: Copyable {
+    public Bool started;
+    public Int exit_code;
+    @life(a)
+    public UInt8[]& stdout!;
+
+    @life(a)
+    public UInt8[]& stderr!;
+
+    public init(self, Bool started, Int exit_code) {
+        self.started = started;
+        self.exit_code = exit_code;
+        self.stdout = "";
+        self.stderr = "";
+    }
+
+    public init(self, Bool started, Int exit_code, UInt8[]& stdout, UInt8[]& stderr) {
+        self.started = started;
+        self.exit_code = exit_code;
+        self.stdout = stdout;
+        self.stderr = stderr;
+    }
+}
+
+public struct SpawnOptions: Copyable {
+    public Bool capture_stdout!;
+    public Bool capture_stderr!;
+    public Bool discard_stderr!;
+
+    public init(self) {
+        self.capture_stdout = false;
+        self.capture_stderr = false;
+        self.discard_stderr = false;
+    }
+}
+
+@life()
+public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    SpawnOptions options = SpawnOptions();
+    return spawn_wait(executable, args, options$.ref());
+}
+
+@life()
+public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args, SpawnOptions& options) {
+    if (options.capture_stderr) {
+        return SpawnResult(false, -1);
+    }
+    if (options.capture_stdout || options.discard_stderr) {
+        return spawn_wait_redirected(executable, args, options.capture_stdout, options.discard_stderr);
+    }
+    return spawn_wait_inherit(executable, args);
+}
+
+@life()
+SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    unsafe {
+        UInt8**! argv = argv_array(executable, args);
+        UInt8**! envp = inherited_environment();
+        Int argv_count = args.len() + 1;
+        Int32*! pid = Int32$.alloc(1);
+        Int32 spawn_result = c.posix_spawnp(
+            pid$.as(Int32*),
+            argv[0],
+            null,
+            null,
+            argv,
+            envp
+        );
+
+        if (spawn_result != 0) {
+            free_argv(argv, argv_count);
+            pid$.dealloc();
+            return SpawnResult(false, Int(spawn_result));
+        }
+
+        Int32*! status = Int32$.alloc(1);
+        if (wait_for_pid(pid[0], status$.as(Int32*)) < 0) {
+            free_argv(argv, argv_count);
+            pid$.dealloc();
+            status$.dealloc();
+            return SpawnResult(false, -1);
+        }
+        Int exit_code = exit_code_from_status(status[0]);
+        free_argv(argv, argv_count);
+        pid$.dealloc();
+        status$.dealloc();
+        return SpawnResult(true, exit_code);
+    }
+}
+
+@life()
+SpawnResult spawn_wait_redirected(
+    UInt8[]& executable,
+    list.ArrayList<UInt8[]&>& args,
+    Bool capture_stdout,
+    Bool discard_stderr
+) {
+    unsafe {
+        UInt8**! argv = argv_array(executable, args);
+        UInt8**! envp = inherited_environment();
+        Int argv_count = args.len() + 1;
+        SpawnFileActions actions! = SpawnFileActions();
+        if (!actions.open(capture_stdout, discard_stderr)) {
+            free_argv(argv, argv_count);
+            return SpawnResult(false, -1);
+        }
+        Int32*! pid = Int32$.alloc(1);
+        Int32 spawn_result = c.posix_spawnp(
+            pid$.as(Int32*),
+            argv[0],
+            actions.file_actions(),
+            null,
+            argv,
+            envp
+        );
+
+        if (spawn_result != 0) {
+            actions.close_parent();
+            free_argv(argv, argv_count);
+            pid$.dealloc();
+            return SpawnResult(false, Int(spawn_result));
+        }
+        actions.close_child_end();
+        UInt8[]& stdout = actions.read_all();
+        Int32*! status = Int32$.alloc(1);
+        if (wait_for_pid(pid[0], status$.as(Int32*)) < 0) {
+            actions.close_parent();
+            free_argv(argv, argv_count);
+            pid$.dealloc();
+            status$.dealloc();
+            return SpawnResult(false, -1);
+        }
+        Int exit_code = exit_code_from_status(status[0]);
+        actions.close_parent();
+        free_argv(argv, argv_count);
+        pid$.dealloc();
+        status$.dealloc();
+        return SpawnResult(true, exit_code, stdout, "");
+    }
+}
+
+struct SpawnFileActions: Movable {
+    Int32 read_fd!;
+    Int32 write_fd!;
+    Int32 discard_fd!;
+    UInt64*! actions!;
+
+    init(self) {
+        self.read_fd = Int32(-1);
+        self.write_fd = Int32(-1);
+        self.discard_fd = Int32(-1);
+        self.actions = null;
+    }
+
+    Bool open(Self&! self, Bool capture_stdout, Bool discard_stderr) {
+        unsafe {
+            if (capture_stdout && !self.open_stdout_pipe()) { return false; }
+            UInt64*! raw! = UInt64$.alloc(spawn_file_actions_word_count);
+            if (c.posix_spawn_file_actions_init(raw$.as(UInt64*)) != 0) {
+                raw$.dealloc();
+                self.close_parent();
+                return false;
+            }
+            self.actions = raw;
+            if (capture_stdout && !self.add_stdout_pipe()) {
+                self.close_parent();
+                return false;
+            }
+            if (discard_stderr && !self.add_stderr_discard()) {
+                self.close_parent();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    Bool open_stdout_pipe(Self&! self) {
+        unsafe {
+            Int32*! fds = Int32$.alloc(2);
+            if (c.pipe(fds$.as(Int32*)) != 0) {
+                fds$.dealloc();
+                return false;
+            }
+            self.read_fd = fds[0];
+            self.write_fd = fds[1];
+            fds$.dealloc();
+            if (!set_close_on_exec(self.read_fd) || !set_close_on_exec(self.write_fd)) {
+                self.close_parent();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    Bool add_stdout_pipe(Self&! self) {
+        unsafe {
+            if (c.posix_spawn_file_actions_adddup2(self.actions, self.write_fd, Int32(1)) != 0) {
+                return false;
+            }
+            if (c.posix_spawn_file_actions_addclose(self.actions, self.read_fd) != 0) {
+                return false;
+            }
+            return c.posix_spawn_file_actions_addclose(self.actions, self.write_fd) == 0;
+        }
+    }
+
+    Bool add_stderr_discard(Self&! self) {
+        unsafe {
+            UInt8*! dev_null = c_string.from_slice("/dev/null");
+            Int32 fd = c.open(dev_null$.as(UInt8*), 1);
+            dev_null$.dealloc();
+            if (fd < 0) {
+                return false;
+            }
+            self.discard_fd = fd;
+            if (!set_close_on_exec(self.discard_fd)) { return false; }
+            if (c.posix_spawn_file_actions_adddup2(self.actions, self.discard_fd, Int32(2)) != 0) {
+                return false;
+            }
+            return c.posix_spawn_file_actions_addclose(self.actions, self.discard_fd) == 0;
+        }
+    }
+
+    UInt64* file_actions(self) {
+        return unsafe { self.actions$.as(UInt64*) };
+    }
+
+    Void close_child_end(Self&! self) {
+        unsafe {
+            if (self.write_fd >= 0) {
+                c.close(self.write_fd);
+                self.write_fd = Int32(-1);
+            }
+            if (self.discard_fd >= 0) {
+                c.close(self.discard_fd);
+                self.discard_fd = Int32(-1);
+            }
+        }
+        self.destroy_actions();
+    }
+
+    Void close_parent(Self&! self) {
+        unsafe {
+            if (self.read_fd >= 0) {
+                c.close(self.read_fd);
+                self.read_fd = Int32(-1);
+            }
+            if (self.write_fd >= 0) {
+                c.close(self.write_fd);
+                self.write_fd = Int32(-1);
+            }
+            if (self.discard_fd >= 0) {
+                c.close(self.discard_fd);
+                self.discard_fd = Int32(-1);
+            }
+        }
+        self.destroy_actions();
+    }
+
+    @life()
+    UInt8[]& read_all(self) {
+        unsafe {
+            if (self.read_fd < 0) {
+                return "";
+            }
+            Int capacity! = 4096;
+            Int length! = 0;
+            UInt8*! buffer! = UInt8$.alloc(capacity + 1);
+            while (true) {
+                if (length + 1024 + 1 > capacity) {
+                    capacity = capacity * 2;
+                    UInt8*! next = UInt8$.alloc(capacity + 1);
+                    copy_bytes(next, buffer, length);
+                    buffer$.dealloc();
+                    buffer = next;
+                }
+                Int count = read_retry(self.read_fd, buffer[length..(length + 1024)]$.ptr(), 1024);
+                if (count <= 0) {
+                    buffer[length] = 0;
+                    return buffer[0..length];
+                }
+                length = length + count;
+            }
+            return "";
+        }
+    }
+
+    Void destroy_actions(Self&! self) {
+        if (self.actions != null) {
+            unsafe {
+                c.posix_spawn_file_actions_destroy(self.actions);
+                self.actions$.dealloc();
+            }
+            self.actions = null;
+        }
+    }
+}
+
+UInt8**! argv_array(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    unsafe {
+        UInt8**! argv = c.calloc(args.len() + 2, UInt8*$.size());
+        UInt8*! executable_arg = c_string.from_slice(executable);
+        argv[0] = executable_arg$.as(UInt8*);
+        Int index! = 0;
+        while (index < args.len()) {
+            UInt8*! arg = c_string.from_slice(args.get(index));
+            argv[index + 1] = arg$.as(UInt8*);
+            index = index + 1;
+        }
+        return argv;
+    }
+}
+
+Void free_argv(UInt8**! argv, Int count) {
+    unsafe {
+        Int index! = 0;
+        while (index < count) {
+            argv[index]$.dealloc();
+            index = index + 1;
+        }
+        argv$.dealloc();
+    }
+}
+
+UInt8**! inherited_environment() {
+    // posix_spawnp 需要显式 envp。传 environ 才能继承 PATH/SDKROOT 等变量，
+    // 让 linker driver 名称（例如 cc）按调用进程的环境解析。
+    return c.environ;
+}
+
+Int exit_code_from_status(Int32 status) {
+    Int signal = Int(status & 127);
+    if (signal != 0) { return 128 + signal; }
+    return Int((status >> 8) & 255);
+}
+
+Int32 wait_for_pid(Int32 pid, Int32* status) {
+    while (true) {
+        Int32 result = unsafe { c.waitpid(pid, status, 0) };
+        if (result >= 0 || last_errno() != errno_interrupted) { return result; }
+    }
+    return Int32(-1);
+}
+
+Int read_retry(Int32 fd, UInt8* buffer, Int length) {
+    while (true) {
+        Int result = unsafe { c.read(fd, buffer, length) };
+        if (result >= 0 || last_errno() != errno_interrupted) { return result; }
+    }
+    return -1;
+}
+
+Bool set_close_on_exec(Int32 fd) {
+    return unsafe { c.fcntl(fd, fcntl_set_fd, fd_close_on_exec) == 0 };
+}
+
+Void copy_bytes(UInt8*! dest, UInt8*! source, Int length) {
+    unsafe {
+        Int index! = 0;
+        while (index < length) {
+            dest[index] = source[index];
+            index = index + 1;
+        }
+    }
+}
+
+comptime {
+    if (build.target.os == .macos) {
+        Int last_errno() {
+            return unsafe { Int(c.__error()$.get()) };
+        }
+    } else {
+        Int last_errno() {
+            return unsafe { Int(c.__errno_location()$.get()) };
+        }
+    }
+}

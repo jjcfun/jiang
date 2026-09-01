@@ -207,8 +207,8 @@ jiang_absolute_path() {
 
 jiang_ensure_build_helper() {
   if [ -x "$JIANG_BUILD_HELPER_BIN" ] && \
-    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/build/main.jiang" ] && \
-    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/build/sdk.jiang" ]; then
+    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/compiler/build/main.jiang" ] && \
+    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/compiler/build/sdk.jiang" ]; then
     return 0
   fi
   local compiler
@@ -224,7 +224,7 @@ jiang_ensure_build_helper() {
     "$compiler" --linker "$LLVM_CLANG" \
       $(jiang_build_helper_bootstrap_link_args) \
       -o "$JIANG_BUILD_HELPER_BIN" \
-      "src/build/main.jiang"
+      "src/compiler/build/main.jiang"
   )
 }
 

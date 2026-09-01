@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
-const OUT = path.join(ROOT, "std/jiang/text/generated/xid.jiang");
+const OUT = path.join(ROOT, "src/std/jiang/text/generated/xid.jiang");
 const MAX_SCALAR = 0x10ffff;
 const CHUNK_SCALARS = 512;
 const CHUNK_BYTES = CHUNK_SCALARS / 8;

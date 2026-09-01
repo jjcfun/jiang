@@ -1,0 +1,460 @@
+// src/compiler/system 私有层中 hosted macOS 的 libdispatch 线程、队列和同步 provider。
+
+import c = "./libc.jiang";
+import atomic = "../../../core/atomic.jiang";
+
+const Int main_job_group_word = 0;
+const Int main_job_context_word = 1;
+const Int main_job_callback_word = 2;
+const Int main_job_next_word = 3;
+const Int main_job_storage_word = 4;
+const Int main_job_word_count = 5;
+const Int main_job_allocated = 0;
+const Int main_job_task_backed = 1;
+const Int64 main_wait_interval_ns = 1000000;
+
+public struct Mutex: Copyable {
+    UInt8* handle;
+
+    public init(self, UInt8* handle) {
+        self.handle = handle;
+    }
+}
+
+public struct Queue: Copyable {
+    Void* handle;
+
+    public init(self, Void* handle) {
+        self.handle = handle;
+    }
+}
+
+public struct Group: Copyable {
+    Void* handle;
+
+    public init(self, Void* handle) {
+        self.handle = handle;
+    }
+}
+
+public struct AtomicStackArray: Copyable {
+    UInt8* handle;
+
+    public init(self, UInt8* handle) {
+        self.handle = handle;
+    }
+}
+
+Mutex main_queue_mutex! = Mutex(null);
+UInt8* main_queue_head! = null;
+UInt8* main_queue_tail! = null;
+Void* main_queue_identity! = null;
+Void* startup_thread! = null;
+Void* dispatch_main_queue_handle! = null;
+UInt8* thread_identity_key_storage! = null;
+Bool thread_identity_ready! = false;
+
+public Bool supported() {
+    return true;
+}
+
+public Bool initialize_main_thread() {
+    startup_thread = unsafe { c.pthread_self() };
+    dispatch_main_queue_handle = resolve_dispatch_main_queue();
+    if (!initialize_thread_identity()) { return false; }
+    if (!mutex_valid(main_queue_mutex)) {
+        main_queue_mutex = create_mutex();
+    }
+    return startup_thread != null && mutex_valid(main_queue_mutex);
+}
+
+public Bool is_main_thread() {
+    if (startup_thread == null) { return false; }
+    return unsafe { c.pthread_equal(c.pthread_self(), startup_thread) != Int32(0) };
+}
+
+public UInt8* allocate_storage(Int size) {
+    return unsafe { c.malloc_zone_malloc(c.malloc_default_zone(), size) };
+}
+
+public UInt8* reallocate_storage(UInt8* pointer, Int size) {
+    return unsafe { c.malloc_zone_realloc(c.malloc_default_zone(), pointer, size) };
+}
+
+public Void deallocate_storage(UInt8* pointer) {
+    unsafe { c.malloc_zone_free(c.malloc_default_zone(), pointer); }
+}
+
+public Mutex create_mutex() {
+    UInt8* storage = allocate_storage(UInt32$.size());
+    if (storage == null) { return Mutex(null); }
+    UInt32*! state = unsafe { storage$.as(UInt32*!) };
+    unsafe { state$.set(UInt32(0)); }
+    return Mutex(storage);
+}
+
+public Bool mutex_valid(Mutex mutex) {
+    return mutex.handle != null;
+}
+
+public Void* mutex_handle(Mutex mutex) {
+    return unsafe { mutex.handle$.as(Void*) };
+}
+
+public Mutex mutex_from_handle(Void* handle) {
+    return Mutex(unsafe { handle$.as(UInt8*) });
+}
+
+public Void destroy_mutex(Mutex mutex) {
+    deallocate_storage(mutex.handle);
+}
+
+public Void lock(Mutex mutex) {
+    unsafe { c.os_unfair_lock_lock(mutex.handle); }
+}
+
+public Void unlock(Mutex mutex) {
+    unsafe { c.os_unfair_lock_unlock(mutex.handle); }
+}
+
+public AtomicStackArray create_atomic_stack_array(Int count) {
+    UInt8* storage = allocate_storage(count * 16);
+    if (storage == null) { return AtomicStackArray(null); }
+    unsafe { c.memset(storage, 0, count * 16); }
+    return AtomicStackArray(storage);
+}
+
+public Bool atomic_stack_array_valid(AtomicStackArray stacks) {
+    return stacks.handle != null;
+}
+
+public Void* atomic_stack_array_handle(AtomicStackArray stacks) {
+    return unsafe { stacks.handle$.as(Void*) };
+}
+
+public AtomicStackArray atomic_stack_array_from_handle(Void* handle) {
+    return AtomicStackArray(unsafe { handle$.as(UInt8*) });
+}
+
+public Void destroy_atomic_stack_array(AtomicStackArray stacks) {
+    deallocate_storage(stacks.handle);
+}
+
+public Void atomic_stack_push(AtomicStackArray stacks, Int index, UInt8* node) {
+    unsafe { c.OSAtomicEnqueue(atomic_stack_head(stacks, index), node$.as(Void*), 0); }
+}
+
+public UInt8* atomic_stack_pop(AtomicStackArray stacks, Int index) {
+    return unsafe { c.OSAtomicDequeue(atomic_stack_head(stacks, index), 0)$.as(UInt8*) };
+}
+
+UInt8* atomic_stack_head(AtomicStackArray stacks, Int index) {
+    Int address = unsafe { stacks.handle$.as(Int) } + index * 16;
+    return unsafe { address$.as(UInt8*) };
+}
+
+public Queue concurrent_queue() {
+    return Queue(unsafe { c.dispatch_get_global_queue(0, 0) });
+}
+
+public Queue serial_queue() {
+    return Queue(unsafe {
+        c.dispatch_queue_create("jiang.serial-domain"$.ptr()$.as(UInt8*), null)
+    });
+}
+
+public Queue main_queue() {
+    if (!mutex_valid(main_queue_mutex)) { return Queue(null); }
+    return Queue(unsafe { main_queue_mutex.handle$.as(Void*) });
+}
+
+public Void destroy_queue(Queue queue, Bool concurrent) {
+    if (queue.handle == null || concurrent || queue_is_main(queue)) { return; }
+    unsafe { c.dispatch_release(queue.handle); }
+}
+
+public Void* queue_handle(Queue queue) {
+    return queue.handle;
+}
+
+public Void set_queue_identity(Queue queue, Void* identity) {
+    if (queue_is_main(queue)) {
+        main_queue_identity = identity;
+        return;
+    }
+    unsafe { c.dispatch_queue_set_specific(queue.handle, identity, identity, null); }
+}
+
+public Bool has_queue_identity(Void* identity) {
+    if (identity == main_queue_identity && is_main_thread()) { return true; }
+    return unsafe { c.dispatch_get_specific(identity) == identity };
+}
+
+public Void* enter_thread_identity(Void* identity) {
+    if (!thread_identity_ready) { return null; }
+    Void* previous = unsafe { c.pthread_getspecific(thread_identity_key()) };
+    unsafe { c.pthread_setspecific(thread_identity_key(), identity); }
+    return previous;
+}
+
+public Void leave_thread_identity(Void* previous) {
+    if (!thread_identity_ready) { return; }
+    unsafe { c.pthread_setspecific(thread_identity_key(), previous); }
+}
+
+public Bool has_thread_identity(Void* identity) {
+    if (!thread_identity_ready || identity == null) { return false; }
+    return unsafe { c.pthread_getspecific(thread_identity_key()) == identity };
+}
+
+public Group create_group() {
+    return Group(unsafe { c.dispatch_group_create() });
+}
+
+public Void destroy_group(Group group) {
+    if (group.handle == null) { return; }
+    unsafe { c.dispatch_release(group.handle); }
+}
+
+public Void* group_handle(Group group) {
+    return group.handle;
+}
+
+public Group group_from_handle(Void* handle) {
+    return Group(handle);
+}
+
+public Bool enqueue(Group group, Queue queue, Void* context, Void* callback) {
+    if (group.handle == null || queue.handle == null) { return false; }
+    if (queue_is_main(queue)) {
+        return enqueue_main(group, context, callback);
+    }
+    unsafe { c.dispatch_group_async_f(group.handle, queue.handle, context, callback); }
+    return true;
+}
+
+public Bool enqueue_task(
+    Group group,
+    Queue queue,
+    UInt8* storage,
+    Void* context,
+    Void* callback
+) {
+    if (group.handle == null || queue.handle == null) { return false; }
+    if (queue_is_main(queue)) {
+        return enqueue_main_job(
+            group, storage, context, callback, main_job_task_backed
+        );
+    }
+    unsafe { c.dispatch_group_async_f(group.handle, queue.handle, context, callback); }
+    return true;
+}
+
+public Bool enter_group(Group group) {
+    if (group.handle == null) { return false; }
+    unsafe { c.dispatch_group_enter(group.handle); }
+    return true;
+}
+
+public Void leave_group(Group group) {
+    if (group.handle == null) { return; }
+    unsafe { c.dispatch_group_leave(group.handle); }
+}
+
+public Void wait_group(Group group) {
+    if (group.handle == null) { return; }
+    if (is_main_thread()) {
+        wait_group_pumping_main(group);
+        return;
+    }
+    unsafe { c.dispatch_group_wait(group.handle, UInt64(18446744073709551615)); }
+}
+
+public Void wait_word(Int*! pointer, Int expected) {
+    atomic.Atomic<Int>& state = unsafe { pointer$.as(atomic.Atomic<Int>&) };
+    while (state.get() == expected) {
+        if (is_main_thread()) {
+            pump_main_queue_once();
+        }
+        UInt32 timeout! = UInt32(0);
+        if (is_main_thread()) { timeout = UInt32(1000); }
+        unsafe {
+            c.__ulock_wait(
+                UInt32(1), pointer$.as(Void*), UInt64(expected), timeout
+            );
+        }
+    }
+}
+
+public Void wake_word(Int*! pointer) {
+    unsafe { c.__ulock_wake(UInt32(257), pointer$.as(Void*), UInt64(0)); }
+}
+
+public Void shutdown() {
+    if (thread_identity_ready) {
+        unsafe { c.pthread_key_delete(thread_identity_key()); }
+    }
+    if (thread_identity_key_storage != null) {
+        deallocate_storage(thread_identity_key_storage);
+    }
+    thread_identity_key_storage = null;
+    thread_identity_ready = false;
+}
+
+Bool initialize_thread_identity() {
+    if (thread_identity_ready) { return true; }
+    if (thread_identity_key_storage == null) {
+        thread_identity_key_storage = allocate_storage(UInt32$.size());
+    }
+    if (thread_identity_key_storage == null) { return false; }
+    thread_identity_ready = unsafe {
+        c.pthread_key_create(thread_identity_key_storage$.as(UInt32*), null) == 0
+    };
+    return thread_identity_ready;
+}
+
+UInt32 thread_identity_key() {
+    UInt32* key = unsafe { thread_identity_key_storage$.as(UInt32*) };
+    return unsafe { key$.get() };
+}
+
+public Bool pump_main_queue_once() {
+    if (!is_main_thread()) { return false; }
+    UInt8* job = take_main_job();
+    if (job == null) { return false; }
+    run_main_job(job);
+    return true;
+}
+
+Bool queue_is_main(Queue queue) {
+    return mutex_valid(main_queue_mutex)
+        && queue.handle == unsafe { main_queue_mutex.handle$.as(Void*) };
+}
+
+Bool enqueue_main(Group group, Void* context, Void* callback) {
+    UInt8* job = allocate_storage(main_job_word_count * Int$.size());
+    if (job == null) { return false; }
+    if (enqueue_main_job(group, job, context, callback, main_job_allocated)) {
+        return true;
+    }
+    deallocate_storage(job);
+    return false;
+}
+
+Bool enqueue_main_job(
+    Group group,
+    UInt8* job,
+    Void* context,
+    Void* callback,
+    Int storage_kind
+) {
+    if (!enter_group(group)) {
+        return false;
+    }
+    store_job_word(job, main_job_group_word, unsafe { group.handle$.as(Int) });
+    store_job_word(job, main_job_context_word, unsafe { context$.as(Int) });
+    store_job_word(job, main_job_callback_word, unsafe { callback$.as(Int) });
+    store_job_word(job, main_job_next_word, 0);
+    store_job_word(job, main_job_storage_word, storage_kind);
+    append_main_job(job);
+    wake_main_queue();
+    return true;
+}
+
+Void wake_main_queue() {
+    if (dispatch_main_queue_handle == null) { return; }
+    RawFn<Void, Void*> drain = drain_main_queue;
+    unsafe {
+        c.dispatch_async_f(
+            dispatch_main_queue_handle,
+            null,
+            drain$.as(Void*)
+        );
+    }
+}
+
+Void* resolve_dispatch_main_queue() {
+    Void* process = unsafe { c.dlopen(null, Int32(1)) };
+    if (process == null) { return null; }
+    Void* queue = unsafe {
+        c.dlsym(process, "_dispatch_main_q"$.ptr()$.as(UInt8*))
+    };
+    unsafe { c.dlclose(process); }
+    return queue;
+}
+
+Void append_main_job(UInt8* job) {
+    lock(main_queue_mutex);
+    if (main_queue_tail == null) {
+        main_queue_head = job;
+    } else {
+        store_job_word(
+            main_queue_tail,
+            main_job_next_word,
+            unsafe { job$.as(Int) }
+        );
+    }
+    main_queue_tail = job;
+    unlock(main_queue_mutex);
+}
+
+UInt8* take_main_job() {
+    lock(main_queue_mutex);
+    UInt8* job = main_queue_head;
+    if (job != null) {
+        main_queue_head = unsafe {
+            load_job_word(job, main_job_next_word)$.as(UInt8*)
+        };
+        if (main_queue_head == null) { main_queue_tail = null; }
+    }
+    unlock(main_queue_mutex);
+    return job;
+}
+
+Void run_main_job(UInt8* job) {
+    assert(is_main_thread());
+    Void* context = unsafe {
+        load_job_word(job, main_job_context_word)$.as(Void*)
+    };
+    Void* callback = unsafe {
+        load_job_word(job, main_job_callback_word)$.as(Void*)
+    };
+    Group group = Group(unsafe {
+        load_job_word(job, main_job_group_word)$.as(Void*)
+    });
+    Int storage_kind = load_job_word(job, main_job_storage_word);
+    RawFn<Void, Void*> run = unsafe { callback$.as(RawFn<Void, Void*>) };
+    run(context);
+    leave_group(group);
+    if (storage_kind == main_job_allocated) {
+        deallocate_storage(job);
+    }
+}
+
+@life()
+Void drain_main_queue(Void* context) {
+    while (pump_main_queue_once()) {}
+}
+
+Void wait_group_pumping_main(Group group) {
+    while (unsafe { c.dispatch_group_wait(group.handle, UInt64(0)) } != 0) {
+        while (pump_main_queue_once()) {}
+        UInt64 deadline = unsafe {
+            c.dispatch_time(UInt64(0), main_wait_interval_ns)
+        };
+        unsafe { c.dispatch_group_wait(group.handle, deadline); }
+    }
+}
+
+Int load_job_word(UInt8* job, Int index) {
+    return unsafe { job_word(job, index)$.get() };
+}
+
+Void store_job_word(UInt8* job, Int index, Int value) {
+    unsafe { job_word(job, index)$.set(value); }
+}
+
+Int*! job_word(UInt8* job, Int index) {
+    Int address = unsafe { job$.as(Int) } + index * Int$.size();
+    return unsafe { address$.as(Int*!) };
+}

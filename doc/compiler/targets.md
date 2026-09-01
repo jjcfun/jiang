@@ -27,8 +27,8 @@ Linux release archive 内的 `ABI.txt` 从最终 `jiangc` ELF 的 GNU symbol ver
 计算最低 glibc 版本，并记录 program interpreter、`DT_NEEDED` 和 SHA-256。这个产物审计结果才是
 release 的最低 glibc 依据；Ubuntu runner 版本只定义验证环境，不自动成为兼容性声明。
 
-`src/system/os/provider.jiang` 是系统能力抽象入口。当前使用
-`src/system/os/linux.jiang` hosted provider；`src/system/os/linux/no_libc.jiang` 是独立的
+`src/compiler/system/os/provider.jiang` 是系统能力抽象入口。当前使用
+`src/compiler/system/os/linux.jiang` hosted provider；`src/compiler/system/os/linux/no_libc.jiang` 是独立的
 实验路线，不参与本版本 hosted 验收。
 
 裸 Wasm `wasm32-unknown-unknown` 当前只承诺 LLVM/object 输出。WASI 使用 `wasm32-wasi`

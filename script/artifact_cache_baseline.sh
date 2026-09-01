@@ -47,14 +47,14 @@ done
 
 mkdir -p "$COMMON_SOURCE"
 cp "$ROOT_DIR/package.ini" "$COMMON_SOURCE/package.ini"
-cp -R "$ROOT_DIR/src" "$ROOT_DIR/std" "$COMMON_SOURCE/"
+cp -R "$ROOT_DIR/src" "$COMMON_SOURCE/"
 # 0.4.9 的 compiler-known core 入口仍是旧路径；只转换入口的相对路径，
 # 不维护旧语义。
 sed 's|"core/|"|g' \
-  "$COMMON_SOURCE/src/core.jiang" >"$COMMON_SOURCE/src/core/core.jiang"
+  "$COMMON_SOURCE/src/compiler/core.jiang" >"$COMMON_SOURCE/src/compiler/core/core.jiang"
 
 append_benchmark_function() {
-  local source="$1/src/support/hash.jiang"
+  local source="$1/src/compiler/support/hash.jiang"
   printf '%s\n' \
     '' \
     'Int artifact_benchmark_private() {' \
@@ -63,7 +63,7 @@ append_benchmark_function() {
 }
 
 change_private_body() {
-  local source="$1/src/support/hash.jiang"
+  local source="$1/src/compiler/support/hash.jiang"
   perl -0pi -e \
     's/Int artifact_benchmark_private\(\) \{\n    1\n\}/Int artifact_benchmark_private() {\n    2\n}/' \
     "$source"
@@ -71,7 +71,7 @@ change_private_body() {
 }
 
 change_public_interface() {
-  local source="$1/src/support/hash.jiang"
+  local source="$1/src/compiler/support/hash.jiang"
   perl -0pi -e \
     's/Int artifact_benchmark_private\(\)/public Int artifact_benchmark_private()/' \
     "$source"
@@ -98,7 +98,7 @@ compile_once() {
   if [ "$mode" = "release" ]; then
     args+=(--mode release)
   fi
-  args+=(-o "$work/jiangc" src/jiangc.jiang)
+  args+=(-o "$work/jiangc" src/compiler/jiangc.jiang)
 
   if ! (cd "$work/source" && /usr/bin/time -p "$compiler" "${args[@]}") \
     >"$log" 2>"$timing"
