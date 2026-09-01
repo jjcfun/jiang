@@ -24,8 +24,10 @@ sql = ../sql-lang
 `std.jiang.syntax.Provider` 的 `Lang`。当前只支持 block invocation，不支持 `#sql(...)`，一个 lang
 package 只提供一个默认 provider。
 
-编译器内建 inline asm provider 同时支持 `#asm { ... }` 和 `#jiang.asm { ... }`。短名允许被用户
-dependency alias 覆盖，完整路径始终指向内建 provider。
+编译器内建 inline asm provider 支持 `#asm { ... }` 和 `#jiang.asm { ... }`；内建文档
+provider 支持 `#doc` / `#doc(module)` 以及完整路径 `#jiang.doc`。短名允许被用户
+dependency alias 覆盖，完整路径始终指向内建 provider。`doc` 的 line/terminated-block header
+是 compiler builtin 的固定入口，不扩展普通 lang package 的 invocation grammar。
 
 ## Public API
 
@@ -99,8 +101,8 @@ source
 
 普通 Jiang lexer/parser 使用 compiler-private 静态调用路径。provider 的 typed factory 通过固定 ABI
 callback 写同一个 `AstUnit`；两条路径复用同一 token、span、diagnostic 和 AST 语义，但普通热路径
-不经过 `Provider.Any` 或 callback dispatch。builtin `#asm` 也直接写 compiler AST，不经过 public
-factory schema。
+不经过 `Provider.Any` 或 callback dispatch。builtin `asm` 和 `doc` 共用 tagged builtin dispatch 与
+LangBlock 生命周期，但不经过 dynamic provider ABI。
 
 每个 invocation 持有固定地址的 compiler-owned state。`scan` 期间只临时绑定 `CompilerStore`；
 `parse` 期间再临时绑定目标 `AstUnit`。调用返回后立即解除绑定，因此 `SyntaxContext` 不能

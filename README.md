@@ -132,6 +132,10 @@ bash ./script/install_wasi.sh
 DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
 syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
 
+API 文档使用 builtin `#doc` 编写 Markdown，并用 `jiangc --doc path/to/package`
+生成 `build/doc/<package>/index.md`。语法、module 文档和预览方式见
+[语言指南](doc/jiang.md#api-文档)。compiler 只生成 Markdown，不内置 HTML 或浏览器服务。
+
 
 
 ## 测试与发布

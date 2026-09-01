@@ -1,0 +1,287 @@
+// `.ji` documentation section 的过滤、排序、按需读取与损坏隔离回归。
+
+import context = "../../../../src/context.jiang";
+import documentation = "../../../../src/artifact/documentation.jiang";
+import ji = "../../../../src/artifact/ji_file.jiang";
+import object_artifact = "../../../../src/artifact/object.jiang";
+import object_key_builder = "../../../../src/artifact/object_key_builder.jiang";
+import module_graph = "../../../../src/resolve/module_graph.jiang";
+import module_resolver = "../../../../src/resolve/module_resolver.jiang";
+import object_hash = "../../../../src/artifact/object_hash.jiang";
+import qid = "../../../../src/id.jiang";
+import qkey = "../../../../src/incremental/key.jiang";
+import source = "../../../../src/source.jiang";
+import source_artifact = "../../../../src/artifact/source.jiang";
+import source_ji = "../../../../src/artifact/source_ji.jiang";
+import string = "../../../../src/support/string.jiang";
+import syntax = "../../../../src/syntax.jiang";
+import fs = "../../../../src/system/fs.jiang";
+import std;
+
+public Int run() {
+    check_documentation_roundtrip();
+    check_empty_documentation_is_omitted();
+    check_doc_only_change_keeps_interface_fingerprints();
+    return 0;
+}
+
+Void check_documentation_roundtrip() {
+    std.StringBuilder source_text! = std.StringBuilder();
+    source_text.append("#doc(module) module docs\n");
+    source_text.append("#doc public box\n");
+    source_text.append("public struct Box {\n");
+    source_text.append("    #doc public field\n");
+    source_text.append("    public Int value;\n");
+    source_text.append("    #doc private field\n");
+    source_text.append("    Int hidden;\n");
+    source_text.append("}\n");
+    source_text.append("#doc private global\n");
+    source_text.append("Int secret = 0;\n");
+    source_text.append("#doc public answer\n");
+    source_text.append("public Int answer() { 42 }\n");
+    source_text.append("#doc public extension\n");
+    source_text.append("public extend Box {\n");
+    source_text.append("    #doc public extension method\n");
+    source_text.append("    public Int visible() { 1 }\n");
+    source_text.append("}\n");
+    source_text.append("#doc private extension\n");
+    source_text.append("extend Box {\n");
+    source_text.append("    #doc private extension method\n");
+    source_text.append("    Int hidden_method() { 2 }\n");
+    source_text.append("}\n");
+    std.String text = source_text.into_string();
+
+    context.CompilerContext ctx! = context.CompilerContext();
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "documentation_roundtrip",
+        text.bytes()
+    );
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.bytes(), source_id);
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver();
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+
+    documentation.Documentation docs = documentation.collect(ctx$.ref(), graph.root_module);
+    assert_doc_contents(ctx$.ref(), docs$.ref());
+    ji.JiSectionPayload payload = documentation.payload(ctx$.ref(), graph.root_module)$.some();
+    assert(payload.kind == .documentation);
+    assert(payload.hash == object_hash.hash_bytes(payload.bytes.slice()));
+
+    ji.JiFileImage image = source_ji.build_source_ji_image(
+        ctx$.ref(),
+        ctx.store.artifacts$.ref(),
+        source_id,
+        UInt64(1)
+    )$.some();
+    assert(image.read_section(.documentation) != null);
+    UInt8[]& path = "/tmp/jiang_documentation_roundtrip.ji";
+    assert(ji.write_ji_file(path, image$.ref()));
+    check_normal_load_skips_documentation(path, text.bytes());
+
+    context.CompilerContext loaded! = context.CompilerContext();
+    assert(loaded.store.sources.empty());
+    documentation.Documentation decoded =
+        documentation.read_from_ji(
+            loaded.store.symbols$.mut_ref(), loaded.store.artifacts$.mut_ref(), path
+        )$.some();
+    assert(loaded.store.artifacts.stats.section_reads == 1);
+    assert(loaded.store.sources.empty());
+    assert_doc_contents(loaded$.ref(), decoded$.ref());
+    corrupt_documentation_section(path);
+    assert(documentation.read_from_ji(
+        loaded.store.symbols$.mut_ref(), loaded.store.artifacts$.mut_ref(), path
+    ) == null);
+    assert(fs.remove_file(path));
+}
+
+Void assert_doc_contents(context.CompilerContext& ctx, documentation.Documentation& docs) {
+    assert(docs.module_markdown != null);
+    assert(string.equal(ctx.store.symbols.text(docs.module_markdown$.some()), "module docs"));
+    assert(docs.declarations.len() == 4);
+    assert_declarations_sorted(docs);
+    assert(has_declaration_doc(ctx, docs, "public box"));
+    assert(has_declaration_doc(ctx, docs, "public field"));
+    assert(has_declaration_doc(ctx, docs, "public answer"));
+    assert(has_declaration_doc(ctx, docs, "public extension method"));
+    assert(!has_declaration_doc(ctx, docs, "private field"));
+    assert(!has_declaration_doc(ctx, docs, "private global"));
+    assert(!has_declaration_doc(ctx, docs, "private extension method"));
+    assert(docs.extensions.len() == 1);
+    assert(docs.extensions.get(0).ordinal == 0);
+    assert(string.equal(
+        ctx.store.symbols.text(docs.extensions.get(0).markdown),
+        "public extension"
+    ));
+}
+
+Void assert_declarations_sorted(documentation.Documentation& docs) {
+    Int index! = 1;
+    while (index < docs.declarations.len()) {
+        qkey.StableSymbolId previous = docs.declarations.get(index - 1).stable_id;
+        qkey.StableSymbolId current = docs.declarations.get(index).stable_id;
+        assert(stable_id_less(previous, current));
+        index = index + 1;
+    }
+}
+
+Bool stable_id_less(qkey.StableSymbolId lhs, qkey.StableSymbolId rhs) {
+    if (lhs.low != rhs.low) { return lhs.low < rhs.low; }
+    return lhs.high < rhs.high;
+}
+
+Bool has_declaration_doc(
+    context.CompilerContext& ctx,
+    documentation.Documentation& docs,
+    UInt8[]& expected
+) {
+    Int index! = 0;
+    while (index < docs.declarations.len()) {
+        if (string.equal(ctx.store.symbols.text(docs.declarations.get(index).markdown), expected)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Void check_normal_load_skips_documentation(UInt8[]& path, UInt8[]& text) {
+    context.CompilerContext loaded! = context.CompilerContext();
+    source.SourceId source_id = loaded.store.sources.intern_virtual("documentation_roundtrip", text);
+    ji.JiDiskLayout layout = ji.read_ji_layout(path)$.some();
+    Int expected_reads! = 0;
+    if (layout.sections.find(.import_summary) != null) { expected_reads = expected_reads + 1; }
+    if (layout.sections.find(.interface_section) != null) { expected_reads = expected_reads + 1; }
+    if (layout.sections.find(.generic_templates) != null) { expected_reads = expected_reads + 1; }
+    assert(source_ji.load_source_artifacts_from_ji(
+        loaded.store$.mut_ref(),
+        source_id,
+        path,
+        UInt64(1),
+        qkey.Fingerprint128()
+    ));
+    assert(loaded.store.artifacts.stats.section_reads == expected_reads);
+}
+
+Void corrupt_documentation_section(UInt8[]& path) {
+    ji.JiDiskLayout layout = ji.read_ji_layout(path)$.some();
+    ji.JiSectionEntry entry = layout.sections.find(.documentation)$.some();
+    UInt8[]^ bytes! = fs.read_all_owned(path)$.some();
+    Int last = entry.offset + entry.length - 1;
+    bytes[last] = bytes[last] ^ UInt8(1);
+    assert(fs.write_all(path, bytes[..]));
+}
+
+Void check_empty_documentation_is_omitted() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "documentation_empty",
+        "public Int answer() { 42 }"
+    );
+    syntax.SyntaxResult parsed! = syntax.parse_source(
+        ctx$.mut_ref(),
+        "public Int answer() { 42 }",
+        source_id
+    );
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver();
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+    assert(documentation.payload(ctx$.ref(), graph.root_module) == null);
+    ji.JiFileImage image = source_ji.build_source_ji_image(
+        ctx$.ref(),
+        ctx.store.artifacts$.ref(),
+        source_id,
+        UInt64(1)
+    )$.some();
+    assert(image.read_section(.documentation) == null);
+}
+
+Void check_doc_only_change_keeps_interface_fingerprints() {
+    UInt8[]& before =
+        "#doc(module) before module\n#doc before answer\npublic Int answer() { 42 }";
+    UInt8[]& after =
+        "#doc(module) after module\n#doc after answer\npublic Int answer() { 42 }";
+    context.CompilerContext before_ctx! = context.CompilerContext();
+    context.CompilerContext after_ctx! = context.CompilerContext();
+    source.SourceId before_source = before_ctx.store.sources.intern_virtual(
+        "documentation_incremental",
+        before
+    );
+    source.SourceId after_source = after_ctx.store.sources.intern_virtual(
+        "documentation_incremental",
+        after
+    );
+    qid.ModuleId before_module = lower_documented_module(before_ctx$.mut_ref(), before_source, before);
+    qid.ModuleId after_module = lower_documented_module(after_ctx$.mut_ref(), after_source, after);
+    source_artifact.ModuleInterface& before_interface =
+        before_ctx.store.artifacts.load_interface(before_source)$.some();
+    source_artifact.ModuleInterface& after_interface =
+        after_ctx.store.artifacts.load_interface(after_source)$.some();
+    assert(before_interface.interface_hash == after_interface.interface_hash);
+    assert(before_interface.public_interface_hash == after_interface.public_interface_hash);
+    assert(before_interface.declarations.len() == after_interface.declarations.len());
+    Int index! = 0;
+    while (index < before_interface.declarations.len()) {
+        source_artifact.InterfaceDeclSummary before_decl = before_interface.declarations.get(index);
+        source_artifact.InterfaceDeclSummary after_decl = after_interface.declarations.get(index);
+        assert(before_decl.stable_id == after_decl.stable_id);
+        assert(before_decl.signature_fingerprint == after_decl.signature_fingerprint);
+        assert(before_decl.body_fingerprint == after_decl.body_fingerprint);
+        index = index + 1;
+    }
+    ji.JiSectionPayload before_docs =
+        documentation.payload(before_ctx$.ref(), before_module)$.some();
+    ji.JiSectionPayload after_docs =
+        documentation.payload(after_ctx$.ref(), after_module)$.some();
+    assert(before_docs.hash != after_docs.hash);
+    ji.JiFileImage before_image = source_ji.build_source_ji_image(
+        before_ctx$.ref(),
+        before_ctx.store.artifacts$.ref(),
+        before_source,
+        UInt64(1)
+    )$.some();
+    ji.JiFileImage after_image = source_ji.build_source_ji_image(
+        after_ctx$.ref(),
+        after_ctx.store.artifacts$.ref(),
+        after_source,
+        UInt64(1)
+    )$.some();
+    assert(
+        before_image.sections.find(.interface_section)$.some().hash
+            == after_image.sections.find(.interface_section)$.some().hash
+    );
+    assert(
+        before_image.sections.find(.documentation)$.some().hash
+            != after_image.sections.find(.documentation)$.some().hash
+    );
+    object_key_builder.SourceObjectFingerprints before_fingerprints =
+        object_key_builder.source_object_fingerprints_for_module(before_ctx$.mut_ref(), before_module);
+    object_key_builder.SourceObjectFingerprints after_fingerprints =
+        object_key_builder.source_object_fingerprints_for_module(after_ctx$.mut_ref(), after_module);
+    object_artifact.SourceObjectKey before_key = object_key_builder.source_object_key_for_module(
+        before_ctx$.ref(), before_module, before_fingerprints,
+        qkey.Fingerprint128(1, 2), qkey.Fingerprint128(3, 4), qkey.Fingerprint128(5, 6)
+    )$.some();
+    object_artifact.SourceObjectKey after_key = object_key_builder.source_object_key_for_module(
+        after_ctx$.ref(), after_module, after_fingerprints,
+        qkey.Fingerprint128(1, 2), qkey.Fingerprint128(3, 4), qkey.Fingerprint128(5, 6)
+    )$.some();
+    assert(object_artifact.SourceObjectKey.equal(before_key$.ref(), after_key$.ref()));
+}
+
+qid.ModuleId lower_documented_module(
+    context.CompilerContext&! ctx,
+    source.SourceId source_id,
+    UInt8[]& text
+) {
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx, text, source_id);
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver();
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx, parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx, graph$.ref()));
+    resolver.finalize_module_graph_model(ctx, graph$.ref());
+    return graph.root_module;
+}

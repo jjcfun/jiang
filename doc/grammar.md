@@ -34,6 +34,7 @@ string_lit  <- /* UTF-8 字符串字面量 */
 provider_path
             <- ident ("." ident)*
 raw_block   <- /* `#provider_path { ... }` 中由 lang provider scan 确定边界的原始 block */
+doc_body    <- /* builtin `#doc` 扫描的单行或以独占行 `#end` 结束的 Markdown */
 
 literal     <- int_lit
              / float_lit
@@ -50,7 +51,8 @@ literal     <- int_lit
 file        <- top_level_item* eof
 
 top_level_item
-            <- compile_block
+            <- module_doc
+             / compile_block
              / intrinsic_block
              / extern_block
              / top_level_decl
@@ -83,9 +85,15 @@ top_level_decl
 member_decl <- leading_annotation* member_modifier* member_decl_body
 
 leading_annotation
-            <- "@" "where" "(" where_constraints ")"
+            <- doc_annotation
+             / "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
              / "@" "alias" "(" alias_attribute_bindings ")"
+
+doc_annotation
+            <- ("#doc" / "#jiang.doc") doc_body
+
+module_doc  <- ("#doc" / "#jiang.doc") "(" "module" ")" doc_body
 
 alias_attribute_bindings
             <- alias_attribute_binding ("," alias_attribute_binding)* ","?

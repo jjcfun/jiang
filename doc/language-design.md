@@ -108,7 +108,8 @@ type = lang
 lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang.syntax.Provider`。
 编译器在 host 上把该 package 编译成 dynamic library，lexer/parser 在 syntax 阶段调用 provider。
 
-语言层规则：
+语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` 有固定的 line/block
+header）：
 
 - 只支持 block invocation：`#alias { ... }`。
 - 当前不支持 `#alias(...)`。
@@ -129,8 +130,15 @@ parse(input, expected, syntax) -> Expansion
 lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`scan` 负责判断 DSL block
 边界，并可把私有 token/cache 保存在 provider 实例字段中。parser 后续读到 `raw_block` token 时
 调用同一实例的 `parse`。provider 通过 `Parser<K>` 的 typed factory 直接生成普通 Jiang syntax，
-不公开 compiler AST data，也不建立 mirror tree。编译器内建 provider 当前包括 inline asm：
-`#asm { ... }` 是短名，`#jiang.asm { ... }` 是完整内建路径。
+不公开 compiler AST data，也不建立 mirror tree。编译器内建 provider 包括 inline asm 和
+API 文档：`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
+`#jiang.doc` 生成 declaration annotation，`#doc(module)` 指向 module semantic owner。短名
+允许被用户的 lang dependency alias 覆盖，`#jiang.*` 始终选择 compiler builtin。
+
+API 文档正文保存规范化后的原始 Markdown。公开 module/declaration 文档写入 `.ji` 的
+独立可选 documentation section；该 section 不进入 interface、body、object 或 monomorph
+fingerprint。`jiangc --doc` 在 type check 后直接从 Semantic Model 生成 Markdown，不进入
+JIL/backend，也不在 compiler 中引入 HTML frontend。
 
 这种机制的目标不是把 Jiang 变成文本宏语言，而是让不同领域可以使用更适合的表面语法，例如
 SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态化和 backend 仍由 Jiang 编译器统一处理。

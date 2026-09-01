@@ -131,7 +131,8 @@ source cursor、trivia、连续 storage 和 `checkpoint/rewind`，但不理解 `
 
 compiler 为 provider 生成 host dynamic library wrapper，普通用户代码不直接调用 wrapper 符号。
 当前 inline asm 由编译器内建 provider 实现；用户源码可写 `#asm { ... }`，需要稳定指向内建实现时
-可写 `#jiang.asm { ... }`。
+可写 `#jiang.asm { ... }`。API 文档也由 compiler builtin provider 实现，使用 `#doc` 或
+`#jiang.doc`；它不扩大 `std.jiang.syntax.Provider` 的 public invocation grammar。
 
 identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节；UTF-8 路径使用 Unicode
 `XID_Start` / `XID_Continue`。压缩 XID 表由 `script/gen_unicode_xid.js` 生成到

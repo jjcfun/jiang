@@ -239,7 +239,8 @@ defer {
 - `defer expr;`
 - `defer { ... }`
 
-当前限制：
+以下限制适用于用户自定义的 lang package；内建 `#doc` 使用上一节的固定 line/block
+语法，不改变 public provider invocation：
 
 - `defer` 体内不支持 `return`、`break`、`continue`
 
@@ -2800,6 +2801,48 @@ import util;
 - root file 可以通过 `public import` 重新导出模块 namespace，也可以通过 `public alias`
   重新导出具体 public symbol
 - 非 root module 的 public 声明不会自动成为 package API
+
+#### API 文档
+
+`#doc` 为紧随其后的 declaration 添加 Markdown 文档；`#doc(module)` 为当前 module
+添加文档，并且必须位于第一个非 import declaration 之前：
+
+```jiang
+#doc(module) collection module。
+
+#doc 返回两个整数之和。
+public Int add(Int left, Int right) {
+    left + right
+}
+```
+
+header 后同一行有正文时为单行文档。header 所在行没有正文时，使用独占一行的
+`#end` 结束多行文档：
+
+```jiang
+#doc
+    ## `Vector`
+
+    连续存储一组元素。正文中的 `{}`、`"..."` 和 fenced code block 都是普通 Markdown。
+#end
+public struct Vector<T> {
+}
+```
+
+如果正文确实需要独占一行的 `#end`，写成 `\#end`。相邻的多个 `#doc` 按源码顺序用
+换行合并。短名 `#doc` 被 lang dependency alias 占用时，可以用 `#jiang.doc` 显式选择
+内建文档语法。
+
+使用 compiler 生成 Markdown API 文档：
+
+```bash
+jiangc --doc path/to/package
+jiangc --doc -o build/doc/custom path/to/package
+```
+
+默认入口为 `build/doc/<package>/index.md`。生成结果只包含 Markdown，可以直接使用
+VS Code Markdown Preview、GitHub 或网站现有的 Markdown 构建链预览。compiler 不内置
+HTML renderer 或 HTTP server。
 
 #### Lang Package / 自定义语法
 

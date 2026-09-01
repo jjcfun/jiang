@@ -36,6 +36,7 @@ import resolve_state = "./state.jiang";
 import scope = "./scope.jiang";
 import store = "./store.jiang";
 import trait_companion = "./trait_companion.jiang";
+import std;
 
 extern {
     Float64 strtod(UInt8* text, Int endptr);
@@ -56,6 +57,7 @@ struct Lower: Movable {
     Bool owner_type_lookup_enabled!;
     map.WyHashMap<qid.DefId, Int> lambda_ordinals!;
     scope.LexicalEnv env!;
+    Bool module_doc_allowed!;
 
     public init(self, resolve_state.AstResolveState&! state) {
         self.state = state;
@@ -64,6 +66,7 @@ struct Lower: Movable {
         self.owner_type_lookup_enabled = false;
         self.lambda_ordinals = map.WyHashMap<qid.DefId, Int>();
         self.env = scope.LexicalEnv();
+        self.module_doc_allowed = true;
     }
 
     // 只遍历能在 Semantic Model 中拥有可执行/类型语法的 declaration。declaration
@@ -83,6 +86,13 @@ struct Lower: Movable {
 
     Void lower_top_level_item(Self&! self, ast.AstId item_id) {
         ast.AstNode item = self.state.unit.get(item_id);
+        if (item.data is .doc_attribute(doc_attr)) {
+            self.lower_module_doc(item.span, doc_attr);
+            return;
+        }
+        if (!self.top_level_item_is_import(item)) {
+            self.module_doc_allowed = false;
+        }
         if (item.data is .top_level_decl(top_level)) {
             ast.AstNode body = self.state.unit.get(top_level.body);
             if (body.data is .extend_decl(extend_decl)) {
@@ -117,6 +127,32 @@ struct Lower: Movable {
         self.lower_decl_with_annotations(item_id, self.empty_ast_range(), false);
     }
 
+    Bool top_level_item_is_import(Self&! self, ast.AstNode item) {
+        guard item.data is .top_level_decl(top_level) else { return false; }
+        return self.state.unit.get(top_level.body).data is .import_decl(_);
+    }
+
+    Void lower_module_doc(Self&! self, token.Span span, ast.DocAttributeData doc_attr) {
+        if (doc_attr.target != .module) {
+            self.add_name_resolution_error(
+                span,
+                "declaration documentation must precede a declaration",
+                "doc_expected_declaration"
+            );
+            return;
+        }
+        if (!self.module_doc_allowed) {
+            self.add_name_resolution_error(
+                span,
+                "module documentation must appear before the first non-import declaration",
+                "doc_module_after_declaration"
+            );
+            return;
+        }
+        qid.SymbolId markdown = self.merge_module_doc(doc_attr.markdown);
+        self.state.ctx.store.model.set_module_doc(self.state.module_id, markdown);
+    }
+
     Void lower_compile_block(Self&! self, ast.CompileBlockData compile_block) {
         Int index! = 0;
         while (index < compile_block.items.length) {
@@ -143,7 +179,12 @@ struct Lower: Movable {
             ast.AstId item_id = self.state.unit.child_at(extern_block.items, index);
             ast.AstNode item = self.state.unit.get(item_id);
             if (item.data is .extern_item(extern_item)) {
-                self.lower_decl_with_extern_kind(extern_item.body, self.empty_ast_range(), extern_kind, true);
+                self.lower_decl_with_extern_kind(
+                    extern_item.body,
+                    extern_item.annotations,
+                    extern_kind,
+                    true
+                );
             }
             index = index + 1;
         }
@@ -182,7 +223,7 @@ struct Lower: Movable {
             return;
         }
         if (decl.data is .deinit_decl(deinit_decl)) {
-            self.lower_deinit(deinit_decl);
+            self.lower_deinit(deinit_decl, annotations);
             return;
         }
         if (decl.data is .global_decl(global_decl)) {
@@ -353,7 +394,12 @@ struct Lower: Movable {
             guard trait_node.data is .trait_bound(trait_bound) else { return; }
             sem.NodeId lowered_trait_ref = self.lower_trait_bound_ref(trait_bound);
             self.state.ctx.store.model.set_extension_trait_ref(extension_index, lowered_trait_ref);
-            self.lower_extension_trait_assoc_bindings(extension_index, extend_decl.target_type, trait_bound, lowered_trait_ref);
+            self.lower_extension_trait_assoc_bindings(
+                extension_index,
+                extend_decl.target_type,
+                trait_bound,
+                lowered_trait_ref
+            );
         }
         ast.AstId? previous_extension_target = self.current_extension_target;
         if (binding_owner.to_index() == owner_def.to_index()) {
@@ -711,13 +757,34 @@ struct Lower: Movable {
         while (index < annotations.length) {
             ast.AstId annotation_id = self.state.unit.child_at(annotations, index);
             ast.AstNode annotation = self.state.unit.get(annotation_id);
-            if (annotation.data is .alias_attribute(alias_attr)) {
+            if (annotation.data is .doc_attribute(doc_attr)) {
+                self.lower_extension_doc(extension_index, annotation.span, doc_attr);
+            } else if (annotation.data is .alias_attribute(alias_attr)) {
                 self.lower_alias_attribute(alias_attr);
             } else {
                 self.lower_extension_where_constraint(extension_index, annotation_id);
             }
             index = index + 1;
         }
+    }
+
+    Void lower_extension_doc(
+        Self&! self,
+        Int extension_index,
+        token.Span span,
+        ast.DocAttributeData doc_attr
+    ) {
+        if (doc_attr.target == .module) {
+            self.add_name_resolution_error(
+                span,
+                "module documentation cannot annotate an extension",
+                "doc_module_target_requires_top_level"
+            );
+            return;
+        }
+        qid.SymbolId? previous = self.state.ctx.store.model.extension_doc(extension_index);
+        qid.SymbolId markdown = self.merge_doc_symbols(previous, doc_attr.markdown);
+        self.state.ctx.store.model.set_extension_doc(extension_index, markdown);
     }
 
     Void lower_extension_where_constraint(Self&! self, Int extension_index, ast.AstId constraint_id) {
@@ -832,6 +899,7 @@ struct Lower: Movable {
             effects: sem.EffectSet()
         );
         self.declare_callable_signature(init_def, signature, false);
+        self.state.ctx.store.model.set_decl_is_failable_init(init_def, init_decl.failable);
         self.lower_annotations(init_def, annotations);
 
         sem.NodeId placeholder = self.add_invalid_node(span);
@@ -908,7 +976,7 @@ struct Lower: Movable {
     // deinit body 归属于隐藏 deinit_def。它没有显式参数，返回 unit；
     // owner type 的泛型 scope 已在 nominal lowering 外层进入，因此 deinit
     // body 仍然能解析 owner 泛型参数。
-    Void lower_deinit(Self&! self, ast.StmtData deinit_decl) {
+    Void lower_deinit(Self&! self, ast.StmtData deinit_decl, ast.AstRange annotations) {
         guard self.current_owner_def is .some(owner_def) else { return; }
         if (!self.state.ctx.store.model.has_def(owner_def)) { return; }
         sem.Def& owner_model = self.state.ctx.store.model.def_ref(owner_def);
@@ -933,6 +1001,7 @@ struct Lower: Movable {
             effects: sem.EffectSet()
         );
         self.declare_callable_signature(deinit_def, signature, false);
+        self.lower_annotations(deinit_def, annotations);
         sem.NodeId placeholder = self.add_invalid_node(span);
         self.state.ctx.store.model.load_body(deinit_def, sem.Body(deinit_def, placeholder));
         self.env.enter_scope(.function_scope);
@@ -1363,6 +1432,19 @@ struct Lower: Movable {
 
     Void lower_annotation(Self&! self, qid.DefId owner_def, ast.AstId annotation_id) {
         ast.AstNode annotation = self.state.unit.get(annotation_id);
+        if (annotation.data is .doc_attribute(doc_attr)) {
+            if (doc_attr.target == .module) {
+                self.add_name_resolution_error(
+                    annotation.span,
+                    "module documentation cannot annotate a declaration",
+                    "doc_module_target_requires_top_level"
+                );
+                return;
+            }
+            qid.SymbolId markdown = self.merge_declaration_doc(owner_def, doc_attr.markdown);
+            self.state.ctx.store.model.set_declaration_doc(owner_def, markdown);
+            return;
+        }
         if (annotation.data is .self_attribute(_)) {
             return;
         }
@@ -1407,6 +1489,26 @@ struct Lower: Movable {
             return;
         }
         self.lower_where_constraint(owner_def, annotation_id);
+    }
+
+    qid.SymbolId merge_module_doc(Self&! self, qid.SymbolId next) {
+        qid.SymbolId? previous = self.state.ctx.store.model.module_doc(self.state.module_id);
+        return self.merge_doc_symbols(previous, next);
+    }
+
+    qid.SymbolId merge_declaration_doc(Self&! self, qid.DefId owner_def, qid.SymbolId next) {
+        qid.SymbolId? previous = self.state.ctx.store.model.declaration_doc(owner_def);
+        return self.merge_doc_symbols(previous, next);
+    }
+
+    qid.SymbolId merge_doc_symbols(Self&! self, qid.SymbolId? previous, qid.SymbolId next) {
+        guard previous is .some(existing) else { return next; }
+        std.StringBuilder builder! = std.StringBuilder();
+        builder.append_valid_utf8(self.state.ctx.store.symbols.text(existing));
+        builder.append("\n");
+        builder.append_valid_utf8(self.state.ctx.store.symbols.text(next));
+        std.String markdown = builder.into_string();
+        return self.state.ctx.store.symbols.intern(markdown.bytes());
     }
 
     Void lower_life_attribute(Self&! self, qid.DefId owner_def, ast.LifeAttributeData life_attr) {
