@@ -5,11 +5,11 @@
 
 ## 常规开发
 
-当前 0.5.3 release 源码已经使用 builtin `#doc`，使用 `bootstrap/0.5.3-api-doc` 产出的 next：
+当前 0.5.3 release 源码已经使用 builtin `#doc`，使用 `bootstrap/0.5.3` 产出的 next：
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
 bash ./script/build_next.sh
 ```
 
@@ -18,7 +18,7 @@ bootstrap 版本前，显式指定：
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN="${JIANG_HOME:-$HOME/.jiang}/versions/0.5.3/bin/jiangc" \
+BOOTSTRAP_BIN="${JIANG_HOME:-$HOME/.jiang}/versions/0.5.3/bin/jiang" \
 bash ./script/build_next.sh
 ```
 
@@ -46,7 +46,7 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
@@ -76,13 +76,12 @@ release 分支保留自己的线性提交历史；bootstrap 分支只提供编�
 ### 0.5.3 enum ADT 过渡
 
 0.5.3 用 payload enum 替代普通 tagged union，并在 compiler 源码中使用 builtin `#doc`。
-0.5.2 stable 不能直接解析迁移后的 release 编译器源码；第一个 bootstrap 支持 payload enum，
-第二个 bootstrap 支持 `#doc`，但自身源码还没有 `#doc` invocation：
+0.5.2 stable 不能直接解析迁移后的 release 编译器源码。唯一的 bootstrap 支持 payload enum，
+并在 lexer 中跳过只影响文档产物的 `#doc`，自身不复制文档 AST、artifact 或 renderer：
 
 ```text
 Jiang 0.5.2 stable
   -> bootstrap/0.5.3 next
-  -> bootstrap/0.5.3-api-doc next
   -> release/0.5.3 next
   -> release/0.5.3 stable
 ```
@@ -93,10 +92,8 @@ Jiang 0.5.2 stable
 bash ./script/build_next.sh
 ```
 
-第一个 bootstrap 只需生成 `build/bin/jiangc.next`，不生成 stable。随后在
-`bootstrap-api-doc-0.5.3` worktree 中显式使用该 next，再生成第二阶段 `jiangc.next`。release
-worktree 必须使用第二阶段 next 生成 release next 和 stable。不得跳过任一 bootstrap 阶段，也不得
-从未记录身份的任意 `jiangc` 开始冷启动。
+bootstrap 只需生成 `build/bin/jiangc.next`，不生成 stable。release worktree 必须直接使用该 next
+生成 release next 和 stable，不得从未记录身份的任意 `jiangc` 开始冷启动。
 
 ### 0.5.2 严格检查过渡模式
 

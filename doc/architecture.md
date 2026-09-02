@@ -357,7 +357,7 @@ src/
     support/    arena、list、hash、unicode 等通用工具
   std/          用户可导入的标准库 package
   lang/         随发行版提供的 builtin/custom language provider
-  tool/         jiangdoc 等独立工具
+  tool/         可选的叶子命令工具
 ```
 
 `src/compiler/system/` 是 compiler、runtime 与 public `std` 共用的私有系统能力层，负责 host/target
@@ -365,7 +365,7 @@ OS、filesystem、process、dynamic library 和 target info。它不是用户可
 面向用户的 OS 能力由 `std` wrapper 暴露可移植语义。
 
 `compiler`、`lang`、`std` 可以按实际 ownership 和启动需求直接复用彼此；不为制造形式上的单向图
-增加 adapter 或复制结构。唯一硬边界是三者都不能依赖 `tool`。`tool` 是最外层，可以依赖前三者。
+增加 adapter 或复制结构。`tool` 只能作为依赖发起方，不能成为前三层的依赖。
 
 ## Support 容器
 
@@ -457,9 +457,9 @@ test/lang/
     run/
 ```
 
-- `check/`：期望 `jiangc --check` 成功。
-- `fail/`：期望 `jiangc --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
-- `emit/`：期望 `jiangc --emit-llvm` 成功。
+- `check/`：期望 `jiang --check` 成功。
+- `fail/`：期望 `jiang --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
+- `emit/`：期望 `jiang --emit-llvm` 成功。
 - `run/`：需要生成并运行目标程序的端到端用例，可用 `// expected-exit: N` 匹配退出码。
 - `diagnostic/` 或专门 fixture：用于精确检查多条 diagnostic、span 和消息的用例。
 

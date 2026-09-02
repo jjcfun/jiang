@@ -4,7 +4,7 @@
 
 # Jiang语言
 
-当前 Jiang 语言编译器已经可以稳定自举。常规版本开发只依赖上一版稳定 `jiangc` 作为
+当前 Jiang 语言编译器已经可以稳定自举。常规版本开发只依赖上一版稳定 compiler 作为
 bootstrap 输入；如果新版本包含旧 release 编译器无法直接编译的破坏性升级，则使用
 `bootstrap/<version>` 和 `release/<version>` 双 worktree 流程。
 
@@ -63,17 +63,16 @@ bash ./script/install_llvm.sh --local --from-source
 源码模式从 Jiang LLVM fork 浅克隆锁定的 `llvmorg-22.1.8`，源码位于
 `build/llvm-source/22.1.8`（可用 `JIANG_LLVM_SOURCE_DIR` 覆盖）。`JIANG_LLVM_FORCE_BUILD=1`
 仍表示强制源码重建。LLVM 库默认以静态库形式
-链接进 `jiangc`，release 用户不需要安装 LLVM runtime。
-macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
+链接进 `jiang`，release 用户不需要安装 LLVM runtime。
+macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
 当前 0.5.3 release 把普通 tagged union 迁移为 payload enum，并在 compiler 源码中使用 builtin
-`#doc`。0.5.2 stable 不能直接解析 release 编译器源码，因此冷启动使用两个最小过渡阶段：
+`#doc`。0.5.2 stable 不能直接解析 release 编译器源码，因此冷启动使用一个最小过渡阶段：
 
 ```text
 0.5.2 stable
   -> bootstrap/0.5.3 next
-  -> bootstrap/0.5.3-api-doc next
   -> release/0.5.3 next
   -> release/0.5.3 stable
 ```
@@ -85,21 +84,12 @@ cd ../bootstrap-0.5.3
 bash ./script/build_next.sh
 ```
 
-再由该 next 构建支持 builtin `#doc`、但源码尚未使用 `#doc` 的第二阶段：
-
-```bash
-cd ../bootstrap-api-doc-0.5.3
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
-bash ./script/build_next.sh
-```
-
-最后在 release worktree 中用第二阶段 next 构建 release next：
+然后在 release worktree 中直接用 bootstrap next 构建 release next：
 
 ```bash
 cd ../jiang
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
 bash ./script/build_next.sh
 ```
 
@@ -107,7 +97,7 @@ bash ./script/build_next.sh
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-api-doc-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
@@ -142,17 +132,8 @@ bash ./script/install_wasi.sh
 DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
 syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
 
-API 文档使用 builtin `#doc` 编写 Markdown。先构建独立工具，再生成文档：
-
-```bash
-JIANGC=./build/bin/jiangc.next bash ./script/build_doc.sh
-./build/bin/jiangdoc path/to/package
-./build/bin/jiangdoc --markdown path/to/package
-```
-
-默认入口为 `build/doc/<package>/index.html`；需要 Markdown 页面树时显式传入 `--markdown`。语法、module 文档和
-预览方式见[语言指南](doc/jiang.md#api-文档)。Markdown/HTML renderer 位于 `src/tool/doc`，
-不进入普通 compiler pipeline。
+Jiang 使用 builtin `#doc` 为 module 和 declaration 保存 Markdown 文档。语法见
+[语言指南](doc/jiang.md#api-文档)。
 
 
 
@@ -217,8 +198,9 @@ bash ./script/package_linux_release.sh
 
 两个入口复用 `package_release.sh` 的公共 staging/install 流程，默认从 `package.ini` 读取版本，
 并要求 `build/bin/jiangc --version` 与包版本一致。macOS 产物是 `.zip`，Linux x86_64 产物是
-`.tar.gz`。其中 `jiangc` 静态链接 LLVM，不动态依赖 `libLLVM` / `liblld`；包内 `install.sh`
-会安装到 `~/.jiang/versions/<version>` 并更新 `~/.jiang/bin/jiangc`。Linux 包额外包含 `ABI.txt`。
+`.tar.gz`。发行包把该产物安装为主命令 `jiang`，并保留 `jiangc` 兼容链接；`jiang` 静态链接 LLVM，
+不动态依赖 `libLLVM` / `liblld`。包内 `install.sh` 会安装到 `~/.jiang/versions/<version>` 并更新
+`~/.jiang/bin/jiang`。Linux 包额外包含 `ABI.txt`。
 
 验证完整 release 链路：
 

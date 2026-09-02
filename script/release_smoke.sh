@@ -144,23 +144,23 @@ BUILD_DIR="$BUILD_DIR" DIST_DIR="$DIST_DIR" VERSION="$VERSION" \
 test -s "$PACKAGE_ARCHIVE"
 
 unpack_archive
-test -x "$PACKAGE_DIR/bin/jiangc"
-test -x "$PACKAGE_DIR/bin/jiangdoc"
-check_binary_version "$PACKAGE_DIR/bin/jiangc"
-check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangc"
-"$PACKAGE_DIR/bin/jiangdoc" --help >/dev/null
-check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangdoc"
+test -x "$PACKAGE_DIR/bin/jiang"
+test -L "$PACKAGE_DIR/bin/jiangc"
+test -L "$PACKAGE_DIR/bin/jiangc.build-id"
+check_binary_version "$PACKAGE_DIR/bin/jiang"
+check_dynamic_dependencies "$PACKAGE_DIR/bin/jiang"
+"$PACKAGE_DIR/bin/jiangc" --version >/dev/null
 
 printf '\n== release smoke: isolated install ==\n'
 PREFIX="$INSTALL_PREFIX" "$PACKAGE_DIR/install.sh" >/dev/null
-test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiangc"
-test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiangdoc"
+test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiang"
+test -L "$INSTALL_PREFIX/versions/$VERSION/bin/jiangc"
+test -L "$INSTALL_PREFIX/versions/$VERSION/bin/jiangc.build-id"
+test -L "$INSTALL_PREFIX/bin/jiang"
 test -L "$INSTALL_PREFIX/bin/jiangc"
-test -L "$INSTALL_PREFIX/bin/jiangdoc"
-check_binary_version "$INSTALL_PREFIX/bin/jiangc"
-check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiangc"
-"$INSTALL_PREFIX/bin/jiangdoc" --help >/dev/null
-check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiangdoc"
-compile_and_run_samples "$INSTALL_PREFIX/bin/jiangc"
+check_binary_version "$INSTALL_PREFIX/bin/jiang"
+check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiang"
+"$INSTALL_PREFIX/bin/jiangc" --version >/dev/null
+compile_and_run_samples "$INSTALL_PREFIX/bin/jiang"
 
 printf '\nOK release smoke: %s\n' "$PACKAGE_ARCHIVE"

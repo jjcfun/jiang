@@ -719,7 +719,7 @@ comptime {
 }
 ```
 
-构建模式只能由 `jiangc --mode debug|release` 选择，程序不能在源码中修改它。
+构建模式只能由 `jiang --mode debug|release` 选择，程序不能在源码中修改它。
 
 ### 进程级 panic
 
@@ -2703,16 +2703,16 @@ public alias min = math_utils.min;
 除了直接编译单个 `.jiang` 文件，编译器也支持把一个目录当作 package 入口：
 
 ```bash
-jiangc --emit-llvm path/to/pkg
-jiangc --emit-obj path/to/pkg -o pkg.o
-jiangc path/to/pkg -o pkg
+jiang --emit-llvm path/to/pkg
+jiang --emit-obj path/to/pkg -o pkg.o
+jiang path/to/pkg -o pkg
 ```
 
 编译器默认把可复用的接口和构建产物保存在当前目录的 `build/cache`。
 可以为一次编译选择其他位置：
 
 ```bash
-jiangc --artifact-cache-dir path/to/cache path/to/pkg -o pkg
+jiang --artifact-cache-dir path/to/cache path/to/pkg -o pkg
 ```
 
 debug 构建会按源码复用未变化的编译产物；release 构建仍对整个 package 做统一优化。
@@ -2721,7 +2721,7 @@ debug 构建会按源码复用未变化的编译产物；release 构建仍对整
 可以显式清理所选择的缓存目录；下次编译会自动重建：
 
 ```bash
-jiangc --artifact-cache-dir path/to/cache --clean-artifact-cache
+jiang --artifact-cache-dir path/to/cache --clean-artifact-cache
 ```
 
 不指定 `--artifact-cache-dir` 时清理默认的 `build/cache`。编译器会拒绝空路径、
@@ -2832,20 +2832,6 @@ public struct Vector<T> {
 如果正文确实需要独占一行的 `#end`，写成 `\#end`。相邻的多个 `#doc` 按源码顺序用
 换行合并。短名 `#doc` 被 lang dependency alias 占用时，可以用 `#jiang.doc` 显式选择
 内建文档语法。
-
-使用独立 `jiangdoc` 生成 API 文档：
-
-```bash
-jiangdoc path/to/package
-jiangdoc -o build/doc/custom path/to/package
-jiangdoc --markdown path/to/package
-```
-
-默认生成 HTML，入口为 `build/doc/<package>/index.html`；传入 `--markdown` 时改为生成 Markdown，入口为
-`index.md`。package 和 module 使用
-`index` 页面，公开类型与函数使用 `struct.Name`、`enum.Name`、`trait.Name`、`fn.name` 等页面；
-field、case、method 和 extension 留在 owner 类型页面内。浏览器可直接打开静态 HTML；Markdown
-仍可交给 VS Code、GitHub 或网站构建链。compiler 不包含 renderer 或 HTTP server。
 
 #### Lang Package / 自定义语法
 

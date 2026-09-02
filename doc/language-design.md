@@ -137,8 +137,7 @@ API 文档：`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
 
 API 文档正文保存规范化后的原始 Markdown。公开 module/declaration 文档写入 `.ji` 的
 独立可选 documentation section；该 section 不进入 interface、body、object 或 monomorph
-fingerprint。`jiangc --doc` 在 type check 后直接从 Semantic Model 生成 Markdown，不进入
-JIL/backend，也不在 compiler 中引入 HTML frontend。
+fingerprint。文档的浏览与输出形式尚未确定，不进入当前语言与 compiler CLI 设计。
 
 这种机制的目标不是把 Jiang 变成文本宏语言，而是让不同领域可以使用更适合的表面语法，例如
 SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态化和 backend 仍由 Jiang 编译器统一处理。
