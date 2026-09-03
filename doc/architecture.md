@@ -25,8 +25,8 @@ driver/cli -> pipeline.compile
 - `source/package`：入口文件或 package manifest 归一化、source 读取和 `SourceId` 建立。
   工作目录内同一文件的绝对路径和相对路径归一为同一个 source identity。
 - `lang registry`：先按入口 source path 构建 provider registry，再按 module graph/package
-  补全 package 级 registry。`#alias { ... }` 优先匹配 compiler builtin provider；否则调用
-  manifest dependency 中的 `type = lang` provider。provider 通过 typed syntax factory 直接生成
+  补全 package 级 registry。manifest 中的 `type = lang` dependency alias 可以覆盖 builtin 短名；
+  `#jiang.*` 始终选择 compiler builtin provider。provider 通过 typed syntax factory 直接生成
   当前 compiler AST unit 中的节点，并返回 opaque `Ast` 根句柄。
 - `Semantic Model`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
@@ -190,7 +190,8 @@ compiler service 可以直接查询 store 或使用 LSP sink，不把终端 I/O 
 `compile_loaded` 分离；后者每轮重新读取源码并重建 ModuleGraph、Semantic Model 和类型事实。
 `SourceStore` 是源码读取的统一入口：没有 overlay 时读取磁盘，IDE/LSP 设置 overlay 后优先读取
 未保存文本；root source 和普通 import 不能绕过它直接读取源码文件。每个逻辑源码先由
-`SourceInfo` 保存稳定 `SourceId`、`SourceKey`、content hash 与 revision；只有实际读取正文时才建立
+`SourceInfo` 保存 session-local `SourceId`、稳定 `SourceKey`、content hash 与 revision；只有实际读取
+正文时才建立
 完整 `Source`，其 text 非 optional。`.ji` header 命中只建立 `SourceInfo` 并跳过正文读取与 parser。
 源码诊断直接读取已载入的 `Source` 快照，不重新读取磁盘。
 `SourceKey` 使用 `.file(path)` / `.virtual(name)` payload enum 区分文件路径和虚拟名称。
@@ -357,7 +358,6 @@ src/
     support/    arena、list、hash、unicode 等通用工具
   std/          用户可导入的标准库 package
   lang/         随发行版提供的 builtin/custom language provider
-  tool/         可选的叶子命令工具
 ```
 
 `src/compiler/system/` 是 compiler、runtime 与 public `std` 共用的私有系统能力层，负责 host/target
@@ -365,7 +365,7 @@ OS、filesystem、process、dynamic library 和 target info。它不是用户可
 面向用户的 OS 能力由 `std` wrapper 暴露可移植语义。
 
 `compiler`、`lang`、`std` 可以按实际 ownership 和启动需求直接复用彼此；不为制造形式上的单向图
-增加 adapter 或复制结构。`tool` 只能作为依赖发起方，不能成为前三层的依赖。
+增加 adapter 或复制结构。
 
 ## Support 容器
 
@@ -427,7 +427,6 @@ public trait Indexable {
 ## 导入纪律
 
 阶段内部仍优先避免无意义的循环 import；源码层不强制 `compiler`、`lang`、`std` 单向分层。
-`src/tool` 只能作为依赖发起方，不能成为前三层的依赖。
 
 ## 测试目录
 
