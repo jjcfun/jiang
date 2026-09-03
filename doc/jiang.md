@@ -2862,8 +2862,8 @@ type = lang
 
 provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider`。编译器在 host 上
 把 lang package 编译成 dynamic library；lexer 调用 `scan` 决定 block 边界，parser 调用 `parse`
-取得 `Expansion`。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续
-走普通 resolve、type check、JIL 和 backend。
+取得生成结果。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续走普通
+resolve、type check、JIL 和 backend。
 
 当前限制：
 
@@ -2877,14 +2877,14 @@ provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider
 
 ```jiang
 public struct Lang: std.jiang.syntax.Provider {
-    public std.jiang.syntax.Expansion parse(
+    public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
-        std.jiang.syntax.ExpansionKind expected,
         std.jiang.syntax.SyntaxContext&! syntax
     ) {
         _ parser! = std.jiang.syntax.default_parser(syntax, input);
-        return .expression(parser.int_literal(input.name_span, "0"));
+        std.jiang.syntax.Expr value = parser.int_literal(input.name_span, "0");
+        return parser.ast(value);
     }
 }
 ```

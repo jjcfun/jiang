@@ -1,8 +1,8 @@
 # DSL / Lang Package
 
-Jiang 的 DSL 是 syntax-stage provider expansion。lexer 看到 `#alias { ... }` 后创建该
+Jiang 的 DSL 由 syntax-stage provider 生成 AST。lexer 看到 `#alias { ... }` 后创建该
 invocation 独有的 provider 实例，调用 `scan` 确定 block 边界；parser 随后调用同一实例的
-`parse`，取得普通 Jiang syntax expansion。生成节点继续进入既有 resolve、type check、JIL 和
+`parse`，取得普通 Jiang opaque `Ast` 根节点。生成节点继续进入既有 resolve、type check、JIL 和
 backend，不允许 provider 直接生成语义模型或后端 IR。
 
 ## 调用形式
@@ -27,7 +27,7 @@ package 只提供一个默认 provider。
 编译器内建 inline asm provider 支持 `#asm { ... }` 和 `#jiang.asm { ... }`；内建文档
 provider 支持 `#doc` / `#doc(module)` 以及完整路径 `#jiang.doc`。短名允许被用户
 dependency alias 覆盖，完整路径始终指向内建 provider。`doc` 的 line/terminated-block header
-是 compiler builtin 的固定入口，不扩展普通 lang package 的 invocation grammar。
+由 doc provider 自己扫描；普通 lang package 当前仍只使用 block invocation envelope。
 
 ## Public API
 
@@ -37,22 +37,21 @@ dependency alias 覆盖，完整路径始终指向内建 provider。`doc` 的 li
 - `SyntaxContext`：单次 invocation 的 opaque capability；compiler 传入，provider 只在调用期间借用。
 - `Token<K>`、`Tokenizer<K>`：可选的通用词法 cursor、token storage、trivia 和 checkpoint。
 - `Parser<K>`：token cursor、诊断、恢复和 typed Jiang syntax factory。
-- `Expansion`：expression、statement、declarations、type syntax 或 pattern。
+- `Ast`：单次 invocation 的 opaque AST 根句柄。
 
 compiler AST data、node index、child range、arena 和 factory operation 不属于 public API。provider 通过
 `Parser<K>` 的 typed method 创建节点，不能读取、遍历或手工组装 compiler AST。
 
 ```jiang
 public struct Lang: std.jiang.syntax.Provider {
-    public std.jiang.syntax.Expansion parse(
+    public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
-        std.jiang.syntax.ExpansionKind expected,
         std.jiang.syntax.SyntaxContext&! syntax
     ) {
         _ parser! = std.jiang.syntax.default_parser(syntax, input);
         std.jiang.syntax.Expr value = parser.int_literal(input.name_span, "0");
-        return .expression(value);
+        return parser.ast(value);
     }
 }
 ```
@@ -62,9 +61,9 @@ delimiter、string、comment 和 EOF，并把连续 token storage 直接交给 `
 自定义 token 的 provider 可以覆盖 `scan`，在实例字段中保存自己的 `Token<CustomKind>`，再在
 `parse` 中构造 `Parser<CustomKind>`。
 
-`expected` 表示 invocation 所在位置。provider 返回的 `Expansion` case 必须一致，否则 compiler
-报告 syntax error。当前 parser 已接入 expression、statement、declaration/member、type 和 pattern
-位置。
+factory 创建节点时直接写入 compiler-owned `AstUnit`。`parse` 返回的 `Ast` 只标识本次生成结果的根节点；
+compiler 根据 invocation 位置验证其实际语法角色。当前 parser 已接入 expression、statement、
+declaration/member、type、pattern 和 annotation 位置。
 
 ## Source、Token 与诊断
 
@@ -94,15 +93,15 @@ source
   -> compiler lexer scans provider block
   -> Provider.scan(Input, SyntaxContext)
   -> raw_block token
-  -> Provider.parse(Input, ExpansionKind, SyntaxContext)
-  -> typed Parser factory writes current AstUnit
+  -> Provider.parse(Input, SyntaxContext) -> opaque Ast root
+  -> compiler validates the root identity and syntax role
   -> resolve / sema / JIL / backend
 ```
 
 普通 Jiang lexer/parser 使用 compiler-private 静态调用路径。provider 的 typed factory 通过固定 ABI
 callback 写同一个 `AstUnit`；两条路径复用同一 token、span、diagnostic 和 AST 语义，但普通热路径
-不经过 `Provider.Any` 或 callback dispatch。builtin `asm` 和 `doc` 共用 tagged builtin dispatch 与
-LangBlock 生命周期，但不经过 dynamic provider ABI。
+不经过 `Provider.Any` 或 callback dispatch。builtin `asm`、`doc` 与第三方 lang 都通过统一的
+`Provider.Any` invocation 路径。
 
 每个 invocation 持有固定地址的 compiler-owned state。`scan` 期间只临时绑定 `CompilerStore`；
 `parse` 期间再临时绑定目标 `AstUnit`。调用返回后立即解除绑定，因此 `SyntaxContext` 不能
@@ -117,7 +116,7 @@ registry：
 dependency alias -> package id -> provider dylib -> Provider.Any
 ```
 
-compiler-private wrapper 位于 `src/lang/`：
+compiler-private host 支持位于 `src/compiler/lang/`：
 
 - `abi.jiang`：wrapper version 和固定入口符号。
 - `wrapper_template.jiang`：生成 host wrapper package。

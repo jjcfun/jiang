@@ -117,7 +117,7 @@ family 或第二套 scheduler/cancellation API。使用方式见[语言指南的
 ## std.jiang
 
 `std.jiang.syntax` 是 lang provider 的公共 syntax API。核心类型是 `Input`、opaque
-`SyntaxContext`、`Token<K>`、`Tokenizer<K>`、`Parser<K>`、typed syntax handle 和 `Expansion`。
+`SyntaxContext`、`Token<K>`、`Tokenizer<K>`、`Parser<K>`、typed syntax handle 和 opaque `Ast`。
 provider 通过 `Parser<K>` 的 typed method 生成 Jiang syntax，不公开 AST data、node index、child
 range 或 arena，也不允许用户手工组装 compiler AST。
 

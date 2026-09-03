@@ -108,15 +108,15 @@ type = lang
 lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang.syntax.Provider`。
 编译器在 host 上把该 package 编译成 dynamic library，lexer/parser 在 syntax 阶段调用 provider。
 
-语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` 有固定的 line/block
-header）：
+语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` provider 自己扫描
+line/block header）：
 
 - 只支持 block invocation：`#alias { ... }`。
 - 当前不支持 `#alias(...)`。
 - 当前不支持源码内声明多个 parser 入口。
 - 一个 lang package 只提供一个默认 provider。
-- provider 返回 `Expansion`，其 case 必须匹配 compiler 传入的 `ExpansionKind`。当前支持
-  expression、statement、declaration/member、type 和 pattern 位置。
+- provider 返回 opaque `Ast` 根句柄。compiler 根据 invocation 位置验证根节点的实际语法角色；当前支持
+  expression、statement、declaration/member、type、pattern 和 annotation 位置。
 - provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
 - DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
 
@@ -124,13 +124,14 @@ provider 有两个阶段：
 
 ```text
 scan(input, syntax) -> ScanResult
-parse(input, expected, syntax) -> Expansion
+parse(input, syntax) -> Ast
 ```
 
 lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`scan` 负责判断 DSL block
 边界，并可把私有 token/cache 保存在 provider 实例字段中。parser 后续读到 `raw_block` token 时
-调用同一实例的 `parse`。provider 通过 `Parser<K>` 的 typed factory 直接生成普通 Jiang syntax，
-不公开 compiler AST data，也不建立 mirror tree。编译器内建 provider 包括 inline asm 和
+调用同一实例的 `parse`。provider 通过 `Parser<K>` 的 typed factory 直接把普通 Jiang syntax 写入
+compiler-owned `AstUnit`，最后只返回根节点 `Ast`；不公开 compiler AST data，也不建立 mirror tree。
+编译器内建 provider 包括 inline asm 和
 API 文档：`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
 `#jiang.doc` 生成 declaration annotation，`#doc(module)` 指向 module semantic owner。短名
 允许被用户的 lang dependency alias 覆盖，`#jiang.*` 始终选择 compiler builtin。
