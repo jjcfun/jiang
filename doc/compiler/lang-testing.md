@@ -108,6 +108,7 @@ root 查找的临时源码必须放在 temp 目录。两者都按 case 唯一分
 - `TEST_RUN_FILTER=<regex>`：进一步筛选需要链接执行的 `run` 用例。
 - `TEST_JOBS=<n>`：设置最大并发进程数；`1` 用于稳定地串行复现。
 - `TEST_TIMEOUT=<seconds>`：限制单个 case 的总时长，`0` 表示不限制。
+- `COMPILER_TEST_MODE=debug|release`：设置 compiler 聚合测试程序的构建模式，默认 `debug`。
 - `TEST_KEEP_GOING=1`：失败后继续完成全部已选择用例。
 - `TEST_KEEP_WORK=1`：成功时也保留 work、cache 和日志。
 - `TEST_TIMING=1`：输出 compile/emit、link、execute、case total 和 suite wall time。

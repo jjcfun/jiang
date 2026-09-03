@@ -18,6 +18,7 @@ TEST_RUN_FILTER="${TEST_RUN_FILTER:-${LANG_CHECK_RUN_FILTER:-}}"
 TEST_SANITIZER="${TEST_SANITIZER:-${LANG_CHECK_SANITIZER:-}}"
 TEST_SANITIZER_CLANG="${TEST_SANITIZER_CLANG:-${LANG_CHECK_SANITIZER_CLANG:-}}"
 TEST_RELEASE_RUNS="${TEST_RELEASE_RUNS:-${LANG_CHECK_RELEASE_RUNS:-0}}"
+COMPILER_TEST_MODE="${COMPILER_TEST_MODE:-debug}"
 TEST_TIMING="${TEST_TIMING:-0}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-0}"
 TEST_RUN_ROOT="${TEST_RUN_ROOT:-}"
@@ -102,6 +103,22 @@ validate_options() {
   validate_boolean_option TEST_KEEP_WORK "$TEST_KEEP_WORK"
   validate_boolean_option TEST_RELEASE_RUNS "$TEST_RELEASE_RUNS"
   validate_boolean_option TEST_TIMING "$TEST_TIMING"
+
+  case "$COMPILER_TEST_MODE" in
+    debug|release) ;;
+    *)
+      echo "invalid COMPILER_TEST_MODE=$COMPILER_TEST_MODE; expected debug or release" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$COMPILER_TEST_MODE" = release ] && [ -n "$TEST_SANITIZER" ]; then
+    echo "COMPILER_TEST_MODE=release cannot be combined with TEST_SANITIZER" >&2
+    exit 2
+  fi
+  if [ "$COMPILER_TEST_MODE" = release ] && [ "$TEST_RELEASE_RUNS" = 1 ]; then
+    echo "COMPILER_TEST_MODE=release already covers release compiler test runs" >&2
+    exit 2
+  fi
 
   if [ -n "$TEST_LIST" ] && [ ! -f "$TEST_LIST" ]; then
     echo "missing test list: $TEST_LIST" >&2
@@ -740,7 +757,7 @@ prepare_compiler_test_runner() {
     return 0
   fi
   COMPILER_TEST_BIN="$RUN_ROOT/compiler-tests"
-  if ! build_compiler_test_executable debug "$COMPILER_TEST_BIN"; then
+  if ! build_compiler_test_executable "$COMPILER_TEST_MODE" "$COMPILER_TEST_BIN"; then
     return 1
   fi
   if [ "$TEST_RELEASE_RUNS" != 1 ]; then
