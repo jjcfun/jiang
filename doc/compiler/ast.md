@@ -32,13 +32,14 @@ AstId            -> 单个 AstUnit 内部的有效 node index
 `AstId` 本身不表示缺失值；所有 `AstId` 都必须指向有效节点，下标 `0` 合法。
 可缺省字段使用 `AstId?`，不能用 `-1` 之类的哨兵值。`children` 中也不能加入缺失节点。
 
-`AstId` 不属于全局 query id。跨文件或跨阶段引用 AST 时应显式携带
-`AstSource`/`SourceFileId` 和 `AstId`，不能只传裸 `AstId`。
+`AstId` 不属于全局 query id。它只在所属 `AstUnit` 内有意义；跨文件引用必须同时保留对应
+`AstUnit`，不能把裸 `AstId` 当作全局或稳定身份。
 
 ## Source
 
-`AstUnit.source` 记录 AST 来源；它只能是普通 `SourceFileId` 或 virtual source。
-测试、宏展开、REPL 片段使用 virtual source，不引入 none 状态。
+`AstUnit.source_id` 记录 session-local `SourceId`。文件和 virtual source 都先进入 `SourceStore`，
+由 `SourceKey.file(path)` / `SourceKey.virtual(name)` 表达来源类别；两者都具有非 optional identity
+和文本，不为 virtual source 引入第二套 AST source 表示。
 
 pipeline 把 owned root `AstUnit` 直接移交给 `ModuleResolver`。resolver 私有持有 root/import
 closure 中尚未完成 lowering 的 AST；每个 module 发布 Semantic Model 后立即释放对应 AST。

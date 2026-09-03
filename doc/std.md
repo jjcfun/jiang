@@ -347,7 +347,7 @@ kernel readiness IO，也不适合作为完整网络 IO runtime。
 | `std.debug` | `write`、`write_line -> Bool`、`trap() -> Void` | hosted stderr；trap 立即 abort，不 unwind |
 | `std.panic` | `panic(UInt8[]&) -> Void` | stderr 输出后 abort，不 unwind、不保证 drop |
 
-`assert(condition[, message])` 在 debug 和 release mode 都保留。失败输出包含 source path、byte offset
+`assert(condition[, message])` 在 debug 和 release mode 都保留。失败输出包含 source path、行列
 和可选 message，随后执行 LLVM trap；它不 unwind，也不保证析构。`std.build.mode` 是只读 compile-time
 `BuildMode`，可以在 comptime branch 中查询 `.debug` 或 `.release`，不能由普通代码改变。
 

@@ -12,6 +12,18 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 [官网与语言文档](https://jiang-lang.org/)
 
+## 安装发行版
+
+Jiang 0.5.3 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
+
+```bash
+cd jiang-0.5.3-<platform>
+./install.sh
+```
+
+默认安装到 `~/.jiang`，主命令是 `jiang`；如有需要，把 `~/.jiang/bin` 加入 `PATH`。
+安装包和 SHA-256 校验文件见 [Jiang 0.5.3 release](https://github.com/jjcfun/jiang/releases/tag/0.5.3)。
+
 
 
 ## 构建自举编译器
@@ -183,6 +195,9 @@ release object/executable 路径和 LLVM O2 pass pipeline 时，打开 release r
 TEST_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/test.sh
 ```
 
+`test/compiler` 的聚合测试程序默认使用 debug 模式；性能敏感的完整验证可设置
+`COMPILER_TEST_MODE=release`。这只改变聚合测试程序的优化级别，不改变 case 集合。
+
 runner 自身的调度契约可独立验证：
 
 ```bash
@@ -216,8 +231,8 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
-- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)（当前 release 分支）
-- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)（上一已发布版本）
+- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)（当前版本）
+- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)（上一版本）
 - [架构文档](doc/architecture.md)
 - [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)

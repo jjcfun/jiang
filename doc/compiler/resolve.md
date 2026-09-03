@@ -150,4 +150,5 @@ resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。Semantic M
 
 - package manifest 诊断还比较粗，只记录错误文本，没有 `package.ini` 的精确行列 span。
 - reset 后旧 namespace/def 的回收或版本化。
-- 长期增量需要 stable def key、source revision diff 和 query invalidation。
+- 跨轮复用 session-local semantic/query facts 仍需要版本化与精确 invalidation；持久 artifact identity
+  已使用 `StableSymbolId`，不能把 `DefId` 直接写入缓存。

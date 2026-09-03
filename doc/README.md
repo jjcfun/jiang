@@ -24,6 +24,12 @@
 - [compiler/](compiler/)：各阶段的详细设计，包括 AST、resolve、Semantic Model、type check、JIL、
   borrow check、backend、incremental 和测试覆盖。
 
+## Release notes
+
+- [Jiang 0.5.3](releases/0.5.3.md)
+- [Jiang 0.5.2](releases/0.5.2.md)
+- [Jiang 0.5.1](releases/0.5.1.md)
+
 ## 0.5.3 自举链
 
 0.5.3 release 使用以下可复现 transition chain：

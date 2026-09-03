@@ -305,7 +305,7 @@ Void swap(Int&! left, Int&! right) {
 
 唯一可变引用会在单个 borrow-check 域内排斥重叠别名，但这不等于自动证明任意并发程序
 没有 data race。跨 domain 传递受 domain borrow 规则约束；跨线程共享可变状态仍必须通过
-标准库的 mutex、atomic 或其他显式同步协议表达。Channel 与 rwlock 尚未进入 0.4.8 公共 API。
+标准库的 mutex、atomic 或其他显式同步协议表达。Channel 与 rwlock 尚未进入 0.5.3 公共 API。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
 或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*` 和 `T[]&`
@@ -634,8 +634,8 @@ Int& take_second((Int& first, Int& second) value);
 消息与换行，再立即 abort；不执行 unwind，也不保证运行局部析构。可恢复失败继续使用 `T@E`，
 Task cancellation 不复用 panic。
 
-`assert(condition[, message])` 在 debug/release mode 都保留。失败路径输出调用点 source path、byte
-offset 和可选 message 后 trap，不执行 unwind。`build.mode` 是 compiler 注入的只读 compile-time
+`assert(condition[, message])` 在 debug/release mode 都保留。失败路径输出调用点 source path、行列
+和可选 message 后 trap，不执行 unwind。`build.mode` 是 compiler 注入的只读 compile-time
 `BuildMode`；库可以据此选择实现，但普通源码不能改变当前 compilation mode。
 
 ## 隐式操作层

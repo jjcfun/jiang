@@ -1,6 +1,6 @@
 # Targets
 
-Linux x86_64 hosted/libc 是正式 release host。Linux native compiler
+macOS arm64 和 Linux x86_64 hosted/libc 是正式 release host。Linux native compiler
 使用系统 libc 和本机 LLVM/linker toolchain 完成自举与 executable 链接；macOS -> Linux
 hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属于当前 release。
 其他 target 先固定 target model、LLVM/object 输出和 executable 诊断边界。

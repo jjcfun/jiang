@@ -507,6 +507,10 @@ token 或调度引用计数。
 Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liveness，否则新增 join 状态
 不会进入 state dispatch，parent frame 生命周期也无法被正确证明。
 
+frame liveness 必须把 `DropTerminator` 的 projection place 和 projection drop flag 都视为读取。
+字段发生部分 move 后，active-field flag 仍可能在 suspend 后的 cleanup 中决定是否析构；该 flag
+必须和其他跨 suspend local 一样进入 coroutine frame，不能留在只为首次进入初始化的 resume 栈上。
+
 ## 实现顺序
 
 1. 已完成：固定结构化 Task 语义，禁止 forget，并为 scope/return/throw/cancel 建立
@@ -553,6 +557,7 @@ storage、sync 和 reclaim policy 可以静态特化，但不能
 - 同/不同 serial executor、concurrent Domain 和外部线程 callback。
 - recursive async、dynamic async Fn/RawFn、detached async 和 sync root。
 - result/capture drop 恰好一次，并在 sanitizer 下无 UAF、leak 或 data race。
+- 部分 move 的 aggregate 跨 suspend 后只析构仍 active 的字段，projection drop flag 必须映射到 frame。
 
 `script/lang_check.sh` 可用 `LANG_CHECK_SANITIZER=address|thread` 对 run 用例启用 ASan/TSan，
 并用 `LANG_CHECK_RUN_FILTER` 选择竞态用例。macOS 默认使用系统 clang 的 compiler-rt；其他平台可用

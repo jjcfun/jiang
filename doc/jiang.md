@@ -703,7 +703,7 @@ Pair replace_left(Pair pair!) {
 ### 断言与构建模式
 
 `assert(condition)` 和 `assert(condition, message)` 在 debug 与 release 构建中都执行检查。失败时向
-标准错误输出 source path、byte offset 和可选 message，随后 trap；它不会 unwind，也不保证析构。
+标准错误输出 source path、行列和可选 message，随后 trap；它不会 unwind，也不保证析构。
 
 `build.mode` 是编译器注入的只读 `BuildMode`，可以在 comptime 中选择 `.debug` 或 `.release` 分支：
 

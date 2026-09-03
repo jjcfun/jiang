@@ -47,10 +47,14 @@ stable source identity；旧文件由显式 cache clean 清理，当前不实现
 - package-visible 与 public interface fingerprint；
 - section table 的位置和数量。
 
-section table 当前描述 import summary、interface、generic template 和 source map。每项保存
-offset、length 与内容 hash。interface section 保存 declaration signature/body fingerprint，不保存
+section table 当前描述 import summary、interface、generic template、source map 和可选 documentation。
+每项保存 offset、length 与内容 hash。interface section 保存 declaration signature/body fingerprint，不保存
 QueryValue、Semantic Model 会话对象或任何 session-local ID。`.ji` 不保存 object、链接输入或
 codegen summary。
+
+documentation section 稀疏保存 module Markdown，以及公开 declaration 的 stable symbol identity
+到 Markdown 的映射。它拥有独立 section hash，不进入 interface、object、monomorph 或 codegen
+fingerprint；普通编译不需要读取，文档工具可以按需单独读取。
 
 长驻 `CompilerSession` 可以在 `SourceStore` 中为文件路径设置未保存文本 overlay。overlay 与磁盘
 source 共用规范化路径和 `SourceId`，每次内容变化递增 revision；存在 overlay 时不读取旧 `.ji`
@@ -73,6 +77,7 @@ package 对象不缓存旧 `DefId` 或 `TypeId`。
 source graph       -> header + compact import summary
 resolve/type check -> interface section
 monomorph          -> generic template section
+documentation tool -> documentation section
 ```
 
 读取 section 时使用 `read_at` 并校验 section hash，不为每个 source 长期保持文件句柄。
