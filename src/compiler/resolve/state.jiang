@@ -8,8 +8,11 @@ import core_traits = "../core/traits.jiang";
 import qid = "../id.jiang";
 import hash = "../support/hash.jiang";
 import map = "../support/map.jiang";
+import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import sem = "../sema/model.jiang";
+import def = "./def.jiang";
+import store = "./store.jiang";
 
 public struct DeclarationDefKey: Copyable, Hashable, Equatable {
     public qid.ModuleId module_id;
@@ -54,6 +57,20 @@ public struct ValuePathResolution: Copyable {
     public Int value_root_segment_index;
 }
 
+// 返回一个普通顶层 declaration 的名字节点。import、extend、comptime 和
+// extern block 没有单一 declaration identity，返回 null。
+public ast.AstId? top_level_declaration_name(ast.AstUnit& unit, ast.AstId item_id) {
+    ast.AstNode item = unit.get(item_id);
+    guard item.data is .top_level_decl(top_level) else { return null; }
+    ast.AstNode body = unit.get(top_level.body);
+    if (body.data is .function_decl(function_decl)) { return function_decl.name; }
+    if (body.data is .global_decl(global_decl)) { return global_decl.name; }
+    if (body.data is .alias_decl(alias_decl)) { return alias_decl.name; }
+    if (body.data is .nominal_decl(nominal)) { return nominal.name; }
+    if (body.data is .trait_decl(trait_decl)) { return trait_decl.name; }
+    return null;
+}
+
 @region(a, b, c)
 public struct AstResolveState: Movable {
     @life(a)
@@ -64,30 +81,175 @@ public struct AstResolveState: Movable {
 
     @life(c)
     public map.WyHashMap<DeclarationDefKey, qid.DefId>&! declaration_defs;
+
+    @life(c)
+    public map.WyHashMap<qid.DefId, ast.AstId>&! declaration_items;
+
+    @life(c)
+    public map.WyHashMap<qid.DefId, ast.AstId>&! declaration_containers;
     public map.WyHashMap<ValuePathKey, ValuePathResolution> value_paths!;
     // Self 是当前实例类型占位，不是普通 named type。resolve 阶段记录
     // 具体 AST 节点，Semantic Model lower 只消费这份语义信息。
     public map.WyHashMap<ValuePathKey, qid.DefId> self_type_refs!;
     public map.WyHashMap<ValuePathKey, TraitCompanionTypeRef> trait_companion_type_refs!;
     public map.WyHashMap<qid.DefId, ast.AstId> generic_param_const_types!;
+    public qid.ModuleId? pending_import_module!;
+    public Int pending_import_index!;
+    public qid.DefId? pending_declaration!;
     public qid.ModuleId module_id;
     public qid.NamespaceId namespace_id;
     public init(self,
         context.CompilerContext&! ctx,
         ast.AstUnit& unit,
         map.WyHashMap<DeclarationDefKey, qid.DefId>&! declaration_defs,
+        map.WyHashMap<qid.DefId, ast.AstId>&! declaration_items,
+        map.WyHashMap<qid.DefId, ast.AstId>&! declaration_containers,
         qid.ModuleId module_id,
         qid.NamespaceId namespace_id
     ) {
         self.ctx = ctx;
         self.unit = unit;
         self.declaration_defs = declaration_defs;
+        self.declaration_items = declaration_items;
+        self.declaration_containers = declaration_containers;
         self.value_paths = map.WyHashMap<ValuePathKey, ValuePathResolution>();
         self.self_type_refs = map.WyHashMap<ValuePathKey, qid.DefId>();
         self.trait_companion_type_refs = map.WyHashMap<ValuePathKey, TraitCompanionTypeRef>();
         self.generic_param_const_types = map.WyHashMap<qid.DefId, ast.AstId>();
+        self.pending_import_module = null;
+        self.pending_import_index = -1;
+        self.pending_declaration = null;
         self.module_id = module_id;
         self.namespace_id = namespace_id;
+    }
+
+    public Bool has_pending_import(self) {
+        return self.pending_import_module != null && self.pending_import_index >= 0;
+    }
+
+    public Bool has_pending_request(self) {
+        return self.has_pending_import() || self.pending_declaration != null;
+    }
+
+    public Void request_binding_signatures(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        qid.DefId selected_def
+    ) {
+        if (self.has_pending_request()) { return; }
+        def.DefKind selected_kind = self.ctx.store.defs.get(selected_def).kind;
+        if (selected_kind != .function_def && selected_kind != .init_def) {
+            self.request_declaration_signature(selected_def);
+            return;
+        }
+        table.MultiTableCursor cursor! =
+            self.ctx.store.resolve.first_binding_cursor(namespace_id, symbol, domain);
+        while (cursor.valid()) {
+            qid.DefId def_id = self.ctx.store.resolve.binding_at(cursor).def_id;
+            self.request_declaration_signature(def_id);
+            if (self.pending_declaration != null) { return; }
+            cursor = self.ctx.store.resolve.next_binding_cursor(cursor);
+        }
+    }
+
+    Void request_declaration_signature(Self&! self, qid.DefId def_id) {
+        if (!self.ctx.store.model.has_def(def_id)
+            || self.declaration_items.get(def_id) == null
+        ) { return; }
+        sem.DeclarationSemaState progress =
+            self.ctx.store.model.declaration_sema_state(def_id);
+        if (progress == .skeleton
+            || (progress == .resolving_signature
+                && self.ctx.store.defs.get(def_id).kind == .alias_def
+                && self.ctx.store.defs.get(def_id).domain == .alias_name)
+        ) {
+            self.pending_declaration = def_id;
+        }
+    }
+
+    public Void request_import_alias(Self&! self, qid.DefId alias_def) {
+        if (self.has_pending_request()) { return; }
+        guard self.ctx.store.defs.get(alias_def).module_id is .some(module_id) else { return; }
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+            store.ImportRecord import_record =
+                self.ctx.store.resolve.module_ref(module_id).imports.get(index);
+            if (import_record.alias_def is .some(candidate)) {
+                if (candidate.to_index() == alias_def.to_index()
+                    && import_record.state == .unresolved
+                ) {
+                    self.pending_import_module = module_id;
+                    self.pending_import_index = index;
+                    return;
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    public Void request_wildcard_import(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        Bool search_parents
+    ) {
+        if (self.has_pending_request()) { return; }
+        qid.NamespaceId current! = namespace_id;
+        while (true) {
+            if (self.request_namespace_wildcard_import(current, true, 0)) { return; }
+            if (!search_parents) { break; }
+            guard self.ctx.store.resolve.namespace(current).parent is .some(parent) else { break; }
+            current = parent;
+        }
+        if (current.to_index() != self.ctx.store.resolve.prelude_namespace.to_index()) {
+            self.request_namespace_wildcard_import(
+                self.ctx.store.resolve.prelude_namespace,
+                true,
+                0
+            );
+        }
+    }
+
+    Bool request_namespace_wildcard_import(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        Bool include_private,
+        Int depth
+    ) {
+        if (depth > self.ctx.store.resolve.wildcard_imports.len()) { return false; }
+        if (self.ctx.store.resolve.namespace(namespace_id).module_id is .some(module_id)) {
+            Int import_index! = 0;
+            while (import_index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+                store.ImportRecord import_record =
+                    self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
+                if (import_record.flatten
+                    && (include_private || import_record.visibility == .public_visibility)
+                    && import_record.state == .unresolved
+                ) {
+                    self.pending_import_module = module_id;
+                    self.pending_import_index = import_index;
+                    return true;
+                }
+                import_index = import_index + 1;
+            }
+        }
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.wildcard_imports.len()) {
+            store.WildcardImportRecord edge = self.ctx.store.resolve.wildcard_imports.get(index);
+            if (edge.namespace_id.to_index() == namespace_id.to_index()
+                && (include_private || edge.visibility == .public_visibility)
+                && self.request_namespace_wildcard_import(
+                    edge.target_namespace_id,
+                    false,
+                    depth + 1
+                )
+            ) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     public qid.SymbolId? name_symbol(self, ast.AstId name_id) {
@@ -107,6 +269,18 @@ public struct AstResolveState: Movable {
 
     public Void record_declaration_def(Self&! self, ast.AstId name_id, qid.DefId def_id) {
         self.declaration_defs.set(DeclarationDefKey(self.module_id, name_id), def_id);
+    }
+
+    public Void record_declaration_item(
+        Self&! self,
+        qid.DefId def_id,
+        ast.AstId item_id,
+        ast.AstId container_id
+    ) {
+        self.declaration_items.set(def_id, item_id);
+        if (item_id.to_index() != container_id.to_index()) {
+            self.declaration_containers.set(def_id, container_id);
+        }
     }
 
     public qid.DefId? declaration_def(self, ast.AstId name_id) {

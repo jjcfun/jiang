@@ -171,7 +171,7 @@ nominal_decl
              / record_decl
              / enum_decl
 
-import_decl <- "import" (import_alias "=")? import_path ";"
+import_decl <- "import" ((import_alias / "*") "=")? import_path ";"
 
 import_alias
             <- name

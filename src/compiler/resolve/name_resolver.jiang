@@ -24,12 +24,18 @@ public struct NameResolver: Movable {
     @life(a)
     public resolve_state.AstResolveState&! state;
     Bool defer_unresolved_aliases!;
+    Bool local_extend_targets_only!;
     Int aliases_collected!;
+    ast.AstId? declaration_item!;
+    ast.AstId? declaration_container!;
 
     public init(self, resolve_state.AstResolveState&! state) {
         self.state = state;
         self.defer_unresolved_aliases = false;
+        self.local_extend_targets_only = false;
         self.aliases_collected = 0;
+        self.declaration_item = null;
+        self.declaration_container = null;
     }
 
     public Void collect_imports(Self&! self) {
@@ -54,13 +60,49 @@ public struct NameResolver: Movable {
         return self.aliases_collected;
     }
 
+    // alias 的 DefId 已在 collect_declaration_names 建立；这里仅解析并绑定
+    // 这一条 alias 的 target，不遍历同文件其他 alias。
+    public Void resolve_alias_declaration(Self&! self, ast.AstId item_id) {
+        ast.AstNode item = self.state.unit.get(item_id);
+        guard item.data is .top_level_decl(top_level) else { return; }
+        ast.AstNode body = self.state.unit.get(top_level.body);
+        guard body.data is .alias_decl(alias_decl) else { return; }
+        self.collect_alias(alias_decl, self.decl_visibility(top_level.modifiers), body.span);
+    }
+
     public Void collect_extend_members(Self&! self) {
         self.for_each_top_level_item(.collect_extend_member);
+    }
+
+    public Void collect_local_extend_members(Self&! self) {
+        self.local_extend_targets_only = true;
+        self.for_each_top_level_item(.collect_extend_member);
+        self.local_extend_targets_only = false;
     }
 
     public Void resolve_references(Self&! self) {
         reference_resolver.ReferenceResolver resolver! = reference_resolver.ReferenceResolver(self.state$.mut_ref());
         resolver.resolve();
+    }
+
+    public Void resolve_top_level_item(Self&! self, ast.AstId item) {
+        reference_resolver.ReferenceResolver resolver! = reference_resolver.ReferenceResolver(self.state$.mut_ref());
+        resolver.resolve_top_level_item(item);
+    }
+
+    public Void resolve_top_level_signature(Self&! self, ast.AstId item) {
+        reference_resolver.ReferenceResolver resolver! = reference_resolver.ReferenceResolver(self.state$.mut_ref());
+        resolver.resolve_top_level_signature(item);
+    }
+
+    public Void resolve_top_level_member(
+        Self&! self,
+        ast.AstId item,
+        qid.DefId def_id,
+        Bool signature_only
+    ) {
+        reference_resolver.ReferenceResolver resolver! = reference_resolver.ReferenceResolver(self.state$.mut_ref());
+        resolver.resolve_top_level_member(item, def_id, signature_only);
     }
 
     public Bool declares_explicit_alias(Self&! self, qid.SymbolId symbol) {
@@ -120,11 +162,23 @@ public struct NameResolver: Movable {
     Void visit_top_level_item(Self&! self, ast.AstId item, TopLevelPass pass) {
         ast.AstNode node = self.state.unit.get(item);
         if (node.data is .top_level_decl(top_level)) {
+            ast.AstId? previous_item = self.declaration_item;
+            ast.AstId? previous_container = self.declaration_container;
+            self.declaration_item = item;
+            self.declaration_container = item;
             self.visit_top_level_decl(top_level, pass);
+            self.declaration_item = previous_item;
+            self.declaration_container = previous_container;
             return;
         }
         if (node.data is .extern_block(extern_block)) {
+            ast.AstId? previous_item = self.declaration_item;
+            ast.AstId? previous_container = self.declaration_container;
+            self.declaration_item = item;
+            self.declaration_container = item;
             self.visit_extern_block(extern_block, pass);
+            self.declaration_item = previous_item;
+            self.declaration_container = previous_container;
             return;
         }
         if (node.data is .compile_block(compile_block)) {
@@ -164,7 +218,10 @@ public struct NameResolver: Movable {
             ast.AstId item_id = self.state.unit.child_at(extern_block.items, index);
             ast.AstNode item = self.state.unit.get(item_id);
             if (item.data is .extern_item(extern_item)) {
+                ast.AstId? previous_item = self.declaration_item;
+                self.declaration_item = item_id;
                 self.collect_extern_item(extern_item);
+                self.declaration_item = previous_item;
             }
             index = index + 1;
         }
@@ -248,7 +305,19 @@ public struct NameResolver: Movable {
             }
             return;
         }
-        if (body.data is .alias_decl(_)) { return; }
+        if (body.data is .alias_decl(alias_decl)) {
+            if (self.state.declaration_def(alias_decl.name) == null) {
+                self.define_top_level_name(
+                    alias_decl.name,
+                    .alias_def,
+                    .alias_name,
+                    visibility,
+                    body.span,
+                    false
+                );
+            }
+            return;
+        }
         if (body.data is .function_decl(function_decl)) {
             self.define_top_level_name(
                 function_decl.name,
@@ -275,6 +344,11 @@ public struct NameResolver: Movable {
 
     Void collect_extend_member_declarations(Self&! self, ast.ExtendData extend_decl) {
         guard self.type_def_for_type_ref(extend_decl.target_type) is .some(owner_def) else { return; }
+        if (self.local_extend_targets_only) {
+            guard self.state.ctx.store.defs.get(owner_def).module_id is .some(owner_module)
+                else { return; }
+            if (owner_module.index != self.state.module_id.index) { return; }
+        }
         def.DefKind owner_kind = self.state.ctx.store.defs.get(owner_def).kind;
         self.collect_member_declarations(owner_def, owner_kind, extend_decl.members);
     }
@@ -346,8 +420,15 @@ public struct NameResolver: Movable {
 
     qid.DefId? visible_type_def(Self&! self, ast.AstId name_id) {
         guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
-        guard self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
-            is .some(binding) else {
+        guard self.state.ctx.store.resolve.lookup_visible_name(
+            self.state.namespace_id,
+            symbol,
+            .type_name,
+            true
+        ) is .some(binding) else {
+            self.request_visible_alias(symbol);
+            if (self.state.has_pending_request()) { return null; }
+            self.state.request_wildcard_import(self.state.namespace_id, true);
             return null;
         }
         return binding.def_id;
@@ -355,23 +436,126 @@ public struct NameResolver: Movable {
 
     qid.DefId? type_def_in_namespace(Self&! self, qid.NamespaceId namespace_id, ast.AstId name_id) {
         guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
-        guard self.state.ctx.store.resolve.lookup_namespace(namespace_id, symbol, .type_name, false)
-            is .some(binding) else {
+        guard self.state.ctx.store.resolve.lookup_namespace(
+            namespace_id,
+            symbol,
+            .type_name,
+            false
+        ) is .some(binding) else {
+            self.request_namespace_alias(namespace_id, symbol);
+            if (self.state.has_pending_request()) { return null; }
+            self.state.request_wildcard_import(namespace_id, false);
             return null;
         }
         return binding.def_id;
     }
 
     Void collect_alias(Self&! self, ast.AliasData alias_decl, def.Visibility visibility, token.Span span) {
-        if (self.state.declaration_def(alias_decl.name) != null) { return; }
+        qid.DefId? existing_alias = self.state.declaration_def(alias_decl.name);
+        if (existing_alias is .some(alias_def)) {
+            if (self.state.ctx.store.model.def_alias_target(alias_def) != null) { return; }
+            if (self.state.ctx.store.defs.get(alias_def).domain != .alias_name) { return; }
+        }
         if (self.alias_decl_target(alias_decl, visibility) is .some(target)) {
-            self.define_alias_name(alias_decl.name, target, visibility, span);
+            if (existing_alias is .some(alias_def)) {
+                self.complete_alias_name(alias_def, alias_decl.name, target, visibility, span);
+            } else {
+                self.define_alias_name(alias_decl.name, target, visibility, span);
+            }
             self.aliases_collected = self.aliases_collected + 1;
             return;
         }
+        // 查找 simple alias target 时可能刚请求了一个 import 或另一个 alias
+        // declaration。此时保持 skeleton，等调度器完成依赖后重试；不能提前
+        // 把它归类成普通 type alias。
+        if (self.state.has_pending_request()) { return; }
         if (self.defer_unresolved_aliases && alias_decl.target != null) { return; }
-        self.define_type_alias(alias_decl.name, visibility, span);
+        if (existing_alias is .some(alias_def)) {
+            self.complete_type_alias(alias_def, alias_decl.name, visibility, span);
+        } else {
+            self.define_type_alias(alias_decl.name, visibility, span);
+        }
         self.aliases_collected = self.aliases_collected + 1;
+    }
+
+    Void complete_alias_name(Self&! self,
+        qid.DefId alias_def,
+        ast.AstId name_id,
+        AliasTarget target,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
+        token.Span name_span = self.state.unit.get(name_id).span;
+        Bool duplicate! = false;
+        if (self.existing_top_level_conflict(symbol, target.domain, .alias_def)
+            is .some(existing)
+        ) {
+            duplicate = true;
+            self.add_duplicate_def_diagnostic(name_span, existing.span, symbol);
+        }
+        qid.NamespaceId? target_namespace =
+            self.state.ctx.store.defs.get(target.def_id).owned_namespace_id;
+        self.state.ctx.store.defs.set_domain(alias_def, target.domain);
+        self.state.ctx.store.defs.set_owned_namespace(
+            alias_def,
+            target_namespace
+        );
+        if (!duplicate) {
+            self.state.ctx.store.resolve.bind_name(
+                self.state.namespace_id,
+                symbol,
+                target.domain,
+                alias_def,
+                visibility,
+                name_span
+            );
+        }
+        self.state.ctx.store.model.set_alias_target(alias_def, target.def_id);
+        self.record_stable_def(
+            alias_def,
+            .alias_def,
+            target.domain,
+            symbol,
+            self.module_owner_def(),
+            span
+        );
+    }
+
+    Void complete_type_alias(Self&! self,
+        qid.DefId alias_def,
+        ast.AstId name_id,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
+        token.Span name_span = self.state.unit.get(name_id).span;
+        Bool duplicate! = false;
+        if (self.existing_top_level_conflict(symbol, .type_name, .alias_def)
+            is .some(existing)
+        ) {
+            duplicate = true;
+            self.add_duplicate_def_diagnostic(name_span, existing.span, symbol);
+        }
+        self.state.ctx.store.defs.set_domain(alias_def, .type_name);
+        if (!duplicate) {
+            self.state.ctx.store.resolve.bind_name(
+                self.state.namespace_id,
+                symbol,
+                .type_name,
+                alias_def,
+                visibility,
+                name_span
+            );
+        }
+        self.record_stable_def(
+            alias_def,
+            .alias_def,
+            .type_name,
+            symbol,
+            self.module_owner_def(),
+            span
+        );
     }
 
     AliasTarget? alias_decl_target(Self&! self, ast.AliasData alias_decl, def.Visibility visibility) {
@@ -426,6 +610,9 @@ public struct NameResolver: Movable {
             self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
             is .some(binding)
         ) else {
+            self.request_visible_alias(symbol);
+            if (self.state.has_pending_request()) { return null; }
+            self.state.request_wildcard_import(self.state.namespace_id, true);
             return null;
         }
         return self.alias_binding_in_namespace(binding.namespace_id, symbol, domain, visibility);
@@ -500,16 +687,54 @@ public struct NameResolver: Movable {
         def.NameDomain domain,
         def.Visibility visibility
     ) {
-        table.MultiTableCursor cursor! =
-            self.state.ctx.store.resolve.first_binding_cursor(namespace_id, symbol, domain);
-        while (cursor.valid()) {
-            namespace.BindingEntry binding = self.state.ctx.store.resolve.binding_at(cursor);
+        if (self.state.ctx.store.resolve.lookup_namespace(
+            namespace_id, symbol, domain, false
+        ) is .some(binding)) {
             if (self.alias_binding_accessible(binding.def_id, visibility)) {
                 return AliasTarget(def_id: binding.def_id, domain: domain);
             }
-            cursor = self.state.ctx.store.resolve.next_binding_cursor(cursor);
+            return null;
         }
+        self.request_namespace_alias(namespace_id, symbol);
+        if (self.state.has_pending_request()) { return null; }
+        self.state.request_wildcard_import(namespace_id, false);
         return null;
+    }
+
+    Void request_visible_alias(Self&! self, qid.SymbolId symbol) {
+        if (self.state.has_pending_request()) { return; }
+        guard self.state.ctx.store.resolve.lookup_visible_name(
+            self.state.namespace_id,
+            symbol,
+            .alias_name,
+            true
+        ) is .some(binding) else { return; }
+        self.state.request_binding_signatures(
+            binding.namespace_id,
+            symbol,
+            .alias_name,
+            binding.def_id
+        );
+    }
+
+    Void request_namespace_alias(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol
+    ) {
+        if (self.state.has_pending_request()) { return; }
+        guard self.state.ctx.store.resolve.lookup_namespace(
+            namespace_id,
+            symbol,
+            .alias_name,
+            false
+        ) is .some(binding) else { return; }
+        self.state.request_binding_signatures(
+            binding.namespace_id,
+            symbol,
+            .alias_name,
+            binding.def_id
+        );
     }
 
     Bool alias_binding_accessible(Self&! self, qid.DefId def_id, def.Visibility visibility) {
@@ -538,7 +763,12 @@ public struct NameResolver: Movable {
             self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
             is .some(namespace_binding)
         ) {
-            return self.state.ctx.store.defs.get(namespace_binding.def_id).owned_namespace_id;
+            qid.NamespaceId? owned_namespace =
+                self.state.ctx.store.defs.get(namespace_binding.def_id).owned_namespace_id;
+            if (owned_namespace == null) {
+                self.state.request_import_alias(namespace_binding.def_id);
+            }
+            return owned_namespace;
         }
         if (
             self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
@@ -546,6 +776,9 @@ public struct NameResolver: Movable {
         ) {
             return self.state.ctx.store.defs.get(type_binding.def_id).owned_namespace_id;
         }
+        self.request_visible_alias(symbol);
+        if (self.state.has_pending_request()) { return null; }
+        self.state.request_wildcard_import(self.state.namespace_id, true);
         return null;
     }
 
@@ -554,11 +787,19 @@ public struct NameResolver: Movable {
         if (self.state.ctx.store.resolve.lookup_namespace(
             namespace_id, symbol, .namespace_name, false
         ) is .some(binding)) {
-            return self.state.ctx.store.defs.get(binding.def_id).owned_namespace_id;
+            qid.NamespaceId? owned_namespace =
+                self.state.ctx.store.defs.get(binding.def_id).owned_namespace_id;
+            if (owned_namespace == null) {
+                self.state.request_import_alias(binding.def_id);
+            }
+            return owned_namespace;
         }
         if (self.state.ctx.store.resolve.lookup_namespace(namespace_id, symbol, .type_name, false) is .some(binding)) {
             return self.state.ctx.store.defs.get(binding.def_id).owned_namespace_id;
         }
+        self.request_namespace_alias(namespace_id, symbol);
+        if (self.state.has_pending_request()) { return null; }
+        self.state.request_wildcard_import(namespace_id, false);
         return null;
     }
 
@@ -607,9 +848,17 @@ public struct NameResolver: Movable {
             owned_namespace
         );
         if (!duplicate) {
-            self.state.ctx.store.resolve.bind_name(self.state.namespace_id, symbol, domain, def_id, name_span);
+            self.state.ctx.store.resolve.bind_name(
+                self.state.namespace_id,
+                symbol,
+                domain,
+                def_id,
+                visibility,
+                name_span
+            );
         }
         self.state.record_declaration_def(name_id, def_id);
+        self.record_declaration_item(def_id);
         self.declare_model_def(def_id, kind, span);
         self.record_stable_def(def_id, kind, domain, symbol, self.module_owner_def(), span);
         self.record_model_member(self.state.ctx.store.resolve.module_ref(self.state.module_id).def_id, def_id);
@@ -646,10 +895,12 @@ public struct NameResolver: Movable {
                 symbol,
                 target.domain,
                 alias_def,
+                visibility,
                 name_span
             );
         }
         self.state.record_declaration_def(name_id, alias_def);
+        self.record_declaration_item(alias_def);
         self.declare_model_def(alias_def, .alias_def, span);
         self.state.ctx.store.model.set_alias_target(alias_def, target.def_id);
         self.record_stable_def(alias_def, .alias_def, target.domain, symbol, self.module_owner_def(), span);
@@ -667,6 +918,8 @@ public struct NameResolver: Movable {
         while (index < members.length) {
             ast.AstId member_id = self.state.unit.child_at(members, index);
             ast.AstNode member = self.state.unit.get(member_id);
+            ast.AstId? previous_item = self.declaration_item;
+            self.declaration_item = member_id;
             if (member.data is .member_decl(member_decl)) {
                 ast.AstNode body = self.state.unit.get(member_decl.body);
                 self.collect_member_body(
@@ -684,6 +937,7 @@ public struct NameResolver: Movable {
                     )
                 );
             }
+            self.declaration_item = previous_item;
             index = index + 1;
         }
     }
@@ -790,9 +1044,17 @@ public struct NameResolver: Movable {
             def_namespace
         );
         if (!duplicate) {
-            self.state.ctx.store.resolve.bind_name(owner_namespace, symbol, .type_name, def_id, name_span);
+            self.state.ctx.store.resolve.bind_name(
+                owner_namespace,
+                symbol,
+                .type_name,
+                def_id,
+                visibility,
+                name_span
+            );
         }
         self.state.record_declaration_def(nominal.name, def_id);
+        self.record_declaration_item(def_id);
         self.declare_model_def(def_id, kind, span);
         self.record_stable_def(def_id, kind, .type_name, symbol, owner_def, span);
         self.record_model_member(owner_def, def_id);
@@ -845,10 +1107,12 @@ public struct NameResolver: Movable {
                 init_symbol,
                 .value_name,
                 init_def,
+                visibility,
                 name_span
             );
         }
         self.declare_model_def(init_def, .init_def, span);
+        self.record_declaration_item(init_def);
         self.record_stable_def(init_def, .init_def, .value_name, init_symbol, owner_def, name_span);
         self.record_model_member(owner_def, init_def);
         self.record_builtin_extension_module_member(owner_def, init_def);
@@ -895,6 +1159,7 @@ public struct NameResolver: Movable {
             null
         );
         self.declare_model_def(deinit_def, .deinit_def, span);
+        self.record_declaration_item(deinit_def);
         self.record_stable_def(deinit_def, .deinit_def, .value_name, deinit_symbol, owner_def, span);
         self.record_model_member(owner_def, deinit_def);
         self.state.ctx.store.model.mark_custom_deinit(owner_def, deinit_def);
@@ -912,6 +1177,7 @@ public struct NameResolver: Movable {
         def.Visibility visibility,
         token.Span span
     ) {
+        if (self.state.declaration_def(name_id) is .some(_)) { return; }
         guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
         def.DefRecord owner = self.state.ctx.store.defs.get(owner_def);
         token.Span name_span = self.state.unit.get(name_id).span;
@@ -936,9 +1202,17 @@ public struct NameResolver: Movable {
             null
         );
         if (!duplicate) {
-            self.state.ctx.store.resolve.bind_name(owner_namespace, symbol, domain, def_id, name_span);
+            self.state.ctx.store.resolve.bind_name(
+                owner_namespace,
+                symbol,
+                domain,
+                def_id,
+                visibility,
+                name_span
+            );
         }
         self.state.record_declaration_def(name_id, def_id);
+        self.record_declaration_item(def_id);
         self.declare_model_def(def_id, kind, span);
         self.record_stable_def(def_id, kind, domain, symbol, owner_def, span);
         self.record_model_member(owner_def, def_id);
@@ -980,6 +1254,7 @@ public struct NameResolver: Movable {
         token.Span span,
         def.NameDomain domain
     ) {
+        if (self.state.declaration_def(path_id) != null) { return; }
         guard self.state.name_symbol(leaf_id) is .some(symbol) else { return; }
         def.DefRecord owner = self.state.ctx.store.defs.get(owner_def);
         guard owner.owned_namespace_id is .some(owner_namespace) else { return; }
@@ -995,6 +1270,7 @@ public struct NameResolver: Movable {
             null
         );
         self.state.record_declaration_def(path_id, def_id);
+        self.record_declaration_item(def_id);
         self.declare_model_def(def_id, .associated_type_def, span);
         self.record_stable_def(def_id, .associated_type_def, .type_name, symbol, owner_def, span);
         self.record_model_member(owner_def, def_id);
@@ -1006,6 +1282,12 @@ public struct NameResolver: Movable {
             return;
         }
         self.record_model_member(self.state.ctx.store.resolve.module_ref(self.state.module_id).def_id, member_def);
+    }
+
+    Void record_declaration_item(Self&! self, qid.DefId def_id) {
+        guard self.declaration_item is .some(item_id) else { return; }
+        guard self.declaration_container is .some(container_id) else { return; }
+        self.state.record_declaration_item(def_id, item_id, container_id);
     }
 
     // payload enum case 和 type member function 共用 `Type.member` 访问面。
@@ -1148,6 +1430,8 @@ public struct NameResolver: Movable {
         if (kind == .function_def || kind == .init_def || kind == .deinit_def) {
             return;
         }
+        // alias 的真实名字域由 target 决定；skeleton 阶段不能发布临时 stable key。
+        if (domain == .alias_name) { return; }
         store.ModuleRecord& module = self.state.ctx.store.resolve.module_ref(self.state.module_id);
         store.PackageRecord& package_record = self.state.ctx.store.resolve.package_ref(module.package_id);
         qkey.StableSymbolKind stable_kind = self.stable_symbol_kind(kind);
@@ -1217,6 +1501,7 @@ public struct NameResolver: Movable {
             self.state.module_id,
             store.ImportRecord (
                 kind: import_kind,
+                state: .unresolved,
                 span: span,
                 visibility: visibility,
                 flatten: import_decl.flatten,

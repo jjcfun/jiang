@@ -31,22 +31,55 @@ public struct ReferenceResolver: Movable {
     scope.LexicalEnv env!;
     qid.DefId? current_owner_def!;
     Bool owner_type_lookup_enabled!;
-    Int extension_cursor!;
     map.WyHashMap<qid.DefId, Int> init_def_cursors!;
+    Bool signature_only!;
+    qid.DefId? target_def!;
 
     public init(self, resolve_state.AstResolveState&! state) {
         self.state = state;
         self.env = scope.LexicalEnv();
         self.current_owner_def = null;
         self.owner_type_lookup_enabled = false;
-        self.extension_cursor = 0;
         self.init_def_cursors = map.WyHashMap<qid.DefId, Int>();
+        self.signature_only = false;
+        self.target_def = null;
     }
 
     public Void resolve(Self&! self) {
         self.env.enter_scope(.file_scope);
         self.for_each_top_level_item();
         self.env.exit_scope();
+    }
+
+    // 渐进式 Sema 只请求一个顶层 declaration 时，仍用完整的 file scope
+    // 规则解析该 declaration，但不遍历同文件的其他 body。
+    public Void resolve_top_level_item(Self&! self, ast.AstId item) {
+        self.env.enter_scope(.file_scope);
+        self.visit_top_level_item(item);
+        self.env.exit_scope();
+    }
+
+    public Void resolve_top_level_signature(Self&! self, ast.AstId item) {
+        self.signature_only = true;
+        self.env.enter_scope(.file_scope);
+        self.visit_top_level_item(item);
+        self.env.exit_scope();
+        self.signature_only = false;
+    }
+
+    public Void resolve_top_level_member(
+        Self&! self,
+        ast.AstId item,
+        qid.DefId def_id,
+        Bool signature_only
+    ) {
+        self.signature_only = signature_only;
+        self.target_def = def_id;
+        self.env.enter_scope(.file_scope);
+        self.visit_top_level_item(item);
+        self.env.exit_scope();
+        self.target_def = null;
+        self.signature_only = false;
     }
 
     Void for_each_top_level_item(Self&! self) {
@@ -64,6 +97,7 @@ public struct ReferenceResolver: Movable {
 
     Void visit_top_level_item(Self&! self, ast.AstId item) {
         ast.AstNode node = self.state.unit.get(item);
+        if (self.top_level_item_is_ready(item)) { return; }
         if (node.data is .top_level_decl(top_level)) {
             ast.AstNode body = self.state.unit.get(top_level.body);
             self.resolve_top_level_decl(top_level, body);
@@ -81,6 +115,19 @@ public struct ReferenceResolver: Movable {
             self.resolve_compile_if(compile_if);
             return;
         }
+    }
+
+    Bool top_level_item_is_ready(Self&! self, ast.AstId item_id) {
+        if (self.target_def != null) { return false; }
+        guard resolve_state.top_level_declaration_name(self.state.unit, item_id)
+            is .some(name) else { return false; }
+        guard self.state.declaration_def(name) is .some(def_id) else { return false; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(def_id);
+        if (self.signature_only) {
+            return progress == .signature_ready || progress == .body_ready;
+        }
+        return progress == .body_ready;
     }
 
     Bool current_source_allows_bodyless_extension(Self&! self) {
@@ -188,6 +235,15 @@ public struct ReferenceResolver: Movable {
     }
 
     Void resolve_extern_block(Self&! self, ast.ExternBlockData extern_block) {
+        if (self.target_def is .some(target_def)) {
+            guard self.state.declaration_items.get(target_def) is .some(member) else { return; }
+            ast.AstId member_id = member$.get();
+            ast.AstNode item = self.state.unit.get(member_id);
+            if (item.data is .extern_item(extern_item)) {
+                self.resolve_extern_item(extern_item);
+            }
+            return;
+        }
         Int index! = 0;
         while (index < extern_block.items.length) {
             ast.AstId item_id = self.state.unit.child_at(extern_block.items, index);
@@ -217,7 +273,7 @@ public struct ReferenceResolver: Movable {
         }
         self.resolve_type_ref(global_decl.type_ref);
         self.resolve_global_annotations(annotations);
-        if (global_decl.initializer is .some(initializer)) {
+        if (!self.signature_only && global_decl.initializer is .some(initializer)) {
             self.resolve_expr(initializer);
         }
         self.current_owner_def = previous_owner;
@@ -251,7 +307,7 @@ public struct ReferenceResolver: Movable {
             }
             self.resolve_global_annotations(top_level.annotations);
             self.resolve_type_ref(global_decl.type_ref);
-            if (global_decl.initializer is .some(initializer)) {
+            if (!self.signature_only && global_decl.initializer is .some(initializer)) {
                 self.resolve_expr(initializer);
             }
             self.current_owner_def = previous_owner;
@@ -271,8 +327,7 @@ public struct ReferenceResolver: Movable {
             return;
         }
         if (body.data is .extend_decl(extend_decl)) {
-            Int extension_ordinal = self.extension_cursor;
-            self.extension_cursor = self.extension_cursor + 1;
+            Int extension_ordinal = body.span.start;
             if (
                 extend_decl.members.length == 0
                 && !top_level.modifiers.unsafe_flag
@@ -302,11 +357,15 @@ public struct ReferenceResolver: Movable {
                 self.check_extend_target_args(extend_decl.target_type, owner_def);
             } else {
                 self.resolve_type_ref(extend_decl.target_type);
-                self.add_diagnostic(
-                    self.state.unit.get(extend_decl.target_type).span,
-                    "extend target must be a namespace-bearing type",
-                    "unsupported_extend_target"
-                );
+                // 渐进 lookup 可能刚请求了 import target 的 alias surface；
+                // 等 ModuleResolver 推进后重试，不能把暂时未解析当成最终错误。
+                if (!self.state.has_pending_request()) {
+                    self.add_diagnostic(
+                        self.state.unit.get(extend_decl.target_type).span,
+                        "extend target must be a namespace-bearing type",
+                        "unsupported_extend_target"
+                    );
+                }
             }
             if (extend_decl.trait_path is .some(trait_path)) {
                 self.resolve_type_bound(trait_path);
@@ -392,6 +451,13 @@ public struct ReferenceResolver: Movable {
         Int extension_ordinal
     ) {
         guard generics is .some(generic_id) else { return; }
+        if (self.state.declaration_def(generic_id) is .some(binding_owner)) {
+            qid.DefId? previous_owner = self.current_owner_def;
+            self.current_owner_def = binding_owner;
+            self.define_owner_generic_params(binding_owner);
+            self.current_owner_def = previous_owner;
+            return;
+        }
         token.Span span = self.state.unit.get(generic_id).span;
         qid.DefId binding_owner = self.create_extension_binding_owner(
             owner_def,
@@ -614,15 +680,23 @@ public struct ReferenceResolver: Movable {
         self.env.enter_scope(.generic_scope);
         qid.DefId? previous_owner = self.current_owner_def;
         Bool previous_owner_type_lookup = self.owner_type_lookup_enabled;
+        Bool header_ready! = false;
         if (self.owner_type_def(nominal.name) is .some(owner_def)) {
             self.current_owner_def = owner_def;
             self.owner_type_lookup_enabled = true;
             self.define_self_type(owner_def);
+            header_ready = self.declaration_header_ready(owner_def);
+            if (header_ready) {
+                self.define_owner_generic_params(owner_def);
+            } else {
+                self.resolve_optional_generics_with_annotations(nominal.generics, annotations);
+                self.resolve_where_annotations(annotations);
+                self.resolve_type_bound_range(nominal.traits);
+            }
         }
-        self.resolve_optional_generics_with_annotations(nominal.generics, annotations);
-        self.resolve_where_annotations(annotations);
-        self.resolve_path_range(nominal.traits, .type_name);
-        self.resolve_member_range(nominal.members);
+        if (!self.signature_only || self.target_def != null) {
+            self.resolve_member_range(nominal.members);
+        }
         self.current_owner_def = previous_owner;
         self.owner_type_lookup_enabled = previous_owner_type_lookup;
         self.env.exit_scope();
@@ -632,19 +706,33 @@ public struct ReferenceResolver: Movable {
         self.env.enter_scope(.generic_scope);
         qid.DefId? previous_owner = self.current_owner_def;
         Bool previous_owner_type_lookup = self.owner_type_lookup_enabled;
+        Bool header_ready! = false;
         if (self.owner_type_def(trait_decl.name) is .some(owner_def)) {
             self.current_owner_def = owner_def;
             self.owner_type_lookup_enabled = true;
             self.define_self_type(owner_def);
+            header_ready = self.declaration_header_ready(owner_def);
+            if (header_ready) {
+                self.define_owner_generic_params(owner_def);
+            } else {
+                self.resolve_optional_generics_with_annotations(trait_decl.generics, annotations);
+                self.resolve_where_annotations(annotations);
+                self.resolve_type_bound_range(trait_decl.parents);
+            }
         }
-        self.resolve_optional_generics_with_annotations(trait_decl.generics, annotations);
-        self.resolve_where_annotations(annotations);
-        self.resolve_path_range(trait_decl.parents, .type_name);
         self.define_member_associated_type_names(trait_decl.members);
-        self.resolve_member_range(trait_decl.members);
+        if (!self.signature_only || self.target_def != null) {
+            self.resolve_member_range(trait_decl.members);
+        }
         self.current_owner_def = previous_owner;
         self.owner_type_lookup_enabled = previous_owner_type_lookup;
         self.env.exit_scope();
+    }
+
+    Bool declaration_header_ready(Self&! self, qid.DefId def_id) {
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(def_id);
+        return progress == .signature_ready || progress == .body_ready;
     }
 
     Void define_member_associated_type_names(Self&! self, ast.AstRange members) {
@@ -719,6 +807,31 @@ public struct ReferenceResolver: Movable {
             domain,
             search_parents
         );
+        if (binding == null) {
+            if (self.state.ctx.store.resolve.lookup_namespace(
+                namespace_id,
+                symbol,
+                .alias_name,
+                search_parents
+            ) is .some(alias_binding)) {
+                self.state.request_binding_signatures(
+                    alias_binding.namespace_id,
+                    symbol,
+                    .alias_name,
+                    alias_binding.def_id
+                );
+                if (self.state.has_pending_request()) { return null; }
+            }
+            self.state.request_wildcard_import(namespace_id, search_parents);
+            if (self.state.has_pending_request()) { return null; }
+        } else if (binding is .some(found)) {
+            self.state.request_binding_signatures(
+                namespace_id,
+                symbol,
+                domain,
+                found.def_id
+            );
+        }
         if (self.current_owner_def is .some(use_owner)) {
             database.observe_namespace_name(
                 self.state.ctx.query$.ref(),
@@ -728,6 +841,46 @@ public struct ReferenceResolver: Movable {
                 symbol,
                 domain,
                 binding
+            );
+        }
+        return binding;
+    }
+
+    namespace.BindingEntry? lookup_visible_name(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        Bool search_parents
+    ) {
+        namespace.BindingEntry? binding = self.state.ctx.store.resolve.lookup_visible_name(
+            namespace_id,
+            symbol,
+            domain,
+            search_parents
+        );
+        if (binding == null) {
+            if (self.state.ctx.store.resolve.lookup_visible_name(
+                namespace_id,
+                symbol,
+                .alias_name,
+                search_parents
+            ) is .some(alias_binding)) {
+                self.state.request_binding_signatures(
+                    alias_binding.namespace_id,
+                    symbol,
+                    .alias_name,
+                    alias_binding.def_id
+                );
+                if (self.state.has_pending_request()) { return null; }
+            }
+            self.state.request_wildcard_import(namespace_id, search_parents);
+        } else if (binding is .some(found)) {
+            self.state.request_binding_signatures(
+                found.namespace_id,
+                symbol,
+                domain,
+                found.def_id
             );
         }
         return binding;
@@ -788,11 +941,45 @@ public struct ReferenceResolver: Movable {
     }
 
     Void resolve_member_range(Self&! self, ast.AstRange members) {
+        if (self.target_is_current_owner()) {
+            if (self.signature_only) { return; }
+        } else if (self.target_def is .some(_)) {
+            guard self.target_member_for_current_owner() is .some(member_id) else { return; }
+            self.resolve_member_decl(member_id);
+            return;
+        }
         Int index! = 0;
         while (index < members.length) {
             self.resolve_member_decl(self.state.unit.child_at(members, index));
             index = index + 1;
         }
+    }
+
+    Bool target_is_current_owner(Self&! self) {
+        guard self.target_def is .some(target_def) else { return false; }
+        guard self.current_owner_def is .some(owner_def) else { return false; }
+        return target_def.to_index() == owner_def.to_index();
+    }
+
+    ast.AstId? target_member_for_current_owner(Self&! self) {
+        guard self.target_def is .some(target_def) else { return null; }
+        guard self.current_owner_def is .some(owner_def) else { return null; }
+        qid.DefId current! = target_def;
+        Int depth! = 0;
+        while (depth < 64) {
+            guard self.state.ctx.store.defs.get(current).owner_def is .some(parent) else {
+                return null;
+            }
+            if (parent.to_index() == owner_def.to_index()) {
+                guard self.state.declaration_items.get(current) is .some(item) else {
+                    return null;
+                }
+                return item$.get();
+            }
+            current = parent;
+            depth = depth + 1;
+        }
+        return null;
     }
 
     Void resolve_member_decl(Self&! self, ast.AstId member_id) {
@@ -825,7 +1012,9 @@ public struct ReferenceResolver: Movable {
         if (body.data is .field_decl(field_decl)) {
             self.resolve_where_annotations(annotations);
             self.resolve_type_ref(field_decl.type_ref);
-            self.resolve_field_declarators(field_decl.fields);
+            if (!self.signature_only) {
+                self.resolve_field_declarators(field_decl.fields);
+            }
             return;
         }
         if (body.data is .enum_case(enum_case)) {
@@ -833,7 +1022,7 @@ public struct ReferenceResolver: Movable {
             if (enum_case.payload_type is .some(payload_type)) {
                 self.resolve_type_ref(payload_type);
             }
-            if (enum_case.value is .some(value)) {
+            if (!self.signature_only && enum_case.value is .some(value)) {
                 self.resolve_expr(value);
             }
             return;
@@ -852,7 +1041,7 @@ public struct ReferenceResolver: Movable {
         if (assoc_type.value is .some(value)) {
             self.resolve_type_ref(value);
         }
-        if (assoc_type.const_value is .some(value)) {
+        if (!self.signature_only && assoc_type.const_value is .some(value)) {
             self.resolve_expr(value);
         }
         if (assoc_type.type_ref is .some(type_ref)) {
@@ -892,6 +1081,16 @@ public struct ReferenceResolver: Movable {
         while (index < fields.length) {
             ast.AstNode field = self.state.unit.get(self.state.unit.child_at(fields, index));
             if (field.data is .field_declarator(field_decl)) {
+                if (self.target_def is .some(target_def)) {
+                    guard self.state.declaration_def(field_decl.name) is .some(field_def) else {
+                        index = index + 1;
+                        continue;
+                    }
+                    if (target_def.to_index() != field_def.to_index()) {
+                        index = index + 1;
+                        continue;
+                    }
+                }
                 if (field_decl.default_value is .some(default_value)) {
                     self.resolve_expr(default_value);
                 }
@@ -904,6 +1103,13 @@ public struct ReferenceResolver: Movable {
         qid.DefId? previous_owner = self.current_owner_def;
         Bool effective_static_member! = static_member;
         if (self.owner_value_def(function_decl.name) is .some(function_def)) {
+            sem.DeclarationSemaState progress =
+                self.state.ctx.store.model.declaration_sema_state(function_def);
+            if (progress == .body_ready) { return; }
+            if (progress == .signature_ready) {
+                self.resolve_existing_function_body(function_def, function_decl);
+                return;
+            }
             self.current_owner_def = function_def;
         }
         self.env.enter_scope(.generic_scope);
@@ -926,12 +1132,69 @@ public struct ReferenceResolver: Movable {
         self.env.enter_scope(.function_scope);
         self.define_self_for_instance_function(effective_static_member);
         self.resolve_param_names_and_defaults(function_decl.params);
-        if (function_decl.body is .some(body)) {
+        if (!self.signature_only && function_decl.body is .some(body)) {
             self.resolve_block(body);
         }
         self.env.exit_scope();
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
+    }
+
+    Void resolve_existing_function_body(
+        Self&! self,
+        qid.DefId function_def,
+        ast.FunctionData function_decl
+    ) {
+        if (self.signature_only) { return; }
+        guard function_decl.body is .some(body) else { return; }
+        guard self.state.ctx.store.model.def_ref(function_def).decl.function_signature
+            is .some(signature) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = function_def;
+        self.env.enter_scope(.generic_scope);
+        self.bind_existing_generic_params(function_decl.generics);
+        self.env.enter_scope(.function_scope);
+        self.define_self_for_instance_function(!signature.has_receiver);
+        self.bind_existing_param_names(function_decl.params, signature.has_receiver);
+        self.resolve_block(body);
+        self.env.exit_scope();
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
+
+    Void bind_existing_generic_params(Self&! self, ast.AstId? generics) {
+        guard generics is .some(generic_id) else { return; }
+        ast.AstNode generic_node = self.state.unit.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+        Int index! = 0;
+        while (index < generic_data.type_params.length) {
+            ast.AstNode param_node =
+                self.state.unit.get(self.state.unit.child_at(generic_data.type_params, index));
+            if (param_node.data is .generic_param(param)) {
+                self.bind_existing_local_name(param.name);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void bind_existing_param_names(Self&! self, ast.AstRange params, Bool has_receiver) {
+        Int index! = 0;
+        while (index < params.length) {
+            ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (param_node.data is .param(param)) {
+                if (!has_receiver || index != 0) {
+                    self.bind_existing_local_name(param.name);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    Void bind_existing_local_name(Self&! self, ast.AstId name_id) {
+        guard self.state.declaration_def(name_id) is .some(def_id) else { return; }
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
+        def.DefRecord record = self.state.ctx.store.defs.get(def_id);
+        self.env.define(symbol, record.domain, def_id, record.name.span);
     }
 
     Void define_self_for_instance_function(Self&! self, Bool static_member) {
@@ -948,9 +1211,15 @@ public struct ReferenceResolver: Movable {
     Void resolve_init(Self&! self, ast.InitData init_decl, ast.AstRange annotations) {
         qid.DefId? previous_owner = self.current_owner_def;
         if (previous_owner is .some(owner_def)) {
-            if (self.next_init_def(owner_def) is .some(init_def)) {
-                self.current_owner_def = init_def;
+            guard self.init_def_for_request(owner_def) is .some(init_def) else { return; }
+            sem.DeclarationSemaState progress =
+                self.state.ctx.store.model.declaration_sema_state(init_def);
+            if (progress == .body_ready) { return; }
+            if (progress == .signature_ready) {
+                self.resolve_existing_init_body(init_def, owner_def, init_decl);
+                return;
             }
+            self.current_owner_def = init_def;
         }
         self.resolve_where_annotations(annotations);
         self.env.enter_scope(.function_scope);
@@ -959,6 +1228,37 @@ public struct ReferenceResolver: Movable {
         }
         self.validate_explicit_receiver_params(init_decl.params, true);
         self.resolve_params(init_decl.params);
+        if (!self.signature_only) {
+            self.resolve_block(init_decl.body);
+        }
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
+
+    qid.DefId? init_def_for_request(Self&! self, qid.DefId owner_def) {
+        if (self.target_def is .some(target_def)) {
+            def.DefRecord target = self.state.ctx.store.defs.get(target_def);
+            if (target.kind == .init_def && target.owner_def is .some(target_owner)) {
+                if (target_owner.to_index() == owner_def.to_index()) {
+                    return target_def;
+                }
+            }
+        }
+        return self.next_init_def(owner_def);
+    }
+
+    Void resolve_existing_init_body(
+        Self&! self,
+        qid.DefId init_def,
+        qid.DefId owner_def,
+        ast.InitData init_decl
+    ) {
+        if (self.signature_only) { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = init_def;
+        self.env.enter_scope(.function_scope);
+        self.define_self_value(owner_def);
+        self.bind_existing_param_names(init_decl.params, false);
         self.resolve_block(init_decl.body);
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
@@ -971,7 +1271,11 @@ public struct ReferenceResolver: Movable {
         while (index < member_count) {
             qid.DefId member_def = self.state.ctx.store.model.def_ref(owner_def).members.get(index);
             index = index + 1;
-            if (self.state.ctx.store.defs.get(member_def).kind == .init_def) {
+            def.DefRecord member = self.state.ctx.store.defs.get(member_def);
+            if (member.kind == .init_def
+                && member.module_id is .some(module_id)
+                && module_id.index == self.state.module_id.index
+            ) {
                 self.init_def_cursors.set(owner_def, index);
                 return member_def;
             }
@@ -987,6 +1291,7 @@ public struct ReferenceResolver: Movable {
     }
 
     Void resolve_deinit(Self&! self, ast.StmtData deinit_decl) {
+        if (self.signature_only) { return; }
         self.env.enter_scope(.function_scope);
         if (self.current_owner_def is .some(owner_def)) {
             self.define_self_value(owner_def);
@@ -1204,6 +1509,10 @@ public struct ReferenceResolver: Movable {
     Void define_alias_attribute_name(Self&! self, ast.AstId name_id) {
         if (self.state.name_symbol(name_id) is .some(symbol)) {
             token.Span span = self.state.unit.get(name_id).span;
+            if (self.state.declaration_def(name_id) is .some(def_id)) {
+                self.env.define(symbol, .type_name, def_id, span);
+                return;
+            }
             Bool duplicate = self.add_local_duplicate_diagnostic(symbol, .type_name, span);
             qid.DefId def_id = self.state.ctx.store.defs.create(
                 .alias_def,
@@ -1658,6 +1967,14 @@ public struct ReferenceResolver: Movable {
         }
     }
 
+    Void resolve_type_bound_range(Self&! self, ast.AstRange range) {
+        Int index! = 0;
+        while (index < range.length) {
+            self.resolve_type_bound(self.state.unit.child_at(range, index));
+            index = index + 1;
+        }
+    }
+
     Void resolve_type_ref(Self&! self, ast.AstId type_id) {
         ast.AstNode node = self.state.unit.get(type_id);
         if (node.data is .infer_type) { return; }
@@ -1906,8 +2223,6 @@ public struct ReferenceResolver: Movable {
 
     Void resolve_expr(Self&! self, ast.AstId expr_id) {
         ast.AstNode expr = self.state.unit.get(expr_id);
-        if (expr_id.to_index() > 700) {
-        }
         if (expr.data is .literal(_)) { return; }
         if (expr.data is .lambda_expr(lambda)) {
             self.resolve_lambda_expr(lambda);
@@ -2452,7 +2767,7 @@ public struct ReferenceResolver: Movable {
             return self.state.ctx.store.defs.get(owner_member).owned_namespace_id;
         }
         if (
-            self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
+            self.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
             is .some(type_binding)
         ) {
             guard self.check_accessible(type_binding.def_id, segment_id) else { return null; }
@@ -2633,6 +2948,10 @@ public struct ReferenceResolver: Movable {
     Void define_local_name(Self&! self, ast.AstId name_id, def.DefKind kind, def.NameDomain domain) {
         if (self.state.name_symbol(name_id) is .some(symbol)) {
             token.Span span = self.state.unit.get(name_id).span;
+            if (self.state.declaration_def(name_id) is .some(def_id)) {
+                self.env.define(symbol, domain, def_id, span);
+                return;
+            }
             Bool duplicate = self.add_local_duplicate_diagnostic(symbol, domain, span);
             qid.DefId def_id = self.state.ctx.store.defs.create(
                 kind,
@@ -2824,7 +3143,7 @@ public struct ReferenceResolver: Movable {
                 }
             }
             if (
-                self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+                self.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
                 is .some(binding)
             ) {
                 return binding.def_id;
@@ -2888,7 +3207,7 @@ public struct ReferenceResolver: Movable {
             return owner_member;
         }
         if (
-            self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
+            self.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
             is .some(binding)
         ) {
             guard self.check_accessible(binding.def_id, name_id) else { return null; }
@@ -2907,7 +3226,7 @@ public struct ReferenceResolver: Movable {
             return local_def;
         }
         if (
-            self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .value_name, true)
+            self.lookup_visible_name(self.state.namespace_id, symbol, .value_name, true)
             is .some(binding)
         ) {
             return binding.def_id;
@@ -2918,12 +3237,17 @@ public struct ReferenceResolver: Movable {
     qid.NamespaceId? resolve_first_qualified_namespace(Self&! self, ast.AstId segment_id) {
         guard self.state.name_symbol(segment_id) is .some(symbol) else { return null; }
         guard (
-            self.state.ctx.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
+            self.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
             is .some(binding)
         ) else {
             return null;
         }
-        return self.state.ctx.store.defs.get(binding.def_id).owned_namespace_id;
+        qid.NamespaceId? namespace_id =
+            self.state.ctx.store.defs.get(binding.def_id).owned_namespace_id;
+        if (namespace_id == null) {
+            self.state.request_import_alias(binding.def_id);
+        }
+        return namespace_id;
     }
 
     // 从已经确定的 namespace 开始，逐段解析剩余 path。
@@ -3023,7 +3347,10 @@ public struct ReferenceResolver: Movable {
         qid.DefId def_id
     ) {
         guard self.state.ctx.store.defs.get(def_id).owned_namespace_id is .some(namespace_id) else {
-            self.add_unresolved_diagnostic(segment_id, .namespace_name);
+            self.state.request_import_alias(def_id);
+            if (!self.state.has_pending_request()) {
+                self.add_unresolved_diagnostic(segment_id, .namespace_name);
+            }
             return null;
         }
         return namespace_id;
@@ -3117,6 +3444,7 @@ public struct ReferenceResolver: Movable {
     }
 
     Void add_unresolved_diagnostic(Self&! self, ast.AstId name_id, def.NameDomain domain) {
+        if (self.state.has_pending_request()) { return; }
         if (self.add_removed_builtin_type_diagnostic(name_id, domain)) { return; }
         token.Span span = self.state.unit.get(name_id).span;
         std.String name! = std.String.from_valid_utf8(self.name_text(name_id));
@@ -3190,6 +3518,7 @@ public struct ReferenceResolver: Movable {
     }
 
     Void add_unresolved_in_namespace_diagnostic(Self&! self, ast.AstId name_id, def.NameDomain domain) {
+        if (self.state.has_pending_request()) { return; }
         token.Span span = self.state.unit.get(name_id).span;
         std.String name! = std.String.from_valid_utf8(self.name_text(name_id));
         diagnostics.add_unresolved_in_namespace(

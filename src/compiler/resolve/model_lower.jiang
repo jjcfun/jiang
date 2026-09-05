@@ -43,8 +43,34 @@ extern {
 }
 
 public Bool lower_unit(resolve_state.AstResolveState&! state) {
-    Lower lower! = Lower(state);
+    Lower lower! = Lower(state, false);
     lower.lower();
+    return !state.ctx.store.model.has_errors();
+}
+
+// 按需 lower 单个顶层 declaration。调用方负责先完成 declaration discovery
+// 和该 item 的 reference resolve。
+public Bool lower_top_level_item(resolve_state.AstResolveState&! state, ast.AstId item_id) {
+    Lower lower! = Lower(state, false);
+    lower.lower_one(item_id);
+    return !state.ctx.store.model.has_errors();
+}
+
+public Bool lower_top_level_signature(resolve_state.AstResolveState&! state, ast.AstId item_id) {
+    Lower lower! = Lower(state, true);
+    lower.lower_one(item_id);
+    return !state.ctx.store.model.has_errors();
+}
+
+public Bool lower_top_level_member(
+    resolve_state.AstResolveState&! state,
+    ast.AstId item_id,
+    qid.DefId def_id,
+    Bool signature_only
+) {
+    Lower lower! = Lower(state, signature_only);
+    lower.target_def = def_id;
+    lower.lower_one(item_id);
     return !state.ctx.store.model.has_errors();
 }
 
@@ -56,17 +82,23 @@ struct Lower: Movable {
     ast.AstId? current_extension_target!;
     Bool owner_type_lookup_enabled!;
     map.WyHashMap<qid.DefId, Int> lambda_ordinals!;
+    map.WyHashMap<qid.DefId, Int> init_def_cursors!;
     scope.LexicalEnv env!;
     Bool module_doc_allowed!;
+    Bool signature_only;
+    qid.DefId? target_def!;
 
-    public init(self, resolve_state.AstResolveState&! state) {
+    public init(self, resolve_state.AstResolveState&! state, Bool signature_only) {
         self.state = state;
         self.current_owner_def = null;
         self.current_extension_target = null;
         self.owner_type_lookup_enabled = false;
         self.lambda_ordinals = map.WyHashMap<qid.DefId, Int>();
+        self.init_def_cursors = map.WyHashMap<qid.DefId, Int>();
         self.env = scope.LexicalEnv();
         self.module_doc_allowed = true;
+        self.signature_only = signature_only;
+        self.target_def = null;
     }
 
     // 只遍历能在 Semantic Model 中拥有可执行/类型语法的 declaration。declaration
@@ -84,6 +116,10 @@ struct Lower: Movable {
         }
     }
 
+    public Void lower_one(Self&! self, ast.AstId item_id) {
+        self.lower_top_level_item(item_id);
+    }
+
     Void lower_top_level_item(Self&! self, ast.AstId item_id) {
         ast.AstNode item = self.state.unit.get(item_id);
         if (item.data is .doc_attribute(doc_attr)) {
@@ -93,6 +129,7 @@ struct Lower: Movable {
         if (!self.top_level_item_is_import(item)) {
             self.module_doc_allowed = false;
         }
+        if (self.top_level_item_is_ready(item_id)) { return; }
         if (item.data is .top_level_decl(top_level)) {
             ast.AstNode body = self.state.unit.get(top_level.body);
             if (body.data is .extend_decl(extend_decl)) {
@@ -125,6 +162,19 @@ struct Lower: Movable {
             return;
         }
         self.lower_decl_with_annotations(item_id, self.empty_ast_range(), false);
+    }
+
+    Bool top_level_item_is_ready(Self&! self, ast.AstId item_id) {
+        if (self.target_def != null) { return false; }
+        guard resolve_state.top_level_declaration_name(self.state.unit, item_id)
+            is .some(name) else { return false; }
+        guard self.state.declaration_def(name) is .some(def_id) else { return false; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(def_id);
+        if (self.signature_only) {
+            return progress == .signature_ready || progress == .body_ready;
+        }
+        return progress == .body_ready;
     }
 
     Bool top_level_item_is_import(Self&! self, ast.AstNode item) {
@@ -174,6 +224,20 @@ struct Lower: Movable {
 
     Void lower_extern_block(Self&! self, ast.ExternBlockData extern_block) {
         sem.ExternKind extern_kind = self.extern_kind(extern_block.extern_kind);
+        if (self.target_def is .some(target_def)) {
+            guard self.state.declaration_items.get(target_def) is .some(member) else { return; }
+            ast.AstId member_id = member$.get();
+            ast.AstNode item = self.state.unit.get(member_id);
+            if (item.data is .extern_item(extern_item)) {
+                self.lower_decl_with_extern_kind(
+                    extern_item.body,
+                    extern_item.annotations,
+                    extern_kind,
+                    true
+                );
+            }
+            return;
+        }
         Int index! = 0;
         while (index < extern_block.items.length) {
             ast.AstId item_id = self.state.unit.child_at(extern_block.items, index);
@@ -256,23 +320,41 @@ struct Lower: Movable {
             if (self.decl_def_for_name(nominal.name, .type_name) is .some(owner_def)) {
                 self.current_owner_def = owner_def;
                 self.owner_type_lookup_enabled = true;
-                self.enter_generic_scope_for_owner(owner_def, nominal.generics);
+                Bool header_ready = self.declaration_header_ready(owner_def);
+                if (header_ready) {
+                    self.enter_existing_generic_scope_for_owner(owner_def, nominal.generics);
+                } else {
+                    self.state.ctx.store.model.set_declaration_sema_state(
+                        owner_def,
+                        .resolving_signature
+                    );
+                    self.enter_generic_scope_for_owner(owner_def, nominal.generics);
+                }
                 self.define_self_type(owner_def);
                 entered_generics = true;
-                self.lower_annotations(owner_def, annotations);
-                if (nominal.enum_underlying_type is .some(underlying_type)) {
-                    sem.NodeId type_ref = self.lower_type_ref(underlying_type);
-                    self.state.ctx.store.model.set_enum_underlying_type_ref(owner_def, type_ref);
+                if (!header_ready) {
+                    self.lower_annotations(owner_def, annotations);
+                    if (nominal.enum_underlying_type is .some(underlying_type)) {
+                        sem.NodeId type_ref = self.lower_type_ref(underlying_type);
+                        self.state.ctx.store.model.set_enum_underlying_type_ref(owner_def, type_ref);
+                    }
+                    self.state.ctx.store.model.set_enum_has_payload_variants(
+                        owner_def,
+                        nominal.has_payload_variants
+                    );
+                    sem.LayoutOptions layout_options = self.lower_layout_options(nominal);
+                    self.state.ctx.store.model.set_layout_options(owner_def, layout_options);
+                    self.lower_trait_ref_range(owner_def, nominal.traits);
+                    self.state.ctx.store.model.set_declaration_sema_state(
+                        owner_def,
+                        .signature_ready
+                    );
                 }
-                self.state.ctx.store.model.set_enum_has_payload_variants(
-                    owner_def,
-                    nominal.has_payload_variants
-                );
-                sem.LayoutOptions layout_options = self.lower_layout_options(nominal);
-                self.state.ctx.store.model.set_layout_options(owner_def, layout_options);
-                self.lower_trait_ref_range(owner_def, nominal.traits);
             }
-            self.lower_member_range(nominal.members);
+            if (!self.signature_only || self.target_def != null) {
+                self.lower_member_range(nominal.members);
+            }
+            self.finish_current_owner_if_complete();
             if (entered_generics) {
                 self.env.exit_scope();
             }
@@ -287,14 +369,32 @@ struct Lower: Movable {
             if (self.decl_def_for_name(trait_decl.name, .type_name) is .some(owner_def)) {
                 self.current_owner_def = owner_def;
                 self.owner_type_lookup_enabled = true;
-                self.enter_generic_scope_for_owner(owner_def, trait_decl.generics);
+                Bool header_ready = self.declaration_header_ready(owner_def);
+                if (header_ready) {
+                    self.enter_existing_generic_scope_for_owner(owner_def, trait_decl.generics);
+                } else {
+                    self.state.ctx.store.model.set_declaration_sema_state(
+                        owner_def,
+                        .resolving_signature
+                    );
+                    self.enter_generic_scope_for_owner(owner_def, trait_decl.generics);
+                }
                 self.define_self_type(owner_def);
                 entered_generics = true;
-                self.lower_annotations(owner_def, annotations);
-                self.lower_trait_ref_range(owner_def, trait_decl.parents);
+                if (!header_ready) {
+                    self.lower_annotations(owner_def, annotations);
+                    self.lower_trait_ref_range(owner_def, trait_decl.parents);
+                    self.state.ctx.store.model.set_declaration_sema_state(
+                        owner_def,
+                        .signature_ready
+                    );
+                }
                 self.define_member_associated_type_names(trait_decl.members);
             }
-            self.lower_member_range(trait_decl.members);
+            if (!self.signature_only || self.target_def != null) {
+                self.lower_member_range(trait_decl.members);
+            }
+            self.finish_current_owner_if_complete();
             if (entered_generics) {
                 self.env.exit_scope();
             }
@@ -306,6 +406,12 @@ struct Lower: Movable {
             self.lower_extend(extend_decl, annotations, false, false);
             return;
         }
+    }
+
+    Bool declaration_header_ready(Self&! self, qid.DefId def_id) {
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(def_id);
+        return progress == .signature_ready || progress == .body_ready;
     }
 
     sem.LayoutOptions lower_layout_options(Self&! self, ast.NominalData nominal) {
@@ -377,28 +483,28 @@ struct Lower: Movable {
         self.current_owner_def = owner_def;
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
-        qid.DefId binding_owner = self.define_extend_generic_params(extend_decl.generics, owner_def);
-        Int extension_index = self.state.ctx.store.model.add_extension_group(
-            self.state.module_id,
-            owner_def,
-            binding_owner,
-            public_flag,
-            unsafe_conformance
-        );
-        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, binding_owner);
-        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, binding_owner);
-        self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
-        self.lower_extension_annotations(extension_index, annotations);
-        if (extend_decl.trait_path is .some(trait_path)) {
-            ast.AstNode trait_node = self.state.unit.get(trait_path);
-            guard trait_node.data is .trait_bound(trait_bound) else { return; }
-            sem.NodeId lowered_trait_ref = self.lower_trait_bound_ref(trait_bound);
-            self.state.ctx.store.model.set_extension_trait_ref(extension_index, lowered_trait_ref);
-            self.lower_extension_trait_assoc_bindings(
+        Int? existing_extension = self.extension_group_for_members(extend_decl.members);
+        qid.DefId binding_owner!;
+        Int extension_index!;
+        if (existing_extension is .some(existing_index)) {
+            extension_index = existing_index;
+            binding_owner = self.state.ctx.store.model.extension_group_binding_owner(existing_index);
+            self.define_existing_generic_params(binding_owner, extend_decl.generics);
+        } else {
+            binding_owner = self.define_extend_generic_params(extend_decl.generics, owner_def);
+            extension_index = self.state.ctx.store.model.add_extension_group(
+                self.state.module_id,
+                owner_def,
+                binding_owner,
+                public_flag,
+                unsafe_conformance
+            );
+            self.lower_extend_header(
                 extension_index,
-                extend_decl.target_type,
-                trait_bound,
-                lowered_trait_ref
+                extend_decl,
+                annotations,
+                binding_owner,
+                owner_def
             );
         }
         ast.AstId? previous_extension_target = self.current_extension_target;
@@ -407,9 +513,75 @@ struct Lower: Movable {
         }
         self.lower_member_range(extend_decl.members);
         self.current_extension_target = previous_extension_target;
-        self.record_extension_members(extension_index, extend_decl.members);
+        if (existing_extension == null) {
+            self.record_extension_members(extension_index, extend_decl.members);
+        }
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
+    }
+
+    Int? extension_group_for_members(Self&! self, ast.AstRange members) {
+        Int index! = 0;
+        while (index < members.length) {
+            ast.AstId member_id = self.state.unit.child_at(members, index);
+            if (self.member_def_for_ast(member_id) is .some(member_def)) {
+                if (self.state.ctx.store.model.extension_group_for_member(member_def)
+                    is .some(extension_index)
+                ) {
+                    return extension_index;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Void define_existing_generic_params(
+        Self&! self,
+        qid.DefId owner_def,
+        ast.AstId? generics
+    ) {
+        guard generics is .some(generic_id) else { return; }
+        ast.AstNode generic_node = self.state.unit.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+        Int index! = 0;
+        while (index < generic_data.type_params.length) {
+            ast.AstId param_id = self.state.unit.child_at(generic_data.type_params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .generic_param(param)) {
+                if (self.generic_param_def_for_name_in_any_domain(owner_def, param.name)
+                    is .some(param_def)
+                ) {
+                    def.NameDomain domain = self.state.ctx.store.defs.get(param_def).domain;
+                    self.define_existing_local(param.name, domain, param_def);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    Void lower_extend_header(Self&! self,
+        Int extension_index,
+        ast.ExtendData extend_decl,
+        ast.AstRange annotations,
+        qid.DefId binding_owner,
+        qid.DefId owner_def
+    ) {
+        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, binding_owner);
+        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, binding_owner);
+        self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
+        self.lower_extension_annotations(extension_index, annotations);
+        guard extend_decl.trait_path is .some(trait_path) else { return; }
+        ast.AstNode trait_node = self.state.unit.get(trait_path);
+        guard trait_node.data is .trait_bound(trait_bound) else { return; }
+        sem.NodeId lowered_trait_ref = self.lower_trait_bound_ref(trait_bound);
+        self.state.ctx.store.model.set_extension_trait_ref(extension_index, lowered_trait_ref);
+        self.lower_extension_trait_assoc_bindings(
+            extension_index,
+            extend_decl.target_type,
+            trait_bound,
+            lowered_trait_ref
+        );
     }
 
     qid.DefId define_extend_generic_params(Self&! self, ast.AstId? generics, qid.DefId owner_def) {
@@ -870,13 +1042,30 @@ struct Lower: Movable {
     // 直接在调用方给出的 storage 上初始化，不能把 Self 当普通返回值复制。
     Void lower_init(Self&! self, ast.InitData init_decl, ast.AstRange annotations) {
         guard self.current_owner_def is .some(owner_def) else { return; }
-        token.Span span = self.state.unit.get(init_decl.body).span;
-        guard self.next_unlowered_init_def(owner_def) is .some(init_def) else { return; }
+        guard self.init_def_for_request(owner_def) is .some(init_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(init_def);
+        if (progress == .body_ready) { return; }
+        if (progress != .signature_ready) {
+            self.lower_init_signature(init_def, owner_def, init_decl, annotations);
+        }
+        if (self.signature_only) { return; }
+        self.lower_init_body(init_def, owner_def, init_decl);
+    }
 
+    Void lower_init_signature(
+        Self&! self,
+        qid.DefId init_def,
+        qid.DefId owner_def,
+        ast.InitData init_decl,
+        ast.AstRange annotations
+    ) {
+        self.state.ctx.store.model.set_declaration_sema_state(init_def, .resolving_signature);
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = init_def;
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
+        token.Span span = self.state.unit.get(init_decl.body).span;
         list.ArrayList<sem.NodeId> params! = list.ArrayList<sem.NodeId>(init_decl.params.length);
         list.ArrayList<qid.SymbolId> param_symbols! = list.ArrayList<qid.SymbolId>(init_decl.params.length);
         list.ArrayList<qid.SymbolId> exclusive_symbols! = list.ArrayList<qid.SymbolId>();
@@ -901,18 +1090,42 @@ struct Lower: Movable {
         self.declare_callable_signature(init_def, signature, false);
         self.state.ctx.store.model.set_decl_is_failable_init(init_def, init_decl.failable);
         self.lower_annotations(init_def, annotations);
+        self.state.ctx.store.model.set_declaration_sema_state(init_def, .signature_ready);
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
 
+    Void lower_init_body(
+        Self&! self,
+        qid.DefId init_def,
+        qid.DefId owner_def,
+        ast.InitData init_decl
+    ) {
+        guard self.state.ctx.store.model.def_ref(init_def).decl.function_signature
+            is .some(signature) else { return; }
+        self.state.ctx.store.model.set_declaration_sema_state(init_def, .resolving_body);
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = init_def;
+        self.env.enter_scope(.generic_scope);
+        self.define_self_type(owner_def);
+        token.Span span = self.state.unit.get(init_decl.body).span;
         sem.NodeId placeholder = self.add_invalid_node(span);
         self.state.ctx.store.model.load_body(init_def, sem.Body(init_def, placeholder));
         self.env.enter_scope(.function_scope);
         self.add_init_self_local(init_def, owner_def);
-        self.lower_parameters(init_def, init_decl.params, signature.params);
+        self.lower_parameters(
+            init_def,
+            init_decl.params,
+            init_decl.params.length > signature.params.length,
+            signature.params
+        );
         sem.NodeId user_body = self.lower_expr(init_decl.body);
         sem.NodeId root = self.synthetic_init_root(user_body, span);
         self.env.exit_scope();
         self.env.exit_scope();
 
         self.state.ctx.store.model.set_body_root(init_def, root);
+        self.state.ctx.store.model.set_declaration_sema_state(init_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
@@ -952,25 +1165,41 @@ struct Lower: Movable {
         )), span);
     }
 
-    qid.DefId? next_unlowered_init_def(Self&! self, qid.DefId owner_def) {
+    qid.DefId? init_def_for_request(Self&! self, qid.DefId owner_def) {
+        if (self.target_def is .some(target_def)) {
+            def.DefRecord target = self.state.ctx.store.defs.get(target_def);
+            if (target.kind == .init_def && target.owner_def is .some(target_owner)) {
+                if (target_owner.to_index() == owner_def.to_index()) {
+                    return target_def;
+                }
+            }
+        }
+        return self.next_init_def(owner_def);
+    }
+
+    qid.DefId? next_init_def(Self&! self, qid.DefId owner_def) {
         Int member_count = self.state.ctx.store.model.def_ref(owner_def).members.len();
-        Int index! = 0;
+        Int index! = self.next_init_cursor(owner_def);
         while (index < member_count) {
             qid.DefId member_def = self.state.ctx.store.model.def_ref(owner_def).members.get(index);
-            if (self.unlowered_init_def(member_def)) {
+            index = index + 1;
+            def.DefRecord member = self.state.ctx.store.defs.get(member_def);
+            if (member.kind == .init_def
+                && member.module_id is .some(module_id)
+                && module_id.index == self.state.module_id.index
+            ) {
+                self.init_def_cursors.set(owner_def, index);
                 return member_def;
             }
-            index = index + 1;
         }
         return null;
     }
 
-    Bool unlowered_init_def(Self&! self, qid.DefId def_id) {
-        if (self.state.ctx.store.defs.get(def_id).kind != .init_def) {
-            return false;
+    Int next_init_cursor(Self&! self, qid.DefId owner_def) {
+        if (self.init_def_cursors.get(owner_def) is .some(cursor)) {
+            return cursor$.get();
         }
-        sem.Def& init_model = self.state.ctx.store.model.def_ref(def_id);
-        return init_model.decl.function_signature == null;
+        return 0;
     }
 
     // deinit body 归属于隐藏 deinit_def。它没有显式参数，返回 unit；
@@ -981,7 +1210,23 @@ struct Lower: Movable {
         if (!self.state.ctx.store.model.has_def(owner_def)) { return; }
         sem.Def& owner_model = self.state.ctx.store.model.def_ref(owner_def);
         guard owner_model.custom_deinit_def is .some(deinit_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(deinit_def);
+        if (progress == .body_ready) { return; }
+        if (progress != .signature_ready) {
+            self.lower_deinit_signature(deinit_def, deinit_decl, annotations);
+        }
+        if (self.signature_only) { return; }
+        self.lower_deinit_body(deinit_def, owner_def, deinit_decl);
+    }
 
+    Void lower_deinit_signature(
+        Self&! self,
+        qid.DefId deinit_def,
+        ast.StmtData deinit_decl,
+        ast.AstRange annotations
+    ) {
+        self.state.ctx.store.model.set_declaration_sema_state(deinit_def, .resolving_signature);
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = deinit_def;
         token.Span span = self.state.unit.get(deinit_decl.value).span;
@@ -1002,6 +1247,20 @@ struct Lower: Movable {
         );
         self.declare_callable_signature(deinit_def, signature, false);
         self.lower_annotations(deinit_def, annotations);
+        self.state.ctx.store.model.set_declaration_sema_state(deinit_def, .signature_ready);
+        self.current_owner_def = previous_owner;
+    }
+
+    Void lower_deinit_body(
+        Self&! self,
+        qid.DefId deinit_def,
+        qid.DefId owner_def,
+        ast.StmtData deinit_decl
+    ) {
+        self.state.ctx.store.model.set_declaration_sema_state(deinit_def, .resolving_body);
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = deinit_def;
+        token.Span span = self.state.unit.get(deinit_decl.value).span;
         sem.NodeId placeholder = self.add_invalid_node(span);
         self.state.ctx.store.model.load_body(deinit_def, sem.Body(deinit_def, placeholder));
         self.env.enter_scope(.function_scope);
@@ -1009,25 +1268,72 @@ struct Lower: Movable {
         sem.NodeId root = self.lower_expr(deinit_decl.value);
         self.env.exit_scope();
         self.state.ctx.store.model.set_body_root(deinit_def, root);
+        self.state.ctx.store.model.set_declaration_sema_state(deinit_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
     Void lower_member_range(Self&! self, ast.AstRange members) {
+        if (self.target_is_current_owner()) {
+            if (self.signature_only) { return; }
+        } else if (self.target_def is .some(_)) {
+            guard self.target_member_for_current_owner() is .some(member_id) else { return; }
+            self.lower_member(member_id);
+            return;
+        }
         Int index! = 0;
         while (index < members.length) {
-            ast.AstId member_id = self.state.unit.child_at(members, index);
-            ast.AstNode member = self.state.unit.get(member_id);
-            if (member.data is .member_decl(member_decl)) {
-                self.lower_decl_with_annotations(
-                    member_decl.body,
-                    member_decl.annotations,
-                    member_decl.modifiers.static_flag
-                );
-            } else {
-                self.lower_decl_with_annotations(member_id, self.empty_ast_range(), false);
-            }
+            self.lower_member(self.state.unit.child_at(members, index));
             index = index + 1;
         }
+    }
+
+    Bool target_is_current_owner(Self&! self) {
+        guard self.target_def is .some(target_def) else { return false; }
+        guard self.current_owner_def is .some(owner_def) else { return false; }
+        return target_def.to_index() == owner_def.to_index();
+    }
+
+    Void finish_current_owner_if_complete(Self&! self) {
+        if (self.signature_only) { return; }
+        guard self.current_owner_def is .some(owner_def) else { return; }
+        if (self.target_def is .some(target_def)) {
+            if (target_def.to_index() != owner_def.to_index()) { return; }
+        }
+        self.state.ctx.store.model.set_declaration_sema_state(owner_def, .body_ready);
+    }
+
+    ast.AstId? target_member_for_current_owner(Self&! self) {
+        guard self.target_def is .some(target_def) else { return null; }
+        guard self.current_owner_def is .some(owner_def) else { return null; }
+        qid.DefId current! = target_def;
+        Int depth! = 0;
+        while (depth < 64) {
+            guard self.state.ctx.store.defs.get(current).owner_def is .some(parent) else {
+                return null;
+            }
+            if (parent.to_index() == owner_def.to_index()) {
+                guard self.state.declaration_items.get(current) is .some(item) else {
+                    return null;
+                }
+                return item$.get();
+            }
+            current = parent;
+            depth = depth + 1;
+        }
+        return null;
+    }
+
+    Void lower_member(Self&! self, ast.AstId member_id) {
+        ast.AstNode member = self.state.unit.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            self.lower_decl_with_annotations(
+                member_decl.body,
+                member_decl.annotations,
+                member_decl.modifiers.static_flag
+            );
+            return;
+        }
+        self.lower_decl_with_annotations(member_id, self.empty_ast_range(), false);
     }
 
     Void record_extension_members(Self&! self, Int extension_index, ast.AstRange members) {
@@ -1090,6 +1396,31 @@ struct Lower: Movable {
         sem.ExternKind extern_kind
     ) {
         guard self.decl_def_for_name(function_decl.name, .value_name) is .some(function_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(function_def);
+        if (progress == .body_ready) { return; }
+        if (progress != .signature_ready) {
+            self.lower_function_signature(
+                function_def,
+                function_decl,
+                annotations,
+                static_member,
+                extern_kind
+            );
+        }
+        if (self.signature_only) { return; }
+        self.lower_function_body(function_def, function_decl);
+    }
+
+    Void lower_function_signature(
+        Self&! self,
+        qid.DefId function_def,
+        ast.FunctionData function_decl,
+        ast.AstRange annotations,
+        Bool static_member,
+        sem.ExternKind extern_kind
+    ) {
+        self.state.ctx.store.model.set_declaration_sema_state(function_def, .resolving_signature);
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = function_def;
 
@@ -1128,26 +1459,49 @@ struct Lower: Movable {
             effects: effects
         );
         self.declare_callable_signature(function_def, signature, true);
+        self.state.ctx.store.model.set_declaration_sema_state(function_def, .signature_ready);
         if (extern_kind != .none) {
             self.state.ctx.store.model.set_decl_extern_kind(function_def, extern_kind);
             self.state.ctx.store.model.set_decl_is_external(function_def, function_decl.body == null);
         }
-        if (function_decl.body is .some(body_ast)) {
-            // Body 拥有自己的 def-local node 空间。先放一个临时 invalid root，
-            // 这样可以在真实 root expression lower 之前创建 params/locals。
-            token.Span span = self.state.unit.get(function_decl.name).span;
-            sem.NodeId placeholder = self.add_invalid_node(span);
-            self.state.ctx.store.model.load_body(function_def, sem.Body(function_def, placeholder));
-            self.env.enter_scope(.function_scope);
-            self.add_self_local_for_instance_function(
-                function_def, has_receiver, function_decl.params
-            );
-            self.lower_parameters(function_def, function_decl.params, signature.params);
-            sem.NodeId root = self.lower_expr(body_ast);
-            self.env.exit_scope();
-            self.state.ctx.store.model.set_body_root(function_def, root);
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
+
+    Void lower_function_body(Self&! self, qid.DefId function_def, ast.FunctionData function_decl) {
+        guard function_decl.body is .some(body_ast) else {
+            self.state.ctx.store.model.set_declaration_sema_state(function_def, .body_ready);
+            return;
+        }
+        guard self.state.ctx.store.model.def_ref(function_def).decl.function_signature
+            is .some(signature) else { return; }
+        self.state.ctx.store.model.set_declaration_sema_state(function_def, .resolving_body);
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = function_def;
+        self.enter_existing_generic_scope_for_owner(function_def, function_decl.generics);
+        if (self.state.ctx.store.defs.get(function_def).owner_def is .some(owner_def)) {
+            self.define_self_type(owner_def);
         }
 
+        // Body 拥有自己的 def-local node 空间。先放一个临时 invalid root，
+        // 这样可以在真实 root expression lower 之前创建 params/locals。
+        token.Span span = self.state.unit.get(function_decl.name).span;
+        sem.NodeId placeholder = self.add_invalid_node(span);
+        self.state.ctx.store.model.load_body(function_def, sem.Body(function_def, placeholder));
+        self.env.enter_scope(.function_scope);
+        self.add_self_local_for_instance_function(
+            function_def, signature.has_receiver, function_decl.params
+        );
+        self.lower_parameters(
+            function_def,
+            function_decl.params,
+            signature.has_receiver,
+            signature.params
+        );
+        sem.NodeId root = self.lower_expr(body_ast);
+        self.env.exit_scope();
+        self.state.ctx.store.model.set_body_root(function_def, root);
+        self.state.ctx.store.model.set_declaration_sema_state(function_def, .body_ready);
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
     }
@@ -1173,7 +1527,6 @@ struct Lower: Movable {
         if (params.length == 0) { return false; }
         ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, 0));
         guard param_node.data is .param(param) else { return false; }
-        if (!self.param_is_explicit_receiver(param, 0)) { return false; }
         return param.mutable_binding;
     }
 
@@ -1254,16 +1607,28 @@ struct Lower: Movable {
     // function body 一样消费它；没有 initializer 的 global 只有 decl type。
     Void lower_global(Self&! self, ast.GlobalData global_decl, ast.AstRange annotations, sem.ExternKind extern_kind) {
         guard self.decl_def_for_name(global_decl.name, .value_name) is .some(global_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(global_def);
+        if (progress == .body_ready) { return; }
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = global_def;
 
-        sem.NodeId type_ref = self.lower_type_ref(global_decl.type_ref);
-        self.state.ctx.store.model.set_decl_type_ref(global_def, type_ref);
-        self.state.ctx.store.model.set_decl_mutable_binding(global_def, global_decl.mutable_binding);
-        self.state.ctx.store.model.set_decl_is_const(global_def, global_decl.is_const);
-        self.state.ctx.store.model.set_decl_extern_kind(global_def, extern_kind);
-        self.lower_annotations(global_def, annotations);
+        if (progress != .signature_ready) {
+            self.state.ctx.store.model.set_declaration_sema_state(global_def, .resolving_signature);
+            sem.NodeId type_ref = self.lower_type_ref(global_decl.type_ref);
+            self.state.ctx.store.model.set_decl_type_ref(global_def, type_ref);
+            self.state.ctx.store.model.set_decl_mutable_binding(global_def, global_decl.mutable_binding);
+            self.state.ctx.store.model.set_decl_is_const(global_def, global_decl.is_const);
+            self.state.ctx.store.model.set_decl_extern_kind(global_def, extern_kind);
+            self.lower_annotations(global_def, annotations);
+            self.state.ctx.store.model.set_declaration_sema_state(global_def, .signature_ready);
+        }
 
+        if (self.signature_only) {
+            self.current_owner_def = previous_owner;
+            return;
+        }
+        self.state.ctx.store.model.set_declaration_sema_state(global_def, .resolving_body);
         if (global_decl.initializer is .some(initializer)) {
             sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(global_decl.name).span);
             self.state.ctx.store.model.load_body(global_def, sem.Body(global_def, placeholder));
@@ -1271,11 +1636,16 @@ struct Lower: Movable {
             self.state.ctx.store.model.set_body_root(global_def, root);
         }
 
+        self.state.ctx.store.model.set_declaration_sema_state(global_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
     Void lower_alias(Self&! self, ast.AliasData alias_decl, ast.AstRange annotations) {
         guard self.state.declaration_def(alias_decl.name) is .some(alias_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(alias_def);
+        if (progress == .body_ready) { return; }
+        self.state.ctx.store.model.set_declaration_sema_state(alias_def, .resolving_signature);
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = alias_def;
         sem.Def& alias_model = self.state.ctx.store.model.def_ref(alias_def);
@@ -1287,6 +1657,7 @@ struct Lower: Movable {
             }
         }
         self.lower_annotations(alias_def, annotations);
+        self.state.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
@@ -1297,16 +1668,47 @@ struct Lower: Movable {
             ast.AstNode field_node = self.state.unit.get(field_id);
             if (field_node.data is .field_declarator(field_data)) {
                 if (self.decl_def_for_name(field_data.name, .member_name) is .some(field_def)) {
+                    if (self.target_def is .some(target_def)) {
+                        if (target_def.to_index() != field_def.to_index()) {
+                            index = index + 1;
+                            continue;
+                        }
+                    }
+                    sem.DeclarationSemaState progress =
+                        self.state.ctx.store.model.declaration_sema_state(field_def);
+                    if (progress == .body_ready) {
+                        index = index + 1;
+                        continue;
+                    }
                     qid.DefId? previous_owner = self.current_owner_def;
                     self.current_owner_def = field_def;
-                    sem.NodeId type_ref = self.lower_type_ref(field_decl.type_ref);
-                    self.state.ctx.store.model.set_decl_type_ref(field_def, type_ref);
-                    self.state.ctx.store.model.set_decl_mutable_binding(field_def, field_data.mutable_binding);
+                    if (progress != .signature_ready) {
+                        self.state.ctx.store.model.set_declaration_sema_state(
+                            field_def,
+                            .resolving_signature
+                        );
+                        sem.NodeId type_ref = self.lower_type_ref(field_decl.type_ref);
+                        self.state.ctx.store.model.set_decl_type_ref(field_def, type_ref);
+                        self.state.ctx.store.model.set_decl_mutable_binding(
+                            field_def,
+                            field_data.mutable_binding
+                        );
+                        self.lower_annotations(field_def, annotations);
+                        self.state.ctx.store.model.set_declaration_sema_state(
+                            field_def,
+                            .signature_ready
+                        );
+                    }
+                    if (self.signature_only) {
+                        self.current_owner_def = previous_owner;
+                        return;
+                    }
+                    self.state.ctx.store.model.set_declaration_sema_state(field_def, .resolving_body);
                     if (field_data.default_value is .some(default_value)) {
                         sem.NodeId value = self.lower_expr(default_value);
                         self.state.ctx.store.model.set_field_default(field_def, value);
                     }
-                    self.lower_annotations(field_def, annotations);
+                    self.state.ctx.store.model.set_declaration_sema_state(field_def, .body_ready);
                     self.current_owner_def = previous_owner;
                 }
             }
@@ -1327,6 +1729,33 @@ struct Lower: Movable {
         Int index! = 0;
         while (index < generic_data.type_params.length) {
             self.enter_generic_param(owner_def, self.state.unit.child_at(generic_data.type_params, index));
+            index = index + 1;
+        }
+    }
+
+    // signature 已完成后 lower body 时，只恢复泛型名字的 lexical binding，
+    // 不重复生成约束、type ref node 或 where predicate。
+    Void enter_existing_generic_scope_for_owner(
+        Self&! self,
+        qid.DefId owner_def,
+        ast.AstId? generics
+    ) {
+        self.env.enter_scope(.generic_scope);
+        guard generics is .some(generic_id) else { return; }
+        ast.AstNode generic_node = self.state.unit.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+        Int index! = 0;
+        while (index < generic_data.type_params.length) {
+            ast.AstId param_id = self.state.unit.child_at(generic_data.type_params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .generic_param(param)) {
+                if (self.generic_param_def_for_name_in_any_domain(owner_def, param.name)
+                    is .some(param_def)
+                ) {
+                    def.NameDomain domain = self.state.ctx.store.defs.get(param_def).domain;
+                    self.define_existing_local(param.name, domain, param_def);
+                }
+            }
             index = index + 1;
         }
     }
@@ -1871,46 +2300,75 @@ struct Lower: Movable {
 
     Void lower_enum_case(Self&! self, ast.EnumCaseData enum_case, ast.AstRange annotations) {
         guard self.decl_def_for_name(enum_case.name, .member_name) is .some(case_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(case_def);
+        if (progress == .body_ready) { return; }
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = case_def;
-        if (enum_case.payload_type is .some(payload_type)) {
-            self.state.ctx.store.model.set_decl_type_ref(case_def, self.lower_type_ref(payload_type));
-        } else if (self.state.ctx.store.defs.get(case_def).owner_def is .some(owner_def)) {
-            if (self.state.ctx.store.model.def_enum_has_payload_variants(owner_def)) {
-                sem.NodeId unit_type = self.add_node(.unit_type_ref(), self.state.unit.get(enum_case.name).span);
-                self.state.ctx.store.model.set_decl_type_ref(case_def, unit_type);
+        if (progress != .signature_ready) {
+            self.state.ctx.store.model.set_declaration_sema_state(case_def, .resolving_signature);
+            if (enum_case.payload_type is .some(payload_type)) {
+                self.state.ctx.store.model.set_decl_type_ref(case_def, self.lower_type_ref(payload_type));
+            } else if (self.state.ctx.store.defs.get(case_def).owner_def is .some(owner_def)) {
+                if (self.state.ctx.store.model.def_enum_has_payload_variants(owner_def)) {
+                    sem.NodeId unit_type = self.add_node(
+                        .unit_type_ref(),
+                        self.state.unit.get(enum_case.name).span
+                    );
+                    self.state.ctx.store.model.set_decl_type_ref(case_def, unit_type);
+                }
             }
+            self.lower_annotations(case_def, annotations);
+            self.state.ctx.store.model.set_declaration_sema_state(case_def, .signature_ready);
         }
+        if (self.signature_only) {
+            self.current_owner_def = previous_owner;
+            return;
+        }
+        self.state.ctx.store.model.set_declaration_sema_state(case_def, .resolving_body);
         if (enum_case.value is .some(value)) {
             sem.NodeId lowered = self.lower_expr(value);
             self.state.ctx.store.model.set_enum_case_value(case_def, lowered);
         }
-        self.lower_annotations(case_def, annotations);
+        self.state.ctx.store.model.set_declaration_sema_state(case_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
     Void lower_assoc_type(Self&! self, ast.AssocTypeData assoc_type, ast.AstRange annotations) {
         def.NameDomain domain = self.assoc_type_domain(assoc_type);
         guard self.decl_def_for_name(assoc_type.name, domain) is .some(assoc_def) else { return; }
+        sem.DeclarationSemaState progress =
+            self.state.ctx.store.model.declaration_sema_state(assoc_def);
+        if (progress == .body_ready) { return; }
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = assoc_def;
-        self.lower_annotations(assoc_def, annotations);
-        self.state.ctx.store.model.set_decl_is_const(assoc_def, assoc_type.is_const);
-        if (assoc_type.value is .some(value)) {
-            sem.NodeId type_ref = self.lower_type_ref(value);
-            self.state.ctx.store.model.set_decl_type_ref(assoc_def, type_ref);
+        if (progress != .signature_ready) {
+            self.state.ctx.store.model.set_declaration_sema_state(assoc_def, .resolving_signature);
+            self.lower_annotations(assoc_def, annotations);
+            self.state.ctx.store.model.set_decl_is_const(assoc_def, assoc_type.is_const);
+            if (assoc_type.value is .some(value)) {
+                sem.NodeId type_ref = self.lower_type_ref(value);
+                self.state.ctx.store.model.set_decl_type_ref(assoc_def, type_ref);
+            }
+            if (assoc_type.type_ref is .some(type_ref)) {
+                sem.NodeId lowered = self.lower_type_ref(type_ref);
+                self.state.ctx.store.model.set_decl_type_ref(assoc_def, lowered);
+            }
+            self.lower_assoc_type_constraints(assoc_def, assoc_type.constraints);
+            self.state.ctx.store.model.set_declaration_sema_state(assoc_def, .signature_ready);
         }
-        if (assoc_type.type_ref is .some(type_ref)) {
-            sem.NodeId lowered = self.lower_type_ref(type_ref);
-            self.state.ctx.store.model.set_decl_type_ref(assoc_def, lowered);
+        if (self.signature_only) {
+            self.current_owner_def = previous_owner;
+            return;
         }
+        self.state.ctx.store.model.set_declaration_sema_state(assoc_def, .resolving_body);
         if (assoc_type.const_value is .some(value)) {
             sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(assoc_type.name).span);
             self.state.ctx.store.model.load_body(assoc_def, sem.Body(assoc_def, placeholder));
             sem.NodeId root = self.lower_expr(value);
             self.state.ctx.store.model.set_body_root(assoc_def, root);
         }
-        self.lower_assoc_type_constraints(assoc_def, assoc_type.constraints);
+        self.state.ctx.store.model.set_declaration_sema_state(assoc_def, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
@@ -2250,14 +2708,22 @@ struct Lower: Movable {
         }
     }
 
-    Void lower_parameters(Self&! self, qid.DefId owner_def, ast.AstRange params, sem.NodeId[]& param_type_refs) {
+    Void lower_parameters(Self&! self,
+        qid.DefId owner_def,
+        ast.AstRange params,
+        Bool has_receiver,
+        sem.NodeId[]& param_type_refs
+    ) {
         Int index! = 0;
         Int type_index! = 0;
         while (index < params.length) {
             ast.AstId param_id = self.state.unit.child_at(params, index);
             ast.AstNode param_node = self.state.unit.get(param_id);
             if (param_node.data is .param(param)) {
-                if (self.param_is_explicit_receiver(param, index)) {
+                // Signature lowering already classified the first parameter.
+                // A body-only pass uses a fresh AstResolveState and does not
+                // rebuild the transient Self type-ref map for the signature.
+                if (has_receiver && index == 0) {
                     index = index + 1;
                     continue;
                 }

@@ -756,6 +756,27 @@ manifest 的 `[dependencies]` alias 解析到依赖 package root；未命中 dep
 import 只引入一个模块命名空间 alias，不把目标模块的声明平铺到当前 namespace。被导入模块
 的 public API 通过 `dep.Name` 访问。`public import` re-export 的也是这个模块命名空间 alias。
 
+file import 省略 alias 时，默认使用路径 basename 去掉最后一个扩展名后的名字。因此下面两种写法
+语义完全相同，都只在当前 namespace 中登记一个名为 `foo` 的 module namespace binding：
+
+```jiang
+import "foo.jiang";
+import foo = "foo.jiang";
+```
+
+如果默认名字不是合法 Jiang identifier，必须显式提供 alias。显式和默认 alias 走相同的 import
+target、可见性、循环检测、稳定身份和增量失效路径。
+
+`import * = path;` 不创建默认 module namespace，也不为目标模块的每个 public declaration 复制
+alias `DefId`。它登记一条 wildcard namespace edge；lookup 按需查询目标 public namespace，并原样
+保留函数 overload candidates。extension member 也通过同一个 public namespace surface 可达。
+`public import *` re-export 同一条 edge。
+
+本地 declaration binding 优先于 wildcard edge。多条 wildcard edge 按源码登记顺序查询；最终
+namespace validation 会枚举直接目标的 public binding，使未引用的同名导出也产生稳定冲突诊断。
+枚举会沿 public wildcard edge 继续读取传递 re-export surface。import cycle 只复用已经登记的 module
+namespace skeleton，并由 import 状态截断，不复制或递归展开 wildcard alias。
+
 file import 只允许引用当前 package 内的 source file。跨 package 源码依赖必须通过
 `[dependencies]` 和 `import dep;` 进入；直接用字符串路径导入另一个 package 的 source 会报错。
 
@@ -1603,7 +1624,8 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - `comptime { ... }` 是语言内建编译期 block，表示 block 内 Jiang 代码在编译期执行。
 - `comptime` 使用普通关键字入口，不占用后续 `#sql { ... }`、`#asm { ... }` 这类 custom syntax
   namespace；`@` 保留给 attribute / annotation。
-- 当前 `comptime` 只支持 module-level，用于 target-specific import / declaration 选择。
+- 当前 `comptime` 只支持 module-level，用于 target-specific import / declaration 选择；0.5.4 将其显式
+  记为 `comptime [early]`，并在完整检查后增加 `comptime [late]`。
 - `comptime` block 不生成 runtime code。
 - `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
   parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only
@@ -1611,9 +1633,13 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - `comptime` block 内未执行的分支不参与 import graph、name resolve、type check 或 codegen。
 - 第一版仍然先完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
   之后的语义阶段会跳过未执行分支。
-- `comptime if` 的 condition 是普通表达式，但类型必须能在编译期求值为 `Bool`。
-  conditional import 需要在 module graph 阶段就决定依赖边，因此 source selection 使用一个窄的
-  AST-level 前置 evaluator；它只负责选源文件里的顶层 item，并产出同一套 `ComptimeValue` 模型。
+- `comptime if` 的 condition 是普通表达式，但类型必须能在编译期求值为 `Bool`。当前 conditional
+  import 在 module graph 封闭前使用窄 AST-level evaluator；这也是它还不能读取同文件普通 const
+  的原因。0.5.4 改为先登记当前 source 的全部 declaration skeleton，再由 early comptime 按需推进
+  condition 依赖的 const、signature 和纯函数 body，求值结果再决定需要发现的 import source。
+- early comptime 可以读取已经发现 source 中的普通 const，并按需调用符合 comptime 安全边界的普通
+  函数。依赖尚未由当前 source-selection 路径选中的 declaration 时，不猜测分支；统一查询状态输出
+  不可达或依赖循环诊断。
 - 常规 const initializer 由 type check 后的 Semantic Model comptime interpreter 执行。它支持 const 引用、
   aggregate literal、字段访问、控制流、block 尾表达式、普通函数调用和自定义 `init`，但不执行
   IO，不访问运行时变量。

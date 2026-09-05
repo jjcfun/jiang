@@ -209,10 +209,29 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
 - 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
 - `ModuleResolver` 私有持有尚未完成 lowering 的 owned `AstUnit`，不把 AST 放入长期 store。
+- root parse 后先由 `begin_module_graph` 发布 declaration skeleton；可执行 root 先 demand `main` body，无
+  `main` 的 library/check root 则 demand 本 root 的源码 declaration。查询实际使用的 import 会在此时扩展
+  graph，随后 `seal_module_graph` 才补齐未使用 import closure。seal 使用可增长 module worklist 和单 import
+  ensure 状态机；最终 model sweep 通过同一 declaration ensure 入口推进，不另建 eager Semantic Model。
+- declaration lookup 可以在 seal 前请求精确 import 下标：目标 namespace/skeleton 发布后重试当前 declaration，
+  同一个 `ModuleGraph` 同步吸收查询发现的 module/edge，并按同一 binding key 逐个确保 callable overload
+  signature；传递 public wildcard 与跨模块 extension target 复用该入口。最终 seal 只负责补齐未使用 import 和
+  固化 graph。
+- 命名 import 在 target resolve 前发布 namespace alias skeleton，resolve 后只连接目标 namespace；
+  `import *` 保存 lazy wildcard namespace edge，lookup 时按 binding visibility 读取目标 public surface，不批量
+  复制 alias DefId，也不让 private 同名声明遮住其他 public re-export。namespace 在 bind 时维护本地 binding
+  index；wildcard 冲突只递归读取参与比较的 public surface，不扫描全局 binding 表，并按相同 `DefId` 去重菱形
+  re-export。
 - `ResolveStore` 保存 package、module、namespace、import/export 和 def store，是名字事实 owner。
-- `sem_store.Store` 保存每个 `DefId` 的 Semantic Model signature/body，是 Semantic Model 事实 owner。
+- `sem_store.Store` 保存每个 `DefId` 的 Semantic Model signature/body 和 declaration Sema 推进状态，是
+  Semantic Model 事实 owner。
+- resolve lowering 对所有 declaration 使用同一套 signature/body 状态：callable body、global initializer、
+  field default、enum discriminant 和 associated const value 都不在 signature-only 请求中生成；type/trait 与
+  extension 的共享 header 只生成一次，member 继续按各自 `DefId` 推进。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
 - `TypeCheckStore` 保存 node/def/call/pattern 的类型事实，不和 `TypeStore` 合并所有权语义。
+- declaration signature validation、declaration type 和 body check 都以 `DefId` 进入 typed query cache；
+  package type check 是这些 ensure 的最终全量 sweep，不维护另一套批量结果。
 - `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
   public interface artifact 和 Semantic Model->JIL lowering；JIL 之后的阶段只能看 `jil.Const`、
   `jil.Global` 和 `jil.StaticValue`。

@@ -18,6 +18,7 @@ import map = "../support/map.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
 import source_graph = "../incremental/source_graph.jiang";
+import sem = "../sema/model.jiang";
 import source = "../source.jiang";
 import package_manifest = "../source/package_manifest.jiang";
 import fs = "../system/fs.jiang";
@@ -33,6 +34,7 @@ import diagnostics = "./diagnostics.jiang";
 import import_path_resolver = "./import_path_resolver.jiang";
 import module_graph = "./module_graph.jiang";
 import name_resolver = "./name_resolver.jiang";
+import namespace = "./namespace.jiang";
 import resolve_state = "./state.jiang";
 import store = "./store.jiang";
 
@@ -65,6 +67,12 @@ public struct ModuleGraphBuilder: Movable {
     map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>&! declaration_defs;
 
     @life(a)
+    map.WyHashMap<qid.DefId, ast.AstId>&! declaration_items;
+
+    @life(a)
+    map.WyHashMap<qid.DefId, ast.AstId>&! declaration_containers;
+
+    @life(a)
     UInt8[]& artifact_cache_dir;
     UInt64 compiler_version_hash;
     Bool use_source_artifacts!;
@@ -78,6 +86,8 @@ public struct ModuleGraphBuilder: Movable {
         map.WyHashMap<source.SourceId, ast.AstUnit>&! asts,
         map.WyHashMap<qid.ModuleId, ModuleResolvePassState>&! module_states,
         map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>&! declaration_defs,
+        map.WyHashMap<qid.DefId, ast.AstId>&! declaration_items,
+        map.WyHashMap<qid.DefId, ast.AstId>&! declaration_containers,
         UInt8[]& artifact_cache_dir = "build/cache",
         UInt64? compiler_version_hash = null,
         Bool use_source_artifacts = true,
@@ -87,6 +97,8 @@ public struct ModuleGraphBuilder: Movable {
         self.asts = asts;
         self.module_states = module_states;
         self.declaration_defs = declaration_defs;
+        self.declaration_items = declaration_items;
+        self.declaration_containers = declaration_containers;
         self.artifact_cache_dir = artifact_cache_dir;
         if (compiler_version_hash is .some(hash)) {
             self.compiler_version_hash = hash;
@@ -107,20 +119,53 @@ public struct ModuleGraphBuilder: Movable {
     }
 
     public module_graph.ModuleGraph^ build_module_graph_for_source(Self&! self, source.SourceId source_id) {
-        qid.ModuleId root_module = self.ensure_module(source_id);
+        module_graph.ModuleGraph^ graph! = self.begin_module_graph_for_source(source_id);
+        self.seal_module_graph(graph$.mut_ref());
+        return graph;
+    }
+
+    // 先发布 root source 的 declaration skeleton；此时 import target 尚未
+    // ensure，ModuleGraph 也尚未封闭。
+    public module_graph.ModuleGraph^ begin_module_graph_for_source(Self&! self, source.SourceId source_id) {
+        qid.ModuleId root_module = self.ensure_declarations(source_id);
         store.ModuleRecord& root = self.ctx.store.resolve.module_ref(root_module);
-        module_graph.ModuleGraph^ graph! = new module_graph.ModuleGraph(
+        return new module_graph.ModuleGraph(
             root.package_id,
             root_module,
             true
         );
-        self.discover_core_imports(graph$.mut_ref());
-        self.discover_module_imports(graph$.mut_ref(), root_module);
-        self.discover_std_prelude_imports(graph$.mut_ref());
-        self.discover_target_startup_imports(graph$.mut_ref());
-        self.record_implicit_source_dependencies(graph$.mut_ref());
-        self.check_package_dependency_cycles(graph$.mut_ref());
-        return graph;
+    }
+
+    public Void seal_module_graph(Self&! self, module_graph.ModuleGraph&! graph) {
+        qid.ModuleId root_module = graph.root_module;
+        self.discover_core_imports(graph);
+        self.discover_module_imports(graph, root_module);
+        self.discover_std_prelude_imports(graph);
+        self.discover_target_startup_imports(graph);
+        self.resolve_graph_import_worklist(graph);
+        self.record_implicit_source_dependencies(graph);
+        self.check_package_dependency_cycles(graph);
+    }
+
+    // root declaration 查询开始前只登记语言隐式可见的 core/std prelude。
+    // 用户源码 import 仍由具体 lookup 按需连接，完整 closure 留给 seal。
+    public Void prepare_query_environment(Self&! self, module_graph.ModuleGraph&! graph) {
+        self.discover_core_imports(graph);
+        self.discover_std_prelude_imports(graph);
+    }
+
+    public Void resolve_graph_import_worklist(Self&! self, module_graph.ModuleGraph&! graph) {
+        Int module_index! = 0;
+        while (module_index < graph.module_count()) {
+            qid.ModuleId module_id = graph.module_at(module_index);
+            Int import_index! = 0;
+            while (import_index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+                self.ensure_import_target(graph, module_id, import_index);
+                import_index = import_index + 1;
+            }
+            self.write_import_summary(module_id);
+            module_index = module_index + 1;
+        }
     }
 
     Void discover_core_imports(Self&! self, module_graph.ModuleGraph&! graph) {
@@ -134,6 +179,15 @@ public struct ModuleGraphBuilder: Movable {
         guard self.load_file_import("src/std/prelude.jiang", true) is .some(std_source) else { return; }
         qid.ModuleId std_module = self.ensure_module(std_source);
         self.ctx.store.resolve.set_std_prelude_module(std_module);
+        qid.NamespaceId prelude_namespace = self.ctx.store.resolve.prelude_namespace;
+        qid.NamespaceId std_namespace =
+            self.ctx.store.resolve.module_ref(std_module).namespace_id;
+        self.ctx.store.resolve.add_wildcard_import(
+            prelude_namespace,
+            std_namespace,
+            .public_visibility,
+            token.Span()
+        );
         self.discover_module_imports(graph, std_module);
     }
 
@@ -195,19 +249,146 @@ public struct ModuleGraphBuilder: Movable {
         }
         self.record_source_node(module_id);
         self.collect_imports_for_module(module_id);
-        Int index! = 0;
-        while (index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
-            self.discover_import_target(graph, module_id, index);
-            index = index + 1;
-        }
-        self.write_import_summary(module_id);
+        self.bind_import_alias_skeletons(module_id);
     }
 
     public qid.ModuleId ensure_declarations(Self&! self, source.SourceId source_id) {
         qid.ModuleId module_id = self.ensure_module(source_id);
         self.collect_imports_for_module(module_id);
+        self.bind_import_alias_skeletons(module_id);
         self.collect_declaration_names_for_module(module_id);
         return module_id;
+    }
+
+    Void bind_import_alias_skeletons(Self&! self, qid.ModuleId module_id) {
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+            store.ImportRecord import_record =
+                self.ctx.store.resolve.module_ref(module_id).imports.get(index);
+            if (!import_record.flatten && import_record.alias_def == null) {
+                self.create_import_alias_skeleton(module_id, index, import_record);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void create_import_alias_skeleton(
+        Self&! self,
+        qid.ModuleId module_id,
+        Int import_index,
+        store.ImportRecord import_record
+    ) {
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        source.SourceId source_id = module.source_id;
+        qid.DefId module_def = module.def_id;
+        qid.PackageId package_id = module.package_id;
+        qid.SymbolId module_path = module.path_symbol;
+        qid.NamespaceId namespace_id = module.namespace_id;
+        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record$.ref());
+        Bool duplicate = self.import_alias_has_conflict(
+            source_id,
+            namespace_id,
+            alias_symbol,
+            import_record.span
+        );
+        qid.DefId alias_def = self.ctx.store.defs.create(
+            .import_alias_def,
+            .namespace_name,
+            import_record.visibility,
+            def.Name(symbol: alias_symbol, span: import_record.span),
+            module_def,
+            module_id,
+            namespace_id,
+            null
+        );
+        self.ctx.store.model.declare_def(alias_def, .import_alias_decl);
+        self.ctx.store.model.add_member(module_def, alias_def);
+        self.ctx.store.source_map.set_def_span(alias_def, source_id, import_record.span);
+        self.record_import_alias_stable_key(
+            package_id,
+            module_path,
+            module_def,
+            alias_def,
+            alias_symbol
+        );
+        if (!duplicate) {
+            self.ctx.store.resolve.bind_name(
+                namespace_id,
+                alias_symbol,
+                .namespace_name,
+                alias_def,
+                import_record.visibility,
+                import_record.span
+            );
+        }
+        self.ctx.store.resolve.set_import_alias_def(module_id, import_index, alias_def);
+    }
+
+    Bool import_alias_has_conflict(
+        Self&! self,
+        source.SourceId source_id,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId alias_symbol,
+        token.Span span
+    ) {
+        namespace.BindingEntry? existing! =
+            self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .namespace_name);
+        if (existing == null) {
+            existing = self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .type_name);
+        }
+        if (existing == null) {
+            existing = self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .value_name);
+        }
+        guard existing is .some(binding) else { return false; }
+        diagnostics.add_duplicate_def(
+            self.ctx.store.diagnostics$.mut_ref(),
+            source_id,
+            span,
+            binding.span,
+            self.ctx.store.symbols.text(alias_symbol)
+        );
+        self.ctx.store.model.mark_error();
+        return true;
+    }
+
+    qid.SymbolId import_alias_symbol(Self&! self, store.ImportRecord& import_record) {
+        if (import_record.alias_symbol is .some(explicit_alias)) { return explicit_alias; }
+        if (import_record.kind != .file_import) { return import_record.path_symbol; }
+        UInt8[]& text = self.ctx.store.symbols.text(import_record.path_symbol);
+        Int name_start! = 0;
+        Int index! = 0;
+        while (index < text.length) {
+            if (text[index] == 47) { name_start = index + 1; }
+            index = index + 1;
+        }
+        std.String name! =
+            std.String.from_valid_utf8(string.trim_extension(text[name_start..text.length]));
+        if (name.byte_length() == 0) { return import_record.path_symbol; }
+        return self.ctx.store.symbols.intern(name.bytes());
+    }
+
+    Void record_import_alias_stable_key(
+        Self&! self,
+        qid.PackageId package_id,
+        qid.SymbolId module_path,
+        qid.DefId module_def,
+        qid.DefId alias_def,
+        qid.SymbolId alias_symbol
+    ) {
+        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
+        qkey.StableSymbolId? owner = self.ctx.store.incremental.stable_id_for_def(module_def);
+        self.ctx.store.incremental.record_symbol(
+            self.ctx.store.symbols$.ref(),
+            qkey.StableSymbolKey (
+                kind: qkey.StableSymbolKind.module_symbol,
+                package_name: package_name,
+                module_path: module_path,
+                owner: owner,
+                name: alias_symbol,
+                domain: def.NameDomain.namespace_name
+            ),
+            alias_def
+        );
     }
 
     public Void collect_imports_for_module(Self&! self, qid.ModuleId module_id) {
@@ -271,6 +452,7 @@ public struct ModuleGraphBuilder: Movable {
                 module_id,
                 store.ImportRecord (
                     kind: entry.kind,
+                    state: .unresolved,
                     span: token.Span(),
                     visibility: entry.visibility,
                     flatten: entry.flatten,
@@ -298,6 +480,8 @@ public struct ModuleGraphBuilder: Movable {
             self.ctx$.mut_ref(),
             unit,
             self.declaration_defs$.mut_ref(),
+            self.declaration_items$.mut_ref(),
+            self.declaration_containers$.mut_ref(),
             module_id,
             module.namespace_id
         );
@@ -321,6 +505,8 @@ public struct ModuleGraphBuilder: Movable {
                 self.ctx$.mut_ref(),
                 unit,
                 self.declaration_defs$.mut_ref(),
+                self.declaration_items$.mut_ref(),
+                self.declaration_containers$.mut_ref(),
                 module_id,
                 namespace_id
             );
@@ -436,35 +622,94 @@ public struct ModuleGraphBuilder: Movable {
         self.module_states.set(module_id, state);
     }
 
-    public Void discover_import_target(Self&! self,
+    public Bool ensure_import_target(Self&! self,
         module_graph.ModuleGraph&! graph,
         qid.ModuleId module_id,
         Int import_index
     ) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        source.SourceId module_source = self.ctx.store.resolve.module_ref(module_id).source_id;
         // 这里复制 ImportRecord 是有意的：解析 target 可能递归加载/创建
         // module，不能跨递归持有 ResolveStore 内部引用。后续只读 helper
         // 接收的是这份局部副本的引用。
-        store.ImportRecord import_record! = module.imports.get(import_index);
-        if (!self.import_paths.valid_import_path(import_record$.ref())) {
-            self.add_invalid_import_path_diagnostic(module.source_id, import_record);
+        store.ImportRecord import_record! =
+            self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
+        if (import_record.state == .failed) {
             graph.mark_error();
-            return;
+            return false;
+        }
+        if (import_record.state == .resolving) { return true; }
+        if (import_record.state == .resolved) {
+            guard import_record.target_module is .some(target_module) else {
+                self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
+                graph.mark_error();
+                return false;
+            }
+            self.finalize_import_alias_target(module_id, import_index, target_module);
+            self.publish_import_target(graph, module_id, import_record, target_module);
+            return true;
+        }
+        self.ctx.store.resolve.set_import_state(module_id, import_index, .resolving);
+        if (!self.import_paths.valid_import_path(import_record$.ref())) {
+            self.add_invalid_import_path_diagnostic(module_source, import_record);
+            self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
+            graph.mark_error();
+            return false;
         }
         guard self.resolve_import_target(module_id, import_record$.ref()) is .some(target_module) else {
-            self.add_import_not_found_diagnostic(module.source_id, import_record);
+            self.add_import_not_found_diagnostic(module_source, import_record);
+            self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
             graph.mark_error();
-            return;
+            return false;
         }
         if (self.file_import_crosses_package(module_id, target_module, import_record$.ref())) {
-            self.add_cross_package_file_import_diagnostic(module.source_id, import_record);
+            self.add_cross_package_file_import_diagnostic(module_source, import_record);
+            self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
             graph.mark_error();
-            return;
+            return false;
         }
         self.ctx.store.resolve.set_import_target(module_id, import_index, target_module);
+        self.finalize_import_alias_target(module_id, import_index, target_module);
         if (!self.cached_import_target_matches(module_id, import_index, target_module)) {
             self.mark_source_dirty(module_id);
         }
+        self.publish_import_target(graph, module_id, import_record, target_module);
+        return true;
+    }
+
+    Void finalize_import_alias_target(
+        Self&! self,
+        qid.ModuleId module_id,
+        Int import_index,
+        qid.ModuleId target_module
+    ) {
+        store.ImportRecord import_record =
+            self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
+        qid.NamespaceId namespace_id =
+            self.ctx.store.resolve.module_ref(module_id).namespace_id;
+        qid.NamespaceId target_namespace =
+            self.ctx.store.resolve.module_ref(target_module).namespace_id;
+        if (import_record.flatten) {
+            self.ctx.store.resolve.add_wildcard_import(
+                namespace_id,
+                target_namespace,
+                import_record.visibility,
+                import_record.span
+            );
+            return;
+        }
+        guard import_record.alias_def is .some(alias_def) else { return; }
+        self.ctx.store.defs.set_owned_namespace(alias_def, target_namespace);
+        if (self.ctx.store.model.has_def(alias_def)) {
+            self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
+        }
+    }
+
+    Void publish_import_target(Self&! self,
+        module_graph.ModuleGraph&! graph,
+        qid.ModuleId module_id,
+        store.ImportRecord import_record,
+        qid.ModuleId target_module
+    ) {
         graph.add_import(module_id, target_module, import_record.span, import_record.path_symbol);
         self.record_source_dependency(module_id, target_module);
         self.discover_module_imports(graph, target_module);

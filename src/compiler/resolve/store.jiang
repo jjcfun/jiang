@@ -17,8 +17,16 @@ public enum ImportKind {
     file_import,
 }
 
+public enum ImportResolveState {
+    unresolved,
+    resolving,
+    resolved,
+    failed,
+}
+
 public struct ImportRecord: Copyable {
     public ImportKind kind;
+    public ImportResolveState state!;
     public token.Span span;
     public def.Visibility visibility;
     public Bool flatten;
@@ -26,6 +34,15 @@ public struct ImportRecord: Copyable {
     public qid.SymbolId? alias_symbol;
     public qid.ModuleId? target_module!;
     public qid.DefId? alias_def!;
+}
+
+// `import *` 不预先复制目标 module 的所有名字。它先记录一条 namespace
+// view edge，具体 symbol 只在 lookup 时沿 edge 查询。
+public struct WildcardImportRecord: Copyable {
+    public qid.NamespaceId namespace_id;
+    public qid.NamespaceId target_namespace_id!;
+    public def.Visibility visibility!;
+    public token.Span span;
 }
 
 public struct PackageDependencyRecord: Copyable {
@@ -273,6 +290,7 @@ public struct ResolveStore: Movable {
     public table.ArrayTable<qid.ModuleId, ModuleRecord> modules!;
     public map.WyHashMap<source.SourceId, qid.ModuleId> source_modules!;
     public namespace.NamespaceStore namespaces!;
+    public list.ArrayList<WildcardImportRecord> wildcard_imports!;
     public qid.PackageId? root_package!;
     public qid.ModuleId? core_module!;
     public qid.ModuleId? std_prelude_module!;
@@ -290,6 +308,7 @@ public struct ResolveStore: Movable {
         self.modules = table.ArrayTable<qid.ModuleId, ModuleRecord>();
         self.source_modules = map.WyHashMap<source.SourceId, qid.ModuleId>();
         self.namespaces = namespace.NamespaceStore();
+        self.wildcard_imports = list.ArrayList<WildcardImportRecord>();
         self.root_package = null;
         self.core_module = null;
         self.std_prelude_module = null;
@@ -357,9 +376,10 @@ public struct ResolveStore: Movable {
         qid.SymbolId symbol,
         def.NameDomain domain,
         qid.DefId def_id,
+        def.Visibility visibility,
         token.Span span
     ) {
-        return self.namespaces.bind_name(namespace_id, symbol, domain, def_id, span);
+        return self.namespaces.bind_name(namespace_id, symbol, domain, def_id, visibility, span);
     }
 
     public Int bind_builtin_name(
@@ -369,7 +389,14 @@ public struct ResolveStore: Movable {
         qid.DefId def_id,
         token.Span span
     ) {
-        return self.bind_name(self.builtin_namespace, symbol, domain, def_id, span);
+        return self.bind_name(
+            self.builtin_namespace,
+            symbol,
+            domain,
+            def_id,
+            .public_visibility,
+            span
+        );
     }
 
     public Int bind_prelude_name(
@@ -379,7 +406,14 @@ public struct ResolveStore: Movable {
         qid.DefId def_id,
         token.Span span
     ) {
-        return self.bind_name(self.prelude_namespace, symbol, domain, def_id, span);
+        return self.bind_name(
+            self.prelude_namespace,
+            symbol,
+            domain,
+            def_id,
+            .public_visibility,
+            span
+        );
     }
 
     public Void set_movable_trait(Self&! self, qid.DefId movable_trait) {
@@ -553,6 +587,27 @@ public struct ResolveStore: Movable {
         return self.namespaces.binding_at(cursor);
     }
 
+    public table.MultiTableCursor first_namespace_binding(
+        self,
+        qid.NamespaceId namespace_id
+    ) {
+        return self.namespaces.first_namespace_binding(namespace_id);
+    }
+
+    public table.MultiTableCursor next_namespace_binding(
+        self,
+        table.MultiTableCursor cursor
+    ) {
+        return self.namespaces.next_namespace_binding(cursor);
+    }
+
+    public namespace.BindingEntry namespace_binding_at(
+        self,
+        table.MultiTableCursor cursor
+    ) {
+        return self.namespaces.namespace_binding_at(cursor);
+    }
+
     public Int binding_len(self) {
         return self.namespaces.binding_len();
     }
@@ -573,7 +628,9 @@ public struct ResolveStore: Movable {
     ) {
         qid.NamespaceId current! = start_namespace;
         while (true) {
-            if (self.first_binding(current, symbol, domain) is .some(binding)) {
+            if (self.lookup_namespace_level(current, symbol, domain, false, 0)
+                is .some(binding)
+            ) {
                 return binding;
             }
             if (!search_parents) {
@@ -595,13 +652,135 @@ public struct ResolveStore: Movable {
         def.NameDomain domain,
         Bool search_parents
     ) {
-        if (self.lookup_namespace(start_namespace, symbol, domain, search_parents) is .some(binding)) {
-            return binding;
+        qid.NamespaceId current! = start_namespace;
+        while (true) {
+            if (self.lookup_namespace_level(current, symbol, domain, true, 0)
+                is .some(binding)
+            ) {
+                return binding;
+            }
+            if (!search_parents) { break; }
+            namespace.NamespaceRecord record = self.namespaces.get(current);
+            guard record.parent is .some(parent) else { break; }
+            current = parent;
         }
-        if (self.first_binding(self.prelude_namespace, symbol, domain) is .some(prelude_binding)) {
+        if (self.lookup_namespace_level(self.prelude_namespace, symbol, domain, true, 0)
+            is .some(prelude_binding)
+        ) {
             return prelude_binding;
         }
         return self.first_binding(self.builtin_namespace, symbol, domain);
+    }
+
+    namespace.BindingEntry? lookup_namespace_level(
+        self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        Bool include_private,
+        Int depth
+    ) {
+        if (self.first_binding(namespace_id, symbol, domain) is .some(binding)) {
+            return binding;
+        }
+        if (depth > self.wildcard_imports.len()) { return null; }
+        Int index! = 0;
+        while (index < self.wildcard_imports.len()) {
+            WildcardImportRecord edge = self.wildcard_imports.get(index);
+            if (edge.namespace_id.to_index() == namespace_id.to_index()
+                && (include_private || edge.visibility == .public_visibility)
+            ) {
+                if (self.lookup_public_wildcard_target(edge, symbol, domain, depth)
+                    is .some(imported)
+                ) {
+                    return imported;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    namespace.BindingEntry? lookup_public_wildcard_target(
+        self,
+        WildcardImportRecord edge,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        Int depth
+    ) {
+        guard self.lookup_public_namespace_level(
+            edge.target_namespace_id,
+            symbol,
+            domain,
+            depth + 1
+        ) is .some(binding) else {
+            return null;
+        }
+        return binding;
+    }
+
+    namespace.BindingEntry? lookup_public_namespace_level(
+        self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        Int depth
+    ) {
+        if (self.namespaces.first_public_binding(namespace_id, symbol, domain)
+            is .some(binding)
+        ) {
+            return binding;
+        }
+        if (depth > self.wildcard_imports.len()) { return null; }
+        Int index! = 0;
+        while (index < self.wildcard_imports.len()) {
+            WildcardImportRecord edge = self.wildcard_imports.get(index);
+            if (edge.namespace_id.to_index() == namespace_id.to_index()
+                && edge.visibility == .public_visibility
+            ) {
+                if (self.lookup_public_wildcard_target(edge, symbol, domain, depth)
+                    is .some(imported)
+                ) {
+                    return imported;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Void add_wildcard_import(
+        Self&! self,
+        qid.NamespaceId namespace_id,
+        qid.NamespaceId target_namespace_id,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        Int index! = 0;
+        while (index < self.wildcard_imports.len()) {
+            WildcardImportRecord edge = self.wildcard_imports.get(index);
+            if (edge.namespace_id.to_index() == namespace_id.to_index()
+                && edge.span.start == span.start
+                && edge.span.length == span.length
+                // ImportSummary 当前不持久化 span，恢复出的多条 `import *`
+                // 都是 0..0；此时只能把相同 target 视为重复，不能相互覆盖。
+                && (span.start != 0
+                    || span.length != 0
+                    || edge.target_namespace_id.to_index() == target_namespace_id.to_index())
+            ) {
+                WildcardImportRecord&! existing = self.wildcard_imports.mut_ref_at(index);
+                existing.target_namespace_id = target_namespace_id;
+                existing.visibility = visibility;
+                return;
+            }
+            index = index + 1;
+        }
+        self.wildcard_imports.add(WildcardImportRecord (
+            namespace_id: namespace_id,
+            target_namespace_id: target_namespace_id,
+            visibility: visibility,
+            span: span
+        ));
     }
 
     public qid.PackageId create_package(Self&! self,
@@ -762,6 +941,27 @@ public struct ResolveStore: Movable {
         ModuleRecord&! module_record = self.modules.mut_ref_at(module_id);
         ImportRecord&! import_record = module_record.imports.mut_ref_at(import_index);
         import_record.target_module = target_module;
+        import_record.state = .resolved;
+    }
+
+    public Void set_import_alias_def(
+        Self&! self,
+        qid.ModuleId module_id,
+        Int import_index,
+        qid.DefId alias_def
+    ) {
+        ModuleRecord&! module_record = self.modules.mut_ref_at(module_id);
+        module_record.imports.mut_ref_at(import_index).alias_def = alias_def;
+    }
+
+    public Void set_import_state(
+        Self&! self,
+        qid.ModuleId module_id,
+        Int import_index,
+        ImportResolveState state
+    ) {
+        ModuleRecord&! module_record = self.modules.mut_ref_at(module_id);
+        module_record.imports.mut_ref_at(import_index).state = state;
     }
 
 }

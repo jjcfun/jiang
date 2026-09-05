@@ -117,6 +117,42 @@ public struct InterfaceLoader: Movable {
         }
         self.load_extension_groups(module_id, module_interface);
         self.load_public_aliases(module_id, module_interface, false);
+        qid.DefId module_def = self.ctx.store.resolve.module_ref(module_id).def_id;
+        self.ctx.store.model.set_declaration_sema_state(module_def, .body_ready);
+    }
+
+    public Bool ensure_declaration_facts(
+        Self&! self,
+        qid.DefId def_id,
+        artifact.ModuleInterface& module_interface
+    ) {
+        if (self.ctx.store.model.declaration_sema_state(def_id) == .body_ready) {
+            return true;
+        }
+        guard self.ctx.store.incremental.stable_id_for_def(def_id)
+            is .some(stable_id) else {
+            self.ctx.store.model.mark_error();
+            return false;
+        }
+        Int index! = 0;
+        while (index < module_interface.declarations.len()) {
+            artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+            if (declaration.stable_id == stable_id) {
+                self.load_declaration_facts(module_interface, declaration);
+                return self.ctx.store.model.declaration_sema_state(def_id) == .body_ready;
+            }
+            index = index + 1;
+        }
+        self.ctx.store.model.mark_error();
+        return false;
+    }
+
+    public Void load_module_interface_extension_groups(
+        Self&! self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface
+    ) {
+        self.load_extension_groups(module_id, module_interface);
     }
 
     public Void load_module_interface_templates(Self&! self, artifact.ModuleInterface& module_interface) {
@@ -211,6 +247,38 @@ public struct InterfaceLoader: Movable {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
         qid.DefId module_def = module.def_id;
         qid.NamespaceId module_namespace = module.namespace_id;
+        if (declaration.kind == .function_def
+            || declaration.kind == .init_def
+            || declaration.kind == .deinit_def
+        ) {
+            // Source name collection 不能在 signature 之前计算 callable 的
+            // disambiguator/stable id。interface 只会在 source hash 完全相同
+            // 时加载，因此按原 owner/member 顺序复用第一个尚未绑定的同名
+            // callable skeleton，避免为同一声明创建第二个 DefId。
+            sem.Def& owner_model = self.ctx.store.model.def_ref(semantic_owner);
+            Int member_index! = 0;
+            while (member_index < owner_model.members.len()) {
+                qid.DefId candidate = owner_model.members.get(member_index);
+                member_index = member_index + 1;
+                def.DefRecord candidate_record = self.ctx.store.defs.get(candidate);
+                if (candidate_record.kind != declaration.kind
+                    || candidate_record.domain != declaration.domain
+                    || candidate_record.name.symbol != declaration.name
+                    || candidate_record.module_id != module_id
+                    || self.ctx.store.incremental.stable_id_for_def(candidate) != null
+                ) {
+                    continue;
+                }
+                self.record_interface_stable_key(
+                    module_def,
+                    module_interface,
+                    declaration,
+                    candidate
+                );
+                self.record_declaration_fingerprints(declaration);
+                return candidate;
+            }
+        }
         qid.NamespaceId decl_namespace = self.decl_namespace(module_def, module_namespace, semantic_owner);
         qid.NamespaceId? owned_namespace! = null;
         if (self.def_kind_owns_namespace(declaration.kind)) {
@@ -243,6 +311,7 @@ public struct InterfaceLoader: Movable {
                 declaration.name,
                 declaration.domain,
                 def_id,
+                declaration.visibility,
                 token.Span()
             );
         }
@@ -400,6 +469,15 @@ public struct InterfaceLoader: Movable {
         Self&! self,
         artifact.InterfaceDeclSummary declaration
     ) {
+        if (self.ctx.store.incremental.current_def_for_stable(declaration.stable_id)
+            is .some(def_id)
+        ) {
+            if (self.ctx.store.model.has_def(def_id)
+                && self.ctx.store.model.def_ref(def_id).body != null
+            ) {
+                return;
+            }
+        }
         self.ctx.store.incremental.set_loaded_fingerprints(
             declaration.stable_id,
             declaration.signature_fingerprint,
@@ -449,6 +527,13 @@ public struct InterfaceLoader: Movable {
             self.ctx.store.model.mark_error();
             return;
         }
+        sem.DeclarationSemaState progress =
+            self.ctx.store.model.declaration_sema_state(def_id);
+        if (progress == .body_ready) { return; }
+        if (progress == .signature_ready) {
+            self.ctx.store.model.set_declaration_sema_state(def_id, .body_ready);
+            return;
+        }
         self.load_declaration_modifiers(def_id, declaration);
         self.load_field_default(def_id, module_interface, declaration);
         self.load_decl_type_ref(def_id, module_interface, declaration);
@@ -467,6 +552,9 @@ public struct InterfaceLoader: Movable {
         self.load_life_clauses(def_id, module_interface, declaration);
         self.load_function_signature(def_id, module_interface, declaration);
         self.load_const_value(def_id, module_interface, declaration);
+        // `.ji` declaration 没有待解析的 source AST；泛型 body template
+        // 由独立 template pass 恢复，因此 declaration 查询在此已完成。
+        self.ctx.store.model.set_declaration_sema_state(def_id, .body_ready);
     }
 
     Void load_declaration_modifiers(
@@ -662,9 +750,56 @@ public struct InterfaceLoader: Movable {
         ) {
             self.ctx.store.model.set_alias_target(alias_def, target_def);
             self.ctx.store.defs.set_owned_namespace(alias_def, target_record.owned_namespace_id);
+            self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
+            return;
+        }
+        if (self.source_alias_skeleton(module_id, alias_export.alias_symbol)
+            is .some(alias_def)
+        ) {
+            def.DefRecord alias_record = self.ctx.store.defs.get(alias_def);
+            qid.NamespaceId namespace_id =
+                self.ctx.store.resolve.module_ref(module_id).namespace_id;
+            self.ctx.store.defs.set_domain(alias_def, domain);
+            self.ctx.store.defs.set_owned_namespace(alias_def, target_record.owned_namespace_id);
+            self.ctx.store.resolve.bind_name(
+                namespace_id,
+                alias_export.alias_symbol,
+                domain,
+                alias_def,
+                alias_record.visibility,
+                alias_record.name.span
+            );
+            self.ctx.store.model.set_alias_target(alias_def, target_def);
+            self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
             return;
         }
         self.create_interface_alias(module_id, alias_export.alias_symbol, target_def, target_record, domain);
+    }
+
+    qid.DefId? source_alias_skeleton(
+        Self&! self,
+        qid.ModuleId module_id,
+        qid.SymbolId alias_symbol
+    ) {
+        qid.NamespaceId namespace_id = self.ctx.store.resolve.module_ref(module_id).namespace_id;
+        table.MultiTableCursor cursor! = self.ctx.store.resolve.first_binding_cursor(
+            namespace_id,
+            alias_symbol,
+            .alias_name
+        );
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.ctx.store.resolve.binding_at(cursor);
+            def.DefRecord record = self.ctx.store.defs.get(binding.def_id);
+            if (record.kind == .alias_def
+                && record.module_id == module_id
+                && record.domain == .alias_name
+                && self.ctx.store.model.def_alias_target(binding.def_id) == null
+            ) {
+                return binding.def_id;
+            }
+            cursor = self.ctx.store.resolve.next_binding_cursor(cursor);
+        }
+        return null;
     }
 
     qid.DefId? loaded_alias_def(
@@ -721,12 +856,20 @@ public struct InterfaceLoader: Movable {
             namespace_id,
             target_record.owned_namespace_id
         );
-        self.ctx.store.resolve.bind_name(namespace_id, alias_symbol, domain, alias_def, token.Span());
+        self.ctx.store.resolve.bind_name(
+            namespace_id,
+            alias_symbol,
+            domain,
+            alias_def,
+            .public_visibility,
+            token.Span()
+        );
         sem.DeclKind decl_kind = self.model_decl_kind(kind);
         self.ctx.store.model.declare_def(alias_def, decl_kind);
         self.ctx.store.model.add_member(module_def, alias_def);
         self.ctx.store.model.set_alias_target(alias_def, target_def);
         self.ctx.store.source_map.set_def_span(alias_def, source_id, token.Span());
+        self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
         return alias_def;
     }
 
