@@ -1639,13 +1639,15 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
   函数。依赖尚未由当前 source-selection 路径选中的 declaration 时，不猜测分支；对应查询状态输出
   不可达或依赖循环诊断。
 - eval 不隐式执行 IO，不读取运行期变量；在编译期执行内部声明、初始化和修改的局部变量不属于运行期状态。
-- 顶层或 namespace 的 eval 块中，普通变量遵守所在 block 的词法作用域，不成为运行期全局变量。
-  eval 块也可以出现在函数体或普通局部 block 中；限制的是声明发布，而非块的位置。
-  只有直接属于 namespace 的 eval 块才能发布 const 等 namespace 声明；局部 eval 执行到这种
-  声明时报编译错误，不向外搜索可接收声明的 namespace。块内条件分支继承发布目标。
-  const 声明则发布到所在 namespace；块外可以引用，跨模块访问仍要求 public。
-  const 初始化在执行到声明时读取当前编译期局部状态，成功取得可物化的常量后才发布结果，
-  不保留对已结束局部存储的引用。未执行分支不发布 const，重复名字沿用 namespace 的冲突规则。
+- const 可以在模块或局部作用域中声明，遵守普通词法作用域。comptime 块及其条件分支中的
+  const 仅在所在 block 内有效，不隐式提升或发布到外层 namespace。
+- `const foo = expr` 要求初始化结果是 comptime value；允许由初始化结果推导类型，也可显式
+  写出类型。字面量、常量运算及 comptime block 的求值结果均可用于初始化，不强制包一层 comptime。
+  普通运行期变量不能因被 const 初始化器引用就自动变成编译期值。
+- comptime block 可以返回值，外部 const 通过初始化表达式接收该结果，名字归属由外部声明
+  的位置决定。局部计算使用同一次执行中的存储和生命周期；结果不得保留对已结束局部存储的引用。
+- import 的位置要求独立于 const 和 comptime 块的词法作用域规则；不能用 import 的限制
+  禁止局部编译期计算。
 - eval、普通 const、数组长度、const generic 和 enum discriminant 共用 JIL 求值，generate 也复用
   同一执行语义，不维护独立的 AST 或 Semantic Model 表达式解释语义。
   JIL 执行遵守 borrow/drop、target 布局及执行配额，编译器回收内存不代替语言 deinit，host 地址不得逃逸。

@@ -200,7 +200,7 @@ function_decl
             <- result_type name function_tail
 
 const_global_decl
-            <- "const" type name "=" expr ";"
+            <- "const" type? name "=" expr ";"
 
 global_decl <- type name global_tail
 
@@ -237,11 +237,9 @@ binding_name
 `eval`、`generate` 仅在选项位置有特殊含义，不是保留关键字。未知 kind、多个 kind 和空选项均诊断。
 `[eval]` 表示语义分析期间所需的求值；`[generate]` 表示输入完整通过语义检查后的生成任务，
 两者不能隐式互换。
-顶层或 namespace 的 eval 块允许局部语句；其中普通变量声明按 block 局部变量解释，
-不因与 global declaration 使用相同拼写而发布到 namespace。const 声明发布到所在 namespace，
-public 控制跨模块可见性；初始化在执行到声明时求值，未执行分支不发布声明。
-eval 块也可以出现在普通语句位置。只有直接属于 namespace（包括文件顶层）的 eval 块能发布
-const 等 namespace 声明；局部 eval 中执行到这种声明时报错，不向外搜索 namespace。
+eval 块也可以出现在普通语句位置。块内普通变量及 const 都遵守所在 block 的词法作用域，
+不隐式发布到 namespace。局部 const 与模块 const 的初始化结果都必须是 comptime value；
+comptime block 可以返回这样的值供外部 const 初始化使用。import 的位置限制独立处理。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 顶层变量只使用普通 global declaration。独立 destructure 是函数体内的语句，
@@ -564,6 +562,7 @@ block       <- "{" stmt* tail_expr? "}"
 
 stmt        <- return_stmt
              / compile_block
+             / const_local_decl
              / throw_stmt
              / break_stmt
              / continue_stmt
@@ -581,6 +580,9 @@ stmt        <- return_stmt
              / call_stmt
 
 tail_expr   <- expr
+
+const_local_decl
+            <- "const" type? name "=" expr ";"
 
 return_stmt <- "return" expr? ";"
 
@@ -656,6 +658,7 @@ expr        <- lambda_expr
 
 expr_with_block
             <- block_expr
+             / comptime_expr
              / effect_block_expr
              / async_call_expr
              / if_expr
@@ -795,6 +798,9 @@ lang_invocation
             <- "#" provider_path raw_block
 
 block_expr  <- block
+
+comptime_expr
+            <- "comptime" ("[" "eval" ","? "]")? block
 
 effect_block_expr
             <- effect_keywords block

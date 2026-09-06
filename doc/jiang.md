@@ -727,23 +727,21 @@ comptime {
 在输入完整通过语义检查后执行的生成任务。普通 build/check 不执行 generate 文件输出，
 也不会因为 eval 失败而自动改用 generate。
 
-顶层或 namespace 的 eval 块按以下作用域规则设计：普通变量仅在所在 block 内有效，
-const 则发布到所在 namespace；跨模块访问仍需 public。const 初始化使用执行到声明时的
-编译期局部值，未执行分支中的 const 不会发布。
-eval 块也可以用于函数体或普通局部 block，但只有直接属于 namespace 的 eval 块能发布
-const 等 namespace 声明；局部 eval 中执行到这种声明会报错，不向外搜索 namespace。
-块内条件分支继承发布目标。
+const 可以在局部声明，名字只在所在词法作用域有效。初始化结果必须是 comptime value，
+可以由结果推导类型，也可以显式标注类型。comptime block 的求值结果也属于 comptime value；
+字面量和常量运算不必额外包一层 comptime。块内 const 不会自动变成外部声明。
 
 ```jiang
-comptime {
+const Int answer = comptime {
     Int count! = 0;
     count = count + 1;
-    const Int answer = count + 41;
-}
+    count + 41
+};
 
 Int main() {
-    // answer 在块外可见，count 不可见。
-    answer - 42
+    const expected = 42;
+    // answer 属于模块，expected 属于 main，count 只属于上面的计算块。
+    answer - expected
 }
 ```
 
