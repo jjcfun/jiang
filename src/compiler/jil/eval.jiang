@@ -984,6 +984,11 @@ struct Executor: Movable {
     }
 
     Int? resolve_place(Self&! self, frame_api.Frame& frame, jil.Place place) {
+        return self.resolve_place_prefix(frame, place, place.projection.length);
+    }
+
+    #doc 求值 projection 前缀，不复制 JIL projection；末尾取址可保留原元素指针的分配身份。
+    Int? resolve_place_prefix(Self&! self, frame_api.Frame& frame, jil.Place place, Int count) {
         guard place.base is .local(local) else {
             self.frame_error(frame, "comptime_global_not_supported",
                 "runtime global storage is not available during eval");
@@ -991,7 +996,7 @@ struct Executor: Movable {
         }
         Int address! = frame.locals.get(local.to_index());
         Int index! = 0;
-        while (index < place.projection.length) {
+        while (index < count) {
             guard self.project(frame, address, place.projection[index]) is .some(child) else { return null; }
             address = child;
             index = index + 1;
@@ -1030,6 +1035,7 @@ struct Executor: Movable {
             result = self.index_element(frame, address, Int(bits));
         }
         if (result != null) { return result; }
+        if (self.failed) { return null; }
         self.frame_error(frame, "comptime_invalid_projection",
             "invalid, out of bounds or unsupported JIL memory projection");
         return null;
@@ -1037,6 +1043,14 @@ struct Executor: Movable {
 
     #doc 动态索引访问 slice 的数据字段，常量字段 projection 仍访问描述符自身的布局字段。
     Int? index_element(Self&! self, frame_api.Frame& frame, Int address, Int index) {
+        guard self.index_pointer(frame, address, index) is .some(pointer) else { return null; }
+        if (pointer is .reference(target)) { return target; }
+        guard pointer is .element_reference(storage, first, offset) else { assert(false); return null; }
+        return self.memory.sequence_element(storage, first, offset);
+    }
+
+    #doc 索引读写和取址共用偏移计算；返回已有指针 payload，不为每次元素访问分配临时 cell。
+    memory_api.CellData? index_pointer(Self&! self, frame_api.Frame& frame, Int address, Int index) {
         if (index < 0) { return null; }
         Int base! = address;
         if (self.slice_element_type(self.memory.get(address).type_id) != null) {
@@ -1045,14 +1059,18 @@ struct Executor: Movable {
         }
         if (self.memory.get(base).data is .element_reference(storage, first, offset)) {
             if (!self.sequence_live(frame, storage, first)) { return null; }
-            if (index > self.memory.limit - offset) { return null; }
-            return self.memory.sequence_element(storage, first, offset + index);
+            guard self.memory.get(storage).data is .aggregate(_, count) else { assert(false); return null; }
+            if (index > count - offset) { return null; }
+            return memory_api.CellData.element_reference(storage, first, offset + index);
         }
         if (self.memory.get(base).data is .reference(target)) {
-            if (index == 0) { return target; }
+            if (index == 0) { return memory_api.CellData.reference(target); }
             return null;
         }
-        return self.memory.child(self.store, self.query, base, index);
+        if (!self.memory.ensure_aggregate(self.store, self.query, base)) { return null; }
+        guard self.memory.get(base).data is .aggregate(first, count) else { assert(false); return null; }
+        if (index > count) { return null; }
+        return memory_api.CellData.element_reference(base, first, index);
     }
 
     Bool sequence_live(Self&! self, frame_api.Frame& frame, Int storage, Int first) {
@@ -1062,10 +1080,57 @@ struct Executor: Movable {
     }
 
     Int? reference(Self&! self, frame_api.Frame& frame, jil.Place place, qid.TypeId type_id) {
-        guard self.resolve_place(frame, place) is .some(address) else { return null; }
-        if (self.memory.reference(type_id, address) is .some(result)) { return result; }
+        guard self.place_pointer(frame, place) is .some(pointer) else {
+            if (!self.failed) {
+                self.frame_error(frame, "comptime_invalid_projection", "cannot form pointer to JIL place");
+            }
+            return null;
+        }
+        if (pointer is .element_reference(storage, first, index)) {
+            if (!self.sequence_live(frame, storage, first)) { return null; }
+            guard self.store.types.get(type_id).data is .handle_type(handle) else { assert(false); return null; }
+            if (handle.kind != .raw_pointer && self.memory.sequence_element(storage, first, index) == null) {
+                self.frame_error(frame, "comptime_invalid_projection", "cannot borrow a past-the-end element");
+                return null;
+            }
+        }
+        if (pointer is .reference(target) && !self.memory.get(target).alive) {
+            self.frame_error(frame, "comptime_dead_storage", "cannot reference expired JIL storage");
+            return null;
+        }
+        if (self.memory.allocate(type_id) is .some(result)) {
+            self.memory.set_data(result, pointer);
+            return result;
+        }
         self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval reference");
         return null;
+    }
+
+    #doc 末尾元素取址或解引用后再取址均保留原分配；普通字段地址仍绑定该字段的存储 cell。
+    memory_api.CellData? place_pointer(Self&! self, frame_api.Frame& frame, jil.Place place) {
+        if (place.projection.length == 0) {
+            guard self.resolve_place(frame, place) is .some(address) else { return null; }
+            return memory_api.CellData.reference(address);
+        }
+        Int last = place.projection.length - 1;
+        guard self.resolve_place_prefix(frame, place, last) is .some(base) else { return null; }
+        jil.PlaceElem projection = place.projection[last];
+        if (projection is .deref_projection(_)) {
+            memory_api.CellData data = self.memory.get(base).data;
+            if (data is .reference(_) || data is .element_reference(_, _, _)) { return data; }
+            return null;
+        }
+        if (projection is .index_projection(item)) {
+            guard self.scalar(frame, frame.locals.get(item.index_local.to_index())) is .some(value) else { return null; }
+            guard integer.bits(value) is .some(bits) else { return null; }
+            return self.index_pointer(frame, base, Int(bits));
+        }
+        if (projection is .constant_index_projection(item)
+            && self.store.types.get(self.memory.get(base).type_id).data is .array_type(_)) {
+            return self.index_pointer(frame, base, item.offset);
+        }
+        guard self.project(frame, base, projection) is .some(address) else { return null; }
+        return memory_api.CellData.reference(address);
     }
 
     Int? aggregate(Self&! self, frame_api.Frame&! frame, jil.AggregateRvalue aggregate, qid.TypeId type_id) {
