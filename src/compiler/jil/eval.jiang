@@ -428,8 +428,9 @@ struct Executor: Movable {
     }
 
     Bool call_terminator(Self&! self, frame_api.Frame&! frame, jil.CallTerminator call, token.Span span) {
+        if (call.callee is .indirect_operand(operand)) { return self.call_indirect(frame, call, operand, span); }
         guard call.callee is .direct_function(reference) else {
-            self.frame_error(frame, "comptime_call_not_supported", "indirect JIL call is not supported in eval");
+            self.frame_error(frame, "comptime_call_not_supported", "domain dispatch is not supported in eval");
             return false;
         }
         reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
@@ -438,21 +439,11 @@ struct Executor: Movable {
             self.frame_error(frame, "comptime_dispatch_not_supported", "JIL builtin dispatch is not supported in eval");
             return false;
         }
-        list.ArrayList<Int> args! = list.ArrayList<Int>(call.args.length);
         guard self.store.types.get(reader.type_id(reference.type_id)).data is .function_type(signature) else {
             self.frame_error(frame, "comptime_function_not_ready", "JIL call signature must be prepared before eval");
             return false;
         }
-        if (signature.params.length != call.args.length) {
-            self.frame_error(frame, "comptime_argument_mismatch", "JIL argument count does not match call signature");
-            return false;
-        }
-        Int index! = 0;
-        while (index < call.args.length) {
-            guard self.call_operand(frame, call.args[index], signature.params[index]) is .some(arg) else { return false; }
-            args.add(arg);
-            index = index + 1;
-        }
+        guard self.call_arguments(frame, call, signature) is .some(args) else { return false; }
         Int? result!;
         if (target.target is .source(def_id)) {
             result = self.call(def_id, target.args.slice(), args.slice(), span);
@@ -462,6 +453,52 @@ struct Executor: Movable {
         }
         guard result is .some(address) else { return false; }
         return self.write(frame, call.destination, address);
+    }
+
+    #doc 间接调用只读取值中已准备的实例身份，不解析源码名字或触发新的语义分析。
+    Bool call_indirect(
+        Self&! self, frame_api.Frame&! frame, jil.CallTerminator call, jil.Operand operand, token.Span span
+    ) {
+        guard self.operand(frame, operand) is .some(address) else { return false; }
+        memory_api.Cell cell = self.memory.get(address);
+        guard cell.data is .function(item) else {
+            self.frame_error(frame, "comptime_invalid_callee", "indirect call requires a JIL function value");
+            return false;
+        }
+        guard self.store.types.get(cell.type_id).data is .function_type(signature) else {
+            self.frame_error(frame, "comptime_argument_type_mismatch", "indirect callee has no function signature");
+            return false;
+        }
+        guard self.call_arguments(frame, call, signature) is .some(args) else { return false; }
+        Int? result!;
+        if (item is .source_instance(identity)) {
+            jil.InstanceKey instance = self.program.program.function_instance_at(identity);
+            result = self.call(instance.def_id, instance.args, args.slice(), span);
+        } else {
+            guard item is .generated_function(id) else { assert(false); return false; }
+            result = self.call_generated(id, args.slice(), span);
+        }
+        guard result is .some(value) else { return false; }
+        return self.write(frame, call.destination, value);
+    }
+
+    #doc 直接和间接调用共享参数数量检查与已有 JIL 借用实参约定。
+    list.ArrayList<Int>? call_arguments(
+        Self&! self, frame_api.Frame&! frame, jil.CallTerminator call, types.FunctionType signature
+    ) {
+        if (signature.params.length != call.args.length) {
+            self.frame_error(frame, "comptime_argument_mismatch", "JIL argument count does not match call signature");
+            return null;
+        }
+        list.ArrayList<Int> args! = list.ArrayList<Int>(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            guard self.call_operand(frame, call.args[index], signature.params[index])
+                is .some(arg) else { return null; }
+            args.add(arg);
+            index = index + 1;
+        }
+        return args;
     }
 
     #doc 复用 JIL 的引用实参约定，在原 place 上借用，不先 move 再引用临时拷贝。
@@ -926,6 +963,7 @@ struct Executor: Movable {
 
     Int? operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
         if (operand is .const_operand(constant)) { return self.constant(frame, constant); }
+        if (operand is .function_operand(reference)) { return self.function_value(frame, reference); }
         if (operand is .global_operand(global)) {
             guard self.global_address(frame, global) is .some(address) else { return null; }
             return self.copy_value(frame, address);
@@ -948,6 +986,34 @@ struct Executor: Movable {
         }
         self.frame_error(frame, "comptime_operand_not_supported", "JIL operand is not supported in eval");
         return null;
+    }
+
+    #doc 函数值引用既有实例索引，泛型实参由当前 InstanceReader 固化，不保存宿主函数指针。
+    Int? function_value(Self&! self, frame_api.Frame& frame, jil.FunctionRef reference) {
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        reader_api.ResolvedCallee target = reader.callee(reference.target, reference.args, reference.dispatch_type);
+        if (target.dispatch_type != null || target.builtin != null || !(reference.variant is .body)) {
+            self.frame_error(frame, "comptime_dispatch_not_supported", "function value requires a resolved JIL body");
+            return null;
+        }
+        jil.MonoItem item!;
+        if (target.target is .source(def_id)) {
+            guard self.program.program.existing_function_instance_identity(def_id, target.args.slice())
+                is .some(identity) else {
+                self.frame_error(frame, "comptime_function_not_ready", "function value instance must be prepared");
+                return null;
+            }
+            item = .source_instance(identity);
+        } else {
+            guard target.target is .generated(generated) else { assert(false); return null; }
+            item = .generated_function(generated.id);
+        }
+        guard self.memory.allocate(reader.type_id(reference.type_id)) is .some(address) else {
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL function value");
+            return null;
+        }
+        self.memory.set_data(address, .function(item));
+        return address;
     }
 
     Int? constant(Self&! self, frame_api.Frame& frame, jil.Const source) {
