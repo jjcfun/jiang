@@ -26,6 +26,9 @@ import store = "../../../../src/compiler/resolve/store.jiang";
 import source = "../../../../src/compiler/source.jiang";
 import compilation = "../../../../src/compiler/analysis.jiang";
 import types = "../../../../src/compiler/sema/type.jiang";
+import type_check = "../../../../src/compiler/sema/type_check.jiang";
+import comptime_value = "../../../../src/compiler/sema/comptime/value.jiang";
+import eval_memory = "../../../../src/compiler/jil/eval/memory.jiang";
 import list = "../../../../src/compiler/support/list.jiang";
 import string = "../../../../src/compiler/support/string.jiang";
 import fs = "../../../../src/compiler/system/fs.jiang";
@@ -1878,7 +1881,11 @@ Void check_interface_builder_exports_field_default() {
 
 Void check_interface_builder_exports_private_const_value() {
     context.CompilerContext ctx! = context.CompilerContext();
-    UInt8[]& text = "const Int SECRET = 7; public Int answer() { SECRET }";
+    std.StringBuilder source_text! = std.StringBuilder();
+    source_text.append_valid_utf8("const Int SECRET = 7; public Int answer() { SECRET }");
+    source_text.append_valid_utf8(" const Int? MISSING = null; const Int? PRESENT = 7;");
+    source_text.append_valid_utf8(" Int?? wrap(Int? value) { value } const Int?? NESTED = wrap(MISSING);");
+    UInt8[]& text = source_text.slice();
     source.SourceId source_id = ctx.store.sources.intern_virtual(
         "interface_private_const_value",
         text
@@ -1909,6 +1916,85 @@ Void check_interface_builder_exports_private_const_value() {
         )$.some();
     assert(interface_decl(decoded$.ref(), const_stable).is_const);
     assert(decoded.const_value(const_stable) != null);
+    assert_optional_interface_values(ctx$.ref(), decoded$.ref());
+    check_optional_interface_restore(text, section.bytes.slice());
+}
+
+#doc 用新的编译会话恢复接口常量，再按声明类型导入执行器，不依赖原会话的聚合或类型 ID。
+Void check_optional_interface_restore(UInt8[]& text, UInt8[]& bytes) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.symbols.intern("shift_interface_symbols");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("interface_private_const_value", text);
+    artifact.ModuleInterface decoded = source_fingerprint.decode_module_interface_section(
+        ctx.store.symbols$.mut_ref(), source_id, ctx.store.sources.content_hash(source_id), bytes
+    )$.some();
+    assert_optional_interface_values(ctx$.ref(), decoded$.ref());
+    map.WyHashMap<source.SourceId, ast.AstUnit> asts! = map.WyHashMap<source.SourceId, ast.AstUnit>();
+    map.WyHashMap<qid.ModuleId, graph_builder.ModuleResolvePassState> module_states! =
+        map.WyHashMap<qid.ModuleId, graph_builder.ModuleResolvePassState>();
+    map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId> declaration_defs! =
+        map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>();
+    map.WyHashMap<qid.DefId, ast.AstId> declaration_items! = map.WyHashMap<qid.DefId, ast.AstId>();
+    map.WyHashMap<qid.DefId, ast.AstId> declaration_containers! = map.WyHashMap<qid.DefId, ast.AstId>();
+    qid.ModuleId module_id!;
+    {
+        graph_builder.ModuleGraphBuilder builder! = graph_builder.ModuleGraphBuilder(
+            ctx$.mut_ref(), asts$.mut_ref(), module_states$.mut_ref(), declaration_defs$.mut_ref(),
+            declaration_items$.mut_ref(), declaration_containers$.mut_ref(), "build/cache"
+        );
+        module_id = builder.ensure_module(source_id);
+    }
+    {
+        interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(
+            ctx$.mut_ref(), module_states$.mut_ref(), declaration_defs$.mut_ref()
+        );
+        loader.load_module_interface(module_id, decoded$.ref());
+    }
+    qid.DefId present = ctx.store.incremental.current_def_for_stable(
+        stable_decl_named(decoded$.ref(), ctx.store.symbols.find("PRESENT")$.some())
+    )$.some();
+    qid.DefId nested = ctx.store.incremental.current_def_for_stable(
+        stable_decl_named(decoded$.ref(), ctx.store.symbols.find("NESTED")$.some())
+    )$.some();
+    assert(type_check.ensure_declaration_checked(ctx$.mut_ref(), module_id, { _, _, _ => null }, present));
+    assert(type_check.ensure_declaration_checked(ctx$.mut_ref(), module_id, { _, _, _ => null }, nested));
+    comptime_value.ComptimeValue present_value = restored_optional_value(ctx$.mut_ref(), present);
+    guard present_value.data is .optional_value(present_items) else { assert(false); return; }
+    assert(ctx.store.comptime_store.item_at(present_items, 0).data is .int_value(7));
+    comptime_value.ComptimeValue nested_value = restored_optional_value(ctx$.mut_ref(), nested);
+    guard nested_value.data is .optional_value(nested_items) else { assert(false); return; }
+    comptime_value.ComptimeValue inner = ctx.store.comptime_store.item_at(nested_items, 0);
+    guard inner.data is .optional_value(inner_items) else { assert(false); return; }
+    assert(ctx.store.comptime_store.item_count(inner_items) == 0);
+    assert(inner.type_id != ctx.store.types.invalid_type());
+}
+
+#doc 接口仅保存稳定 payload，执行器根据消费位置恢复各层类型。
+comptime_value.ComptimeValue restored_optional_value(context.CompilerContext&! ctx, qid.DefId def_id) {
+    comptime_value.ComptimeValue loaded = ctx.store.comptime_store.const_value(def_id)$.some();
+    qid.TypeId type_id = ctx.store.typeck.def_type(def_id)$.some();
+    eval_memory.Memory memory! = eval_memory.Memory();
+    Int address = memory.import_value(ctx.store$.mut_ref(), ctx.query$.mut_ref(),
+        comptime_value.ComptimeValue(type_id: type_id, data: loaded.data)
+    )$.some();
+    return memory.export_value(ctx.store$.mut_ref(), ctx.query$.mut_ref(), address)$.some();
+}
+
+#doc 接口往返保留 optional 的三种不同形状，不将 some(none) 压平为 none。
+Void assert_optional_interface_values(context.CompilerContext& ctx, artifact.ModuleInterface& module_interface) {
+    qkey.StableSymbolId missing_id = stable_decl_named(module_interface, ctx.store.symbols.find("MISSING")$.some());
+    qkey.StableSymbolId present_id = stable_decl_named(module_interface, ctx.store.symbols.find("PRESENT")$.some());
+    qkey.StableSymbolId nested_id = stable_decl_named(module_interface, ctx.store.symbols.find("NESTED")$.some());
+    artifact.InterfaceConstValue missing = module_interface.const_value(missing_id)$.some();
+    artifact.InterfaceConstValue present = module_interface.const_value(present_id)$.some();
+    artifact.InterfaceConstValue nested = module_interface.const_value(nested_id)$.some();
+    guard missing.data is .optional_value(no_items) else { assert(false); return; }
+    guard present.data is .optional_value(one_item) else { assert(false); return; }
+    guard nested.data is .optional_value(nested_items) else { assert(false); return; }
+    assert(no_items.length == 0 && one_item.length == 1 && nested_items.length == 1);
+    assert(one_item[0].data is .int_value(7));
+    guard nested_items[0].data is .optional_value(inner_items) else { assert(false); return; }
+    assert(inner_items.length == 0);
 }
 
 artifact.InterfaceDeclSummary interface_decl(
