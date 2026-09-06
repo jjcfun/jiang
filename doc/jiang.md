@@ -727,6 +727,26 @@ comptime {
 在输入完整通过语义检查后执行的生成任务。普通 build/check 不执行 generate 文件输出，
 也不会因为 eval 失败而自动改用 generate。
 
+顶层或 namespace 的 eval 块按以下作用域规则设计：普通变量仅在所在 block 内有效，
+const 则发布到所在 namespace；跨模块访问仍需 public。const 初始化使用执行到声明时的
+编译期局部值，未执行分支中的 const 不会发布。
+eval 块也可以用于函数体或普通局部 block，但只有直接属于 namespace 的 eval 块能发布
+const 等 namespace 声明；局部 eval 中执行到这种声明会报错，不向外搜索 namespace。
+块内条件分支继承发布目标。
+
+```jiang
+comptime {
+    Int count! = 0;
+    count = count + 1;
+    const Int answer = count + 41;
+}
+
+Int main() {
+    // answer 在块外可见，count 不可见。
+    answer - 42
+}
+```
+
 ### 进程级 panic
 
 `panic(message)` 是默认 prelude 提供的不可恢复错误入口。它向标准错误输出 `message` 与换行，
