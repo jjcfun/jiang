@@ -11,6 +11,7 @@ import database = "../../db.jiang";
 import layout = "../../layout.jiang";
 import list = "../../support/list.jiang";
 import set = "../../support/set.jiang";
+import map = "../../support/map.jiang";
 
 public enum CellData: Copyable {
     uninitialized,
@@ -25,16 +26,19 @@ public struct Cell: Copyable {
     public qid.TypeId type_id;
     public CellData data;
     public Bool alive;
+    public Bool read_only;
 }
 
 public struct Memory: Movable {
     list.ArrayList<Cell> cells!;
     set.HashSet<Int> heap_roots!;
+    map.WyHashMap<qid.SymbolId, Int> strings!;
     public Int limit;
 
     public init(self, Int limit = 1000000) {
         self.cells = list.ArrayList<Cell>();
         self.heap_roots = set.HashSet<Int>();
+        self.strings = map.WyHashMap<qid.SymbolId, Int>();
         self.limit = limit;
     }
 
@@ -43,7 +47,7 @@ public struct Memory: Movable {
     public Int? allocate(Self&! self, qid.TypeId type_id) {
         if (self.cells.len() >= self.limit) { return null; }
         Int address = self.cells.len();
-        self.cells.add(Cell(type_id: type_id, data: .uninitialized, alive: true));
+        self.cells.add(Cell(type_id: type_id, data: .uninitialized, alive: true, read_only: false));
         return address;
     }
 
@@ -117,7 +121,7 @@ public struct Memory: Movable {
 
     public Void set_data(Self&! self, Int address, CellData data) {
         Cell cell = self.get(address);
-        self.cells.set(address, Cell(type_id: cell.type_id, data: data, alive: cell.alive));
+        self.cells.set(address, Cell(type_id: cell.type_id, data: data, alive: cell.alive, read_only: cell.read_only));
     }
 
     public Void set_live(Self&! self, Int address, Bool alive) {
@@ -129,14 +133,18 @@ public struct Memory: Movable {
                 index = index + 1;
             }
         }
-        self.cells.set(address, Cell(type_id: cell.type_id, data: .uninitialized, alive: alive));
+        self.cells.set(address, Cell(
+            type_id: cell.type_id, data: .uninitialized, alive: alive, read_only: cell.read_only
+        ));
     }
 
     // move/drop 消耗值但不结束 local 的存储期；旧字段地址必须失效，不能继续读到搬走前的数据。
     public Void clear_value(Self&! self, Int address) {
         Cell cell = self.get(address);
         self.set_live(address, false);
-        self.cells.set(address, Cell(type_id: cell.type_id, data: .uninitialized, alive: cell.alive));
+        self.cells.set(address, Cell(
+            type_id: cell.type_id, data: .uninitialized, alive: cell.alive, read_only: cell.read_only
+        ));
     }
 
     public Bool initialized(self, Int address) {
@@ -167,6 +175,7 @@ public struct Memory: Movable {
         // 可变性已经由 typecheck/borrow 检查；存储拷贝比较值形状，不要求非驻留 TypeId 相同。
         if (!store.types.same_type_ignoring_mutability(cell.type_id, self.get(target).type_id)) { return false; }
         if (target == source) { return true; }
+        if (self.get(target).read_only) { return false; }
         if (cell.data is .aggregate(start, count)) {
             if (!self.ensure_aggregate(store, query, target)) { return false; }
             guard self.get(target).data is .aggregate(target_start, target_count) else { return false; }
@@ -244,6 +253,7 @@ public struct Memory: Movable {
     public Int? import_value(
         Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, value.ComptimeValue source
     ) {
+        if (source.data is .string_value(symbol)) { return self.import_string(store, query, source.type_id, symbol); }
         guard self.allocate(source.type_id) is .some(address) else { return null; }
         if (source.data is .struct_value(aggregate)) {
             Int index! = 0;
@@ -263,6 +273,78 @@ public struct Memory: Movable {
         return address;
     }
 
+    #doc 字符串共享含末尾 NUL 的只读字节；描述符仍是普通可复制的 JIL 值。
+    public Int? import_string(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        qid.TypeId type_id, qid.SymbolId symbol
+    ) {
+        if (store.types.get(type_id).data is .array_type(array)) {
+            return self.import_string_array(store, query, type_id, array, symbol);
+        }
+        guard store.types.get(type_id).data is .handle_type(handle) else { return null; }
+        if (!store.types.same_type(handle.element, store.types.uint8_type())) { return null; }
+        guard self.string_storage(store, symbol) is .some(root) else { return null; }
+        if (handle.kind == .raw_pointer) { return self.element_reference(type_id, root, 0); }
+        if (handle.kind != .slice) { return null; }
+        guard self.allocate(type_id) is .some(result) else { return null; }
+        guard self.child(store, query, result, 0) is .some(pointer) else { return null; }
+        guard self.child(store, query, result, 1) is .some(length) else { return null; }
+        guard self.get(root).data is .aggregate(first, _) else { assert(false); return null; }
+        self.set_data(pointer, .element_reference(root, first, 0));
+        self.set_data(length, .scalar(.uint_value(UInt64(store.symbols.text_length(symbol)))));
+        return result;
+    }
+
+    Int? string_storage(Self&! self, compiler_store.CompilerStore& store, qid.SymbolId symbol) {
+        if (self.strings.get(symbol) is .some(root)) { return root$.get(); }
+        Int length = store.symbols.text_length(symbol);
+        if (length >= self.limit - 1) { return null; }
+        qid.TypeId byte_type = store.types.uint8_type();
+        guard self.allocate(byte_type) is .some(root) else { return null; }
+        if (!self.allocate_array(root, byte_type, length + 1)) { return null; }
+        guard self.get(root).data is .aggregate(first, count) else { assert(false); return null; }
+        Int index! = 0;
+        while (index < count) {
+            UInt64 byte! = UInt64(0);
+            if (index < length) { byte = UInt64(store.symbols.text_byte_at(symbol, index)); }
+            self.set_data(first + index, .scalar(.uint_value(byte)));
+            self.freeze(first + index);
+            index = index + 1;
+        }
+        self.freeze(root);
+        self.strings.set(symbol, root);
+        return root;
+    }
+
+    Void freeze(Self&! self, Int address) {
+        Cell cell = self.get(address);
+        self.cells.set(address, Cell(type_id: cell.type_id, data: cell.data, alive: cell.alive, read_only: true));
+    }
+
+    #doc 字符串构造定长数组时复制字节；数组值不共享字面量的只读权限。
+    Int? import_string_array(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        qid.TypeId type_id, types.ArrayType array, qid.SymbolId symbol
+    ) {
+        if (!store.types.same_type(array.element, store.types.uint8_type())) { return null; }
+        Int length = store.symbols.text_length(symbol);
+        if (length > array.count) { return null; }
+        guard self.allocate(type_id) is .some(root) else { return null; }
+        if (!self.ensure_aggregate(store, query, root)) { return null; }
+        Int index! = 0;
+        while (index < types.array_storage_count(array)) {
+            UInt64 byte! = UInt64(0);
+            if (index < length) { byte = UInt64(store.symbols.text_byte_at(symbol, index)); }
+            if (index == array.count && types.sentinel_has(array.sentinel)) {
+                byte = types.sentinel_value(array.sentinel);
+            }
+            guard self.child(store, query, root, index) is .some(target) else { return null; }
+            self.set_data(target, .scalar(.uint_value(byte)));
+            index = index + 1;
+        }
+        return root;
+    }
+
     Int? import_items(
         Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
         Int address, value.ComptimeAggregateId aggregate
@@ -279,7 +361,7 @@ public struct Memory: Movable {
         return address;
     }
 
-    // 引用永远不导出，包含引用的聚合也不能以原始编译期地址逃逸。
+    #doc 静态字符串切片按字节导出；其他引用及聚合中的引用不能以原始编译期地址逃逸。
     public value.ComptimeValue? export_value(
         Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int address
     ) {
@@ -287,6 +369,9 @@ public struct Memory: Movable {
         Cell cell = self.get(address);
         if (cell.data is .scalar(data)) { return value.ComptimeValue(type_id: cell.type_id, data: data); }
         guard cell.data is .aggregate(start, count) else { return null; }
+        if (store.types.get(cell.type_id).data is .handle_type(handle) && handle.kind == .slice) {
+            return self.export_string(store, cell.type_id, start);
+        }
         if (store.types.get(cell.type_id).data is .named(_)) {
             return self.export_struct(store, query, cell.type_id, start, count);
         }
@@ -304,6 +389,30 @@ public struct Memory: Movable {
             return store.comptime_store.tuple_value(cell.type_id, items.slice());
         }
         return null;
+    }
+
+    #doc 只读字面量的子切片导出为字节符号；普通借用不自动变成静态值。
+    value.ComptimeValue? export_string(
+        Self&! self, compiler_store.CompilerStore&! store, qid.TypeId type_id, Int start
+    ) {
+        guard self.get(start).data is .element_reference(root, first, offset) else { return null; }
+        if (!self.sequence_live(root, first) || !self.get(root).read_only) { return null; }
+        if (!store.types.same_type(self.get(first).type_id, store.types.uint8_type())) { return null; }
+        guard self.get(start + 1).data is .scalar(length_data) else { return null; }
+        guard length_data is .uint_value(bits) else { return null; }
+        guard self.get(root).data is .aggregate(_, available) else { assert(false); return null; }
+        if (bits > UInt64(available - offset)) { return null; }
+        Int length = Int(bits);
+        list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>(length);
+        Int index! = 0;
+        while (index < length) {
+            guard self.get(first + offset + index).data is .scalar(byte_data) else { return null; }
+            guard byte_data is .uint_value(byte) else { return null; }
+            bytes.add(UInt8(byte));
+            index = index + 1;
+        }
+        qid.SymbolId symbol = store.symbols.intern(bytes.slice());
+        return value.ComptimeValue(type_id: type_id, data: .string_value(symbol));
     }
 
     value.ComptimeValue? export_struct(

@@ -661,6 +661,15 @@ struct Executor: Movable {
         return null;
     }
 
+    #doc 哨兵 slice 的长度不包含末尾存储槽；owning 描述符的哨兵由 pointee 类型提供。
+    types.Sentinel? slice_sentinel(self, qid.TypeId type_id) {
+        guard self.store.types.get(type_id).data is .handle_type(handle) else { return null; }
+        if (handle.kind == .slice) { return handle.sentinel; }
+        if (handle.kind != .owner_pointer) { return null; }
+        if (self.store.types.get(handle.element).data is .slice_value_type(slice)) { return slice.sentinel; }
+        return null;
+    }
+
     Int? allocate_array(
         Self&! self, frame_api.Frame&! frame, jil.AllocArrayRvalue allocated, qid.TypeId result_type
     ) {
@@ -669,12 +678,7 @@ struct Executor: Movable {
         Int count = Int(bits);
         reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
         qid.TypeId element = reader.type_id(allocated.element_type);
-        Bool sentinel! = false;
-        if (self.store.types.get(result_type).data is .handle_type(handle)) {
-            if (self.store.types.get(handle.element).data is .slice_value_type(slice)) {
-                sentinel = types.sentinel_has(slice.sentinel);
-            }
-        }
+        Bool sentinel = types.sentinel_has(self.slice_sentinel(result_type));
         if (count < 0 || count >= self.memory.limit) {
             self.frame_error(frame, "comptime_invalid_allocation",
                 "JIL allocation count is negative or exceeds eval quota");
@@ -888,6 +892,10 @@ struct Executor: Movable {
             Int? result = self.read(frame, move.place);
             if (result == null) { return null; }
             guard self.resolve_place(frame, move.place) is .some(address) else { return null; }
+            if (self.memory.get(address).read_only) {
+                self.frame_error(frame, "comptime_readonly_storage", "cannot move from static JIL storage");
+                return null;
+            }
             self.memory.clear_value(address);
             return result;
         }
@@ -914,11 +922,11 @@ struct Executor: Movable {
                 type_id: constant.type_id, data: .bool_value(boolean.value)
             ));
         }
-        if (constant.value is .string_value(string) && !string.nul_terminated) {
-            // 静态字面量保存符号身份，不把宿主字符串地址带进编译期内存或产物。
-            return self.scalar_result(frame, value.ComptimeValue(
-                type_id: constant.type_id, data: .string_value(string.symbol_id)
-            ));
+        if (constant.value is .string_value(string)) {
+            if (self.memory.import_string(self.store, self.query, constant.type_id, string.symbol_id)
+                is .some(result)) { return result; }
+            self.frame_error(frame, "comptime_constant_not_supported", "cannot import JIL string storage");
+            return null;
         }
         if (constant.value is .unit_value(_)) {
             return self.scalar_result(frame, value.ComptimeValue(type_id: constant.type_id, data: .unit_value));
@@ -946,9 +954,11 @@ struct Executor: Movable {
         return null;
     }
 
+    #doc 按 place 的语义类型读取；例如 slice.length 的 Int 投影不同于布局 UInt。
     Int? read(Self&! self, frame_api.Frame& frame, jil.Place place) {
         guard self.resolve_place(frame, place) is .some(address) else { return null; }
-        return self.copy_value(frame, address);
+        guard self.copy_value(frame, address) is .some(result) else { return null; }
+        return self.use_value(frame, result, self.place_type(frame, place));
     }
 
     Int? local(Self&! self, frame_api.Frame& frame, jil.LocalId local) {
@@ -968,6 +978,10 @@ struct Executor: Movable {
 
     Bool write(Self&! self, frame_api.Frame&! frame, jil.Place place, Int result) {
         guard self.resolve_place(frame, place) is .some(address) else { return false; }
+        if (self.memory.get(address).read_only) {
+            self.frame_error(frame, "comptime_readonly_storage", "cannot write to static JIL storage");
+            return false;
+        }
         if (self.memory.copy_into(self.store, self.query, address, result)) { return true; }
         std.StringBuilder message! = std.StringBuilder();
         message.append("cannot assign value to JIL eval storage: type ");
@@ -1043,17 +1057,24 @@ struct Executor: Movable {
 
     #doc 动态索引访问 slice 的数据字段，常量字段 projection 仍访问描述符自身的布局字段。
     Int? index_element(Self&! self, frame_api.Frame& frame, Int address, Int index) {
-        guard self.index_pointer(frame, address, index) is .some(pointer) else { return null; }
+        guard self.index_pointer(frame, address, index, false) is .some(pointer) else { return null; }
         if (pointer is .reference(target)) { return target; }
         guard pointer is .element_reference(storage, first, offset) else { assert(false); return null; }
         return self.memory.sequence_element(storage, first, offset);
     }
 
     #doc 索引读写和取址共用偏移计算；返回已有指针 payload，不为每次元素访问分配临时 cell。
-    memory_api.CellData? index_pointer(Self&! self, frame_api.Frame& frame, Int address, Int index) {
+    memory_api.CellData? index_pointer(Self&! self, frame_api.Frame& frame, Int address, Int index, Bool allow_end) {
         if (index < 0) { return null; }
         Int base! = address;
         if (self.slice_element_type(self.memory.get(address).type_id) != null) {
+            guard self.memory.child(self.store, self.query, address, 1) is .some(length) else { return null; }
+            guard self.scalar(frame, length) is .some(value) else { return null; }
+            guard integer.bits(value) is .some(count) else { return null; }
+            UInt64 bound = count + UInt64(types.sentinel_storage_extra(
+                self.slice_sentinel(self.memory.get(address).type_id)
+            ));
+            if (UInt64(index) > bound || (!allow_end && UInt64(index) == bound)) { return null; }
             guard self.memory.child(self.store, self.query, address, 0) is .some(pointer) else { return null; }
             base = pointer;
         }
@@ -1080,7 +1101,8 @@ struct Executor: Movable {
     }
 
     Int? reference(Self&! self, frame_api.Frame& frame, jil.Place place, qid.TypeId type_id) {
-        guard self.place_pointer(frame, place) is .some(pointer) else {
+        guard self.store.types.get(type_id).data is .handle_type(handle) else { assert(false); return null; }
+        guard self.place_pointer(frame, place, handle.kind == .raw_pointer) is .some(pointer) else {
             if (!self.failed) {
                 self.frame_error(frame, "comptime_invalid_projection", "cannot form pointer to JIL place");
             }
@@ -1088,7 +1110,6 @@ struct Executor: Movable {
         }
         if (pointer is .element_reference(storage, first, index)) {
             if (!self.sequence_live(frame, storage, first)) { return null; }
-            guard self.store.types.get(type_id).data is .handle_type(handle) else { assert(false); return null; }
             if (handle.kind != .raw_pointer && self.memory.sequence_element(storage, first, index) == null) {
                 self.frame_error(frame, "comptime_invalid_projection", "cannot borrow a past-the-end element");
                 return null;
@@ -1107,7 +1128,7 @@ struct Executor: Movable {
     }
 
     #doc 末尾元素取址或解引用后再取址均保留原分配；普通字段地址仍绑定该字段的存储 cell。
-    memory_api.CellData? place_pointer(Self&! self, frame_api.Frame& frame, jil.Place place) {
+    memory_api.CellData? place_pointer(Self&! self, frame_api.Frame& frame, jil.Place place, Bool allow_end) {
         if (place.projection.length == 0) {
             guard self.resolve_place(frame, place) is .some(address) else { return null; }
             return memory_api.CellData.reference(address);
@@ -1123,11 +1144,11 @@ struct Executor: Movable {
         if (projection is .index_projection(item)) {
             guard self.scalar(frame, frame.locals.get(item.index_local.to_index())) is .some(value) else { return null; }
             guard integer.bits(value) is .some(bits) else { return null; }
-            return self.index_pointer(frame, base, Int(bits));
+            return self.index_pointer(frame, base, Int(bits), allow_end);
         }
         if (projection is .constant_index_projection(item)
             && self.store.types.get(self.memory.get(base).type_id).data is .array_type(_)) {
-            return self.index_pointer(frame, base, item.offset);
+            return self.index_pointer(frame, base, item.offset, allow_end);
         }
         guard self.project(frame, base, projection) is .some(address) else { return null; }
         return memory_api.CellData.reference(address);
