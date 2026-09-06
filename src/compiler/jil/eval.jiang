@@ -912,6 +912,19 @@ struct Executor: Movable {
         memory_api.Cell cell = self.memory.get(address);
         types.TypeData source = self.store.types.get(cell.type_id).data;
         types.TypeData target = self.store.types.get(result_type).data;
+        if (cell.data is .function(item)) {
+            Bool function_target! = false;
+            if (target is .function_type(function)) { function_target = function.kind == .raw; }
+            if (target is .handle_type(handle)) { function_target = handle.kind == .raw_pointer; }
+            if (function_target) {
+                guard self.memory.allocate(result_type) is .some(result) else {
+                    self.frame_error(frame, "comptime_memory_limit", "cannot allocate erased JIL function value");
+                    return null;
+                }
+                self.memory.set_data(result, .function(item));
+                return result;
+            }
+        }
         if (source is .handle_type(source_handle) && target is .handle_type(target_handle)) {
             Bool same_element = self.store.types.same_type_ignoring_mutability(
                 source_handle.element, target_handle.element
@@ -964,6 +977,21 @@ struct Executor: Movable {
     Int? operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
         if (operand is .const_operand(constant)) { return self.constant(frame, constant); }
         if (operand is .function_operand(reference)) { return self.function_value(frame, reference); }
+        if (operand is .raw_fn_vtable_operand(raw_type, type_id)) {
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            guard self.program.program.raw_fn_vtable_global(reader.type_id(raw_type)) is .some(id) else {
+                self.frame_error(frame, "comptime_dependency_not_ready", "RawFn function table is not prepared");
+                return null;
+            }
+            return self.operand(frame, jil.global_address_operand_value(jil.GlobalRef(id: id, type_id: type_id)));
+        }
+        if (operand is .global_address_operand(global)) {
+            guard self.global_address(frame, global) is .some(address) else { return null; }
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            if (self.memory.reference(reader.type_id(global.type_id), address) is .some(pointer)) { return pointer; }
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL global reference");
+            return null;
+        }
         if (operand is .global_operand(global)) {
             guard self.global_address(frame, global) is .some(address) else { return null; }
             return self.copy_value(frame, address);
@@ -1117,11 +1145,25 @@ struct Executor: Movable {
         return self.resolve_place_prefix(frame, place, place.projection.length);
     }
 
-    #doc 只导入已发布的不可变常量；全局存储在一次求值中共享身份，不回头计算 initializer。
+    #doc 导入已发布常量或 compiler-generated 静态值；全局存储共享身份，不回头计算源码 initializer。
     Int? global_address(Self&! self, frame_api.Frame& frame, jil.GlobalRef reference) {
         Int index = reference.id.to_index();
         if (self.globals.get(index) is .some(address)) { return address$.get(); }
         jil.Global& global = self.program.program.globals.ref_at(index);
+        if (global.read_only && !global.is_external && global.origin is .generated(_)
+            && global.initializer is .some(initializer)) {
+            guard self.memory.allocate(global.type_id) is .some(address) else {
+                self.frame_error(frame, "comptime_memory_limit", "cannot allocate generated static storage");
+                return null;
+            }
+            self.globals.set(index, address);
+            if (!self.initialize_static_value(frame, initializer, address)) {
+                self.frame_error(frame, "comptime_global_not_materializable", "cannot import generated static storage");
+                return null;
+            }
+            self.memory.freeze(address);
+            return address;
+        }
         if (global.read_only && global.origin is .source(def_id)) {
             if (self.store.comptime_store.const_value(def_id) is .some(constant)) {
                 reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
@@ -1140,6 +1182,41 @@ struct Executor: Movable {
         self.frame_error(frame, "comptime_global_not_supported",
             "eval requires a published constant global; runtime storage is not available");
         return null;
+    }
+
+    #doc JIL 静态值按逻辑字段导入，指针保留全局身份；预登记根允许静态表之间的循环引用。
+    Bool initialize_static_value(Self&! self, frame_api.Frame& frame, jil.StaticValue value, Int destination) {
+        if (!self.tick(frame, frame.span)) { return false; }
+        if (value is .scalar(constant)) {
+            guard self.constant(frame, constant) is .some(source) else { return false; }
+            return self.memory.copy_into(self.store, self.query, destination, source);
+        }
+        if (value is .function(reference)) {
+            guard self.function_value(frame, reference) is .some(source) else { return false; }
+            return self.memory.copy_into(self.store, self.query, destination, source);
+        }
+        if (value is .global_address(reference)) {
+            guard self.global_address(frame, reference) is .some(address) else { return false; }
+            self.memory.set_data(destination, .reference(address));
+            return true;
+        }
+        guard jil.static_value_fields(value) is .some(fields) else { return false; }
+        if (!self.memory.ensure_aggregate(self.store, self.query, destination)) { return false; }
+        Int active! = -1;
+        if (value is .variant(index, _)) {
+            active = index;
+            if (!self.memory.select_payload(self.store, self.query, destination, active)) { return false; }
+        }
+        Int index! = 0;
+        while (index < fields.length) {
+            Int field_index! = index;
+            if (index == 1 && active >= 0) { field_index = active; }
+            guard self.memory.child(self.store, self.query, destination, field_index) is .some(child)
+                else { return false; }
+            if (!self.initialize_static_value(frame, fields[index].value, child)) { return false; }
+            index = index + 1;
+        }
+        return true;
     }
 
     #doc 求值 projection 前缀，不复制 JIL projection；末尾取址可保留原元素指针的分配身份。

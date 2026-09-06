@@ -101,7 +101,13 @@ public value.ComptimeValue? evaluate_checked_expression(
     ) is .some(expression) else { return null; }
     list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
     if (!prepare_eval_dependencies(ctx, .generated_function(expression), args.slice(),
-        { [ref graph] eval_ctx, function_def => prepare_eval_source(eval_ctx, graph, function_def) }
+        { [ref graph] eval_ctx, item, bindings =>
+            if (item is .source_instance(identity)) {
+                qid.DefId function_def = eval_ctx.jil.program.function_instance_at(identity).def_id;
+                if (!prepare_eval_source(eval_ctx, graph, function_def)) { return null; }
+            }
+            prepare_eval_metadata(eval_ctx, graph, item, bindings)
+        }
     )) { return null; }
     return executor.evaluate_expression(
         ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, args.slice()
@@ -131,7 +137,7 @@ public value.ComptimeValue? evaluate_checked_expression(
 #end
 Bool prepare_eval_dependencies(
     context.CompilerContext&! ctx, jil.MonoItem root, types.GenericArg[]& root_args,
-    Fn<Bool, context.CompilerContext&!, qid.DefId> prepare_source
+    Fn<references.References?, context.CompilerContext&!, jil.MonoItem, bindings_api.GenericBindings&> prepare_item
 ) {
     bindings_api.GenericBindings expression_bindings! = bindings_api.GenericBindings();
     if (root is .generated_function(id)) {
@@ -143,24 +149,25 @@ Bool prepare_eval_dependencies(
     }
     list.ArrayList<jil.MonoItem> pending! = list.ArrayList<jil.MonoItem>();
     set.HashSet<Int> seen! = set.HashSet<Int>();
+    set.HashSet<Int> seen_globals! = set.HashSet<Int>();
     append_eval_item(root, pending$.mut_ref(), seen$.mut_ref());
     Int prepared! = 0;
     Int dropped! = 0;
     while (dropped < pending.len()) {
         while (prepared < pending.len()) {
             jil.MonoItem item = pending.get(prepared);
-            if (item is .source_instance(identity)) {
-                qid.DefId function_def = ctx.jil.program.function_instance_at(identity).def_id;
-                if (!prepare_source(ctx$.mut_ref(), function_def)) { return false; }
+            guard prepare_item(ctx$.mut_ref(), item, expression_bindings$.ref()) is .some(dependencies) else {
+                return false;
             }
-            append_eval_references(ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref());
+            append_eval_dependencies(ctx, dependencies, pending$.mut_ref(),
+                seen$.mut_ref(), seen_globals$.mut_ref());
             prepared = prepared + 1;
         }
         if (!check_eval_borrows(ctx, pending.slice(), dropped)) { return false; }
         while (dropped < prepared) {
             jil.MonoItem item = pending.get(dropped);
             if (!prepare_eval_drops(
-                ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref()
+                ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref(), seen_globals$.mut_ref()
             )) { return false; }
             dropped = dropped + 1;
         }
@@ -208,7 +215,7 @@ Bool check_eval_borrows(context.CompilerContext&! ctx, jil.MonoItem[]& items, In
 
 Bool prepare_eval_drops(
     context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
-    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
 ) {
     list.ArrayList<jil.FunctionId> glues! = list.ArrayList<jil.FunctionId>();
     if (item is .source_instance(identity)) {
@@ -227,7 +234,7 @@ Bool prepare_eval_drops(
                 ctx.store$.ref(), ctx.query.layout$.mut_ref(), ctx.jil.storage$.ref(),
                 ctx.jil.program$.mut_ref(), ctx.jil.drop_elaboration$.mut_ref(), id
             );
-            append_eval_references(ctx, item, expression_bindings, pending, seen);
+            append_eval_references(ctx, item, expression_bindings, pending, seen, seen_globals);
         }
     }
     Int index! = 0;
@@ -247,7 +254,25 @@ Void append_eval_item(jil.MonoItem item, list.ArrayList<jil.MonoItem>&! pending,
 
 Void append_eval_references(
     context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
-    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
+) {
+    references.References dependencies = collect_eval_references(ctx, item, expression_bindings);
+    append_eval_dependencies(ctx, dependencies, pending, seen, seen_globals);
+}
+
+#doc 求值实例只遍历一次具体依赖，同一结果供元数据派生和执行队列使用。
+references.References? prepare_eval_metadata(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, jil.MonoItem item,
+    bindings_api.GenericBindings& expression_bindings
+) {
+    references.References dependencies = collect_eval_references(ctx, item, expression_bindings);
+    if (!lower.ensure_eval_metadata(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output,
+        graph, ctx.jil$.mut_ref(), item, dependencies$.ref())) { return null; }
+    return dependencies;
+}
+
+references.References collect_eval_references(
+    context.CompilerContext& ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings
 ) {
     bindings_api.GenericBindings empty! = bindings_api.GenericBindings();
     references.References dependencies!;
@@ -261,7 +286,7 @@ Void append_eval_references(
             ctx.store$.ref(), bindings$.ref(), ctx.jil.program.source_function(instance.def_id)
         );
     } else {
-        guard item is .generated_function(id) else { assert(false); return; }
+        guard item is .generated_function(id) else { assert(false); return references.References(); }
         jil.Function function = ctx.jil.program.function(id);
         if (jil.function_is_eval_expression(function.origin)) {
             dependencies = references.collect_instance_function_refs(ctx.store$.ref(), expression_bindings, function);
@@ -269,6 +294,42 @@ Void append_eval_references(
             dependencies = references.collect_instance_function_refs(ctx.store$.ref(), empty$.ref(), function);
         }
     }
+    return dependencies;
+}
+
+Void append_eval_dependencies(
+    context.CompilerContext&! ctx, references.References dependencies!,
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
+) {
+    append_eval_function_references(ctx, dependencies$.ref(), pending, seen);
+    Int table_index! = 0;
+    while (table_index < dependencies.raw_fn_vtables.len()) {
+        qid.TypeId raw_type = dependencies.raw_fn_vtables.get(table_index);
+        guard ctx.jil.program.raw_fn_vtable_global(raw_type) is .some(id) else { assert(false); return; }
+        dependencies.globals.add(id);
+        table_index = table_index + 1;
+    }
+    Int global_cursor! = 0;
+    while (global_cursor < dependencies.globals.len()) {
+        jil.GlobalId id = dependencies.globals.get(global_cursor);
+        global_cursor = global_cursor + 1;
+        if (seen_globals.has(id.to_index())) { continue; }
+        seen_globals.add(id.to_index());
+        references.References children = references.collect_global_refs(ctx.jil.program.globals.get(id.to_index()));
+        append_eval_function_references(ctx, children$.ref(), pending, seen);
+        Int index! = 0;
+        while (index < children.globals.len()) {
+            dependencies.globals.add(children.globals.get(index));
+            index = index + 1;
+        }
+    }
+}
+
+#doc 普通函数和静态表中的函数引用共用求值队列，静态表遍历不改变运行期发射根。
+Void append_eval_function_references(
+    context.CompilerContext&! ctx, references.References& dependencies,
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen
+) {
     Int index! = 0;
     while (index < dependencies.functions.len()) {
         references.FunctionReference& dependency = dependencies.functions.ref_at(index);
@@ -340,19 +401,31 @@ Bool prepare_resolved_eval(
     module_graph.ModuleGraph&! graph, jil.MonoItem root, types.GenericArg[]& root_args
 ) {
     return prepare_eval_dependencies(ctx, root, root_args,
-        { [ref! resolver, ref! graph] eval_ctx, function_def =>
-            if (!resolver.ensure_declaration_model(eval_ctx, graph, function_def)) { return false; }
-            if (!prepare_type_models(eval_ctx, resolver, graph, function_def)) { return false; }
-            if (!type_check.ensure_body_checked(eval_ctx, graph.root_module,
-                { [ref! resolver, ref! graph] nested_ctx, node, target =>
-                    evaluate_checked_expression(nested_ctx, resolver, graph, node, target)
-                }, function_def
-            )) { return false; }
-            lower.ensure_checked_source_function(
-                eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(), eval_ctx.output,
-                graph, eval_ctx.jil$.mut_ref(), function_def
-            )
+        { [ref! resolver, ref! graph] eval_ctx, item, bindings =>
+            if (item is .source_instance(identity)) {
+                qid.DefId function_def = eval_ctx.jil.program.function_instance_at(identity).def_id;
+                if (!prepare_eval_source(eval_ctx, resolver, graph, function_def)) { return null; }
+            }
+            prepare_eval_metadata(eval_ctx, graph, item, bindings)
         }
+    );
+}
+
+#doc resolver 权限只用于准备源码依赖，派生元数据继续由 JIL lowering 负责。
+Bool prepare_eval_source(
+    context.CompilerContext&! eval_ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, qid.DefId function_def
+) {
+    if (!resolver.ensure_declaration_model(eval_ctx, graph, function_def)) { return false; }
+    if (!prepare_type_models(eval_ctx, resolver, graph, function_def)) { return false; }
+    if (!type_check.ensure_body_checked(eval_ctx, graph.root_module,
+        { [ref! resolver, ref! graph] nested_ctx, node, target =>
+            evaluate_checked_expression(nested_ctx, resolver, graph, node, target)
+        }, function_def
+    )) { return false; }
+    return lower.ensure_checked_source_function(
+        eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(), eval_ctx.output,
+        graph, eval_ctx.jil$.mut_ref(), function_def
     );
 }
 
