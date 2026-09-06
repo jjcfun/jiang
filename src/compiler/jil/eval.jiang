@@ -301,8 +301,9 @@ struct Executor: Movable {
     }
 
     Void statement(Self&! self, frame_api.Frame&! frame, jil.Statement statement) {
-        // 初始化/独占标记已被 borrow 与 drop scheduling 消费，不是第二次值写入。
-        if (statement.kind is .drop_initialized_stmt(_) || statement.kind is .exclusive_stmt(_)) { return; }
+        // 初始化、forget 和独占标记已被 borrow/drop 消费，析构标志已有对应 JIL 写入。
+        if (statement.kind is .drop_initialized_stmt(_) || statement.kind is .exclusive_stmt(_)
+            || statement.kind is .forget_stmt(_)) { return; }
         if (statement.kind is .assign_stmt(assign)) {
             qid.TypeId type_id = self.place_type(frame, assign.destination);
             guard self.rvalue(frame, assign.value, type_id) is .some(result) else { return; }
@@ -527,6 +528,13 @@ struct Executor: Movable {
         }
         if (rvalue is .layout_value(layout_value)) { return self.layout_value(frame, layout_value, result_type); }
         if (rvalue is .aggregate_value(aggregate)) { return self.aggregate(frame, aggregate, result_type); }
+        if (rvalue is .closure_value(closure)) {
+            if (self.closure_value(frame, closure, result_type) is .some(result)) { return result; }
+            if (!self.failed) {
+                self.frame_error(frame, "comptime_invalid_closure", "cannot construct JIL closure storage");
+            }
+            return null;
+        }
         if (rvalue is .optional_value(optional)) { return self.optional_value(frame, optional, result_type); }
         if (rvalue is .error_union_value(error_union)) { return self.error_union_value(frame, error_union, result_type); }
         if (rvalue is .discriminant_value(discriminant)) {
@@ -929,6 +937,19 @@ struct Executor: Movable {
             Bool same_element = self.store.types.same_type_ignoring_mutability(
                 source_handle.element, target_handle.element
             );
+            if (cell.data is .reference(storage)) {
+                Bool erased_target = target_handle.kind == .raw_pointer
+                    && self.store.types.same_type(target_handle.element, self.store.types.unit_type());
+                Bool restored_source = source_handle.kind == .raw_pointer
+                    && self.store.types.same_type(source_handle.element, self.store.types.unit_type())
+                    && self.store.types.same_type_ignoring_mutability(
+                        self.memory.get(storage).type_id, target_handle.element);
+                if (erased_target || restored_source) {
+                    if (self.memory.reference(result_type, storage) is .some(result)) { return result; }
+                    self.frame_error(frame, "comptime_invalid_pointer", "erased pointer storage is no longer alive");
+                    return null;
+                }
+            }
             if (same_element && cell.data is .reference(pointer)) {
                 if (self.memory.reference(result_type, pointer) is .some(result)) { return result; }
                 self.frame_error(frame, "comptime_invalid_pointer", "eval pointer target is dead or memory limit exceeded");
@@ -1498,6 +1519,70 @@ struct Executor: Movable {
         }
         if (!self.write_aggregate_fields(frame, result, aggregate.fields)) { return null; }
         return result;
+    }
+
+    #doc 闭包保持 JIL 的环境/函数表双字段表示，调用和销毁由已有间接调用与 drop 指令处理。
+    Int? closure_value(
+        Self&! self, frame_api.Frame&! frame, jil.ClosureRvalue closure, qid.TypeId result_type
+    ) {
+        qid.TypeId closure_type;
+        qid.TypeId vtable_type;
+        jil.GlobalId table;
+        {
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            list.ArrayList<types.GenericArg> args = reader.generic_args(closure.args);
+            guard self.program.program.closure_vtable_global(closure.lambda_def, args.slice(),
+                closure.environment_storage == .heap) is .some(id) else {
+                self.frame_error(frame, "comptime_dependency_not_ready", "closure function table is not prepared");
+                return null;
+            }
+            table = id;
+            closure_type = reader.type_id(closure.closure_type);
+            vtable_type = reader.type_id(closure.vtable_type);
+        }
+        Int? allocated!;
+        if (closure.storage == .heap) { allocated = self.memory.allocate_heap(closure_type); }
+        else { allocated = self.memory.allocate(closure_type); }
+        guard allocated is .some(record) else {
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL closure record");
+            return null;
+        }
+        guard self.memory.child(self.store, self.query, record, 0) is .some(environment) else { return null; }
+        if (!self.initialize_closure_environment(frame, closure, environment)) { return null; }
+        guard self.memory.child(self.store, self.query, record, 1) is .some(vtable) else { return null; }
+        guard self.global_address(frame, jil.GlobalRef(id: table, type_id: vtable_type))
+            is .some(table_address) else { return null; }
+        self.memory.set_data(vtable, .reference(table_address));
+        if (closure.storage != .heap) { return record; }
+        if (self.memory.reference(result_type, record) is .some(owner)) { return owner; }
+        self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL closure owner");
+        return null;
+    }
+
+    #doc 栈环境使用 JIL 显式 local；堆环境跨帧保留，直到已展开的析构路径释放。
+    Bool initialize_closure_environment(
+        Self&! self, frame_api.Frame&! frame, jil.ClosureRvalue closure, Int pointer
+    ) {
+        if (closure.captures.length == 0) {
+            self.memory.set_data(pointer, .null_pointer);
+            return true;
+        }
+        Int environment;
+        if (closure.environment_storage == .heap) {
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            guard self.memory.allocate_heap(reader.type_id(closure.environment_type)) is .some(allocated) else {
+                self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL closure environment");
+                return false;
+            }
+            environment = allocated;
+        } else {
+            guard closure.stack_environment is .some(place) else { return false; }
+            guard self.resolve_place(frame, place) is .some(address) else { return false; }
+            environment = address;
+        }
+        if (!self.write_aggregate_fields(frame, environment, closure.captures)) { return false; }
+        self.memory.set_data(pointer, .reference(environment));
+        return true;
     }
 
     Bool write_aggregate_fields(Self&! self, frame_api.Frame&! frame, Int target, jil.Operand[]& fields) {
