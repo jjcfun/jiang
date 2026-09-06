@@ -1,6 +1,7 @@
-// 函数树、泛型实例和外部函数的 JIL lowering。
-//
-// 本模块负责从 Semantic Model 声明生成具体 JIL Function。
+#doc(module)
+    将已检查的 Semantic Model 函数与表达式发布为 JIL；源码模板由实例绑定复用。
+    按需入口与整包 lowering 共享源码 drop scheduling 状态。
+#end
 
 import context = "../../context.jiang";
 import database = "../../db.jiang";
@@ -52,6 +53,53 @@ struct TemplateAsyncDependency: Copyable {
 }
 
 public extend lower_context.Context {
+    #doc 使用原声明内的 NodeId 缓存表达式 CFG，不合成 AST/function declaration。
+    public jil.FunctionId lower_eval_expression(
+        Self&! self, database.JilInstanceQuery& body_query,
+        database.LayoutQuery&! layouts, sem.NodeId root, qid.TypeId result_type
+    ) {
+        jil.GeneratedKey key = jil.GeneratedKey(
+            .eval_expression, identity_def: root.owner_def,
+            identity_type: result_type, expression_index: root.local_index
+        );
+        if (self.program.generated_function(key) is .some(id)) { return id; }
+        jil.FunctionId id = self.compute_eval_expression(body_query, layouts, root, result_type, key);
+        jil.Function scheduled = drop_elaborate.schedule_function(
+            self.store, layouts, self.storage, self.program.function(id)
+        );
+        self.program.set_function(scheduled);
+        return id;
+    }
+
+    #doc 完成表达式 body lowering 后结束其可变借用，调用方再推进 drop scheduling。
+    jil.FunctionId compute_eval_expression(
+        Self&! self, database.JilInstanceQuery& body_query, database.LayoutQuery&! layouts,
+        sem.NodeId root, qid.TypeId result_type, jil.GeneratedKey key
+    ) {
+        jil.FunctionId id = jil.FunctionId.from_index(self.program.functions.len());
+        token.Span span = self.model_span(root);
+        jil.GeneratedFunctionOrigin origin = jil.GeneratedFunctionOrigin(
+            name: self.program.add_generated_name("__eval_expression"),
+            module_id: self.store.defs.get(root.owner_def).module_id,
+            kind: .eval_expression, provenance_def: root.owner_def, identity_type: null
+        );
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        self.collect_template_args(root.owner_def, args$.mut_ref());
+        BodyBuilder builder! = BodyBuilder(self.storage, span, false);
+        BodyLowerer lowerer! = BodyLowerer(
+            self, body_query, layouts, builder$.mut_ref(), jil.BodyId.from_index(id.to_index()),
+            self.model.def_ref(root.owner_def), args.slice(), span
+        );
+        jil.Body body = lowerer.lower_expression(root, result_type);
+        return self.program.add_generated_function(key, jil.Function(
+            id: id, origin: .generated(origin), args: self.storage.generic_arg_array(args.slice()),
+            signature_id: null, effects: types.EffectSet(), is_coroutine: false,
+            coroutine_frame: null, is_coroutine_resume: false, is_coroutine_completion: false,
+            is_language_entry: false, is_runtime_entry: false, is_external: false,
+            inline_always: false, naked: false, span: span, body: body
+        ));
+    }
+
     public Void lower_def_tree(
         Self&! self,
         database.JilInstanceQuery& instance_query,
@@ -340,20 +388,21 @@ public extend lower_context.Context {
         database.LayoutQuery&! layouts,
         Int&! global_cursor
     ) {
-        while (global_cursor$.get() < self.program.globals.len()) {
-            Int global_index = global_cursor$.get();
-            global_cursor$.set(global_index + 1);
-            list.ArrayList<jil_references.FunctionReference> references =
+        while (global_cursor$.get() < self.program.runtime_global_count()) {
+            Int global_index = self.program.runtime_global_at(global_cursor$.get()).to_index();
+            global_cursor$.set(global_cursor$.get() + 1);
+            jil_references.References references =
                 jil_references.collect_global_refs(
                     self.program.globals.get(global_index)
                 );
+            self.mark_runtime_references(references$.ref());
             Int reference_index! = 0;
-            while (reference_index < references.len()) {
+            while (reference_index < references.functions.len()) {
                 self.lower_referenced_instance(
                     body_query,
                     layouts,
                     null,
-                    references.ref_at(reference_index),
+                    references.functions.ref_at(reference_index),
                     self.program.globals.get(global_index).span,
                     0,
                     null,
@@ -402,6 +451,7 @@ public extend lower_context.Context {
             jil_references.collect_instance_function_refs(
                 self.store, substitutions$.ref(), function
             );
+        self.mark_runtime_references(references$.ref());
         Int index! = 0;
         while (index < references.functions.len()) {
             self.lower_referenced_instance(
@@ -439,6 +489,7 @@ public extend lower_context.Context {
         if (function.origin is .source(def_id)) { caller_def = def_id; }
         jil_references.References references =
             jil_references.collect_function_refs(function);
+        self.mark_runtime_references(references$.ref());
         Int reference_index! = 0;
         while (reference_index < references.functions.len()) {
             jil_references.FunctionReference& reference =
@@ -455,6 +506,28 @@ public extend lower_context.Context {
                 self.template_arg_count(caller_def)
             );
             reference_index = reference_index + 1;
+        }
+    }
+
+    #doc 把函数和静态初始化器的显式引用及 Domain 隐含存储加入同一运行期闭包。
+    Void mark_runtime_references(Self&! self, jil_references.References& references) {
+        Int index! = 0;
+        while (index < references.generated_functions.len()) {
+            self.program.mark_generated_function(references.generated_functions.get(index));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < references.globals.len()) {
+            self.program.mark_runtime_global(references.globals.get(index));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < references.domain_executors.len()) {
+            if (self.program.domain_executor_descriptor(references.domain_executors.get(index)) is .some(descriptor)) {
+                self.program.mark_runtime_global(descriptor.descriptor.id);
+                self.program.mark_runtime_global(descriptor.domain_config.id);
+            }
+            index = index + 1;
         }
     }
 
@@ -503,13 +576,16 @@ public extend lower_context.Context {
             );
         }
         if (function_ref.variant is .coroutine_serial_completion) {
-            self.ensure_serial_completion_shim(function_def, args, span);
+            jil.FunctionId id = self.ensure_serial_completion_shim(function_def, args, span);
+            self.program.mark_generated_function(id);
         }
         if (function_ref.variant is .coroutine_start) {
-            self.ensure_async_callable_shims(function_def, args, span);
+            jil.FunctionId id = self.ensure_async_callable_shims(function_def, args, span);
+            self.program.mark_generated_function(id);
         }
         if (function_ref.variant is .coroutine_sync) {
-            self.ensure_async_sync_shim(function_def, args, span);
+            jil.FunctionId id = self.ensure_async_sync_shim(function_def, args, span);
+            self.program.mark_generated_function(id);
         }
         if (function_ref.closure is .some(closure)) {
             self.materialize_closure(layouts, closure, args, span);
@@ -702,11 +778,13 @@ public extend lower_context.Context {
         }
     }
 
-    Void schedule_source_function(
+    #doc 按需发布与最终 sweep 复用同一份已插入析构标志的源码 CFG。
+    public Void schedule_source_function(
         Self&! self,
         database.LayoutQuery&! layouts,
         qid.DefId function_def
     ) {
+        if (self.drop_elaboration.source_is_scheduled(function_def)) { return; }
         jil.Function source = drop_elaborate.schedule_function(
             self.store,
             layouts,
@@ -715,6 +793,7 @@ public extend lower_context.Context {
         );
         if (!source.effects.has_async) {
             self.program.set_source_function(function_def, source);
+            self.drop_elaboration.mark_source_scheduled(function_def);
             return;
         }
         qid.TypeId result_type =
@@ -738,6 +817,7 @@ public extend lower_context.Context {
             function_def,
             jil.function_with_coroutine_frame(source, frame)
         );
+        self.drop_elaboration.mark_source_scheduled(function_def);
     }
 
     Bool materialize_template_async_function(
@@ -979,39 +1059,45 @@ public extend lower_context.Context {
             && references.runtime_domain_descriptors.empty()) {
             return;
         }
-        BodyBuilder builder! = BodyBuilder(
-            self.storage, template_span, template_is_async
-        );
-        BodyLowerer lowerer! = BodyLowerer(
-            self,
-            body_query,
-            layouts,
-            builder$.mut_ref(),
-            template_body_id,
-            model_def,
-            args,
-            template_span
-        );
-        Int index! = 0;
-        while (index < references.trait_vtables.len()) {
-            jil.TraitVTableRef reference = references.trait_vtables.get(index);
-            index = index + 1;
-            jil.TraitVTableKey key = reference.key;
-            guard lowerer.ensure_trait_vtable_global(
-                key.trait_def, key.subject_type, reference.span
-            ) is .some(_) else {
-                self.program.mark_error();
-                return;
+        list.ArrayList<jil.GlobalId> globals! = list.ArrayList<jil.GlobalId>();
+        {
+            BodyBuilder builder! = BodyBuilder(self.storage, template_span, template_is_async);
+            BodyLowerer lowerer! = BodyLowerer(
+                self, body_query, layouts, builder$.mut_ref(), template_body_id, model_def, args, template_span
+            );
+            Int index! = 0;
+            while (index < references.trait_vtables.len()) {
+                jil.TraitVTableRef reference = references.trait_vtables.get(index);
+                index = index + 1;
+                jil.TraitVTableKey key = reference.key;
+                guard lowerer.ensure_trait_vtable_global(
+                    key.trait_def, key.subject_type, reference.span
+                ) is .some(global_id) else {
+                    self.program.mark_error();
+                    return;
+                }
+                globals.add(global_id);
             }
+            index = 0;
+            while (index < references.runtime_domain_descriptors.len()) {
+                jil_references.RuntimeDomainDescriptorReference reference =
+                    references.runtime_domain_descriptors.get(index);
+                index = index + 1;
+                lowerer.ensure_runtime_domain_executor_descriptor(reference.domain_type, reference.span);
+            }
+        }
+        Int index! = 0;
+        while (index < globals.len()) {
+            self.program.mark_runtime_global(globals.get(index));
+            index = index + 1;
         }
         index = 0;
         while (index < references.runtime_domain_descriptors.len()) {
-            jil_references.RuntimeDomainDescriptorReference reference =
-                references.runtime_domain_descriptors.get(index);
+            qid.TypeId domain_type = references.runtime_domain_descriptors.get(index).domain_type;
+            if (self.program.runtime_domain_executor_descriptor(domain_type) is .some(descriptor)) {
+                self.program.mark_runtime_global(descriptor.id);
+            }
             index = index + 1;
-            lowerer.ensure_runtime_domain_executor_descriptor(
-                reference.domain_type, reference.span
-            );
         }
     }
 

@@ -8,6 +8,7 @@ import diagnostic_helper = "../diagnostic/helper.jiang";
 import store_api = "../store.jiang";
 import qid = "../id.jiang";
 import types = "../sema/type.jiang";
+import generic_bindings = "../sema/generic/bindings.jiang";
 import jil = "./model.jiang";
 import jil_references = "./references.jiang";
 import type_requirements = "./type_requirements.jiang";
@@ -48,45 +49,98 @@ Bool verify_emission_ready(
     while (function_index < store.program.functions.len()) {
         jil.Function function = store.program.functions.get(function_index);
         function_index = function_index + 1;
-        if (function.is_external) { continue; }
-        jil_references.References references =
-            jil_references.collect_function_refs(function);
-        if (!references.trait_vtables.empty()) {
-            diagnostic_helper.add_package_error(
-                compiler_store.diagnostics$.mut_ref(),
-                "emission JIL contains an unresolved trait vtable demand",
-                "jil_concrete_trait_vtable"
-            );
-            store.program.mark_error();
-            return false;
-        }
-        Int block_index! = 0;
-        while (block_index < function.body.blocks.length) {
-            jil.Block block = function.body.blocks[block_index];
-            if (block.terminator.kind is .call_term(call)
-                && (call.deferred_async_direct || call.deferred_async_task != null)) {
-                std.StringBuilder message! = std.StringBuilder();
-                message.append("emission JIL contains deferred async operation in FunctionId ");
-                message.append(function.id.to_index());
-                message.append(" block ");
-                message.append(block.id.to_index());
-                append_deferred_async_failure(
-                    compiler_store$.ref(), store$.ref(), function, call, message$.mut_ref()
-                );
-                diagnostic_helper.add_package_error(
-                    compiler_store.diagnostics$.mut_ref(),
-                    message.into_string().bytes(),
-                    "jil_concrete_deferred_async"
-                );
-                store.program.mark_error();
-                return false;
-            }
-            block_index = block_index + 1;
-        }
+        if (!store.program.has_generated_mono_item(function.id)) { continue; }
+        if (!verify_function_emission_ready(compiler_store, store, function)) { return false; }
     }
     guard type_requirements.concrete_failure(
         compiler_store$.ref(), store$.ref()
     ) is .some(failure) else { return true; }
+    return report_concrete_failure(compiler_store, store, failure);
+}
+
+Bool verify_function_emission_ready(
+    store_api.CompilerStore&! compiler_store, jil.Store&! store, jil.Function function
+) {
+    if (function.is_external) { return true; }
+    jil_references.References references = jil_references.collect_function_refs(function);
+    if (!references.trait_vtables.empty()) {
+        diagnostic_helper.add_package_error(
+            compiler_store.diagnostics$.mut_ref(),
+            "emission JIL contains an unresolved trait vtable demand", "jil_concrete_trait_vtable"
+        );
+        store.program.mark_error();
+        return false;
+    }
+    Int block_index! = 0;
+    while (block_index < function.body.blocks.length) {
+        jil.Block block = function.body.blocks[block_index];
+        block_index = block_index + 1;
+        guard block.terminator.kind is .call_term(call) else { continue; }
+        if (!call.deferred_async_direct && call.deferred_async_task == null) { continue; }
+        std.StringBuilder message! = std.StringBuilder();
+        message.append("emission JIL contains deferred async operation in FunctionId ");
+        message.append(function.id.to_index());
+        message.append(" block ");
+        message.append(block.id.to_index());
+        append_deferred_async_failure(compiler_store$.ref(), store$.ref(), function, call, message$.mut_ref());
+        diagnostic_helper.add_package_error(
+            compiler_store.diagnostics$.mut_ref(), message.into_string().bytes(), "jil_concrete_deferred_async"
+        );
+        store.program.mark_error();
+        return false;
+    }
+    return true;
+}
+
+// source instance 保留泛型 CFG，检查其结构与替换后的类型；generated body 检查实际 pass 状态。
+public Bool verify_instance(
+    store_api.CompilerStore&! compiler_store, jil.Store&! store, jil.MonoItem item, Stage stage
+) {
+    if (store.program.has_errors()) { return false; }
+    Bool valid! = false;
+    if (item is .source_instance(identity)) {
+        qid.DefId def_id = store.program.function_instance_at(identity).def_id;
+        valid = store.program.has_source_function(def_id)
+            && verify_function(store, store.program.source_function(def_id), .lower_output, true);
+    } else if (item is .generated_function(function_id)) {
+        jil.Function function = store.program.functions.get(function_id.to_index());
+        if (!verify_function_emission_ready(compiler_store, store, function)) { return false; }
+        valid = function.id == function_id && verify_function(store, function, stage, false);
+    }
+    if (!valid) {
+        add_failure(compiler_store.diagnostics$.mut_ref(), stage);
+        store.program.mark_error();
+        return false;
+    }
+    guard type_requirements.concrete_failure(
+        compiler_store$.ref(), store$.ref(), item
+    ) is .some(failure) else { return true; }
+    return report_concrete_failure(compiler_store, store, failure);
+}
+
+#doc
+    表达式模板只验证原始 CFG 结构，具体性按本次泛型绑定验证。
+#end
+public Bool verify_expression(
+    store_api.CompilerStore&! compiler_store, jil.Store&! store, jil.FunctionId id,
+    generic_bindings.GenericBindings& bindings
+) {
+    if (store.program.has_errors()) { return false; }
+    jil.Function function = store.program.function(id);
+    if (!verify_function(store, function, .lower_output, true)) {
+        add_failure(compiler_store.diagnostics$.mut_ref(), .lower_output);
+        store.program.mark_error();
+        return false;
+    }
+    guard type_requirements.expression_concrete_failure(
+        compiler_store$.ref(), function, bindings
+    ) is .some(failure) else { return true; }
+    return report_concrete_failure(compiler_store, store, failure);
+}
+
+Bool report_concrete_failure(
+    store_api.CompilerStore&! compiler_store, jil.Store&! store, type_requirements.ConcreteFailure failure
+) {
     std.StringBuilder message! = std.StringBuilder();
     message.append("emission JIL contains an unbound generic parameter");
     if (failure.type_id is .some(type_id)) {
@@ -384,6 +438,7 @@ Bool verify_functions(jil.Store& store, Stage stage) {
     while (index < store.program.functions.len()) {
         jil.Function function = store.program.functions.get(index);
         if (function.id.to_index() != index) { return false; }
+        if (!store.program.has_generated_mono_item(function.id)) { index = index + 1; continue; }
         if (function.origin is .source(_)
             && !function.is_external
             && !function.is_runtime_entry) {

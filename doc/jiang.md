@@ -721,6 +721,12 @@ comptime {
 
 构建模式只能由 `jiang --mode debug|release` 选择，程序不能在源码中修改它。
 
+`comptime { ... }` 与 `comptime [eval] { ... }` 等价。`eval` 和 `generate` 是块的选项，
+仍可用作普通标识符；不支持旧的 `[early]` / `[late]` 名称。
+`comptime [eval]` 在语义分析需要结果时执行；`comptime [generate]` 定义由 `jiang generate`
+在输入完整通过语义检查后执行的生成任务。普通 build/check 不执行 generate 文件输出，
+也不会因为 eval 失败而自动改用 generate。
+
 ### 进程级 panic
 
 `panic(message)` 是默认 prelude 提供的不可恢复错误入口。它向标准错误输出 `message` 与换行，

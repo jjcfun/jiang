@@ -1,0 +1,297 @@
+#doc(module)
+    一次 JIL 求值的逻辑存储，地址不是宿主指针。帧存储与显式分配的存储分别结束生命周期。
+    聚合字段保持稳定身份，复制不复制引用目标；结果导出时才固化为不可变编译期值。
+#end
+
+import compiler_store = "../../store.jiang";
+import qid = "../../id.jiang";
+import value = "../../sema/comptime/value.jiang";
+import types = "../../sema/type.jiang";
+import database = "../../db.jiang";
+import layout = "../../layout.jiang";
+import list = "../../support/list.jiang";
+import set = "../../support/set.jiang";
+
+public enum CellData: Copyable {
+    uninitialized,
+    scalar(value.ComptimeValueData),
+    aggregate(Int start, Int count),
+    reference(Int target),
+    null_pointer,
+}
+
+public struct Cell: Copyable {
+    public qid.TypeId type_id;
+    public CellData data;
+    public Bool alive;
+}
+
+public struct Memory: Movable {
+    list.ArrayList<Cell> cells!;
+    set.HashSet<Int> heap_roots!;
+    public Int limit;
+
+    public init(self, Int limit = 1000000) {
+        self.cells = list.ArrayList<Cell>();
+        self.heap_roots = set.HashSet<Int>();
+        self.limit = limit;
+    }
+
+    public Cell get(self, Int address) { return self.cells.get(address); }
+
+    public Int? allocate(Self&! self, qid.TypeId type_id) {
+        if (self.cells.len() >= self.limit) { return null; }
+        Int address = self.cells.len();
+        self.cells.add(Cell(type_id: type_id, data: .uninitialized, alive: true));
+        return address;
+    }
+
+    #doc JIL 显式分配的根不随调用帧退出失效；只有 free 可以释放它及其子字段。
+    public Int? allocate_heap(Self&! self, qid.TypeId type_id) {
+        guard self.allocate(type_id) is .some(address) else { return null; }
+        self.heap_roots.add(address);
+        return address;
+    }
+
+    #doc free 只结束一次活跃分配，不执行析构；析构顺序完全由已经展开的 JIL 决定。
+    public Bool release_heap(Self&! self, Int address) {
+        if (!self.heap_roots.has(address) || !self.get(address).alive) { return false; }
+        self.set_live(address, false);
+        return true;
+    }
+
+    public Int? scalar(Self&! self, value.ComptimeValue scalar) {
+        guard self.allocate(scalar.type_id) is .some(address) else { return null; }
+        self.set_data(address, .scalar(scalar.data));
+        return address;
+    }
+
+    public Int? reference(Self&! self, qid.TypeId type_id, Int target) {
+        if (!self.get(target).alive) { return null; }
+        guard self.allocate(type_id) is .some(address) else { return null; }
+        self.set_data(address, .reference(target));
+        return address;
+    }
+
+    public Int? null_pointer(Self&! self, qid.TypeId type_id) {
+        guard self.allocate(type_id) is .some(address) else { return null; }
+        self.set_data(address, .null_pointer);
+        return address;
+    }
+
+    public Void set_data(Self&! self, Int address, CellData data) {
+        Cell cell = self.get(address);
+        self.cells.set(address, Cell(type_id: cell.type_id, data: data, alive: cell.alive));
+    }
+
+    public Void set_live(Self&! self, Int address, Bool alive) {
+        Cell cell = self.get(address);
+        if (cell.data is .aggregate(start, count)) {
+            Int index! = 0;
+            while (index < count) {
+                self.set_live(start + index, alive);
+                index = index + 1;
+            }
+        }
+        self.cells.set(address, Cell(type_id: cell.type_id, data: .uninitialized, alive: alive));
+    }
+
+    // move/drop 消耗值但不结束 local 的存储期；旧字段地址必须失效，不能继续读到搬走前的数据。
+    public Void clear_value(Self&! self, Int address) {
+        Cell cell = self.get(address);
+        self.set_live(address, false);
+        self.cells.set(address, Cell(type_id: cell.type_id, data: .uninitialized, alive: cell.alive));
+    }
+
+    public Bool initialized(self, Int address) {
+        Cell cell = self.get(address);
+        if (!cell.alive || cell.data is .uninitialized) { return false; }
+        if (cell.data is .aggregate(start, count)) {
+            Int index! = 0;
+            while (index < count) {
+                if (!self.initialized(start + index)) { return false; }
+                index = index + 1;
+            }
+        }
+        return true;
+    }
+
+    public Int? clone(Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int source) {
+        if (!self.initialized(source)) { return null; }
+        guard self.allocate(self.get(source).type_id) is .some(target) else { return null; }
+        if (!self.copy_into(store, query, target, source)) { return null; }
+        return target;
+    }
+
+    public Bool copy_into(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int target, Int source
+    ) {
+        Cell cell = self.get(source);
+        if (!cell.alive || !self.get(target).alive) { return false; }
+        // 可变性已经由 typecheck/borrow 检查；存储拷贝比较值形状，不要求非驻留 TypeId 相同。
+        if (!store.types.same_type_ignoring_mutability(cell.type_id, self.get(target).type_id)) { return false; }
+        if (target == source) { return true; }
+        if (cell.data is .aggregate(start, count)) {
+            if (!self.ensure_aggregate(store, query, target)) { return false; }
+            guard self.get(target).data is .aggregate(target_start, target_count) else { return false; }
+            if (target_count != count) { return false; }
+            Int index! = 0;
+            while (index < count) {
+                if (!self.copy_into(store, query, target_start + index, start + index)) { return false; }
+                index = index + 1;
+            }
+            return true;
+        }
+        self.set_data(target, cell.data);
+        return true;
+    }
+
+    public Bool ensure_aggregate(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int address
+    ) {
+        Cell cell = self.get(address);
+        if (!cell.alive) { return false; }
+        if (cell.data is .aggregate(_, _)) { return true; }
+        if (!(cell.data is .uninitialized)) { return false; }
+        if (store.types.get(cell.type_id).data is .array_type(array)) {
+            if (array.count_param != null) { return false; }
+            return self.allocate_array(address, array.element, types.array_storage_count(array));
+        }
+        layout.LayoutId layout_id = database.layout_of_type(query$.mut_ref(), store$.ref(), cell.type_id);
+        if (database.layout_has_errors(query$.ref())) { return false; }
+        layout.TypeLayout shape = query.layout.store().layout(layout_id);
+        if (shape.kind != .aggregate && shape.kind != .zero_sized) { return false; }
+        if (shape.fields.length > self.limit - self.cells.len()) { return false; }
+        Int start = self.cells.len();
+        Int index! = 0;
+        while (index < shape.fields.length) {
+            self.allocate(shape.fields[index].field_type);
+            index = index + 1;
+        }
+        self.set_data(address, .aggregate(start, shape.fields.length));
+        return true;
+    }
+
+    Bool allocate_array(Self&! self, Int address, qid.TypeId element, Int count) {
+        if (count < 0 || count > self.limit - self.cells.len()) { return false; }
+        Int start = self.cells.len();
+        Int index! = 0;
+        while (index < count) { self.allocate(element); index = index + 1; }
+        self.set_data(address, .aggregate(start, count));
+        return true;
+    }
+
+    public Int? child(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int address, Int index
+    ) {
+        if (!self.ensure_aggregate(store, query, address)) { return null; }
+        guard self.get(address).data is .aggregate(start, count) else { return null; }
+        if (index < 0 || index >= count) { return null; }
+        return start + index;
+    }
+
+    public Int? field(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        Int address, qid.DefId field_def
+    ) {
+        qid.TypeId type_id = self.get(address).type_id;
+        layout.LayoutId id = database.layout_of_type(query$.mut_ref(), store$.ref(), type_id);
+        layout.TypeLayout shape = query.layout.store().layout(id);
+        Int index! = 0;
+        while (index < shape.fields.length) {
+            if (shape.fields[index].field_def == field_def) { return self.child(store, query, address, index); }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Int? import_value(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, value.ComptimeValue source
+    ) {
+        guard self.allocate(source.type_id) is .some(address) else { return null; }
+        if (source.data is .struct_value(aggregate)) {
+            Int index! = 0;
+            while (index < store.comptime_store.field_count(aggregate)) {
+                value.ComptimeAggregateField field = store.comptime_store.field_at(aggregate, index);
+                guard self.field(store, query, address, field.field_def) is .some(target) else { return null; }
+                guard self.import_value(store, query, field.value) is .some(child) else { return null; }
+                if (!self.copy_into(store, query, target, child)) { return null; }
+                index = index + 1;
+            }
+            if (!self.ensure_aggregate(store, query, address)) { return null; }
+            return address;
+        }
+        if (source.data is .tuple_value(aggregate)) { return self.import_items(store, query, address, aggregate); }
+        if (source.data is .array_value(aggregate)) { return self.import_items(store, query, address, aggregate); }
+        self.set_data(address, .scalar(source.data));
+        return address;
+    }
+
+    Int? import_items(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        Int address, value.ComptimeAggregateId aggregate
+    ) {
+        if (!self.ensure_aggregate(store, query, address)) { return null; }
+        Int index! = 0;
+        while (index < store.comptime_store.item_count(aggregate)) {
+            value.ComptimeValue value = store.comptime_store.item_at(aggregate, index);
+            guard self.child(store, query, address, index) is .some(target) else { return null; }
+            guard self.import_value(store, query, value) is .some(child) else { return null; }
+            if (!self.copy_into(store, query, target, child)) { return null; }
+            index = index + 1;
+        }
+        return address;
+    }
+
+    // 引用永远不导出，包含引用的聚合也不能以原始编译期地址逃逸。
+    public value.ComptimeValue? export_value(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int address
+    ) {
+        if (!self.initialized(address)) { return null; }
+        Cell cell = self.get(address);
+        if (cell.data is .scalar(data)) { return value.ComptimeValue(type_id: cell.type_id, data: data); }
+        guard cell.data is .aggregate(start, count) else { return null; }
+        if (store.types.get(cell.type_id).data is .named(_)) {
+            return self.export_struct(store, query, cell.type_id, start, count);
+        }
+        list.ArrayList<value.ComptimeValue> items! = list.ArrayList<value.ComptimeValue>();
+        Int index! = 0;
+        while (index < count) {
+            guard self.export_value(store, query, start + index) is .some(item) else { return null; }
+            items.add(item);
+            index = index + 1;
+        }
+        if (store.types.get(cell.type_id).data is .array_type(_)) {
+            return store.comptime_store.array_value(cell.type_id, items.slice());
+        }
+        if (store.types.get(cell.type_id).data is .tuple_type(_)) {
+            return store.comptime_store.tuple_value(cell.type_id, items.slice());
+        }
+        return null;
+    }
+
+    value.ComptimeValue? export_struct(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        qid.TypeId type_id, Int start, Int count
+    ) {
+        layout.LayoutId id = database.layout_of_type(query$.mut_ref(), store$.ref(), type_id);
+        layout.TypeLayout shape = query.layout.store().layout(id);
+        list.ArrayList<value.ComptimeAggregateField> fields! = list.ArrayList<value.ComptimeAggregateField>();
+        Int index! = 0;
+        while (index < count) {
+            guard shape.fields[index].field_def is .some(field_def) else {
+                // Domain 的编译器管理 owner 槽不属于语义字段；只允许未创建运行期 owner 的空状态。
+                guard store.resolve.core_traits.domain_trait is .some(domain_trait) else { return null; }
+                guard store.types.named_type_def(type_id) is .some(owner) else { return null; }
+                if (index != count - 1 || !store.model.def_has_direct_trait(owner, domain_trait)
+                    || !(self.get(start + index).data is .null_pointer)) { return null; }
+                index = index + 1;
+                continue;
+            }
+            guard self.export_value(store, query, start + index) is .some(item) else { return null; }
+            fields.add(value.ComptimeAggregateField(field_def: field_def, value: item));
+            index = index + 1;
+        }
+        return store.comptime_store.struct_value(type_id, fields.slice());
+    }
+}

@@ -1,0 +1,431 @@
+#doc(module)
+    编译级语义与求值编排：沿声明 ensure 和 JIL 实例索引推进依赖，不先封闭 source graph。
+    向 resolver/typecheck 提供求值能力，串联 lowering、borrow/drop 与执行；不解释表达式或实现类型规则。
+#end
+
+import context = "./context.jiang";
+import qid = "./id.jiang";
+import resolver_api = "./resolve/module_resolver.jiang";
+import module_graph = "./resolve/module_graph.jiang";
+import jil = "./jil.jiang";
+import lower = "./jil/lower.jiang";
+import references = "./jil/references.jiang";
+import executor = "./jil/eval.jiang";
+import borrow = "./borrow_check.jiang";
+import bindings_api = "./sema/generic/bindings.jiang";
+import types = "./sema/type.jiang";
+import value = "./sema/comptime/value.jiang";
+import list = "./support/list.jiang";
+import set = "./support/set.jiang";
+import sem = "./sema/model.jiang";
+import def = "./resolve/def.jiang";
+import diagnostics = "./sema/diagnostics.jiang";
+import type_check = "./sema/type_check.jiang";
+import drop_elaborate = "./jil/drop_elaborate.jiang";
+import verifier = "./jil/verifier.jiang";
+
+#doc
+    将源码条件接入统一求值；resolver 仅持有此无捕获回调，不依赖 JIL 或本模块。
+#end
+public Bool? evaluate_condition(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, sem.NodeId root
+) {
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    qid.TypeId expected = ctx.store.types.bool_type();
+    guard evaluate_model_expression(ctx, resolver, graph, root, args.slice(), expected)
+        is .some(result) else { return null; }
+    guard result.data is .bool_value(value) else { assert(false); return null; }
+    return value;
+}
+
+#doc
+    已发现模型的检查入口由编译层接入求值，Sema 本身只调用提供的回调。
+#end
+public qid.TypeId? check_expression(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph,
+    sem.NodeId root, qid.TypeId? expected = null
+) {
+    return type_check.check_expression(ctx, graph.root_module,
+        { [ref graph] eval_ctx, node => evaluate_checked_expression(eval_ctx, graph, node) }, root, expected);
+}
+
+public Bool ensure_declaration_checked(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, qid.DefId def_id
+) {
+    return type_check.ensure_declaration_checked(ctx, graph.root_module,
+        { [ref graph] eval_ctx, node => evaluate_checked_expression(eval_ctx, graph, node) }, def_id);
+}
+
+public Bool ensure_body_checked(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, qid.DefId def_id
+) {
+    return type_check.ensure_body_checked(ctx, graph.root_module,
+        { [ref graph] eval_ctx, node => evaluate_checked_expression(eval_ctx, graph, node) }, def_id);
+}
+
+public Bool check_model_package(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
+    return type_check.check_model_package(ctx, graph,
+        { [ref graph] eval_ctx, node => evaluate_checked_expression(eval_ctx, graph, node) });
+}
+
+#doc
+    将 body 检查与 lowering 分开调用；执行所需的依赖闭包和 borrow/drop 由求值请求继续准备。
+#end
+public Bool ensure_source_function(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, jil.Store&! output, qid.DefId function_def
+) {
+    assert(!output.program.is_frozen());
+    assert(ctx.store.model.has_def(function_def));
+    assert(ctx.store.model.has_function_signature(function_def));
+    if (output.program.has_errors()) { return false; }
+    if (!ensure_body_checked(ctx, graph, function_def)) {
+        output.program.mark_error();
+        return false;
+    }
+    return lower.ensure_checked_source_function(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, output, function_def
+    );
+}
+
+#doc 普通常量消费者已完成 root 的类型检查；callee body 仍在遇到 JIL 调用依赖时按需检查。
+public value.ComptimeValue? evaluate_checked_expression(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, sem.NodeId root
+) {
+    guard ctx.store.typeck.node_type(root) is .some(result_type) else { return null; }
+    guard lower.ensure_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, ctx.jil$.mut_ref(), root, result_type
+    ) is .some(expression) else { return null; }
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    if (!prepare_eval_dependencies(ctx, .generated_function(expression), args.slice(),
+        { [ref graph] eval_ctx, function_def => prepare_eval_source(eval_ctx, graph, function_def) }
+    )) { return null; }
+    return executor.evaluate_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, args.slice()
+    );
+}
+
+#doc 持有 resolver 的调用方允许求值继续发现模型；TypeCheck 仅借用此调用方提供的回调。
+public value.ComptimeValue? evaluate_checked_expression(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, sem.NodeId root
+) {
+    guard ctx.store.typeck.node_type(root) is .some(result_type) else { return null; }
+    guard lower.ensure_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, ctx.jil$.mut_ref(), root, result_type
+    ) is .some(expression) else { return null; }
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    if (!prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), args.slice())) { return null; }
+    return executor.evaluate_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, args.slice()
+    );
+}
+
+#doc
+    每轮先结束递归 Sema/lowering，再借用 JIL 做 borrow/drop；表达式实参贯穿依赖准备与验证。
+#end
+Bool prepare_eval_dependencies(
+    context.CompilerContext&! ctx, jil.MonoItem root, types.GenericArg[]& root_args,
+    Fn<Bool, context.CompilerContext&!, qid.DefId> prepare_source
+) {
+    bindings_api.GenericBindings expression_bindings! = bindings_api.GenericBindings();
+    if (root is .generated_function(id)) {
+        bindings_api.GenericBindings empty! = bindings_api.GenericBindings();
+        qid.DefId owner = jil.function_provenance_def(ctx.jil.program.function(id).origin);
+        expression_bindings = bindings_api.bindings_for_instance(
+            ctx.store.defs$.ref(), ctx.store.model$.ref(), ctx.store.types$.ref(), owner, root_args, empty$.ref()
+        );
+    }
+    list.ArrayList<jil.MonoItem> pending! = list.ArrayList<jil.MonoItem>();
+    set.HashSet<Int> seen! = set.HashSet<Int>();
+    append_eval_item(root, pending$.mut_ref(), seen$.mut_ref());
+    Int prepared! = 0;
+    Int dropped! = 0;
+    while (dropped < pending.len()) {
+        while (prepared < pending.len()) {
+            jil.MonoItem item = pending.get(prepared);
+            if (item is .source_instance(identity)) {
+                qid.DefId function_def = ctx.jil.program.function_instance_at(identity).def_id;
+                if (!prepare_source(ctx$.mut_ref(), function_def)) { return false; }
+            }
+            append_eval_references(ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref());
+            prepared = prepared + 1;
+        }
+        if (!check_eval_borrows(ctx, pending.slice(), dropped)) { return false; }
+        while (dropped < prepared) {
+            jil.MonoItem item = pending.get(dropped);
+            if (!prepare_eval_drops(
+                ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref()
+            )) { return false; }
+            dropped = dropped + 1;
+        }
+    }
+    Int index! = 0;
+    while (index < pending.len()) {
+        jil.MonoItem item = pending.get(index);
+        index = index + 1;
+        if (item is .generated_function(id) && jil.function_is_eval_expression(ctx.jil.program.function(id).origin)) {
+            if (!verifier.verify_expression(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), id,
+                expression_bindings$.ref())) { return false; }
+            continue;
+        }
+        if (!verifier.verify_instance(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), item, .drop_output)) { return false; }
+    }
+    return true;
+}
+
+Bool prepare_eval_source(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, qid.DefId function_def
+) {
+    if (!ensure_body_checked(ctx, graph, function_def)) { return false; }
+    return lower.ensure_checked_source_function(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, ctx.jil$.mut_ref(), function_def
+    );
+}
+
+Bool check_eval_borrows(context.CompilerContext&! ctx, jil.MonoItem[]& items, Int begin) {
+    Int index! = begin;
+    while (index < items.length) {
+        jil.MonoItem item = items[index];
+        index = index + 1;
+        jil.FunctionTarget target!;
+        if (item is .source_instance(identity)) {
+            target = .source(ctx.jil.program.function_instance_at(identity).def_id);
+        } else {
+            guard item is .generated_function(id) else { assert(false); return false; }
+            qid.DefId owner = jil.function_provenance_def(ctx.jil.program.function(id).origin);
+            target = .generated(jil.GeneratedFunctionTarget(id: id, provenance_def: owner));
+        }
+        if (!borrow.run_function(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), target)) { return false; }
+    }
+    return true;
+}
+
+Bool prepare_eval_drops(
+    context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen
+) {
+    list.ArrayList<jil.FunctionId> glues! = list.ArrayList<jil.FunctionId>();
+    if (item is .source_instance(identity)) {
+        glues = drop_elaborate.prepare_instance_drop_glues(
+            ctx.store$.ref(), ctx.query.layout$.mut_ref(), ctx.jil.storage$.ref(),
+            ctx.jil.program$.mut_ref(), ctx.jil.drop_elaboration$.mut_ref(), identity
+        );
+    } else if (item is .generated_function(id)) {
+        if (jil.function_is_eval_expression(ctx.jil.program.function(id).origin)) {
+            glues = drop_elaborate.prepare_expression_drop_glues(
+                ctx.store$.ref(), ctx.query.layout$.mut_ref(), ctx.jil.storage$.ref(),
+                ctx.jil.program$.mut_ref(), ctx.jil.drop_elaboration$.mut_ref(), id, expression_bindings
+            );
+        } else {
+            drop_elaborate.prepare_function_drops(
+                ctx.store$.ref(), ctx.query.layout$.mut_ref(), ctx.jil.storage$.ref(),
+                ctx.jil.program$.mut_ref(), ctx.jil.drop_elaboration$.mut_ref(), id
+            );
+            append_eval_references(ctx, item, expression_bindings, pending, seen);
+        }
+    }
+    Int index! = 0;
+    while (index < glues.len()) {
+        append_eval_item(.generated_function(glues.get(index)), pending, seen);
+        index = index + 1;
+    }
+    return !ctx.jil.program.has_errors() && !ctx.query.layout.has_errors();
+}
+
+Void append_eval_item(jil.MonoItem item, list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen) {
+    Int identity = jil.mono_item_identity(item);
+    if (seen.has(identity)) { return; }
+    seen.add(identity);
+    pending.add(item);
+}
+
+Void append_eval_references(
+    context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen
+) {
+    bindings_api.GenericBindings empty! = bindings_api.GenericBindings();
+    references.References dependencies!;
+    if (item is .source_instance(identity)) {
+        jil.InstanceKey instance = ctx.jil.program.function_instance_at(identity);
+        bindings_api.GenericBindings bindings = bindings_api.bindings_for_instance(
+            ctx.store.defs$.ref(), ctx.store.model$.ref(), ctx.store.types$.ref(),
+            instance.def_id, instance.args, empty$.ref()
+        );
+        dependencies = references.collect_instance_function_refs(
+            ctx.store$.ref(), bindings$.ref(), ctx.jil.program.source_function(instance.def_id)
+        );
+    } else {
+        guard item is .generated_function(id) else { assert(false); return; }
+        jil.Function function = ctx.jil.program.function(id);
+        if (jil.function_is_eval_expression(function.origin)) {
+            dependencies = references.collect_instance_function_refs(ctx.store$.ref(), expression_bindings, function);
+        } else {
+            dependencies = references.collect_instance_function_refs(ctx.store$.ref(), empty$.ref(), function);
+        }
+    }
+    Int index! = 0;
+    while (index < dependencies.functions.len()) {
+        references.FunctionReference& dependency = dependencies.functions.ref_at(index);
+        Int identity = ctx.jil.program.function_instance_identity(
+            ctx.jil.storage$.ref(), dependency.def_id, dependency.args.slice()
+        );
+        append_eval_item(.source_instance(identity), pending, seen);
+        index = index + 1;
+    }
+    index = 0;
+    while (index < dependencies.generated_functions.len()) {
+        append_eval_item(.generated_function(dependencies.generated_functions.get(index)), pending, seen);
+        index = index + 1;
+    }
+}
+
+public value.ComptimeValue? evaluate_function(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph,
+    qid.DefId function_def, types.GenericArg[]& generic_args, value.ComptimeValue[]& args
+) {
+    if (!prepare_function(ctx, resolver, graph, function_def, generic_args)) { return null; }
+    return executor.evaluate_function(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), function_def, generic_args, args
+    );
+}
+
+#doc 表达式只检查本次 root，不借由 owner body check 提前执行或发布整个 const initializer。
+public value.ComptimeValue? evaluate_expression(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph,
+    sem.NodeId root, types.GenericArg[]& generic_args, qid.TypeId? expected = null
+) {
+    if (!resolver.ensure_declaration_model(ctx, graph, root.owner_def)) { return null; }
+    return evaluate_model_expression(ctx, resolver, graph, root, generic_args, expected);
+}
+
+#doc 已由 resolve 发布的独立表达式可以属于 module，不要求 owner 是带 body 的普通声明。
+public value.ComptimeValue? evaluate_model_expression(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver, module_graph.ModuleGraph&! graph,
+    sem.NodeId root, types.GenericArg[]& generic_args, qid.TypeId? expected = null
+) {
+    if (!prepare_type_models(ctx, resolver, graph, root.owner_def)) { return null; }
+    guard type_check.check_expression(ctx, graph.root_module,
+        { [ref! resolver, ref! graph] eval_ctx, node => evaluate_checked_expression(eval_ctx, resolver, graph, node) },
+        root, expected
+    ) is .some(result_type) else { return null; }
+    guard lower.ensure_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, ctx.jil$.mut_ref(), root, result_type
+    ) is .some(expression) else { return null; }
+    if (!prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), generic_args)) { return null; }
+    return executor.evaluate_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, generic_args
+    );
+}
+
+public Bool prepare_function(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph,
+    qid.DefId function_def, types.GenericArg[]& generic_args
+) {
+    Int root = ctx.jil.program.function_instance_identity(ctx.jil.storage$.ref(), function_def, generic_args);
+    return prepare_resolved_eval(ctx, resolver, graph, .source_instance(root), generic_args);
+}
+
+Bool prepare_resolved_eval(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, jil.MonoItem root, types.GenericArg[]& root_args
+) {
+    return prepare_eval_dependencies(ctx, root, root_args,
+        { [ref! resolver, ref! graph] eval_ctx, function_def =>
+            if (!resolver.ensure_declaration_model(eval_ctx, graph, function_def)) { return false; }
+            if (!prepare_type_models(eval_ctx, resolver, graph, function_def)) { return false; }
+            if (!type_check.ensure_body_checked(eval_ctx, graph.root_module,
+                { [ref! resolver, ref! graph] nested_ctx, node =>
+                    evaluate_checked_expression(nested_ctx, resolver, graph, node)
+                }, function_def
+            )) { return false; }
+            lower.ensure_checked_source_function(
+                eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(), eval_ctx.output,
+                graph, eval_ctx.jil$.mut_ref(), function_def
+            )
+        }
+    );
+}
+
+#doc
+    为 typecheck 准备字段、被调用函数签名及其类型；这些声明不能只有名字 skeleton。
+    只遍历本次依赖的 Semantic Model 节点，不扫描源文件 AST，也不请求 callee/member body。
+#end
+Bool prepare_type_models(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, qid.DefId root
+) {
+    list.ArrayList<qid.DefId> pending! = list.ArrayList<qid.DefId>();
+    set.HashSet<qid.DefId> visited! = set.HashSet<qid.DefId>();
+    pending.add(root);
+    Int cursor! = 0;
+    while (cursor < pending.len()) {
+        qid.DefId current = pending.get(cursor);
+        cursor = cursor + 1;
+        if (visited.has(current) || !ctx.store.model.has_def(current)) { continue; }
+        visited.add(current);
+        if (requires_signature(ctx.store.defs.get(current).kind)
+            && ctx.store.model.declaration_sema_state(current) == .skeleton) {
+            if (!resolver.ensure_declaration_signature(ctx, graph, current)) {
+                if (!ctx.store.diagnostics.has_errors()) {
+                    diagnostics.add_global_error(ctx.store.diagnostics$.mut_ref(),
+                        "eval type dependency has no available declaration signature", "comptime_dependency_not_ready");
+                }
+                return false;
+            }
+        }
+        // const 的定义检查会读取 initializer；signature skeleton 的空 body 不能被当成没有 initializer。
+        if (ctx.store.model.def_decl_kind(current) == .global_decl && ctx.store.model.def_is_const(current)) {
+            if (!resolver.ensure_declaration_model(ctx, graph, current)) { return false; }
+        }
+        collect_type_model_dependencies(ctx, current, pending$.mut_ref());
+    }
+    // 字段/成员签名先全部发布；约束检查随后复用最终 sweep 的入口，不能边发现边封存不完整结论。
+    cursor = pending.len();
+    while (cursor > 0) {
+        cursor = cursor - 1;
+        qid.DefId current = pending.get(cursor);
+        if (!ctx.store.model.has_def(current) || !requires_signature(ctx.store.defs.get(current).kind)) { continue; }
+        if (!type_check.ensure_declaration_checked(ctx, graph.root_module,
+            { [ref! resolver, ref! graph] eval_ctx, node =>
+                evaluate_checked_expression(eval_ctx, resolver, graph, node)
+            },
+            current
+        )) { return false; }
+    }
+    return true;
+}
+
+Bool requires_signature(def.DefKind kind) {
+    return kind == .alias_def || kind == .struct_def || kind == .enum_def || kind == .trait_def
+        || kind == .function_def || kind == .init_def || kind == .deinit_def || kind == .global_def
+        || kind == .field_def || kind == .enum_case_def || kind == .associated_type_def;
+}
+
+Void collect_type_model_dependencies(
+    context.CompilerContext& ctx, qid.DefId current, list.ArrayList<qid.DefId>&! pending
+) {
+    sem.Def& model = ctx.store.model.def_ref(current);
+    if (model.decl.alias_target is .some(target)) { pending.add(target); }
+    Int index! = 0;
+    while (index < model.nodes.len()) {
+        sem.Node node = model.nodes.get(index);
+        if (node.data is .named_type_ref(named)) { pending.add(named.def_id); }
+        if (node.data is .name_ref(name)) {
+            if (name is .def_ref(target)) { pending.add(target); }
+        }
+        index = index + 1;
+    }
+    index = 0;
+    def.DefKind owner_kind = ctx.store.defs.get(current).kind;
+    if (owner_kind != .struct_def && owner_kind != .enum_def && owner_kind != .enum_case_def
+        && owner_kind != .trait_def) { return; }
+    while (index < model.members.len()) {
+        qid.DefId member = model.members.get(index);
+        pending.add(member);
+        index = index + 1;
+    }
+}

@@ -1,0 +1,139 @@
+#doc(module)
+    JIL 浮点标量执行；按目标类型选择 binary16/32/64 运算，每一步完成该精度的舍入。
+    ComptimeValue 沿用 binary64 位模式载荷，窄类型的值先舍入再无损扩展保存。
+#end
+
+import compiler_store = "../../store.jiang";
+import qid = "../../id.jiang";
+import jil = "../model.jiang";
+import value = "../../sema/comptime/value.jiang";
+import database = "../../db.jiang";
+import integer = "./integer.jiang";
+
+#doc 整数直接转换到目标精度，避免先转换为 Double 再窄化造成二次舍入。
+public value.ComptimeValue? from_integer(
+    compiler_store.CompilerStore& store, value.ComptimeValue input, qid.TypeId result_type
+) {
+    guard store.types.get(result_type).data is .float_type(type) else { return null; }
+    if (input.data is .int_value(number)) {
+        if (type.bits == 16) { return from_number(store, result_type, Float64(Float16(number))); }
+        if (type.bits == 32) { return from_number(store, result_type, Float64(Float32(number))); }
+        if (type.bits == 64) { return from_number(store, result_type, Float64(number)); }
+        return null;
+    }
+    guard integer.bits(input) is .some(number) else { return null; }
+    if (type.bits == 16) { return from_number(store, result_type, Float64(Float16(number))); }
+    if (type.bits == 32) { return from_number(store, result_type, Float64(Float32(number))); }
+    if (type.bits == 64) { return from_number(store, result_type, Float64(number)); }
+    return null;
+}
+
+#doc
+    解码指数与尾数向零截断，再检查目标整数范围；NaN、无穷与溢出不进入宿主的未定义转换。
+#end
+public value.ComptimeValue? to_integer(
+    compiler_store.CompilerStore& store, database.QueryEngine& query,
+    value.ComptimeValue input, qid.TypeId result_type
+) {
+    guard input.data is .float_bits(bits) else { return null; }
+    Int exponent = Int((bits >> UInt64(52)) & UInt64(2047)) - 1023;
+    if (exponent >= 64) { return null; }
+    Int width = integer.width(store, query, result_type);
+    if (width < 1 || width > 64) { return null; }
+    UInt64 magnitude! = 0;
+    if (exponent >= 0) {
+        magnitude = (bits & UInt64(4503599627370495)) | UInt64(4503599627370496);
+        if (exponent >= 52) { magnitude = magnitude << UInt64(exponent - 52); }
+        else { magnitude = magnitude >> UInt64(52 - exponent); }
+    }
+    Bool negative = (bits >> UInt64(63)) != UInt64(0);
+    Bool signed! = false;
+    if (store.types.get(result_type).data is .int_type(type)) { signed = type.signed; }
+    if (signed) {
+        UInt64 bound = UInt64(1) << UInt64(width - 1);
+        if (magnitude > bound || (magnitude == bound && !negative)) { return null; }
+    } else {
+        if (negative && magnitude != UInt64(0)) { return null; }
+        if (width < 64 && (magnitude >> UInt64(width)) != UInt64(0)) { return null; }
+    }
+    if (negative) { magnitude = UInt64(0) - magnitude; }
+    return integer.from_bits(store, query, result_type, magnitude);
+}
+
+#doc 位模式解码只读取同宽标量，不分配内存，也不向执行器导出宿主地址。
+public Float64? number(value.ComptimeValue input) {
+    guard input.data is .float_bits(bits) else { return null; }
+    return unsafe { bits$.addr()$.as(Float64*)$.get() };
+}
+
+public value.ComptimeValue? from_number(compiler_store.CompilerStore& store, qid.TypeId type_id, Float64 input) {
+    guard store.types.get(type_id).data is .float_type(type) else { return null; }
+    Float64 result! = input;
+    if (type.bits == 16) { result = Float64(Float16(input)); }
+    else if (type.bits == 32) { result = Float64(Float32(input)); }
+    else if (type.bits != 64) { return null; }
+    UInt64 bits = unsafe { result$.addr()$.as(UInt64*)$.get() };
+    return value.ComptimeValue(type_id: type_id, data: .float_bits(bits));
+}
+
+public value.ComptimeValue? unary(
+    compiler_store.CompilerStore& store, jil.UnaryOp op, value.ComptimeValue operand, qid.TypeId result_type
+) {
+    if (op != .neg) { return null; }
+    guard number(operand) is .some(input) else { return null; }
+    return from_number(store, result_type, -input);
+}
+
+public value.ComptimeValue? binary(
+    compiler_store.CompilerStore& store, jil.BinaryOp op, value.ComptimeValue lhs,
+    value.ComptimeValue rhs, qid.TypeId result_type
+) {
+    guard number(lhs) is .some(left) else { return null; }
+    guard number(rhs) is .some(right) else { return null; }
+    if (!store.types.same_type_ignoring_mutability(lhs.type_id, rhs.type_id)) { return null; }
+    if (compare(op, left, right) is .some(result)) {
+        return value.ComptimeValue(type_id: result_type, data: .bool_value(result));
+    }
+    guard store.types.get(result_type).data is .float_type(type) else { return null; }
+    Float64? result! = null;
+    if (type.bits == 16) { result = arithmetic16(op, Float16(left), Float16(right)); }
+    else if (type.bits == 32) { result = arithmetic32(op, Float32(left), Float32(right)); }
+    else if (type.bits == 64) { result = arithmetic64(op, left, right); }
+    guard result is .some(output) else { return null; }
+    return from_number(store, result_type, output);
+}
+
+#doc 比较与 LLVM backend 共用语言的有序谓词语义，NaN 的有序比较结果为 false。
+Bool? compare(jil.BinaryOp op, Float64 left, Float64 right) {
+    if (op == .eq) { return left == right; }
+    if (op == .ne) { return left != right; }
+    if (op == .lt) { return left < right; }
+    if (op == .le) { return left <= right; }
+    if (op == .gt) { return left > right; }
+    if (op == .ge) { return left >= right; }
+    return null;
+}
+
+Float64? arithmetic16(jil.BinaryOp op, Float16 left, Float16 right) {
+    if (op == .add) { return Float64(left + right); }
+    if (op == .sub) { return Float64(left - right); }
+    if (op == .mul) { return Float64(left * right); }
+    if (op == .div) { return Float64(left / right); }
+    return null;
+}
+
+Float64? arithmetic32(jil.BinaryOp op, Float32 left, Float32 right) {
+    if (op == .add) { return Float64(left + right); }
+    if (op == .sub) { return Float64(left - right); }
+    if (op == .mul) { return Float64(left * right); }
+    if (op == .div) { return Float64(left / right); }
+    return null;
+}
+
+Float64? arithmetic64(jil.BinaryOp op, Float64 left, Float64 right) {
+    if (op == .add) { return left + right; }
+    if (op == .sub) { return left - right; }
+    if (op == .mul) { return left * right; }
+    if (op == .div) { return left / right; }
+    return null;
+}

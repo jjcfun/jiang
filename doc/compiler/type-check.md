@@ -51,6 +51,11 @@ type check 需要 lazy query 入口处理跨定义依赖：
 alias cycle、associated type default cycle、trait bound dependency 都应围绕这些 query 入口处理，
 不能通过扫描 AST 临时判断。
 
+声明签名和函数体是独立的检查阶段。签名检查准备其依赖的类型、字段和 lifetime 合同，
+不提前检查无关函数体；单个表达式完成检查也不代表所在声明的全部代码已通过检查。
+编译期值需求可以按依赖推进到 JIL 求值，而不要求先封闭整个 source graph。
+最终检查补齐全部可达声明及跨声明约束，复用按需检查结果，并遵守同一套类型与所有权规则。
+
 ## 泛型和 Trait
 
 type check 只负责证明泛型和 trait 约束在源程序层面成立。它不复制 Semantic Model，

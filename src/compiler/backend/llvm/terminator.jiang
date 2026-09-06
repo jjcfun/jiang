@@ -1,10 +1,12 @@
-// JIL terminator -> LLVM terminator instruction lowering。
-//
-// terminator 是 CFG 的唯一出口。本文件只负责 block 之间的跳转、return、
-// call terminator 等控制流指令，表达式值统一委托给 value helper。
+#doc(module)
+    将 JIL 的跳转、return、call 和 drop 出口转换为 LLVM 指令。
+    引用传参及部分移动路径复用 JIL 规则，表达式值委托给 value helper。
+#end
 
 import jil = "../../jil.jiang";
 import instance_reader = "../../jil/instance_reader.jiang";
+import callable_abi = "../../jil/callable_abi.jiang";
+import drop_projection = "../../jil/drop_projection.jiang";
 import qid = "../../id.jiang";
 import diagnostic = "../../diagnostic.jiang";
 import source = "../../source.jiang";
@@ -105,8 +107,8 @@ Bool lower_semantic_drop_terminator(
             state.builder$.ref(), blocks.get(drop_term.target.to_index())
         ));
     }
-    list.ArrayList<DropFieldStep> path! = list.ArrayList<DropFieldStep>();
-    if (projection_flag_for_drop_path(drop_term, path$.ref()) is .some(root_flag)) {
+    list.ArrayList<drop_projection.DropFieldStep> path! = list.ArrayList<drop_projection.DropFieldStep>();
+    if (drop_projection.projection_flag_for_drop_path(drop_term, path$.ref()) is .some(root_flag)) {
         if (!lower_flagged_partial_drop_field(
             state,
             output,
@@ -116,7 +118,7 @@ Bool lower_semantic_drop_terminator(
             canonical_type,
             pointer,
             root_flag,
-            drop_path_has_descendant(drop_term, path$.ref()),
+            drop_projection.drop_path_has_descendant(drop_term, path$.ref()),
             path$.mut_ref(),
             local_slots
         )) { return false; }
@@ -124,7 +126,7 @@ Bool lower_semantic_drop_terminator(
             state.builder$.ref(), blocks.get(drop_term.target.to_index())
         ));
     }
-    if (!drop_path_has_descendant(drop_term, path$.ref())) {
+    if (!drop_projection.drop_path_has_descendant(drop_term, path$.ref())) {
         if (!lower_drop_glue_call(state, output, canonical_type, pointer)) {
             return false;
         }
@@ -148,10 +150,6 @@ Bool lower_semantic_drop_terminator(
     ));
 }
 
-struct DropFieldStep: Copyable {
-    qid.DefId? field_def;
-    Int field_index;
-}
 
 Bool lower_partial_drop_fields(
     llvm_state.LowerState& state,
@@ -161,23 +159,26 @@ Bool lower_partial_drop_fields(
     jil.DropTerminator drop_term,
     qid.TypeId owner_type,
     ffi.Value owner_pointer,
-    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<drop_projection.DropFieldStep>&! path,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    if (!partial_drop_type_is_expandable(state, owner_type)) {
+    if (!drop_projection.type_is_expandable(state.ctx.store$.ref(), state.type_id(owner_type))) {
         return lower_drop_glue_call(state, output, owner_type, owner_pointer);
     }
     layout.TypeLayout owner_layout = llvm_type.layout_for_type(state, owner_type);
-    Int field_index! = 0;
-    while (field_index < owner_layout.fields.length) {
+    Int step! = 0;
+    while (step < owner_layout.fields.length) {
+        Int field_index = drop_projection.field_index_in_drop_order(
+            state.ctx.store$.ref(), state.type_id(owner_type), owner_layout.fields.length, step
+        );
+        step = step + 1;
         layout.FieldLayout field = owner_layout.fields[field_index];
         guard drop_type_needs_runtime(state, output, field.field_type)
             is .some(needs_drop) else { return false; }
         if (!needs_drop) {
-            field_index = field_index + 1;
             continue;
         }
-        path.add(DropFieldStep(field_def: field.field_def, field_index: field_index));
+        path.add(drop_projection.DropFieldStep(field_def: field.field_def, field_index: field_index));
         Bool lowered = lower_partial_drop_field(
             state,
             output,
@@ -193,7 +194,6 @@ Bool lower_partial_drop_fields(
         );
         path.pop();
         if (!lowered) { return false; }
-        field_index = field_index + 1;
     }
     return true;
 }
@@ -208,11 +208,11 @@ Bool lower_partial_drop_field(
     ffi.Value owner_pointer,
     layout.FieldLayout field,
     Int field_index,
-    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<drop_projection.DropFieldStep>&! path,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    jil.Place? flag = projection_flag_for_drop_path(drop_term, path$.ref());
-    Bool has_descendant = drop_path_has_descendant(drop_term, path$.ref());
+    jil.Place? flag = drop_projection.projection_flag_for_drop_path(drop_term, path$.ref());
+    Bool has_descendant = drop_projection.drop_path_has_descendant(drop_term, path$.ref());
     ffi.Value field_pointer = llvm_place.lower_layout_field_pointer(
         state, output, owner_pointer, owner_type, field_index
     );
@@ -258,7 +258,7 @@ Bool lower_flagged_partial_drop_field(
     ffi.Value field_pointer,
     jil.Place flag_place,
     Bool has_descendant,
-    list.ArrayList<DropFieldStep>&! path,
+    list.ArrayList<drop_projection.DropFieldStep>&! path,
     list.ArrayList<ffi.Value>& local_slots
 ) {
     ffi.Value condition = llvm_place.lower_place_value(
@@ -384,140 +384,6 @@ Bool? drop_type_needs_runtime(
     return sema_drop.drop_category_needs_runtime_drop(category);
 }
 
-Bool partial_drop_type_is_expandable(
-    llvm_state.LowerState& state,
-    qid.TypeId type_id
-) {
-    types.TypeInfo info = state.ctx.store.types.get(state.type_id(type_id));
-    if (info.data is .array_type(_)) { return true; }
-    if (info.data is .tuple_type(_)) { return true; }
-    if (info.data is .closure_environment_type(_)) { return true; }
-    guard info.data is .named(named) else { return false; }
-    return state.ctx.store.defs.get(named.def_id).kind == .struct_def;
-}
-
-@life(return: drop_term.a)
-jil.Place? projection_flag_for_drop_path(
-    jil.DropTerminator drop_term,
-    list.ArrayList<DropFieldStep>& path
-) {
-    Int index! = 0;
-    while (index < drop_term.projection_flags.length) {
-        jil.DropProjectionFlag flag = drop_term.projection_flags[index];
-        if (drop_path_matches_place(drop_term.place, path, flag.place, true)) {
-            return flag.flag;
-        }
-        index = index + 1;
-    }
-    return null;
-}
-
-Bool drop_path_has_descendant(
-    jil.DropTerminator drop_term,
-    list.ArrayList<DropFieldStep>& path
-) {
-    Int index! = 0;
-    while (index < drop_term.projection_flags.length) {
-        if (drop_path_matches_place(
-            drop_term.place,
-            path,
-            drop_term.projection_flags[index].place,
-            false
-        )) { return true; }
-        index = index + 1;
-    }
-    return false;
-}
-
-Bool drop_path_matches_place(
-    jil.Place root,
-    list.ArrayList<DropFieldStep>& path,
-    jil.Place candidate,
-    Bool exact
-) {
-    if (!drop_place_base_equal(root, candidate)) { return false; }
-    Int expected_length = root.projection.length + path.len();
-    if (candidate.projection.length < expected_length) { return false; }
-    if (exact && candidate.projection.length != expected_length) { return false; }
-    if (!exact && candidate.projection.length == expected_length) { return false; }
-    Int index! = 0;
-    while (index < root.projection.length) {
-        if (!drop_place_elem_equal(root.projection[index], candidate.projection[index])) {
-            return false;
-        }
-        index = index + 1;
-    }
-    index = 0;
-    while (index < path.len()) {
-        if (!drop_field_step_matches(
-            path.get(index), candidate.projection[root.projection.length + index]
-        )) { return false; }
-        index = index + 1;
-    }
-    return true;
-}
-
-Bool drop_place_base_equal(jil.Place lhs, jil.Place rhs) {
-    if (lhs.base is .local(lhs_local)) {
-        if (rhs.base is .local(rhs_local)) { return lhs_local == rhs_local; }
-        return false;
-    }
-    guard lhs.base is .global(lhs_global) else { return false; }
-    guard rhs.base is .global(rhs_global) else { return false; }
-    return lhs_global.id == rhs_global.id;
-}
-
-Bool drop_field_step_matches(DropFieldStep step, jil.PlaceElem candidate) {
-    if (step.field_def is .some(field_def)) {
-        if (candidate is .field_projection(field)) {
-            return field.field_def == field_def;
-        }
-        return false;
-    }
-    if (candidate is .constant_index_projection(field)) {
-        return field.offset == step.field_index;
-    }
-    if (candidate is .frame_field_projection(field)) {
-        return field.field_index == step.field_index;
-    }
-    return false;
-}
-
-Bool drop_place_elem_equal(jil.PlaceElem lhs, jil.PlaceElem rhs) {
-    if (lhs is .deref_projection(lhs_value)) {
-        if (rhs is .deref_projection(rhs_value)) {
-            return lhs_value.raw_pointer == rhs_value.raw_pointer;
-        }
-        return false;
-    }
-    if (lhs is .field_projection(lhs_value)) {
-        if (rhs is .field_projection(rhs_value)) {
-            return lhs_value.field_def == rhs_value.field_def;
-        }
-        return false;
-    }
-    if (lhs is .frame_field_projection(lhs_value)) {
-        if (rhs is .frame_field_projection(rhs_value)) {
-            return lhs_value.field_index == rhs_value.field_index;
-        }
-        return false;
-    }
-    if (lhs is .index_projection(lhs_value)) {
-        if (rhs is .index_projection(rhs_value)) {
-            return lhs_value.index_local == rhs_value.index_local;
-        }
-        return false;
-    }
-    if (lhs is .constant_index_projection(lhs_value)) {
-        if (rhs is .constant_index_projection(rhs_value)) {
-            return lhs_value.offset == rhs_value.offset;
-        }
-        return false;
-    }
-    guard lhs is .subslice_projection(lhs_value) else { return false; }
-    guard rhs is .subslice_projection(rhs_value) else { return false; }
-    return lhs_value.from == rhs_value.from && lhs_value.to == rhs_value.to;
-}
 
 Bool lower_branch_terminator(
     llvm_state.LowerState& state,
@@ -1517,13 +1383,10 @@ Bool should_pass_reference_place_pointer(
     jil.Operand& operand,
     qid.TypeId param_type
 ) {
-    if (!type_is_reference(state, param_type)) {
-        return false;
-    }
-    if (type_is_reference(state, call_arg_operand_type(state, body, operand))) {
-        return false;
-    }
-    return operand_place(operand) != null;
+    return operand_place(operand) != null && callable_abi.parameter_borrows_value_place(
+        state.ctx.store.types$.ref(), state.type_id(param_type),
+        state.type_id(call_arg_operand_type(state, body, operand))
+    );
 }
 
 qid.TypeId call_arg_operand_type(llvm_state.LowerState& state, jil.Body& body, jil.Operand& operand) {
@@ -1562,12 +1425,6 @@ jil.Place? operand_place(jil.Operand& operand) {
         return out_operand.place;
     }
     return null;
-}
-
-Bool type_is_reference(llvm_state.LowerState& state, qid.TypeId type_id) {
-    types.TypeInfo info = llvm_type.type_info(state, type_id);
-    guard info.data is .handle_type(handle) else { return false; }
-    return handle.kind == .reference;
 }
 
 Void add_call_arg_error(

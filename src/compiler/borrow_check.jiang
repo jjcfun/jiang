@@ -16,29 +16,62 @@ import string_support = "./support/string.jiang";
 import system_io = "./system/io.jiang";
 import std;
 
+public Bool run_package(context.CompilerContext&! ctx, jil.Store& jil_store, Bool timing_enabled) {
+    return run_package(ctx.store$.mut_ref(), ctx.query$.mut_ref(), jil_store, timing_enabled);
+}
+
+public borrow_store.BorrowCheckStore^ check_package(context.CompilerContext&! ctx, jil.Store& jil_store) {
+    return check_package(ctx.store$.mut_ref(), ctx.query$.mut_ref(), jil_store);
+}
+
+public Bool check_source_function(
+    context.CompilerContext&! ctx, jil.Store& jil_store,
+    borrow_store.BorrowCheckStore&! results, qid.DefId function_def
+) {
+    return check_source_function(ctx.store$.mut_ref(), ctx.query$.mut_ref(), jil_store, results, function_def);
+}
+
+public Bool check_package_into(
+    context.CompilerContext&! ctx, jil.Store& jil_store, borrow_store.BorrowCheckStore&! results
+) {
+    return check_package_into(ctx.store$.mut_ref(), ctx.query$.mut_ref(), jil_store, results);
+}
+
 public Bool run_package(
-    context.CompilerContext&! ctx,
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
     jil.Store& jil_store,
     Bool timing_enabled
 ) {
     if (!jil_store.program.has_query_identity()) {
         checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
         borrow_store.BorrowCheckStore^ uncached = check_package_impl(
-            ctx, jil_store, timing_enabled, timing$.mut_ref()
+            store, query, jil_store, timing_enabled, timing$.mut_ref()
         );
-        print_timing(ctx.store$.ref(), timing_enabled, timing);
+        print_timing(store$.ref(), timing_enabled, timing);
         return uncached.accepted();
     }
-    if (ctx.store.owns_borrow_check_result(jil_store.program.query_identity)) {
-        return ctx.store.borrow_check_result_accepted();
+    if (store.owns_borrow_check_result(jil_store.program.query_identity)) {
+        if (!store.borrowck.covers_program(jil_store.program$.ref())
+            || jil_store.program.has_errors() || store.typeck.has_errors()
+            || database.layout_has_errors(query$.ref())) {
+            checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
+            diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+            check_functions_readonly(
+                store, query, jil_store, store.borrowck$.mut_ref(), null, timing_enabled,
+                timing$.mut_ref(), diagnostics$.mut_ref()
+            );
+            store.diagnostics.append(diagnostics$.move());
+            print_timing(store$.ref(), timing_enabled, timing);
+        }
+        return store.borrow_check_result_accepted();
     }
     checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
     borrow_store.BorrowCheckStore^ results = check_package_impl(
-        ctx, jil_store, timing_enabled, timing$.mut_ref()
+        store, query, jil_store, timing_enabled, timing$.mut_ref()
     );
-    print_timing(ctx.store$.ref(), timing_enabled, timing);
+    print_timing(store$.ref(), timing_enabled, timing);
     Bool accepted = results.accepted();
-    ctx.store.publish_borrow_check_result(
+    store.publish_borrow_check_result(
         jil_store.program.query_identity,
         results
     );
@@ -46,15 +79,35 @@ public Bool run_package(
 }
 
 public borrow_store.BorrowCheckStore^ check_package(
-    context.CompilerContext&! ctx,
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
     jil.Store& jil_store
 ) {
     checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
-    return check_package_impl(ctx, jil_store, false, timing$.mut_ref());
+    return check_package_impl(store, query, jil_store, false, timing$.mut_ref());
+}
+
+// eval 只检查当前入口与调用依赖；共享 Program 中其他入口可能仍在递归准备。
+public Bool run_function(
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& jil_store, jil.FunctionTarget root
+) {
+    assert(jil_store.program.has_query_identity());
+    if (!store.owns_borrow_check_result(jil_store.program.query_identity)) {
+        store.publish_borrow_check_result(jil_store.program.query_identity,
+            new borrow_store.BorrowCheckStore(true));
+    }
+    checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    Bool accepted = check_functions_readonly(
+        store, query, jil_store, store.borrowck$.mut_ref(), root, false,
+        timing$.mut_ref(), diagnostics$.mut_ref()
+    );
+    store.diagnostics.append(diagnostics$.move());
+    return accepted;
 }
 
 borrow_store.BorrowCheckStore^ check_package_impl(
-    context.CompilerContext&! ctx,
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
     jil.Store& jil_store,
     Bool timing_enabled,
     checker.BorrowCheckTiming&! timing
@@ -62,54 +115,83 @@ borrow_store.BorrowCheckStore^ check_package_impl(
     // BorrowCheckStore 后续会保存 loans/dataflow facts，按指针返回避免
     // 阶段边界复制大表，也避开当前 stage1 对含表结构体返回值的复制问题。
     borrow_store.BorrowCheckStore^ results! = new borrow_store.BorrowCheckStore(
-        jil_store.program.ok && ctx.store.typeck.ok && !database.layout_has_errors(ctx.query$.ref())
+        jil_store.program.ok && store.typeck.ok && !database.layout_has_errors(query$.ref())
     );
+    check_functions(store, query, jil_store, results$.mut_ref(), null, timing_enabled, timing);
+    return results;
+}
+
+// 调用者持有同一 Program 的结果表，执行前先发布 root 的 JIL/语义依赖。
+public Bool check_source_function(
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& jil_store,
+    borrow_store.BorrowCheckStore&! results,
+    qid.DefId function_def
+) {
+    checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
+    jil.FunctionTarget root = .source(function_def);
+    return check_functions(store, query, jil_store, results, root, false, timing$.mut_ref());
+}
+
+public Bool check_package_into(
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& jil_store,
+    borrow_store.BorrowCheckStore&! results
+) {
+    checker.BorrowCheckTiming timing! = checker.BorrowCheckTiming();
+    return check_functions(store, query, jil_store, results, null, false, timing$.mut_ref());
+}
+
+Bool check_functions(
+    store_api.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& jil_store,
+    borrow_store.BorrowCheckStore&! results,
+    jil.FunctionTarget? root,
+    Bool timing_enabled,
+    checker.BorrowCheckTiming&! timing
+) {
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    Bool accepted = check_functions_readonly(
+        store, query, jil_store, results, root, timing_enabled, timing, diagnostics$.mut_ref()
+    );
+    store.diagnostics.append(diagnostics$.move());
+    return accepted;
+}
+
+Bool check_functions_readonly(
+    store_api.CompilerStore& store, database.QueryEngine&! query,
+    jil.Store& jil_store, borrow_store.BorrowCheckStore&! results, jil.FunctionTarget? root,
+    Bool timing_enabled, checker.BorrowCheckTiming&! timing, diagnostic.DiagnosticStore&! diagnostics
+) {
+    if (results.has_errors() && results.checked) { return false; }
+    if (jil_store.program.has_errors() || store.typeck.has_errors()
+        || database.layout_has_errors(query$.ref())) { results.mark_error(); }
     if (!results.has_errors()) {
-        diagnostic.DiagnosticScope scope! = ctx.store.diagnostics.scope();
-        diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
         {
             checker.PackageBorrowChecker package_checker! = checker.PackageBorrowChecker(
-                ctx.store$.ref(),
-                ctx.query$.mut_ref(),
+                store$.ref(),
+                query$.mut_ref(),
                 results$.mut_ref(),
                 diagnostics$.mut_ref(),
                 timing_enabled
             );
-            package_checker.check_store(jil_store);
-            timing.functions = package_checker.timing.functions;
-            timing.block_visits = package_checker.timing.block_visits;
-            timing.active_loan_facts = package_checker.timing.active_loan_facts;
-            timing.max_active_loans = package_checker.timing.max_active_loans;
-            timing.slowest_def = package_checker.timing.slowest_def;
-            timing.slowest_blocks = package_checker.timing.slowest_blocks;
-            timing.slowest_locals = package_checker.timing.slowest_locals;
-            timing.slowest_move_paths = package_checker.timing.slowest_move_paths;
-            timing.slowest_loans = package_checker.timing.slowest_loans;
-            timing.slowest_region_value_loans =
-                package_checker.timing.slowest_region_value_loans;
-            timing.slowest_function_ns = package_checker.timing.slowest_function_ns;
-            timing.move_paths_ns = package_checker.timing.move_paths_ns;
-            timing.liveness_facts_ns = package_checker.timing.liveness_facts_ns;
-            timing.liveness_solve_ns = package_checker.timing.liveness_solve_ns;
-            timing.dataflow_ns = package_checker.timing.dataflow_ns;
-            timing.dataflow_clone_ns = package_checker.timing.dataflow_clone_ns;
-            timing.dataflow_check_ns = package_checker.timing.dataflow_check_ns;
-            timing.dataflow_merge_ns = package_checker.timing.dataflow_merge_ns;
+            if (root is .some(target)) {
+                package_checker.check_function(jil_store, target);
+            } else {
+                package_checker.check_store(jil_store);
+            }
+            timing.add(package_checker.timing);
         }
-        store_api.CompilerStore&! store = ctx.store$.mut_ref();
-        diagnostic.DiagnosticStore&! target_diagnostics = store.diagnostics$.mut_ref();
-        target_diagnostics.append(diagnostics$.move());
-        scope.finish(ctx.store.diagnostics$.ref());
-        results.mark_checked();
     }
     if (results.has_errors()) {
         diagnostic_helper.add_package_error(
-            ctx.store.diagnostics$.mut_ref(),
+            diagnostics,
             "borrow check failed",
             "borrow_check_failed"
         );
+        results.mark_checked();
     }
-    return results;
+    return results.accepted();
 }
 
 Void print_timing(

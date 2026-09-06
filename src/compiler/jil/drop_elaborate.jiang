@@ -1,4 +1,7 @@
-// 泛型 JIL 记录语义 drop 与部分移动状态；具体实例按需展开必要路径并调用共享 drop glue。
+#doc(module)
+    为泛型 JIL 调度语义 drop 与初始化标志，按具体实例展开析构 CFG 并复用 drop glue。
+    字段路径和执行顺序与 JIL eval、LLVM 消费者共享，不用 TypeId 区分同一存储路径。
+#end
 
 import context = "../context.jiang";
 import compiler_store = "../store.jiang";
@@ -18,7 +21,9 @@ import token = "../syntax/token.jiang";
 import jil = "./model.jiang";
 import callable_abi = "./callable_abi.jiang";
 import instance_reader = "./instance_reader.jiang";
+import drop_projection = "./drop_projection.jiang";
 import trait_abi = "./trait_abi.jiang";
+import references = "./references.jiang";
 
 @region(a)
 struct DropContext: Movable {
@@ -170,35 +175,42 @@ public Void elaborate_package(
     jil.Store&! input,
     layout.LayoutStore& layouts
 ) {
+    if (layouts.has_errors()) { input.program.mark_error(); return; }
+    elaborate_package(ctx.store$.mut_ref(), ctx.query.layout$.mut_ref(), input);
+}
+
+public Void elaborate_package(
+    compiler_store.CompilerStore&! store, database.LayoutQuery&! layouts, jil.Store&! input
+) {
     elaborate_package_parts(
-        ctx,
+        store,
+        layouts,
         input.storage$.ref(),
         input.program$.mut_ref(),
-        input.drop_elaboration$.mut_ref(),
-        layouts
+        input.drop_elaboration$.mut_ref()
     );
 }
 
 Void elaborate_package_parts(
-    context.CompilerContext&! ctx,
+    compiler_store.CompilerStore&! store,
+    database.LayoutQuery&! layouts,
     jil.Storage& output,
     jil.Program&! program,
-    jil.DropElaborationState&! drop_elaboration,
-    layout.LayoutStore& layouts
+    jil.DropElaborationState&! drop_elaboration
 ) {
     if (program.has_errors() || layouts.has_errors()) {
         program.mark_error();
         return;
     }
 
-    DropContext drop_ctx! = DropContext(ctx.store$.ref(), ctx.query.layout$.mut_ref());
+    DropContext drop_ctx! = DropContext(store, layouts);
     ensure_source_instance_drop_glues_with_context(
         drop_ctx$.mut_ref(), output, program, drop_elaboration
     );
     Int function_index! = 0;
     while (function_index < program.functions.len()) {
         jil.Function function = program.functions.get(function_index);
-        if (drop_elaboration.contains(function.id)) {
+        if (drop_elaboration.contains(function.id) || !program.has_generated_mono_item(function.id)) {
             function_index = function_index + 1;
             continue;
         }
@@ -212,13 +224,19 @@ Void elaborate_package_parts(
         jil.Function elaborated = materialize_function_drops_with_context(
             drop_ctx$.mut_ref(), output, program, drop_elaboration, expanded
         );
+        references.References dependencies = references.collect_function_refs(elaborated);
         program.set_function(elaborated);
         drop_elaboration.mark(function_id);
+        Int index! = 0;
+        while (index < dependencies.generated_functions.len()) {
+            program.mark_generated_function(dependencies.generated_functions.get(index));
+            index = index + 1;
+        }
         function_index = function_index + 1;
     }
     if (program.has_errors()) {
         diagnostic_helper.add_package_error(
-            ctx.store.diagnostics$.mut_ref(),
+            store.diagnostics$.mut_ref(),
             "drop elaboration failed",
             "drop_elaboration_failed"
         );
@@ -237,6 +255,68 @@ public Void ensure_source_instance_drop_glue(
     ensure_source_instance_drop_glue_with_context(
         ctx$.mut_ref(), output, program, drop_elaboration, identity
     );
+}
+
+#doc 求值需要把隐含的析构调用加入自身依赖闭包，不借用运行期 mono item 发射集合。
+public list.ArrayList<jil.FunctionId> prepare_instance_drop_glues(
+    compiler_store.CompilerStore& store, database.LayoutQuery&! layouts, jil.Storage& output,
+    jil.Program&! program, jil.DropElaborationState&! drop_elaboration, Int identity
+) {
+    DropContext ctx! = DropContext(store, layouts);
+    jil.InstanceKey instance = program.function_instance_at(identity);
+    generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
+    generic_bindings.GenericBindings bindings = generic_bindings.bindings_for_instance(
+        ctx.store.defs$.ref(), ctx.store.model$.ref(), ctx.store.types$.ref(),
+        instance.def_id, instance.args, empty$.ref()
+    );
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(ctx.store, bindings$.ref());
+    return prepare_body_drop_glues(
+        ctx$.mut_ref(), output, program, drop_elaboration, reader$.ref(), program.source_function(instance.def_id)
+    );
+}
+
+#doc
+    每次求值按绑定准备析构依赖，保留表达式模板中的泛型 drop。
+#end
+public list.ArrayList<jil.FunctionId> prepare_expression_drop_glues(
+    compiler_store.CompilerStore& store, database.LayoutQuery&! layouts, jil.Storage& output,
+    jil.Program&! program, jil.DropElaborationState&! drop_elaboration, jil.FunctionId id,
+    generic_bindings.GenericBindings& bindings
+) {
+    DropContext ctx! = DropContext(store, layouts);
+    instance_reader.InstanceReader reader = instance_reader.InstanceReader(store, bindings);
+    return prepare_body_drop_glues(
+        ctx$.mut_ref(), output, program, drop_elaboration, reader$.ref(), program.function(id)
+    );
+}
+
+list.ArrayList<jil.FunctionId> prepare_body_drop_glues(
+    DropContext&! ctx, jil.Storage& output, jil.Program&! program, jil.DropElaborationState&! drop_elaboration,
+    instance_reader.InstanceReader& reader, jil.Function function
+) {
+    list.ArrayList<jil.FunctionId> glues! = list.ArrayList<jil.FunctionId>();
+    Int index! = 0;
+    while (index < function.body.blocks.length) {
+        jil.Terminator terminator = function.body.blocks[index].terminator;
+        index = index + 1;
+        if (ensure_terminator_drop_glue(
+            ctx, output, program, drop_elaboration, reader, function, terminator
+        ) is .some(glue)) { glues.add(glue); }
+    }
+    return glues;
+}
+
+public Void prepare_function_drops(
+    compiler_store.CompilerStore& store, database.LayoutQuery&! layouts, jil.Storage& output,
+    jil.Program&! program, jil.DropElaborationState&! drop_elaboration, jil.FunctionId id
+) {
+    if (drop_elaboration.contains(id) || program.has_errors()) { return; }
+    jil.Function function = program.function(id);
+    jil.Function elaborated = elaborate_function(
+        store, layouts, output, program, drop_elaboration, function
+    );
+    program.set_function(elaborated);
+    drop_elaboration.mark(id);
 }
 
 Void ensure_source_instance_drop_glues_with_context(
@@ -298,19 +378,22 @@ Void ensure_body_drop_glues(
     while (block_index < function.body.blocks.length) {
         jil.Terminator terminator = function.body.blocks[block_index].terminator;
         block_index = block_index + 1;
-        guard terminator.kind is .drop_term(drop) else { continue; }
-        qid.TypeId type_id = reader.type_id(place_type(ctx, function.body, drop.place));
-        if (!type_needs_drop(ctx, type_id)) { continue; }
-        ensure_drop_glue(
-            ctx,
-            output,
-            program,
-            drop_elaboration,
-            type_id,
-            jil.function_provenance_def(function.origin),
-            terminator.span
-        );
+        if (ensure_terminator_drop_glue(
+            ctx, output, program, drop_elaboration, reader, function, terminator
+        ) is .some(glue)) { program.mark_generated_function(glue); }
     }
+}
+
+jil.FunctionId? ensure_terminator_drop_glue(
+    DropContext&! ctx, jil.Storage& output, jil.Program&! program, jil.DropElaborationState&! drop_elaboration,
+    instance_reader.InstanceReader& reader, jil.Function function, jil.Terminator terminator
+) {
+    guard terminator.kind is .drop_term(drop) else { return null; }
+    qid.TypeId type_id = reader.type_id(place_type(ctx, function.body, drop.place));
+    if (!type_needs_drop(ctx, type_id)) { return null; }
+    return ensure_drop_glue(
+        ctx, output, program, drop_elaboration, type_id, jil.function_provenance_def(function.origin), terminator.span
+    );
 }
 
 @life(return: output)
@@ -3203,8 +3286,12 @@ DropExpansion append_owned_field_drop_chain(
         );
         expanded = true;
     }
-    Int field_index! = layout_field_count(ctx, type_id) - 1;
-    while (field_index >= 0) {
+    Int count = layout_field_count(ctx, type_id);
+    Int step! = count;
+    // 从最后执行的字段向前构造 CFG，执行顺序仍由同一语义顺序查询确定。
+    while (step > 0) {
+        step = step - 1;
+        Int field_index = drop_projection.field_index_in_drop_order(ctx.store, type_id, count, step);
         layout.FieldLayout field = layout_field_at(ctx, type_id, field_index);
         if (field_needs_drop(ctx, field)) {
             jil.BlockId skip_target = target;
@@ -3219,7 +3306,6 @@ DropExpansion append_owned_field_drop_chain(
             }
             expanded = true;
         }
-        field_index = field_index - 1;
     }
     return DropExpansion(target, expanded);
 }
@@ -3340,7 +3426,8 @@ jil.BlockId append_place_drop_block(
     jil.BlockId next_target,
     list.ArrayList<jil.Block>&! blocks
 ) {
-    if (place_has_descendant_drop_flag(flags, place)) {
+    if (place_has_descendant_drop_flag(flags, place)
+        && drop_projection.type_is_expandable(ctx.store, type_id)) {
         DropExpansion expansion = append_drop_expansion_chain(
             ctx,
             output,
@@ -4166,7 +4253,7 @@ Bool drop_places_equal(jil.Place lhs, jil.Place rhs) {
     }
     Int index! = 0;
     while (index < lhs.projection.length) {
-        if (!drop_place_elems_equal(lhs.projection[index], rhs.projection[index])) {
+        if (!drop_projection.drop_place_elem_equal(lhs.projection[index], rhs.projection[index])) {
             return false;
         }
         index = index + 1;
@@ -4181,7 +4268,7 @@ Bool drop_place_is_same_or_descendant(jil.Place candidate, jil.Place parent) {
     if (candidate.projection.length < parent.projection.length) { return false; }
     Int index! = 0;
     while (index < parent.projection.length) {
-        if (!drop_place_elems_equal(candidate.projection[index], parent.projection[index])) {
+        if (!drop_projection.drop_place_elem_equal(candidate.projection[index], parent.projection[index])) {
             return false;
         }
         index = index + 1;
@@ -4189,33 +4276,6 @@ Bool drop_place_is_same_or_descendant(jil.Place candidate, jil.Place parent) {
     return true;
 }
 
-Bool drop_place_elems_equal(jil.PlaceElem lhs, jil.PlaceElem rhs) {
-    if (lhs is .deref_projection(lhs_value)) {
-        guard rhs is .deref_projection(rhs_value) else { return false; }
-        return lhs_value.raw_pointer == rhs_value.raw_pointer;
-    }
-    if (lhs is .field_projection(lhs_value)) {
-        guard rhs is .field_projection(rhs_value) else { return false; }
-        return lhs_value.field_def == rhs_value.field_def
-            && lhs_value.field_type == rhs_value.field_type;
-    }
-    if (lhs is .frame_field_projection(lhs_value)) {
-        guard rhs is .frame_field_projection(rhs_value) else { return false; }
-        return lhs_value.field_index == rhs_value.field_index
-            && lhs_value.field_type == rhs_value.field_type;
-    }
-    if (lhs is .index_projection(lhs_value)) {
-        guard rhs is .index_projection(rhs_value) else { return false; }
-        return lhs_value.index_local == rhs_value.index_local;
-    }
-    if (lhs is .constant_index_projection(lhs_value)) {
-        guard rhs is .constant_index_projection(rhs_value) else { return false; }
-        return lhs_value.offset == rhs_value.offset;
-    }
-    guard lhs is .subslice_projection(lhs_value) else { return false; }
-    guard rhs is .subslice_projection(rhs_value) else { return false; }
-    return lhs_value.from == rhs_value.from && lhs_value.to == rhs_value.to;
-}
 
 Void push_set_drop_flag(
     DropContext&! ctx,

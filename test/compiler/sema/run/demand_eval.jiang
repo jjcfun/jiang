@@ -1,0 +1,1077 @@
+#doc(module)
+    在未 seal 的 graph 上从函数 skeleton 请求求值，验证 Sema 到 JIL、borrow 与 eval 的依赖推进。
+#end
+
+import context = "../../../../src/compiler/context.jiang";
+import qid = "../../../../src/compiler/id.jiang";
+import resolver_api = "../../../../src/compiler/resolve/module_resolver.jiang";
+import def = "../../../../src/compiler/resolve/def.jiang";
+import module_graph = "../../../../src/compiler/resolve/module_graph.jiang";
+import syntax = "../../../../src/compiler/syntax.jiang";
+import ast = "../../../../src/compiler/syntax/ast.jiang";
+import source = "../../../../src/compiler/source.jiang";
+import jil = "../../../../src/compiler/jil.jiang";
+import jil_lower = "../../../../src/compiler/jil/lower.jiang";
+import jil_verifier = "../../../../src/compiler/jil/verifier.jiang";
+import jil_drop = "../../../../src/compiler/jil/drop_elaborate.jiang";
+import value = "../../../../src/compiler/sema/comptime/value.jiang";
+import list = "../../../../src/compiler/support/list.jiang";
+import reporter = "../../../../src/compiler/diagnostic/reporter.jiang";
+import compilation = "../../../../src/compiler/analysis.jiang";
+import types = "../../../../src/compiler/sema/type.jiang";
+import sem = "../../../../src/compiler/sema/model.jiang";
+import string = "../../../../src/compiler/support/string.jiang";
+import std;
+import backend_symbol = "../../../../src/compiler/backend/symbol.jiang";
+import codegen_unit = "../../../../src/compiler/backend/codegen_unit.jiang";
+import type_requirements = "../../../../src/compiler/jil/type_requirements.jiang";
+import check_state = "../../../../src/compiler/sema/type_check/state.jiang";
+import comptime_evaluator = "../../../../src/compiler/sema/comptime/evaluator.jiang";
+import sema_diagnostics = "../../../../src/compiler/sema/diagnostics.jiang";
+
+public Int run() {
+    check_init_defaults();
+    check_demand();
+    check_invalid_definition();
+    check_expression();
+    check_generic_expression();
+    check_generic_expression_dependencies();
+    check_unbound_expression();
+    check_source_const_bindings(0);
+    check_source_const_bindings(1);
+    check_source_const_bindings(2);
+    check_expression_runtime_parameter();
+    check_const_consumer();
+    check_const_lowering_requires_value();
+    check_const_query_outcome(false);
+    check_const_query_outcome(true);
+    check_const_cycle("const Int chosen = chosen;");
+    check_const_cycle("const Int chosen = other; const Int other = chosen;");
+    check_const_cycle("const Int chosen = read(); Int read() { chosen }");
+    check_nested_const();
+    check_const_final_sweep();
+    check_drop_dependency();
+    check_partial_drop();
+    check_nested_resolver_demand();
+    check_source_condition(true);
+    check_source_condition(false);
+    check_invalid_source_condition();
+    check_conditional_import();
+    check_string_const();
+    check_condition_callback();
+    return 0;
+}
+
+#doc
+    按需求值显式 init，字段默认表达式及其调用依赖必须先准备，再执行用户语句。
+#end
+Void check_init_defaults() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("Int initial() { 123 } struct Options { Int number! = initial(); ");
+    text.append("Bool enabled = true; Int? absent; public init(self) { ");
+    text.append("assert(self.number == 123); assert(self.enabled); assert(self.absent == null); ");
+    text.append("self.number = self.number + 1; } } ");
+    text.append("Int selected() { Options options = Options(); options.number } ");
+    text.append("Int unrelated() { true }");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("init_defaults_eval", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    qid.DefId unrelated = named_def(ctx$.ref(), graph.root_module, "unrelated");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(124));
+    assert(!ctx.store.typeck.signature_checked(unrelated));
+}
+
+#doc
+    Resolver 只请求调用方的条件值；替换求值能力后不隐式运行 typecheck 或生成 JIL。
+#end
+Void check_condition_callback() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(literal_condition, use_source_artifacts: false);
+    UInt8[]& text = "comptime { if (true) { const Int chosen = 1; } else { import missing; } }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("condition_callback", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(ctx.store.model.declaration_sema_state(chosen) == .skeleton);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.len() == 0);
+    assert(ctx.jil.program.functions.len() == 0);
+    assert(ctx.jil.program.source_function_count() == 0);
+}
+
+#doc
+    JIL lowering 只能消费已发布的 const；缺失值必须暴露前置事实缺口，不能再次解释 Semantic Model。
+#end
+Void check_const_lowering_requires_value() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int chosen = 1 + 2; Int selected() { chosen }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("const_lowering_requires_value", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), selected));
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(3));
+    // 故意移除输入事实，验证阶段边界；生产中的 reset 必须同时使所有下游查询失效。
+    ctx.store.comptime_store.reset();
+    assert(!jil_lower.ensure_checked_source_function(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph$.ref(), ctx.jil$.mut_ref(), selected
+    ));
+    assert(ctx.jil.program.has_errors());
+    assert(!ctx.store.comptime_store.has_const_value(chosen));
+}
+
+#doc
+    未诊断的未就绪请求可以重试；已诊断失败不能重复执行或增加诊断。
+#end
+Void check_const_query_outcome(Bool fail) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int chosen = 7;";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("const_query_outcome", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    sem.NodeId root = ctx.store.model.body_root(chosen)$.some();
+    Int calls! = 0;
+    Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId> evaluate =
+        { [ref! calls, fail] eval_ctx, _ =>
+            calls$.set(calls$.get() + 1);
+            if (fail) {
+                sema_diagnostics.add_global_error(eval_ctx.store.diagnostics$.mut_ref(),
+                    "evaluation failed", "test_eval_failed");
+                return null;
+            }
+            if (calls$.get() == 1) { return null; }
+            return value.ComptimeValue(type_id: eval_ctx.store.types.int_type(), data: .int_value(7));
+        };
+    {
+        check_state.CheckState state! = check_state.CheckState(ctx$.mut_ref(), graph.root_module, evaluate$.ref());
+        comptime_evaluator.ComptimeEvaluator evaluator! = comptime_evaluator.ComptimeEvaluator(state$.mut_ref());
+        assert(evaluator.ensure_const_value(chosen, root) == null);
+        value.ComptimeValue? result = evaluator.ensure_const_value(chosen, root);
+        if (fail) {
+            assert(result == null);
+        } else {
+            assert(result$.some().data is .int_value(7));
+        }
+    }
+    if (fail) {
+        assert(calls == 1);
+        assert(ctx.store.diagnostics.len() == 1);
+    } else {
+        assert(calls == 2);
+        assert(!ctx.store.diagnostics.has_errors());
+    }
+}
+
+#doc
+    initializer 检查和 JIL callee 准备中的 const 重入均给出循环诊断，失败后重复请求不追加事实。
+#end
+Void check_const_cycle(UInt8[]& text) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    source.SourceId source_id = ctx.store.sources.intern_virtual("const_cycle", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(!compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    if (!has_diagnostic(ctx$.ref(), "recursive_const_initializer")) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(has_diagnostic(ctx$.ref(), "recursive_const_initializer"));
+    assert(!ctx.store.comptime_store.has_const_value(chosen));
+    Int count = ctx.store.diagnostics.len();
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(!compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    assert(ctx.store.diagnostics.len() == count);
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+}
+
+#doc 用测试回调直接提供字面量条件，不启动编译求值调度。
+Bool? literal_condition(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, sem.NodeId root
+) {
+    assert(ctx.store.typeck.node_type(root) == null);
+    guard ctx.store.model.node(root).data is .literal(literal) else { assert(false); return null; }
+    guard literal.value is .bool_value(value) else { assert(false); return null; }
+    return value;
+}
+
+#doc
+    同一个泛型表达式共享 JIL 模板，各次求值按实参读取类型布局。
+#end
+Void check_generic_expression() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "Int bytes<T>() { T$.size() } Int other<T>() { T$.size() }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("generic_expression_eval", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId bytes = named_def(ctx$.ref(), graph.root_module, "bytes");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), bytes));
+    sem.NodeId root = ctx.store.model.body_root(bytes)$.some();
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    args.add(types.generic_type_arg(ctx.store.types.int32_type()));
+    value.ComptimeValue? first = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    );
+    if (first == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(first != null);
+    assert(first$.some().data is .int_value(4));
+    Int allocated = ctx.jil.storage.arena.used_bytes();
+    args.set(0, types.generic_type_arg(ctx.store.types.int64_type()));
+    value.ComptimeValue? second = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    );
+    if (second == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(second$.some().data is .int_value(8));
+    assert(ctx.jil.storage.arena.used_bytes() == allocated);
+    assert(ctx.jil.program.functions.len() == 1);
+    assert(ctx.jil.program.mono_item_count() == 0);
+    jil_drop.elaborate_package(ctx.store$.mut_ref(), ctx.query.layout$.mut_ref(), ctx.jil$.mut_ref());
+    assert(jil_verifier.verify(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), .backend_input, true));
+    assert(ctx.jil.storage.arena.used_bytes() == allocated);
+    qid.DefId other = named_def(ctx$.ref(), graph.root_module, "other");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), other));
+    sem.NodeId other_root = ctx.store.model.body_root(other)$.some();
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), other_root, args.slice()
+    ) != null);
+    assert(ctx.jil.program.functions.len() == 2);
+    assert(backend_symbol.validate_unique_function_symbols(ctx$.ref(), ctx.jil$.ref()));
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx$.ref(), ctx.jil$.ref());
+    assert(codegen_unit.statistics(units$.ref()).functions == 0);
+}
+
+#doc
+    类型和常量实参贯穿 callee 与析构依赖；重复求值复用表达式和函数模板。
+#end
+Void check_generic_expression_dependencies() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct Box<T>: Movable { Int*! total; T? marker; ");
+    text.append("deinit(self) { unsafe { self.total$.set(self.total$.get() + T$.size()); } } } ");
+    text.append("Int size<T, N: const Int>() { T$.size() + N } ");
+    text.append("Int selected<T, N: const Int>() { Int result! = size<T, N>(); ");
+    text.append("{ Box<T> box = Box<T>(total: unsafe { result$.mut_ptr() }, marker: null); } result }");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("generic_expression_dependencies", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), selected));
+    sem.NodeId root = ctx.store.model.body_root(selected)$.some();
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    args.add(types.generic_type_arg(ctx.store.types.int32_type()));
+    args.add(types.generic_const_arg(value.ComptimeValue(type_id: ctx.store.types.int_type(), data: .int_value(10))));
+    value.ComptimeValue? first = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    );
+    if (first == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(first != null);
+    assert(first$.some().data is .int_value(18));
+    Int templates = ctx.jil.program.source_function_count();
+    args.set(0, types.generic_type_arg(ctx.store.types.int64_type()));
+    args.set(1, types.generic_const_arg(value.ComptimeValue(
+        type_id: ctx.store.types.int_type(), data: .int_value(20)
+    )));
+    value.ComptimeValue? second = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    );
+    if (second == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(second != null);
+    assert(second$.some().data is .int_value(36));
+    assert(ctx.jil.program.source_function_count() == templates);
+    Int allocated = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    )$.some().data is .int_value(36));
+    assert(ctx.jil.storage.arena.used_bytes() == allocated);
+}
+
+#doc
+    绑定一个常量参数不能掩盖另一个未绑定参数，即使未绑定参数不参与计算。
+#end
+Void check_unbound_expression() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "Int selected<A: const Int, B: const Int>() { A }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("unbound_expression", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), selected));
+    sem.NodeId root = ctx.store.model.body_root(selected)$.some();
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    args.add(types.generic_const_arg(value.ComptimeValue(type_id: ctx.store.types.int_type(), data: .int_value(7))));
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    ) == null);
+    assert(has_diagnostic(ctx$.ref(), "jil_concrete_verifier_failed"));
+}
+
+#doc
+    Source instance 与表达式使用同一具体化契约；未使用的 const 参数也必须完成绑定。
+    mode 分别覆盖完整绑定、缺少第二个参数、第二个参数仍是符号值。
+#end
+Void check_source_const_bindings(Int mode) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "Int selected<A: const Int, B: const Int>() { A }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("source_const_bindings", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    assert(resolver.ensure_declaration_signature(ctx$.mut_ref(), graph$.mut_ref(), selected));
+    qid.DefId second_param = ctx.store.model.def_generic_param_at(selected, 1);
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    generic_args.add(types.generic_const_arg(value.ComptimeValue(
+        type_id: ctx.store.types.int_type(), data: .int_value(7)
+    )));
+    if (mode == 0) {
+        generic_args.add(types.generic_const_arg(value.ComptimeValue(
+            type_id: ctx.store.types.int_type(), data: .int_value(9)
+        )));
+    } else if (mode == 2) {
+        generic_args.add(types.generic_const_arg(value.ComptimeValue(
+            type_id: ctx.store.types.int_type(), data: .const_param_value(second_param)
+        )));
+    }
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    Int allocated = ctx.jil.storage.arena.used_bytes();
+    if (mode != 0) {
+        assert(result == null);
+        assert(has_diagnostic(ctx$.ref(), "jil_concrete_verifier_failed"));
+        Int identity = ctx.jil.program.function_instance_identity(
+            ctx.jil.storage$.ref(), selected, generic_args.slice()
+        );
+        type_requirements.ConcreteFailure failure = type_requirements.concrete_failure(
+            ctx.store$.ref(), ctx.jil$.ref(), .source_instance(identity)
+        )$.some();
+        assert(failure.const_param == second_param);
+        assert(failure.source_instance == identity);
+        Int diagnostics = ctx.store.diagnostics.len();
+        assert(compilation.evaluate_function(
+            ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+        ) == null);
+        assert(ctx.store.diagnostics.len() == diagnostics);
+        assert(ctx.jil.storage.arena.used_bytes() == allocated);
+        return;
+    }
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(7));
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    )$.some().data is .int_value(7));
+    assert(ctx.jil.storage.arena.used_bytes() == allocated);
+}
+
+Void check_string_const() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const UInt8[]& version = \"33.0\"; @life() UInt8[]& selected() { version }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("string_const_eval", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    guard result$.some().data is .string_value(symbol) else { assert(false); return; }
+    assert(string.equal(ctx.store.symbols.text(symbol), "33.0"));
+}
+
+Void check_conditional_import() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& dependency_text = "public Int number() { 9 }";
+    source.SourceId dependency = ctx.store.sources.intern_virtual("selected_condition_dep", dependency_text);
+    syntax.SyntaxResult dependency_ast! = syntax.parse_source(ctx$.mut_ref(), dependency_text, dependency);
+    resolver.add_ast(dependency_ast.take_unit());
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("comptime { if (chosen != 7) { import missing_first; Int bad() { true } } ");
+    text.append("else if (enabled()) { import dep = selected_condition_dep; Int selected() { dep.number() } } ");
+    text.append("else { import missing_last; Int wrong() { false } } } ");
+    text.append("const Int chosen = calculate(); Int calculate() { 7 } Bool enabled() { chosen == 7 }");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("conditional_import_eval", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    qid.ModuleId module_id = graph.root_module;
+    assert(ctx.store.resolve.module_ref(module_id).imports.len() == 0);
+    Bool prepared = resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref());
+    if (!prepared) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(prepared);
+    assert(ctx.store.resolve.module_ref(module_id).comptime_items.len() == 2);
+    assert(ctx.store.resolve.module_ref(module_id).comptime_cursor == 2);
+    assert(ctx.store.resolve.module_ref(module_id).imports.len() == 1);
+    assert(ctx.store.resolve.module_ref(module_id).imports.get(0).target_module == null);
+    qid.DefId selected = named_def(ctx$.ref(), module_id, "selected");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result$.some().data is .int_value(9));
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    assert(ctx.store.resolve.module_ref(module_id).imports.len() == 1);
+}
+
+// 独立条件入口与普通 const 共用 JIL；此处不经过尚未迁移的 top-level selector。
+Void check_source_condition(Bool expected) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& dependency_text = "public Int number() { 7 }";
+    source.SourceId dependency = ctx.store.sources.intern_virtual("source_condition_dep", dependency_text);
+    syntax.SyntaxResult dependency_ast! = syntax.parse_source(ctx$.mut_ref(), dependency_text, dependency);
+    resolver.add_ast(dependency_ast.take_unit());
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("const Bool condition = selected() == ");
+    if (expected) { text.append("7; "); } else { text.append("8; "); }
+    text.append("Int selected() { chosen } const Int chosen = calculate(); ");
+    text.append("Int calculate() { dep.number() } Int bad() { true } ");
+    text.append("import unused = missing_condition_dep; import dep = source_condition_dep;");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("source_condition", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    ast.AstUnit unit! = parsed.take_unit();
+    guard unit.get(unit.root$.some()).data is .root(root) else { assert(false); return; }
+    guard unit.get(unit.child_at(root.items, 0)).data is .top_level_decl(top) else { assert(false); return; }
+    guard unit.get(top.body).data is .global_decl(global) else { assert(false); return; }
+    ast.AstId condition = global.initializer$.some();
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), unit.take());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.ModuleId module_id = graph.root_module;
+    assert(ctx.store.resolve.module_ref(module_id).imports.get(1).target_module == null);
+    Bool? result = resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition);
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result == expected);
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == expected);
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    qid.DefId bad = named_def(ctx$.ref(), graph.root_module, "bad");
+    assert(ctx.store.model.declaration_sema_state(bad) == .skeleton);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(0).target_module == null);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(1).target_module != null);
+    qid.NamespaceId namespace_id = ctx.store.resolve.module_ref(module_id).namespace_id;
+    Int revision = ctx.store.resolve.module_ref(module_id).source_revision;
+    ctx.store.resolve.reset_module(module_id, revision + 1, namespace_id);
+    assert(ctx.store.resolve.module_ref(module_id).condition_roots.get(condition.to_index()) == null);
+    assert(ctx.store.resolve.module_ref(module_id).condition_values.get(condition.to_index()) == null);
+}
+
+Void check_invalid_source_condition() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int condition = 7;";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("invalid_source_condition", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    ast.AstUnit unit! = parsed.take_unit();
+    guard unit.get(unit.root$.some()).data is .root(root) else { assert(false); return; }
+    guard unit.get(unit.child_at(root.items, 0)).data is .top_level_decl(top) else { assert(false); return; }
+    guard unit.get(top.body).data is .global_decl(global) else { assert(false); return; }
+    ast.AstId condition = global.initializer$.some();
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), unit.take());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.ModuleId module_id = graph.root_module;
+    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == null);
+    assert(has_diagnostic(ctx$.ref(), "comptime_expression_type_mismatch"));
+    assert(ctx.store.resolve.module_ref(module_id).condition_values.get(condition.to_index()) == null);
+    Int count = ctx.store.diagnostics.len();
+    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == null);
+    assert(ctx.store.diagnostics.len() == count);
+}
+
+Void check_nested_resolver_demand() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& dependency_text = "public Int number() { inner() } Int inner() { 6 }";
+    source.SourceId dependency = ctx.store.sources.intern_virtual("nested_eval_dep", dependency_text);
+    syntax.SyntaxResult dependency_ast! = syntax.parse_source(ctx$.mut_ref(), dependency_text, dependency);
+    resolver.add_ast(dependency_ast.take_unit());
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("import dep = nested_eval_dep; import unused = missing_nested_eval_dep; ");
+    text.append("const Int chosen = calculate(); Int calculate() { dep.number() + 1 } ");
+    text.append("Bool selected() { chosen == 7 } Int bad() { true }");
+    source.SourceId root = ctx.store.sources.intern_virtual("nested_resolver_eval", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), root);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    qid.DefId calculate = named_def(ctx$.ref(), graph.root_module, "calculate");
+    qid.DefId bad = named_def(ctx$.ref(), graph.root_module, "bad");
+    assert(ctx.store.model.declaration_sema_state(calculate) == .skeleton);
+    Int module_count = graph.module_count();
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(0).target_module == null);
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .bool_value(true));
+    assert(graph.module_count() > module_count);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(0).target_module != null);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(1).target_module == null);
+    assert(ctx.store.model.declaration_sema_state(bad) == .skeleton);
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
+}
+
+#doc 嵌套按值参数先按需调度 drop，再消费部分移动标志；重复请求和最终 sweep 不重复改写 CFG。
+Void check_partial_drop() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct Resource: Movable { ");
+    text.append("    Int value; ");
+    text.append("    Int*! drops; ");
+    text.append("    deinit(self) { unsafe { self.drops$.set(self.drops$.get() * 10 + self.value); } } ");
+    text.append("} ");
+    text.append("struct Inner: Movable { Resource left; Resource right!; } ");
+    text.append("struct Outer: Movable { Inner inner!; Resource tail; } ");
+    text.append(" ");
+    text.append("Void consume(Outer outer!, Bool move_right, Bool replace) { ");
+    text.append("    if (move_right) { ");
+    text.append("        Resource moved = outer.inner.right$.move(); ");
+    text.append("        assert(moved.value == 2); ");
+    text.append("        if (replace) { ");
+    text.append("            outer.inner.right = Resource(value: 4, drops: moved.drops); ");
+    text.append("        } ");
+    text.append("    } ");
+    text.append("    assert(outer.inner.left.value == 1); ");
+    text.append("    assert(outer.tail.value == 3); ");
+    text.append("} ");
+    text.append(" ");
+    text.append("Int selected(Bool move_right, Bool replace) { ");
+    text.append("    Int drops! = 0; ");
+    text.append("    Int*! pointer = unsafe { drops$.mut_ptr() }; ");
+    text.append("    consume(Outer(inner: Inner(left: Resource(value: 1, drops: pointer), ");
+    text.append("        right: Resource(value: 2, drops: pointer)), ");
+    text.append("        tail: Resource(value: 3, drops: pointer)), move_right, replace); ");
+    text.append("    drops } ");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("partial_drop_eval", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    assert(compilation.prepare_function(ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice()));
+    qid.DefId resource = named_def(ctx$.ref(), graph.root_module, "Resource", .type_name);
+    qid.DefId inner = named_def(ctx$.ref(), graph.root_module, "Inner", .type_name);
+    qid.DefId outer = named_def(ctx$.ref(), graph.root_module, "Outer", .type_name);
+    assert(ctx.store.model.def_ref(resource).custom_deinit_def != null);
+    qid.DefId consume = named_def(ctx$.ref(), graph.root_module, "consume");
+    jil.Function body = ctx.jil.program.source_function(consume);
+    Int local_index! = 0;
+    while (local_index < body.body.locals.length) {
+        qid.TypeId type_id = body.body.locals[local_index].type_id;
+        if (ctx.store.types.get(type_id).data is .named(named)
+            && (named.def_id == resource || named.def_id == inner || named.def_id == outer)) {
+            assert(ctx.query.layout.drop_category_of_type(ctx.store$.ref(), type_id) == .custom_drop);
+        }
+        local_index = local_index + 1;
+    }
+    Int drop_count! = 0;
+    Int block_index! = 0;
+    while (block_index < body.body.blocks.length) {
+        if (body.body.blocks[block_index].terminator.kind is .drop_term(_)) { drop_count = drop_count + 1; }
+        block_index = block_index + 1;
+    }
+    assert(drop_count > 0);
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    args.add(value.ComptimeValue(type_id: ctx.store.types.bool_type(), data: .bool_value(false)));
+    args.add(value.ComptimeValue(type_id: ctx.store.types.bool_type(), data: .bool_value(false)));
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(321));
+    Int allocated = ctx.jil.storage.arena.used_bytes();
+    Int selected_case! = 0;
+    while (selected_case < 4) {
+        args.set(0, value.ComptimeValue(type_id: ctx.store.types.bool_type(), data: .bool_value(selected_case >= 2)));
+        args.set(1, value.ComptimeValue(type_id: ctx.store.types.bool_type(), data: .bool_value(selected_case % 2 == 1)));
+        value.ComptimeValue? actual = compilation.evaluate_function(
+            ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+        );
+        if (actual == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+        assert(actual != null);
+        Int expected! = 321;
+        if (selected_case == 2) { expected = 231; }
+        if (selected_case == 3) { expected = 2341; }
+        guard actual$.some().data is .int_value(integer_result) else { assert(false); return; }
+        assert(integer_result == expected);
+        assert(ctx.jil.storage.arena.used_bytes() == allocated);
+        selected_case = selected_case + 1;
+    }
+    Int blocks = body.body.blocks.length;
+    Int locals = body.body.locals.length;
+    resolver.seal_module_graph(ctx$.mut_ref(), graph$.mut_ref());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    jil_lower.lower_package_into(ctx$.mut_ref(), graph$.ref());
+    assert(!ctx.jil.program.has_errors());
+    assert(ctx.jil.program.source_function(consume).body.blocks.length == blocks);
+    assert(ctx.jil.program.source_function(consume).body.locals.length == locals);
+    assert(ctx.jil.drop_elaboration.source_is_scheduled(consume));
+    ctx.begin_compilation();
+    assert(!ctx.jil.drop_elaboration.source_is_scheduled(consume));
+}
+
+Void check_drop_dependency() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct Resource: Movable { Int value; Int*! drops; ");
+    text.append("deinit(self) { unsafe { self.drops$.set(append(self.drops$.get(), self.value)); } } } ");
+    text.append("Int append(Int previous, Int value) { previous * 10 + value } ");
+    text.append("Void consume(Int&! drops) { Int*! ptr = unsafe { drops$.mut_ptr() }; ");
+    text.append("Resource first = Resource(value: 1, drops: ptr); ");
+    text.append("Resource second = Resource(value: 2, drops: ptr); } ");
+    text.append("Int selected() { Int drops! = 0; consume(drops$.mut_ref()); drops }");
+    text.append("const Int chosen = selected();");
+    source.SourceId root = ctx.store.sources.intern_virtual("demand_eval_drop", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), root);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(21));
+    assert(ctx.jil.program.mono_item_count() == 0);
+    Int cached_functions = ctx.jil.program.functions.len();
+    assert(cached_functions > 0);
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    )$.some().data is .int_value(21));
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(21));
+    assert(ctx.jil.program.mono_item_count() == 0);
+    resolver.seal_module_graph(ctx$.mut_ref(), graph$.mut_ref());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    jil_lower.lower_package_into(ctx$.mut_ref(), graph$.ref());
+    jil_drop.elaborate_package(ctx.store$.mut_ref(), ctx.query.layout$.mut_ref(), ctx.jil$.mut_ref());
+    Int index! = 0;
+    while (index < cached_functions) {
+        jil.Function function = ctx.jil.program.functions.get(index);
+        assert(ctx.jil.program.mono_item_index(.generated_function(function.id)) == null);
+        index = index + 1;
+    }
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx$.ref(), ctx.jil$.ref());
+    index = 0;
+    while (index < units.len()) {
+        Int item_index! = 0;
+        while (item_index < units.unit_at(index).functions.len()) {
+            jil.MonoItem item = units.unit_at(index).functions.get(item_index);
+            if (item is .generated_function(id)) { assert(id.to_index() >= cached_functions); }
+            item_index = item_index + 1;
+        }
+        index = index + 1;
+    }
+    assert(!ctx.jil.program.has_source_instance(selected, generic_args.slice()));
+    Int cursor = ctx.jil.program.mono_item_count();
+    Int identity = ctx.jil.program.function_instance_identity(ctx.jil.storage$.ref(), selected, generic_args.slice());
+    ctx.jil.program.mark_source_instance(identity);
+    jil_lower.lower_drop_references(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output,
+        graph$.ref(), ctx.jil$.mut_ref(), cursor);
+    index = 0;
+    while (index < cached_functions) {
+        jil.Function function = ctx.jil.program.functions.get(index);
+        guard function.origin is .generated(origin) else { assert(false); return; }
+        if (origin.kind == .drop_glue) {
+            assert(ctx.jil.program.mono_item_index(.generated_function(function.id)) != null);
+        }
+        index = index + 1;
+    }
+    assert(!ctx.jil.program.has_errors());
+}
+
+Void check_nested_const() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.String source_text = string.concat(
+        "const Int chosen = twice(3) + 1; Int twice(Int n) { identity<Int>(n * factor) } ",
+        "const Int factor = 2; T identity<T>(T n) { n } Int waiting(Int n) { n }"
+    );
+    UInt8[]& text = source_text.bytes();
+    source.SourceId source_id = ctx.store.sources.intern_virtual("nested_const", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId twice = named_def(ctx$.ref(), graph.root_module, "twice");
+    qid.DefId factor = named_def(ctx$.ref(), graph.root_module, "factor");
+    qid.DefId identity = named_def(ctx$.ref(), graph.root_module, "identity");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), twice));
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), factor));
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), identity));
+    qid.DefId waiting = named_def(ctx$.ref(), graph.root_module, "waiting");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), waiting));
+    sem.NodeId waiting_root = ctx.store.model.body_root(waiting)$.some();
+    qid.TypeId waiting_type = compilation.check_expression(ctx$.mut_ref(), graph$.ref(), waiting_root)$.some();
+    // 模拟共享 Program 中尚未请求执行的入口：其运行期参数不能被当前 const 当成待检查依赖。
+    jil.FunctionId pending = jil_lower.ensure_expression(
+        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph$.ref(), ctx.jil$.mut_ref(),
+        waiting_root, waiting_type
+    )$.some();
+    Bool checked = compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen);
+    if (!checked) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(checked);
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
+    assert(ctx.store.comptime_store.const_value(factor)$.some().data is .int_value(2));
+    assert(ctx.jil.program.source_function_count() == 2);
+    assert(ctx.jil.program.functions.len() == 3);
+    assert(!ctx.store.borrowck.generated_function_checked(pending.to_index()));
+    assert(!ctx.jil.drop_elaboration.contains(pending));
+    assert(ctx.jil.program.mono_item_count() == 0);
+}
+
+Void check_const_final_sweep() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int sibling() { 4 }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("const_final_sweep", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId twice = named_def(ctx$.ref(), graph.root_module, "twice");
+    qid.DefId sibling = named_def(ctx$.ref(), graph.root_module, "sibling");
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    Int identity = ctx.jil.program.query_identity;
+    jil.FunctionId twice_id = ctx.jil.program.source_function(twice).id;
+    assert(!ctx.jil.program.has_source_function(sibling));
+    Bool checked = compilation.check_model_package(ctx$.mut_ref(), graph$.ref());
+    if (!checked) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(checked);
+    Int expression_count = ctx.jil.program.functions.len();
+    jil_lower.lower_package_into(ctx$.mut_ref(), graph$.ref());
+    if (ctx.jil.program.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.jil.program.has_errors());
+    assert(ctx.jil.program.query_identity == identity);
+    assert(ctx.jil.program.source_function(twice).id == twice_id);
+    assert(ctx.jil.program.functions.len() == expression_count);
+    assert(ctx.jil.program.has_source_function(sibling));
+    ctx.begin_compilation();
+    assert(ctx.jil.program.source_function_count() == 0);
+    assert(ctx.jil.program.functions.len() == 0);
+    assert(!ctx.jil.program.has_query_identity());
+}
+
+Void check_const_consumer() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int unused() { true }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("demand_const_consumer", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId unused = named_def(ctx$.ref(), graph.root_module, "unused");
+    qid.DefId twice = named_def(ctx$.ref(), graph.root_module, "twice");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), twice));
+    assert(ctx.store.model.body_root(chosen) != null);
+    Bool checked = compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen);
+    if (!checked) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(checked);
+    assert(ctx.store.comptime_store.has_const_value(chosen));
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
+    assert(ctx.jil.program.source_function_count() == 1);
+    assert(ctx.jil.program.functions.len() == 1);
+    assert(!ctx.jil.program.has_source_function(unused));
+    assert(!ctx.store.typeck.signature_checked(unused));
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+}
+
+Void check_expression() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int unused() { true }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("demand_eval_expression", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId unused = named_def(ctx$.ref(), graph.root_module, "unused");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    sem.NodeId root = ctx.store.model.body_root(chosen)$.some();
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    value.ComptimeValue? result = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(7));
+    // 没有执行旧 const query，表达式返回值由调用方决定是否发布到 const store。
+    assert(!ctx.store.comptime_store.has_const_value(chosen));
+    assert(ctx.store.model.declaration_sema_state(unused) == .skeleton);
+    assert(ctx.jil.program.source_function_count() == 1);
+    assert(ctx.jil.program.functions.len() == 1);
+    assert(ctx.jil.program.mono_item_count() == 0);
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    )$.some().data is .int_value(7));
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    guard ctx.store.model.node(root).data is .binary(binary) else { assert(false); return; }
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), binary.right, args.slice()
+    )$.some().data is .int_value(1));
+    assert(ctx.jil.program.functions.len() == 2);
+    assert(ctx.jil.program.mono_item_count() == 0);
+    Int shared_bytes = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
+    assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
+    assert(ctx.jil.storage.arena.used_bytes() == shared_bytes);
+    qid.TypeId boolean = ctx.store.types.bool_type();
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice(), boolean
+    ) == null);
+    assert(ctx.jil.program.functions.len() == 2);
+    assert(has_diagnostic(ctx$.ref(), "comptime_expression_type_mismatch"));
+}
+
+Void check_expression_runtime_parameter() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    UInt8[]& text = "Int chosen(Int n) { n } Int local() { Int x = 3; x }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("demand_eval_runtime_parameter", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), chosen));
+    sem.NodeId root = ctx.store.model.body_root(chosen)$.some();
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    qid.DefId local = named_def(ctx$.ref(), graph.root_module, "local");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), local));
+    sem.NodeId local_root = ctx.store.model.body_root(local)$.some();
+    value.ComptimeValue? local_result = compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), local_root, args.slice()
+    );
+    if (local_result == null) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(local_result != null);
+    assert(local_result$.some().data is .int_value(3));
+    assert(compilation.evaluate_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice()
+    ) == null);
+    if (!ctx.store.borrowck.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(ctx.store.borrowck.has_errors());
+    assert(has_diagnostic(ctx$.ref(), "comptime_uninitialized_value"));
+}
+
+Bool has_diagnostic(context.CompilerContext& ctx, UInt8[]& code) {
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, code)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Void check_demand() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder dependency_source! = std.StringBuilder();
+    dependency_source.append("struct Pair { public Int value; } ");
+    dependency_source.append("public Int number() { Pair p = Pair(value: tail(3)); p.value } ");
+    dependency_source.append("Int tail(Int n) { if (n == 0) { return 4; } tail(n - 1) }");
+    UInt8[]& dependency_text = dependency_source.slice();
+    source.SourceId dependency = ctx.store.sources.intern_virtual("demand_eval_dep", dependency_text);
+    syntax.SyntaxResult dependency_ast! = syntax.parse_source(ctx$.mut_ref(), dependency_text, dependency);
+    resolver.add_ast(dependency_ast.take_unit());
+    std.StringBuilder source_text! = std.StringBuilder();
+    source_text.append("import dep = demand_eval_dep; import unused = missing_eval_dependency; ");
+    source_text.append("Bool selected() { identity<Int>(dep.number()) == 4 } ");
+    source_text.append("T identity<T>(T x) { x } Int sibling() { true }");
+    UInt8[]& text = source_text.slice();
+    source.SourceId root = ctx.store.sources.intern_virtual("demand_eval", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, root);
+    assert(!parsed.has_errors());
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(graph.ok);
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    qid.DefId sibling = named_def(ctx$.ref(), graph.root_module, "sibling");
+    assert(ctx.store.model.declaration_sema_state(selected) == .skeleton);
+    assert(ctx.store.model.declaration_sema_state(sibling) == .skeleton);
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()
+    );
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .bool_value(true));
+    assert(ctx.store.model.declaration_sema_state(selected) == .body_ready);
+    assert(ctx.store.model.declaration_sema_state(sibling) == .skeleton);
+    assert(!ctx.store.typeck.signature_checked(sibling));
+    assert(!ctx.jil.program.has_source_function(sibling));
+    assert(ctx.jil.program.source_function_count() == 4);
+    assert(ctx.jil.program.mono_item_count() == 0);
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.get(1).target_module == null);
+    assert(!ctx.store.diagnostics.has_errors());
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()
+    )$.some().data is .bool_value(true));
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    // 最终检查不能因为此前求值成功而漏掉未被请求的坏 body。
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), sibling));
+    assert(!compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), sibling));
+}
+
+Void check_invalid_definition() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_condition, use_source_artifacts: false
+    );
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct Resource { Int value; } struct Invalid: Copyable { Resource resource; } ");
+    text.append("Int selected() { Invalid$.size() }");
+    source.SourceId root = ctx.store.sources.intern_virtual("demand_eval_invalid_definition", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), root);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()
+    ) == null);
+    Int count = ctx.store.diagnostics.len();
+    Bool found! = false;
+    Int index! = 0;
+    while (index < count) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, "copyable_field_requires_copyable")) {
+            found = true;
+        }
+        index = index + 1;
+    }
+    if (!found) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(found);
+    assert(!ctx.jil.program.has_source_function(selected));
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()
+    ) == null);
+    assert(ctx.store.diagnostics.len() == count);
+}
+
+qid.DefId named_def(
+    context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name, def.NameDomain domain
+) {
+    qid.SymbolId symbol = ctx.store.symbols.find(name)$.some();
+    return ctx.store.resolve.lookup_namespace(
+        ctx.store.resolve.module_ref(module_id).namespace_id, symbol, domain, false
+    )$.some().def_id;
+}
+
+qid.DefId named_def(context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name) {
+    return named_def(ctx, module_id, name, .value_name);
+}

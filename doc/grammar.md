@@ -58,7 +58,18 @@ top_level_item
              / top_level_decl
 
 compile_block
-            <- "comptime" "{" top_level_item* "}"
+            <- "comptime" comptime_kind? compile_item_block
+
+comptime_kind
+            <- "[" ("eval" / "generate") ","? "]"
+
+compile_item_block
+            <- "{" compile_item* "}"
+
+compile_item
+            <- compile_if / top_level_item
+
+compile_if  <- "if" expr compile_item_block ("else" (compile_if / compile_item_block))?
 
 intrinsic_block
             <- intrinsic_attribute leading_annotation* "{" member_decl* "}"
@@ -222,7 +233,10 @@ binding_name
 等规则本身不重复写 `"public"`。
 `const_global_decl` 同样经由 `top_level_decl` 接受 modifier，因此 `public const Type name = expr;`
 是合法顶层声明。
-`comptime` block 是顶层 item，不经由 `decl_modifier`，只负责在编译期选择其中的顶层 item。
+`comptime` block 是顶层 item，不经由 `decl_modifier`。省略 kind 等价于 `[eval]`；
+`eval`、`generate` 仅在选项位置有特殊含义，不是保留关键字。未知 kind、多个 kind 和空选项均诊断。
+`[eval]` 表示语义分析期间所需的求值；`[generate]` 表示输入完整通过语义检查后的生成任务，
+两者不能隐式互换。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 顶层变量只使用普通 global declaration。独立 destructure 是函数体内的语句，

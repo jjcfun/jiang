@@ -1,0 +1,190 @@
+#doc(module)
+    验证单函数检查与 source JIL 缓存、最终 sweep 复用及生成函数/静态表的运行期可达性。
+    不提前执行 JIL，也不把缓存中的适配器当成发射根。
+#end
+
+import context = "../../../../../src/compiler/context.jiang";
+import qid = "../../../../../src/compiler/id.jiang";
+import jil = "../../../../../src/compiler/jil.jiang";
+import lower = "../../../../../src/compiler/jil/lower.jiang";
+import module_graph = "../../../../../src/compiler/resolve/module_graph.jiang";
+import resolve = "../../../../../src/compiler/resolve/module_resolver.jiang";
+import source = "../../../../../src/compiler/source.jiang";
+import syntax = "../../../../../src/compiler/syntax.jiang";
+import compilation = "../../../../../src/compiler/analysis.jiang";
+import references = "../../../../../src/compiler/jil/references.jiang";
+import std;
+
+public Int run() {
+    check_demand_and_sweep();
+    check_invalid_body_is_not_lowered();
+    check_generated_reachability();
+    return 0;
+}
+
+#doc 按需 lowering 可缓存适配器和静态表；仅实际调用的一组在最终 sweep 中成为运行期依赖。
+Void check_generated_reachability() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("Int adapter(RawFn<Int, Int> raw) { Fn<Int, Int> f = Fn(raw); f(41) } ");
+    text.append("Int unused(RawFn<Int, Int, Int> raw) { Fn<Int, Int, Int> f = Fn(raw); f(1, 2) } ");
+    text.append("@life() Int inc(Int value) { value + 1 } Int main() { adapter(inc) - 42 }");
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.mut_ref(), "generated_reachability", text.slice());
+    qid.DefId adapter = find_def(ctx$.ref(), graph.root_module, "adapter");
+    qid.DefId unused = find_def(ctx$.ref(), graph.root_module, "unused");
+    jil.Store lowered! = jil.Store(true);
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), unused));
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), adapter));
+    assert(lowered.program.mono_item_count() == 0);
+    assert(lowered.program.runtime_global_count() == 0);
+    Int cached_functions = lowered.program.functions.len();
+    Int cached_globals = lowered.program.globals.len();
+    assert(cached_functions >= 2);
+    assert(cached_globals >= 2);
+    Int allocated = lowered.storage.arena.used_bytes();
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), adapter));
+    assert(lowered.storage.arena.used_bytes() == allocated);
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    lower.lower_package_into(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref());
+    assert(!lowered.program.has_errors());
+    Int index! = 0;
+    while (index < cached_functions) {
+        jil.Function function = lowered.program.functions.get(index);
+        guard function.origin is .generated(origin) else { assert(false); return; }
+        if (origin.kind == .raw_fn_to_fn) {
+            assert(lowered.program.has_generated_mono_item(function.id) == (origin.provenance_def == adapter));
+        }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < cached_globals) {
+        jil.Global global = lowered.program.globals.get(index);
+        guard global.origin is .generated(origin) else { assert(false); return; }
+        assert(lowered.program.global_is_runtime(global.id) == (origin.provenance_def == adapter));
+        index = index + 1;
+    }
+    index = 0;
+    while (index < lowered.program.runtime_global_count()) {
+        jil.GlobalId id = lowered.program.runtime_global_at(index);
+        references.References dependencies = references.collect_global_refs(lowered.program.globals.get(id.to_index()));
+        Int dependency! = 0;
+        while (dependency < dependencies.generated_functions.len()) {
+            assert(lowered.program.has_generated_mono_item(dependencies.generated_functions.get(dependency)));
+            dependency = dependency + 1;
+        }
+        dependency = 0;
+        while (dependency < dependencies.globals.len()) {
+            assert(lowered.program.global_is_runtime(dependencies.globals.get(dependency)));
+            dependency = dependency + 1;
+        }
+        index = index + 1;
+    }
+}
+
+Void check_demand_and_sweep() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.mut_ref(), "demand_source",
+        "Int chosen() { helper() } Int helper() { 1 } Int sibling() { 2 } T identity<T>(T x) { x }"
+    );
+    qid.DefId chosen = find_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId helper = find_def(ctx$.ref(), graph.root_module, "helper");
+    qid.DefId sibling = find_def(ctx$.ref(), graph.root_module, "sibling");
+    qid.DefId identity = find_def(ctx$.ref(), graph.root_module, "identity");
+    jil.Store lowered! = jil.Store(true);
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), chosen));
+    Int query_identity = lowered.program.query_identity;
+    Int allocated! = lowered.storage.arena.used_bytes();
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), chosen));
+    assert(lowered.storage.arena.used_bytes() == allocated);
+    assert(lowered.program.source_function_count() == 1);
+    assert(ctx.store.typeck.signature_checked(helper));
+    assert(!lowered.program.has_source_function(helper));
+    assert(ctx.store.typeck.node_type(ctx.store.model.body_root(helper)$.some()) == null);
+    assert(!ctx.store.typeck.signature_checked(sibling));
+    assert(!lowered.program.has_source_function(sibling));
+    assert_call_target(lowered.program.source_function(chosen), helper);
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), identity));
+    assert(lowered.program.source_function(identity).args.length == 1);
+    assert(lowered.program.source_function_count() == 2);
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    lower.lower_package_into(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref());
+    assert(!lowered.program.has_errors());
+    assert(lowered.program.query_identity == query_identity);
+    jil.Store^ eager = lower.lower_package(ctx$.mut_ref(), graph$.ref());
+    assert(!eager.program.has_errors());
+    assert(lowered.program.source_function_count() == eager.program.source_function_count());
+    Int source_index! = 0;
+    while (source_index < eager.program.source_function_count()) {
+        jil.Function function = eager.program.source_function_at(source_index);
+        guard function.origin is .source(def_id) else { assert(false); return; }
+        assert(lowered.program.has_source_function(def_id));
+        source_index = source_index + 1;
+    }
+    assert(lowered.program.has_source_function(helper));
+    assert(lowered.program.has_source_function(sibling));
+    allocated = lowered.storage.arena.used_bytes();
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), chosen));
+    assert(lowered.storage.arena.used_bytes() == allocated);
+    assert(ctx.store.diagnostics.len() == 0);
+}
+
+Void check_invalid_body_is_not_lowered() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.mut_ref(), "demand_source_bad", "Int chosen() { 1 } Int bad() { true }"
+    );
+    qid.DefId chosen = find_def(ctx$.ref(), graph.root_module, "chosen");
+    qid.DefId bad = find_def(ctx$.ref(), graph.root_module, "bad");
+    jil.Store lowered! = jil.Store(true);
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), chosen));
+    assert(!ctx.store.typeck.signature_checked(bad));
+    assert(!compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), bad));
+    assert(lowered.program.has_errors());
+    assert(!lowered.program.has_source_function(bad));
+    Int diagnostic_count = ctx.store.diagnostics.len();
+    assert(diagnostic_count > 0);
+    assert(!compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), lowered$.mut_ref(), bad));
+    assert(ctx.store.diagnostics.len() == diagnostic_count);
+    assert(lowered.program.source_function_count() == 1);
+}
+
+Void assert_call_target(jil.Function function, qid.DefId target) {
+    Int index! = 0;
+    while (index < function.body.blocks.length) {
+        jil.Terminator terminator = function.body.blocks[index].terminator;
+        index = index + 1;
+        guard terminator.kind is .call_term(call) else { continue; }
+        guard call.callee is .direct_function(reference) else { assert(false); return; }
+        guard reference.target is .source(actual) else { assert(false); return; }
+        assert(actual == target);
+        return;
+    }
+    assert(false);
+}
+
+module_graph.ModuleGraph^ lower_text_to_model(
+    context.CompilerContext&! ctx, UInt8[]& name, UInt8[]& text
+) {
+    source.SourceId source_id = ctx.store.sources.intern_virtual(name, text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx, text, source_id);
+    assert(!parsed.has_errors());
+    resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_condition);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx, parsed.take_unit());
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(ctx, graph$.ref()));
+    return graph$.move();
+}
+
+qid.DefId find_def(context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name) {
+    qid.DefId module_def = ctx.store.resolve.module_ref(module_id).def_id;
+    qid.SymbolId symbol = ctx.store.symbols.find(name)$.some();
+    Int index! = 0;
+    while (index < ctx.store.model.def_member_count(module_def)) {
+        qid.DefId item = ctx.store.model.def_member_at(module_def, index);
+        if (ctx.store.defs.get(item).name.symbol == symbol) { return item; }
+        index = index + 1;
+    }
+    assert(false);
+    return module_def;
+}

@@ -3,6 +3,7 @@
 import sem = "../../sema/model.jiang";
 import store_api = "../../store.jiang";
 import qid = "../../id.jiang";
+import module_graph = "../../resolve/module_graph.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
 import list = "../../support/list.jiang";
@@ -162,16 +163,12 @@ public struct DeclCheck: Movable {
         self.value_recursion_states = map.WyHashMap<qid.DefId, Int>();
     }
 
-    public Void check_declaration_signatures(Self&! self) {
-        // Lifetime shape 可以跨声明读取字段类型。先绑定整包字段类型，再验证
-        // lifetime/ownership 合同，避免源码顺序影响结构化 shape。函数类型仍在
-        // 合同规范化之后构造。
-        self.predeclare_nominal_region_schemas();
-        self.bind_lifetime_field_types();
+    public Void check_declaration_signatures(Self&! self, module_graph.ModuleGraph& graph) {
+        // 最终 sweep 复用按需声明检查，补齐未引用的声明和跨声明约束。
         self.check_builtin_declaration_signatures();
         Int module_index! = 0;
-        while (module_index < self.type_ops.state.graph.module_count()) {
-            qid.ModuleId module_id = self.type_ops.state.graph.module_at(module_index);
+        while (module_index < graph.module_count()) {
+            qid.ModuleId module_id = graph.module_at(module_index);
             qid.DefId module_def = self.type_ops.state.ctx.store.resolve.module_ref(module_id).def_id;
             self.check_declaration_signature_tree(module_def);
             module_index = module_index + 1;
@@ -180,42 +177,104 @@ public struct DeclCheck: Movable {
         self.check_extension_trait_conformances();
     }
 
-    Void bind_lifetime_field_types(Self&! self) {
-        Int module_index! = 0;
-        while (module_index < self.type_ops.state.graph.module_count()) {
-            qid.ModuleId module_id = self.type_ops.state.graph.module_at(module_index);
-            qid.DefId module_def = self.type_ops.state.ctx.store.resolve.module_ref(module_id).def_id;
-            self.bind_lifetime_field_type_tree(module_def);
-            module_index = module_index + 1;
-        }
-    }
-
-    Void bind_lifetime_field_type_tree(Self&! self, qid.DefId def_id) {
-        if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
-        def.DefKind kind = self.type_ops.state.ctx.store.defs.get(def_id).kind;
-        if (kind == .field_def || kind == .enum_case_def) {
-            self.type_ops.type_for_decl_def(def_id);
-        }
+    // 先发布本次依赖闭包的 region schema，再绑定字段类型，最后检查合同。
+    // 分开这三步以容纳合法的间接递归类型，不再扫描整个 module graph。
+    Void prepare_lifetime_dependencies(Self&! self, qid.DefId def_id) {
+        list.ArrayList<qid.DefId> dependencies! = list.ArrayList<qid.DefId>();
+        self.collect_lifetime_dependency(def_id, dependencies$.mut_ref());
         Int index! = 0;
-        while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
-            qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
-            self.bind_lifetime_field_type_tree(member_def);
+        while (index < dependencies.len()) {
+            qid.DefId dependency = dependencies.get(index);
+            def.DefKind kind = self.type_ops.state.ctx.store.defs.get(dependency).kind;
+            if (kind == .field_def || kind == .enum_case_def) {
+                self.type_ops.type_for_decl_def(dependency);
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < dependencies.len()) {
+            qid.DefId dependency = dependencies.get(index);
+            def.DefKind kind = self.type_ops.state.ctx.store.defs.get(dependency).kind;
+            if (kind == .struct_def || kind == .enum_def) {
+                self.ensure_signature_checked(dependency);
+            }
             index = index + 1;
         }
     }
 
-    Void predeclare_nominal_region_schemas(Self&! self) {
-        Int module_index! = 0;
-        while (module_index < self.type_ops.state.graph.module_count()) {
-            qid.ModuleId module_id = self.type_ops.state.graph.module_at(module_index);
-            qid.DefId module_def = self.type_ops.state.ctx.store.resolve.module_ref(module_id).def_id;
-            self.predeclare_nominal_region_schema_tree(module_def);
-            module_index = module_index + 1;
+    Void collect_lifetime_dependency(Self&! self, qid.DefId def_id, list.ArrayList<qid.DefId>&! dependencies) {
+        if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
+        if (!self.type_ops.state.ctx.store.typeck.begin_lifetime_dependencies(def_id)) { return; }
+        dependencies.add(def_id);
+        self.predeclare_nominal_region_schema(def_id);
+        sem.Decl declaration = self.type_ops.state.ctx.store.model.def_ref(def_id).decl;
+        if (declaration.alias_target is .some(target)) { self.collect_lifetime_dependency(target, dependencies); }
+        if (declaration.type_ref is .some(type_ref)) {
+            self.collect_type_lifetime_dependencies(type_ref, dependencies);
+        }
+        if (declaration.function_signature is .some(signature)) {
+            self.collect_type_list_lifetime_dependencies(signature.params, dependencies);
+            self.collect_type_lifetime_dependencies(signature.result, dependencies);
+        }
+        if (self.type_ops.state.ctx.store.defs.get(def_id).owner_def is .some(owner)) {
+            self.collect_lifetime_dependency(owner, dependencies);
+        }
+        self.collect_field_lifetime_dependencies(def_id, dependencies);
+    }
+
+    Void collect_field_lifetime_dependencies(
+        Self&! self, qid.DefId owner, list.ArrayList<qid.DefId>&! dependencies
+    ) {
+        def.DefKind owner_kind = self.type_ops.state.ctx.store.defs.get(owner).kind;
+        if (owner_kind != .struct_def && owner_kind != .enum_def && owner_kind != .enum_case_def) { return; }
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_member_count(owner)) {
+            qid.DefId member = self.type_ops.state.ctx.store.model.def_member_at(owner, index);
+            def.DefKind kind = self.type_ops.state.ctx.store.defs.get(member).kind;
+            if (kind == .field_def || kind == .enum_case_def) {
+                self.collect_lifetime_dependency(member, dependencies);
+            }
+            index = index + 1;
         }
     }
 
-    Void predeclare_nominal_region_schema_tree(Self&! self, qid.DefId def_id) {
-        if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
+    Void collect_type_list_lifetime_dependencies(
+        Self&! self, sem.NodeId[]& refs, list.ArrayList<qid.DefId>&! dependencies
+    ) {
+        Int index! = 0;
+        while (index < refs.length) {
+            self.collect_type_lifetime_dependencies(refs[index], dependencies);
+            index = index + 1;
+        }
+    }
+
+    Void collect_type_lifetime_dependencies(
+        Self&! self, sem.NodeId type_ref, list.ArrayList<qid.DefId>&! dependencies
+    ) {
+        sem.Node node = self.type_ops.state.ctx.store.model.node(type_ref);
+        if (node.data is .named_type_ref(named)) {
+            self.collect_lifetime_dependency(named.def_id, dependencies);
+            self.collect_type_list_lifetime_dependencies(named.args, dependencies);
+        } else if (node.data is .layered_type_ref(layered)) {
+            self.collect_type_lifetime_dependencies(layered.element, dependencies);
+        } else if (node.data is .array_type_ref(array_type)) {
+            self.collect_type_lifetime_dependencies(array_type.element, dependencies);
+        } else if (node.data is .errorable_type_ref(errorable)) {
+            self.collect_type_lifetime_dependencies(errorable.value_type, dependencies);
+            if (errorable.error_type is .some(error_type)) {
+                self.collect_type_lifetime_dependencies(error_type, dependencies);
+            }
+        } else if (node.data is .function_type_ref(function_type)) {
+            self.collect_type_list_lifetime_dependencies(function_type.params, dependencies);
+            self.collect_type_lifetime_dependencies(function_type.result, dependencies);
+        } else if (node.data is .effect_type_ref(effect_type)) {
+            self.collect_type_lifetime_dependencies(effect_type.base, dependencies);
+        } else if (node.data is .tuple_type_ref(tuple_type)) {
+            self.collect_type_list_lifetime_dependencies(tuple_type.items, dependencies);
+        }
+    }
+
+    Void predeclare_nominal_region_schema(Self&! self, qid.DefId def_id) {
         def.DefKind kind = self.type_ops.state.ctx.store.defs.get(def_id).kind;
         if ((kind == .struct_def || self.is_payload_enum_def(def_id))
             && self.type_ops.state.ctx.store.model.def_region_annotation_count(def_id) > 0) {
@@ -230,12 +289,6 @@ public struct DeclCheck: Movable {
                 bindings$.ref(),
                 flows$.ref()
             );
-        }
-        Int index! = 0;
-        while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
-            qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
-            self.predeclare_nominal_region_schema_tree(member_def);
-            index = index + 1;
         }
     }
 
@@ -530,15 +583,20 @@ public struct DeclCheck: Movable {
 
     Void check_declaration_signature_tree(Self&! self, qid.DefId def_id) {
         if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
-        Bool validate_definition = !self.def_is_from_interface_only_module(def_id);
-        self.check_declaration_signature(def_id);
+        self.ensure_signature_checked(def_id);
         Int index! = 0;
         while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
             qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
             self.check_declaration_signature_tree(member_def);
             index = index + 1;
         }
-        if (!validate_definition) { return; }
+        self.ensure_definition_checked(def_id);
+    }
+
+    // 调用者先保证被依赖声明的全部必要成员签名可用；此处复用最终 sweep 的同一组约束检查。
+    public Void ensure_definition_checked(Self&! self, qid.DefId def_id) {
+        if (self.def_is_from_interface_only_module(def_id)) { return; }
+        if (!self.type_ops.state.ctx.store.typeck.begin_definition_validation(def_id)) { return; }
         self.check_nominal_region_bindings(def_id);
         self.check_callable_overload_ambiguity(def_id);
         self.check_nominal_value_recursion(def_id);
@@ -546,6 +604,23 @@ public struct DeclCheck: Movable {
         // 再检查 trait conformance，避免 CopyQuery 反向依赖 type check 计算。
         self.check_nominal_ownership_contract(def_id);
         self.check_trait_conformance(def_id);
+    }
+
+    #doc
+        检查声明及其泛型参数的签名，不检查 body 或普通 method；完成后未使用的 const 参数也有类型。
+    #end
+    public Void ensure_signature_checked(Self&! self, qid.DefId def_id) {
+        if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
+        if (!self.type_ops.state.ctx.store.typeck.begin_signature_check(def_id)) { return; }
+        self.prepare_lifetime_dependencies(def_id);
+        self.check_declaration_signature(def_id);
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.model.def_generic_param_count(def_id)) {
+            qid.DefId param = self.type_ops.state.ctx.store.model.def_generic_param_at(def_id, index);
+            self.ensure_signature_checked(param);
+            index = index + 1;
+        }
+        self.type_ops.state.ctx.store.typeck.complete_signature_check(def_id);
     }
 
     Void check_declaration_signature(Self&! self, qid.DefId def_id) {
@@ -682,7 +757,7 @@ public struct DeclCheck: Movable {
         qid.SymbolId symbol_id = self.type_ops.state.ctx.store.defs.get(def_id).name.symbol;
         if (!string.equal(self.type_ops.state.ctx.store.symbols.text(symbol_id), "main")) { return false; }
         qid.DefId module_def =
-            self.type_ops.state.ctx.store.resolve.module_ref(self.type_ops.state.graph.root_module).def_id;
+            self.type_ops.state.ctx.store.resolve.module_ref(self.type_ops.state.root_module).def_id;
         if (!self.type_ops.state.ctx.store.model.has_def(module_def)) { return false; }
         Int index! = 0;
         while (index < self.type_ops.state.ctx.store.model.def_member_count(module_def)) {

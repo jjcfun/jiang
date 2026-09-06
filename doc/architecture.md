@@ -12,7 +12,7 @@ driver/cli -> pipeline.compile
         source/package -> lang registry -> syntax parse -> module graph/resolve -> Semantic Model
                               |                 |                 |
                               v                 v                 v
-                       provider dylib      public syntax       early comptime
+                       provider dylib      public syntax       comptime eval
                          prepare             API               source select
 
         Semantic Model -> type facts + const values -> generic JIL -> reachable instance views -> backend output
@@ -29,8 +29,8 @@ driver/cli -> pipeline.compile
   `#jiang.*` 始终选择 compiler builtin provider。provider 通过 typed syntax factory 直接生成
   当前 compiler AST unit 中的节点，并返回 opaque `Ast` 根句柄。
 - `Semantic Model`：resolve 直接生成的未类型化语义树。
-- `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
-  source selection 在 resolve/Semantic Model lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
+- `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。条件声明与普通 const 请求编译期值，
+  编译调度按需准备其语义和 JIL 依赖，通过统一 JIL 执行器求值，再由消费者发布声明或保存值。
 - `generic JIL`：每个源码函数 lowering 和 borrow check 一次，允许包含泛型参数的 CFG。
 - `reachable instance views`：从真实入口和调用引用出发，以 `InstanceKey` 渐进发现实例；
   `InstanceReader` 解释 generic JIL，不复制 CFG。
@@ -80,6 +80,11 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 
 ### 阶段 Contract
 
+- 编译级调度
+  - 负责：依赖驱动的声明分析、JIL lowering、borrow/drop、求值及失败传播。
+  - Resolver 和 Sema 通过调用方提供的求值能力获取编译期值，不依赖执行器实现。
+  - 阶段允许交错，但每次调用都必须满足输入契约；递归请求前结束当前阶段对可变状态的借用。
+  - 完成状态按声明、表达式或实例记录；共享 store 的存在不授予各阶段任意修改其他阶段事实的权限。
 - `syntax`
   - 生产：token、AST、语法诊断。
   - 消费：source text、keyword store、lang registry。
@@ -100,13 +105,12 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
     `TypeCheckStore`。
   - 禁止：重新 resolve 名字、计算 ABI layout、生成 JIL。
 - `comptime`
-  - 生产：早期 source selection 结果，以及 `ComptimeStore` 中的 `DefId -> ComptimeValue`。
-  - 消费：AST、resolve facts、type facts。
-  - 禁止：执行运行时副作用、生成 JIL/backend 节点、把 `ComptimeValue` 泄漏到 backend。
-  - 备注：`comptime if` 的 top-level item 选择目前嵌在 resolve/name resolver 和 Semantic Model lowering
-    中，通过 `CompileSelector` 判断条件；`ComptimeStore` 本身只保存 const value。
+  - 生产：source selection 所需的条件值及普通编译期值。
+  - 消费：完成语义检查与安全检查的 JIL、实例绑定、target facts 和编译上下文提供的常量。
+  - 禁止：另行解释 AST/Semantic Model、读取程序运行期状态、隐式执行外部副作用。
+  - 条件值由 resolver 用于选择声明，普通 const 由语义查询保存；执行器不自行修改 namespace。
 - `jil`
-  - 生产：template CFG，以及按需实例化的 concrete CFG、local、place、rvalue、terminator。
+  - 生产：template CFG，以及实例读取所需的 local、place、rvalue、terminator 和实例身份。
   - 消费：Semantic Model、type facts、builtin operation lowering kind、layout query。
   - 禁止：重新 resolve/type check、按源码文本重新判断 builtin operation、写 backend symbol。
   - 备注：`Trait.Any` 动态调用、`Trait.VTable` slot 和 `Trait.Receiver` 构造在 JIL lowering
@@ -230,8 +234,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   extension 的共享 header 只生成一次，member 继续按各自 `DefId` 推进。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
 - `TypeCheckStore` 保存 node/def/call/pattern 的类型事实，不和 `TypeStore` 合并所有权语义。
-- declaration signature validation、declaration type 和 body check 都以 `DefId` 进入 typed query cache；
-  package type check 是这些 ensure 的最终全量 sweep，不维护另一套批量结果。
+- declaration signature 与 body check 按声明及其依赖推进；检查签名不意味着检查函数体。
+  package type check 补齐未引用声明及跨声明约束，并复用此前完成的检查结果。
 - `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
   public interface artifact 和 Semantic Model->JIL lowering；JIL 之后的阶段只能看 `jil.Const`、
   `jil.Global` 和 `jil.StaticValue`。

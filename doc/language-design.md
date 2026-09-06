@@ -10,15 +10,10 @@ pattern 和 drop 规则。compiler service 保留为后续工具链的基础，L
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
-## 状态标记
+## 设计约定
 
-本文档只记录目标设计和当前实现差异。
-为避免混淆，后续章节使用这些状态：
-
-- **目标规则**：希望长期保留的语言规则。
-- **当前已定义**：parser、Semantic Model/type check/JIL/backend 中已经接入并有测试覆盖的规则。
-- **当前缺口**：目标设计需要，但当前实现尚未完整接入。
-- **未定**：设计尚未冻结，不能作为 resolve/sema 的硬前提。
+本文档记录目标语义与架构决策，不追踪实现完成度或验证进度。标为“未定”的内容仍需讨论，
+不能作为语义分析的既定前提；开发任务及实现差异由对应版本 TODO 维护。
 
 ## 设计目标
 
@@ -80,7 +75,7 @@ Token 只表示词法事实，不承载语义类型。
 
 ## Lang Package / 自定义语法
 
-当前已定义：Jiang 支持 block 形式的 lang invocation：
+Jiang 的 lang invocation 使用 block 形式：
 
 ```jiang
 User user = #sql {
@@ -724,7 +719,10 @@ materialize 成 readonly `jil.Global`，initializer 用 `jil.StaticValue` 表达
 事实，不读取 `ComptimeValue`。
 
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
-`recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
+`recursive_const_initializer`；编译期执行受递归深度和执行步数配额限制，循环与调用共同消耗本次求值的
+步数额度。耗尽时诊断 `comptime_branch_quota_exceeded`，避免编译期执行失控。
+整数与浮点互转按源/目标整数的符号性和目标精度执行。编译期浮点转整数向零截断；NaN、无穷或
+截断后超出目标整数范围的值诊断为 `comptime_invalid_cast`，不执行未定义转换。
 const generic 参数的 canonical 约束语法是 `@where(K: const Type)`，例如
 `@where(N: const Int) struct Fixed<T, N>`。声明列表中的 `N: const Int` 是等价简写，lower
 到同一条 Semantic Model predicate。这里 `const Type` 是一种约束 kind，不是 trait；const generic 名字
@@ -910,7 +908,7 @@ T add<T>(T left, T right);
 
 ## 函数指针和闭包
 
-当前已定义：Jiang 区分裸函数指针和闭包值。
+Jiang 区分裸函数指针和闭包值。
 
 - `RawFn<Ret, Args...>` 是裸函数指针。它只保存函数入口，不携带捕获环境，不需要 drop，
   可用于 C ABI 函数指针边界。
@@ -1624,25 +1622,27 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - `comptime { ... }` 是语言内建编译期 block，表示 block 内 Jiang 代码在编译期执行。
 - `comptime` 使用普通关键字入口，不占用后续 `#sql { ... }`、`#asm { ... }` 这类 custom syntax
   namespace；`@` 保留给 attribute / annotation。
-- 当前 `comptime` 只支持 module-level，用于 target-specific import / declaration 选择；0.5.4 将其显式
-  记为 `comptime [early]`，并在完整检查后增加 `comptime [late]`。
+- `comptime {}` 等价于 `comptime [eval] {}`；`eval` 和 `generate` 是 kind 选项，不是全局保留关键字。
+  不接受 early/late 别名；显式选项必须包含且仅包含一个已知 kind。
+- eval 在语义分析需要结果时执行；generate 在目标输入完整通过语义检查后，由独立的
+  `jiang generate` 命令执行。普通 build/check 不执行 generate 文件输出，不根据失败自动切换 kind。
 - `comptime` block 不生成 runtime code。
 - `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
   parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only
   AST/type system。
 - `comptime` block 内未执行的分支不参与 import graph、name resolve、type check 或 codegen。
-- 第一版仍然先完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
+- 完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
   之后的语义阶段会跳过未执行分支。
-- `comptime if` 的 condition 是普通表达式，但类型必须能在编译期求值为 `Bool`。当前 conditional
-  import 在 module graph 封闭前使用窄 AST-level evaluator；这也是它还不能读取同文件普通 const
-  的原因。0.5.4 改为先登记当前 source 的全部 declaration skeleton，再由 early comptime 按需推进
-  condition 依赖的 const、signature 和纯函数 body，求值结果再决定需要发现的 import source。
-- early comptime 可以读取已经发现 source 中的普通 const，并按需调用符合 comptime 安全边界的普通
-  函数。依赖尚未由当前 source-selection 路径选中的 declaration 时，不猜测分支；统一查询状态输出
+- `comptime if` 的 condition 是普通表达式，必须能在编译期求值为 `Bool`。先登记当前 source 的
+  普通声明，再按需检查并执行条件的依赖，求值结果决定需要发现的 import source；
+  不要求先封闭整个 Sema，也不要求 LLVM/linker 同时渐进式化。
+- eval 可以读取已经发现 source 中的普通 const，并按需调用符合 comptime 安全边界的普通
+  函数。依赖尚未由当前 source-selection 路径选中的 declaration 时，不猜测分支；对应查询状态输出
   不可达或依赖循环诊断。
-- 常规 const initializer 由 type check 后的 Semantic Model comptime interpreter 执行。它支持 const 引用、
-  aggregate literal、字段访问、控制流、block 尾表达式、普通函数调用和自定义 `init`，但不执行
-  IO，不访问运行时变量。
+- eval 不隐式执行 IO，不读取运行期变量；在编译期执行内部声明、初始化和修改的局部变量不属于运行期状态。
+- eval、普通 const、数组长度、const generic 和 enum discriminant 共用 JIL 求值，generate 也复用
+  同一执行语义，不维护独立的 AST 或 Semantic Model 表达式解释语义。
+  JIL 执行遵守 borrow/drop、target 布局及执行配额，编译器回收内存不代替语言 deinit，host 地址不得逃逸。
 
 示例：
 

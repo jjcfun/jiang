@@ -1,0 +1,931 @@
+#doc(module)
+    编译期 JIL 执行入口；仅消费已经检查的 JIL、实例绑定和 target facts，不回读 AST/Sema 表达式。
+    执行标量、聚合、引用、locals、CFG 和直接调用；未支持的操作明确失败，不调用旧解释器。
+#end
+
+import context = "../context.jiang";
+import compiler_store = "../store.jiang";
+import qid = "../id.jiang";
+import jil = "./model.jiang";
+import reader_api = "./instance_reader.jiang";
+import callable_abi = "./callable_abi.jiang";
+import drop_projection = "./drop_projection.jiang";
+import bindings = "../sema/generic/bindings.jiang";
+import value = "../sema/comptime/value.jiang";
+import types = "../sema/type.jiang";
+import drop = "../sema/drop.jiang";
+import list = "../support/list.jiang";
+import diagnostic = "../diagnostic.jiang";
+import token = "../syntax/token.jiang";
+import database = "../db.jiang";
+import layout = "../layout.jiang";
+import frame_api = "./eval/frame.jiang";
+import integer = "./eval/integer.jiang";
+import floating = "./eval/floating.jiang";
+import memory_api = "./eval/memory.jiang";
+import std;
+
+public value.ComptimeValue? evaluate_function(
+    context.CompilerContext&! ctx,
+    jil.Store& program,
+    qid.DefId function_def,
+    types.GenericArg[]& generic_args,
+    value.ComptimeValue[]& args,
+    Int step_quota = 10000,
+    Int depth_limit = 128
+) {
+    return evaluate_function(ctx.store$.mut_ref(), ctx.query$.mut_ref(), program,
+        function_def, generic_args, args, step_quota, depth_limit);
+}
+
+public value.ComptimeValue? evaluate_function(
+    compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& program, qid.DefId function_def, types.GenericArg[]& generic_args, value.ComptimeValue[]& args,
+    Int step_quota = 10000, Int depth_limit = 128
+) {
+    Executor executor! = Executor(store, query, program, step_quota, depth_limit);
+    return executor.evaluate(function_def, generic_args, args);
+}
+
+public value.ComptimeValue? evaluate_expression(
+    context.CompilerContext&! ctx, jil.Store& program, jil.FunctionId expression,
+    types.GenericArg[]& generic_args, Int step_quota = 10000, Int depth_limit = 128
+) {
+    return evaluate_expression(ctx.store$.mut_ref(), ctx.query$.mut_ref(), program, expression,
+        generic_args, step_quota, depth_limit);
+}
+
+public value.ComptimeValue? evaluate_expression(
+    compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+    jil.Store& program, jil.FunctionId expression,
+    types.GenericArg[]& generic_args, Int step_quota = 10000, Int depth_limit = 128
+) {
+    Executor executor! = Executor(store, query, program, step_quota, depth_limit);
+    return executor.evaluate_expression(expression, generic_args);
+}
+
+@region(a, b)
+struct Executor: Movable {
+    @life(a)
+    compiler_store.CompilerStore&! store;
+    @life(a)
+    database.QueryEngine&! query;
+    @life(b)
+    jil.Store& program;
+    Int steps!;
+    Int depth!;
+    Int depth_limit;
+    Bool failed!;
+    memory_api.Memory memory!;
+
+    init(self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        jil.Store& program, Int steps, Int depth_limit) {
+        self.store = store;
+        self.query = query;
+        self.program = program;
+        self.steps = steps;
+        self.depth = 0;
+        self.depth_limit = depth_limit;
+        self.failed = false;
+        self.memory = memory_api.Memory();
+    }
+
+    value.ComptimeValue? evaluate(
+        Self&! self, qid.DefId function_def, types.GenericArg[]& generic_args, value.ComptimeValue[]& args
+    ) {
+        list.ArrayList<Int> addresses! = list.ArrayList<Int>(args.length);
+        Int index! = 0;
+        while (index < args.length) {
+            guard self.memory.import_value(self.store, self.query, args[index]) is .some(address) else {
+                self.fail(function_def, token.Span(), "comptime_invalid_argument",
+                    "cannot import value into eval memory");
+                return null;
+            }
+            addresses.add(address);
+            index = index + 1;
+        }
+        guard self.call(function_def, generic_args, addresses.slice(), token.Span()) is .some(result) else {
+            return null;
+        }
+        return self.export_result(function_def, result);
+    }
+
+    value.ComptimeValue? evaluate_expression(
+        Self&! self, jil.FunctionId expression, types.GenericArg[]& generic_args
+    ) {
+        jil.Function function = self.program.program.function(expression);
+        qid.DefId owner = jil.function_provenance_def(function.origin);
+        if (!self.program_ready()
+            || !self.store.borrowck.generated_function_checked(expression.to_index())) {
+            self.fail(owner, function.span, "comptime_function_not_ready",
+                "JIL expression must be lowered and borrow checked before eval");
+            return null;
+        }
+        bindings.GenericBindings empty! = bindings.GenericBindings();
+        bindings.GenericBindings concrete = bindings.bindings_for_instance(
+            self.store.defs$.ref(), self.store.model$.ref(), self.store.types$.ref(),
+            owner, generic_args, empty$.ref()
+        );
+        list.ArrayList<Int> args! = list.ArrayList<Int>();
+        guard self.execute(function, concrete, args.slice()) is .some(result) else { return null; }
+        return self.export_result(owner, result);
+    }
+
+    value.ComptimeValue? export_result(Self&! self, qid.DefId function_def, Int result) {
+        guard self.memory.export_value(self.store, self.query, result) is .some(value) else {
+            self.fail(function_def, token.Span(), "comptime_value_not_materializable",
+                "eval result contains an address or unsupported value that cannot escape compilation");
+            return null;
+        }
+        return value;
+    }
+
+    Int? call(
+        Self&! self, qid.DefId function_def, types.GenericArg[]& generic_args,
+        Int[]& args, token.Span span
+    ) {
+        if (!self.ready(function_def, span)) { return null; }
+        jil.Function function = self.program.program.source_function(function_def);
+        if (function.is_external || function.effects.has_async) {
+            self.fail(function_def, span, "comptime_call_not_supported",
+                "external or async call is not supported in eval");
+            return null;
+        }
+        bindings.GenericBindings empty! = bindings.GenericBindings();
+        bindings.GenericBindings concrete = bindings.bindings_for_instance(
+            self.store.defs$.ref(), self.store.model$.ref(), self.store.types$.ref(),
+            function_def, generic_args, empty$.ref()
+        );
+        return self.execute(function, concrete, args);
+    }
+
+    Int? call_generated(Self&! self, jil.FunctionId id, Int[]& args, token.Span span) {
+        jil.Function function = self.program.program.function(id);
+        qid.DefId owner = jil.function_provenance_def(function.origin);
+        Bool checked = self.store.borrowck.generated_function_checked(id.to_index())
+            || self.program.program.is_borrow_check_exempt(id);
+        if (!self.program_ready() || !checked || !self.program.drop_elaboration.contains(id)) {
+            self.fail(owner, span, "comptime_function_not_ready",
+                "generated JIL function must be prepared before eval");
+            return null;
+        }
+        if (function.is_external || function.effects.has_async) {
+            self.fail(owner, span, "comptime_call_not_supported", "external or async call is not supported in eval");
+            return null;
+        }
+        bindings.GenericBindings empty! = bindings.GenericBindings();
+        return self.execute(function, empty, args);
+    }
+
+    Int? execute(Self&! self, jil.Function function, bindings.GenericBindings concrete, Int[]& args) {
+        if (self.depth >= self.depth_limit) {
+            self.fail(jil.function_provenance_def(function.origin), function.span,
+                "comptime_recursion_limit", "JIL evaluation exceeded recursion limit");
+            return null;
+        }
+        frame_api.Frame frame! = frame_api.Frame(function, concrete);
+        if (!self.allocate_frame(frame$.mut_ref())) { return null; }
+        if (!self.bind_parameters(frame$.mut_ref(), args)) { return null; }
+        self.depth = self.depth + 1;
+        Int? result = self.run(frame$.mut_ref());
+        self.depth = self.depth - 1;
+        self.release_frame(frame$.ref());
+        return result;
+    }
+
+    Bool allocate_frame(Self&! self, frame_api.Frame&! frame) {
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        Int index! = 0;
+        while (index < frame.function.body.locals.length) {
+            qid.TypeId type_id = reader.type_id(frame.function.body.locals[index].type_id);
+            guard self.memory.allocate(type_id) is .some(address) else {
+                self.frame_error(frame, "comptime_memory_limit", "JIL eval memory limit exceeded");
+                return false;
+            }
+            frame.locals.add(address);
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Void release_frame(Self&! self, frame_api.Frame& frame) {
+        Int index! = 0;
+        while (index < frame.locals.len()) {
+            self.memory.set_live(frame.locals.get(index), false);
+            index = index + 1;
+        }
+    }
+
+    Bool program_ready(self) {
+        return !self.failed && !self.program.program.has_errors() && !self.store.typeck.has_errors()
+            && !database.layout_has_errors(self.query$.ref())
+            && self.store.owns_borrow_check_result(self.program.program.query_identity)
+            && self.store.borrowck.accepted();
+    }
+
+    Bool ready(Self&! self, qid.DefId def_id, token.Span span) {
+        if (self.failed) { return false; }
+        if (self.program_ready()) {
+            if (self.program.program.source_function_index_for_def(def_id) is .some(index)) {
+                if (self.store.borrowck.source_function_checked(index)) { return true; }
+            }
+        }
+        self.fail(def_id, span, "comptime_function_not_ready",
+            "JIL function must be lowered and borrow checked before eval");
+        return false;
+    }
+
+    Bool bind_parameters(Self&! self, frame_api.Frame&! frame, Int[]& args) {
+        Int index! = 0;
+        Int arg_index! = 0;
+        while (index < frame.function.body.locals.length) {
+            jil.LocalDecl local = frame.function.body.locals[index];
+            index = index + 1;
+            if (local.kind != .param) { continue; }
+            if (arg_index >= args.length) {
+                self.frame_error(frame, "comptime_argument_mismatch", "JIL argument count does not match parameters");
+                return false;
+            }
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            if (!self.store.types.same_type_ignoring_mutability(
+                reader.type_id(local.type_id), self.memory.get(args[arg_index]).type_id
+            )) {
+                self.frame_error(frame, "comptime_argument_type_mismatch",
+                    "JIL argument type does not match parameter");
+                return false;
+            }
+            if (!self.memory.copy_into(self.store, self.query, frame.locals.get(local.id.to_index()), args[arg_index])) {
+                self.frame_error(frame, "comptime_invalid_argument", "cannot initialize JIL parameter storage");
+                return false;
+            }
+            arg_index = arg_index + 1;
+        }
+        if (arg_index == args.length && index == frame.function.body.locals.length) { return true; }
+        self.frame_error(frame, "comptime_argument_mismatch", "JIL argument count does not match parameters");
+        return false;
+    }
+
+    Int? run(Self&! self, frame_api.Frame&! frame) {
+        jil.BlockId next! = frame.function.body.entry;
+        while (!self.failed) {
+            jil.Block block = frame.function.body.blocks[next.to_index()];
+            self.statements(frame, block.statements);
+            frame.span = block.terminator.span;
+            if (!self.tick(frame, block.terminator.span)) { return null; }
+            if (block.terminator.kind is .return_term(return_term)) {
+                if (return_term.implicit_unit) {
+                    return self.memory.scalar(value.ComptimeValue(
+                        type_id: self.store.types.unit_type(), data: .unit_value
+                    ));
+                }
+                return self.local(frame, frame.function.body.return_local);
+            }
+            guard self.successor(frame, block.terminator) is .some(target) else { return null; }
+            next = target;
+        }
+        return null;
+    }
+
+    Void statements(Self&! self, frame_api.Frame&! frame, jil.Statement[]& statements) {
+        Int index! = 0;
+        while (index < statements.length) {
+            jil.Statement statement = statements[index];
+            frame.span = statement.span;
+            index = index + 1;
+            if (!self.tick(frame, statement.span)) { return; }
+            self.statement(frame, statement);
+        }
+    }
+
+    Void statement(Self&! self, frame_api.Frame&! frame, jil.Statement statement) {
+        // 初始化/独占标记已被 borrow 与 drop scheduling 消费，不是第二次值写入。
+        if (statement.kind is .drop_initialized_stmt(_) || statement.kind is .exclusive_stmt(_)) { return; }
+        if (statement.kind is .assign_stmt(assign)) {
+            qid.TypeId type_id = self.place_type(frame, assign.destination);
+            guard self.rvalue(frame, assign.value, type_id) is .some(result) else { return; }
+            self.write(frame, assign.destination, result);
+            return;
+        }
+        if (statement.kind is .storage_live_stmt(live)) {
+            Int local = live.local_id.to_index();
+            Int previous = frame.locals.get(local);
+            qid.TypeId type_id = self.memory.get(previous).type_id;
+            self.memory.set_live(previous, false);
+            guard self.memory.allocate(type_id) is .some(address) else {
+                self.frame_error(frame, "comptime_memory_limit", "cannot start JIL local storage lifetime");
+                return;
+            }
+            frame.locals.set(local, address);
+            return;
+        }
+        if (statement.kind is .storage_dead_stmt(dead)) {
+            self.memory.set_live(frame.locals.get(dead.local_id.to_index()), false);
+            return;
+        }
+        self.frame_error(frame, "comptime_statement_not_supported", "JIL statement is not supported in eval");
+    }
+
+    jil.BlockId? successor(Self&! self, frame_api.Frame&! frame, jil.Terminator terminator) {
+        if (terminator.kind is .goto_term(go)) { return go.target; }
+        if (terminator.kind is .branch_term(branch)) {
+            guard self.condition(frame, branch.condition) is .some(condition) else { return null; }
+            if (condition) { return branch.then_target; }
+            return branch.else_target;
+        }
+        if (terminator.kind is .switch_term(switch_term)) { return self.switch_target(frame, switch_term); }
+        if (terminator.kind is .call_term(call)) {
+            if (!self.call_terminator(frame, call, terminator.span)) { return null; }
+            return call.target;
+        }
+        if (terminator.kind is .drop_term(drop_term)) {
+            if (!self.drop_place(frame, drop_term, terminator.span)) { return null; }
+            return drop_term.target;
+        }
+        if (terminator.kind is .assert_term(assert_term)) {
+            guard self.condition(frame, assert_term.condition) is .some(condition) else { return null; }
+            if (condition == assert_term.expected) { return assert_term.target; }
+            self.fail(self.frame_def(frame), terminator.span,
+                "comptime_assertion_failed", "assertion failed during JIL eval");
+            return null;
+        }
+        self.frame_error(frame, "comptime_terminator_not_supported", "JIL terminator is not supported in eval");
+        return null;
+    }
+
+    Bool drop_place(Self&! self, frame_api.Frame&! frame, jil.DropTerminator term, token.Span span) {
+        qid.TypeId type_id = self.place_type(frame, term.place);
+        guard self.resolve_place(frame, term.place) is .some(address) else { return false; }
+        list.ArrayList<drop_projection.DropFieldStep> path! = list.ArrayList<drop_projection.DropFieldStep>();
+        return self.drop_path(frame, term, address, type_id, path$.mut_ref(), span);
+    }
+
+    #doc 按 JIL 初始化标志递归析构有效子路径；不读取已被部分移动的整个聚合值。
+    Bool drop_path(
+        Self&! self, frame_api.Frame&! frame, jil.DropTerminator term, Int address, qid.TypeId type_id,
+        list.ArrayList<drop_projection.DropFieldStep>&! path, token.Span span
+    ) {
+        if (!self.tick(frame, span)) { return false; }
+        drop.DropQuery query = drop.DropQuery(self.store$.ref());
+        if (!query.type_needs_runtime_drop(self.query.layout$.mut_ref(), type_id)) { return true; }
+        if (drop_projection.projection_flag_for_drop_path(term, path) is .some(flag)) {
+            guard self.condition(frame, jil.copy_operand_value(jil.CopyOperand(place: flag)))
+                is .some(initialized) else { return false; }
+            if (!initialized) { return true; }
+        }
+        if (!drop_projection.drop_path_has_descendant(term, path)
+            || !drop_projection.type_is_expandable(self.store$.ref(), type_id)) {
+            return self.drop_value(frame, address, type_id, span);
+        }
+        layout.LayoutId shape_id = database.layout_of_type(self.query$.mut_ref(), self.store$.ref(), type_id);
+        Int count = self.query.layout.store().layout(shape_id).fields.length;
+        Int step! = 0;
+        while (step < count) {
+            Int index = drop_projection.field_index_in_drop_order(self.store$.ref(), type_id, count, step);
+            step = step + 1;
+            layout.FieldLayout field = self.query.layout.store().layout(shape_id).fields[index];
+            guard self.memory.child(self.store, self.query, address, index) is .some(child) else {
+                self.frame_error(frame, "comptime_invalid_place", "partial drop requires aggregate storage");
+                return false;
+            }
+            path.add(drop_projection.DropFieldStep(field_def: field.field_def, field_index: index));
+            Bool dropped = self.drop_path(frame, term, child, field.field_type, path, span);
+            path.pop();
+            if (!dropped) { return false; }
+        }
+        self.memory.clear_value(address);
+        return true;
+    }
+
+    #doc 完整子值交给已准备好的共享 drop glue，不在解释器中重新实现 deinit 规则。
+    Bool drop_value(Self&! self, frame_api.Frame&! frame, Int address, qid.TypeId type_id, token.Span span) {
+        qid.TypeId canonical_type = self.store.types.canonical_substitution_type(type_id);
+        guard self.program.program.drop_glue(canonical_type) is .some(glue) else {
+            self.frame_error(frame, "comptime_function_not_ready", "JIL drop glue must be prepared before eval");
+            return false;
+        }
+        guard self.copy_value(frame, address) is .some(value) else { return false; }
+        self.memory.clear_value(address);
+        list.ArrayList<Int> args! = list.ArrayList<Int>(1);
+        args.add(value);
+        return self.call_generated(glue, args.slice(), span) != null;
+    }
+
+    jil.BlockId? switch_target(Self&! self, frame_api.Frame&! frame, jil.SwitchTerminator switch_term) {
+        guard self.operand(frame, switch_term.discriminator) is .some(discriminator) else { return null; }
+        Int index! = 0;
+        while (index < switch_term.cases.length) {
+            jil.SwitchCase item = switch_term.cases[index];
+            guard self.constant(frame, item.value) is .some(candidate) else { return null; }
+            guard self.scalar(frame, discriminator) is .some(left) else { return null; }
+            guard self.scalar(frame, candidate) is .some(right) else { return null; }
+            if (value.equal(left, right)) { return item.target; }
+            index = index + 1;
+        }
+        return switch_term.default_target;
+    }
+
+    Bool call_terminator(Self&! self, frame_api.Frame&! frame, jil.CallTerminator call, token.Span span) {
+        guard call.callee is .direct_function(reference) else {
+            self.frame_error(frame, "comptime_call_not_supported", "indirect JIL call is not supported in eval");
+            return false;
+        }
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        reader_api.ResolvedCallee target = reader.callee(reference.target, reference.args, reference.dispatch_type);
+        if (target.dispatch_type != null || target.builtin != null) {
+            self.frame_error(frame, "comptime_dispatch_not_supported", "JIL builtin dispatch is not supported in eval");
+            return false;
+        }
+        list.ArrayList<Int> args! = list.ArrayList<Int>(call.args.length);
+        guard self.store.types.get(reader.type_id(reference.type_id)).data is .function_type(signature) else {
+            self.frame_error(frame, "comptime_function_not_ready", "JIL call signature must be prepared before eval");
+            return false;
+        }
+        if (signature.params.length != call.args.length) {
+            self.frame_error(frame, "comptime_argument_mismatch", "JIL argument count does not match call signature");
+            return false;
+        }
+        Int index! = 0;
+        while (index < call.args.length) {
+            guard self.call_operand(frame, call.args[index], signature.params[index]) is .some(arg) else { return false; }
+            args.add(arg);
+            index = index + 1;
+        }
+        Int? result!;
+        if (target.target is .source(def_id)) {
+            result = self.call(def_id, target.args.slice(), args.slice(), span);
+        } else {
+            guard target.target is .generated(generated) else { assert(false); return false; }
+            result = self.call_generated(generated.id, args.slice(), span);
+        }
+        guard result is .some(address) else { return false; }
+        return self.write(frame, call.destination, address);
+    }
+
+    #doc 复用 JIL 的引用实参约定，在原 place 上借用，不先 move 再引用临时拷贝。
+    Int? call_operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand, qid.TypeId parameter) {
+        jil.Place? place! = null;
+        if (operand is .copy_operand(copy)) { place = copy.place; }
+        if (operand is .move_operand(move)) { place = move.place; }
+        if (place is .some(actual)) {
+            qid.TypeId actual_type = self.place_type(frame, actual);
+            if (callable_abi.parameter_borrows_value_place(self.store.types$.ref(), parameter, actual_type)) {
+                guard self.store.types.get(parameter).data is .handle_type(handle) else { assert(false); return null; }
+                if (!self.store.types.same_type_ignoring_mutability(handle.element, actual_type)) {
+                    self.frame_error(frame, "comptime_argument_type_mismatch", "JIL reference argument has wrong pointee type");
+                    return null;
+                }
+                return self.reference(frame, actual, parameter);
+            }
+        }
+        return self.operand(frame, operand);
+    }
+
+    Int? rvalue(Self&! self, frame_api.Frame&! frame, jil.Rvalue rvalue, qid.TypeId result_type) {
+        if (rvalue is .use_value(use)) { return self.operand(frame, use.value); }
+        if (rvalue is .layout_value(layout_value)) { return self.layout_value(frame, layout_value, result_type); }
+        if (rvalue is .aggregate_value(aggregate)) { return self.aggregate(frame, aggregate, result_type); }
+        if (rvalue is .borrow_value(borrow)) { return self.reference(frame, borrow.place, result_type); }
+        if (rvalue is .address_of_value(address)) { return self.reference(frame, address.place, result_type); }
+        if (rvalue is .alloc_box_value(allocated)) {
+            return self.allocate_value(frame, allocated.value_type, null, result_type);
+        }
+        if (rvalue is .alloc_value(allocated)) {
+            return self.allocate_value(frame, allocated.value_type, allocated.value, result_type);
+        }
+        if (rvalue is .free_value(freed)) { return self.release_value(frame, freed.pointer); }
+        if (rvalue is .len_value(length)) {
+            qid.TypeId type_id = self.place_type(frame, length.place);
+            if (self.store.types.get(type_id).data is .array_type(array)) {
+                return self.scalar_result(frame, integer.from_bits(self.store, self.query, result_type, UInt64(array.count)));
+            }
+        }
+        if (rvalue is .binary_value(binary)) {
+            guard self.operand(frame, binary.lhs) is .some(lhs) else { return null; }
+            guard self.operand(frame, binary.rhs) is .some(rhs) else { return null; }
+            Bool structural = binary.op == .structural_eq || binary.op == .structural_ne;
+            if (binary.op == .eq || binary.op == .ne || structural) {
+                if (self.reference_equal(lhs, rhs, structural) is .some(equal)) {
+                    Bool result! = equal;
+                    if (binary.op == .ne || binary.op == .structural_ne) { result = !result; }
+                    return self.scalar_result(frame, value.ComptimeValue(
+                        type_id: result_type, data: .bool_value(result)
+                    ));
+                }
+            }
+            guard self.scalar(frame, lhs) is .some(left) else { return null; }
+            guard self.scalar(frame, rhs) is .some(right) else { return null; }
+            value.ComptimeValue? result!;
+            if (left.data is .float_bits(_)) {
+                result = floating.binary(self.store, binary.op, left, right, result_type);
+            } else {
+                result = integer.binary(self.store, self.query, binary.op, left, right, result_type);
+            }
+            if (result == null) {
+                self.frame_error(frame, "comptime_invalid_operation", "invalid or unsupported JIL binary operation");
+                return null;
+            }
+            return self.scalar_result(frame, result);
+        }
+        if (rvalue is .unary_value(unary)) {
+            guard self.scalar_operand(frame, unary.value) is .some(operand) else { return null; }
+            value.ComptimeValue? result!;
+            if (operand.data is .float_bits(_)) {
+                result = floating.unary(self.store, unary.op, operand, result_type);
+            } else {
+                result = integer.unary(self.store, self.query, unary.op, operand, result_type);
+            }
+            if (result == null) {
+                self.frame_error(frame, "comptime_invalid_operation", "invalid or unsupported JIL unary operation");
+                return null;
+            }
+            return self.scalar_result(frame, result);
+        }
+        if (rvalue is .cast_value(cast)) {
+            if (cast.kind == .ptr_to_ptr) { return self.pointer_cast(frame, cast.value, result_type); }
+            guard self.scalar_operand(frame, cast.value) is .some(operand) else { return null; }
+            if (cast.kind == .int_to_float || cast.kind == .float_to_int) {
+                value.ComptimeValue? result!;
+                if (cast.kind == .int_to_float) {
+                    result = floating.from_integer(self.store, operand, result_type);
+                } else {
+                    result = floating.to_integer(self.store, self.query, operand, result_type);
+                }
+                if (result == null) {
+                    self.frame_error(frame, "comptime_invalid_cast", "invalid or out-of-range JIL numeric cast");
+                    return null;
+                }
+                return self.scalar_result(frame, result);
+            }
+            if (cast.kind == .float_to_float) {
+                guard floating.number(operand) is .some(number) else {
+                    self.frame_error(frame, "comptime_invalid_cast", "JIL float cast requires a floating value");
+                    return null;
+                }
+                return self.scalar_result(frame, floating.from_number(self.store, result_type, number));
+            }
+            if (cast.kind == .int_to_int) {
+                guard integer.bits(operand) is .some(bits) else {
+                    self.frame_error(frame, "comptime_invalid_cast", "JIL integer cast requires an integer value");
+                    return null;
+                }
+                if (integer.from_bits(self.store, self.query, result_type, bits) is .some(result)) {
+                    return self.scalar_result(frame, result);
+                }
+            }
+        }
+        self.frame_error(frame, "comptime_rvalue_not_supported", "JIL value operation is not supported in eval");
+        return null;
+    }
+
+    #doc 显式分配保留未初始化状态，让既有 JIL 构造逻辑直接写入 pointee，不额外复制 owning 对象。
+    Int? allocate_value(
+        Self&! self, frame_api.Frame&! frame, qid.TypeId value_type, jil.Operand? initializer, qid.TypeId result_type
+    ) {
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        qid.TypeId concrete = reader.type_id(value_type);
+        Int? initialized_value! = null;
+        if (initializer is .some(operand)) {
+            guard self.operand(frame, operand) is .some(value) else { return null; }
+            initialized_value = value;
+        }
+        guard self.memory.allocate_heap(concrete) is .some(target) else {
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval owned storage");
+            return null;
+        }
+        if (initialized_value is .some(value)) {
+            if (!self.memory.copy_into(self.store, self.query, target, value)) {
+                self.frame_error(frame, "comptime_invalid_write", "cannot initialize JIL eval owned storage");
+                return null;
+            }
+        }
+        if (self.memory.reference(result_type, target) is .some(pointer)) { return pointer; }
+        self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval owner pointer");
+        return null;
+    }
+
+    #doc 消费 free 指令；拒绝栈地址、内部字段地址和重复释放，不把逻辑地址传给宿主分配器。
+    Int? release_value(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
+        guard self.operand(frame, operand) is .some(pointer) else { return null; }
+        memory_api.CellData data = self.memory.get(pointer).data;
+        if (data is .reference(target)) {
+            if (!self.memory.release_heap(target)) {
+                self.frame_error(frame, "comptime_invalid_free", "JIL free requires a live allocation root");
+                return null;
+            }
+        } else if (!(data is .null_pointer)) {
+            self.frame_error(frame, "comptime_invalid_free", "JIL free requires an allocation pointer or null");
+            return null;
+        }
+        return self.scalar_result(frame, value.ComptimeValue(
+            type_id: self.store.types.unit_type(), data: .unit_value
+        ));
+    }
+
+    #doc 比较逻辑引用和 null，不把解释器 cell 编号转换成目标机器地址。
+    Bool? reference_equal(self, Int lhs, Int rhs, Bool structural) {
+        memory_api.CellData left = self.memory.get(lhs).data;
+        memory_api.CellData right = self.memory.get(rhs).data;
+        // optional 的两个 null 没有 payload；其他结构相等不能用地址相等替代。
+        if (structural) {
+            if (left is .null_pointer && right is .null_pointer) { return true; }
+            return null;
+        }
+        if (left is .null_pointer) {
+            if (right is .null_pointer) { return true; }
+            if (right is .reference(_)) { return false; }
+        }
+        if (left is .reference(address)) {
+            if (right is .null_pointer) { return false; }
+            if (right is .reference(other)) { return address == other; }
+        }
+        return null;
+    }
+
+    Int? pointer_cast(Self&! self, frame_api.Frame&! frame, jil.Operand operand, qid.TypeId result_type) {
+        guard self.operand(frame, operand) is .some(address) else { return null; }
+        memory_api.Cell cell = self.memory.get(address);
+        types.TypeData source = self.store.types.get(cell.type_id).data;
+        types.TypeData target = self.store.types.get(result_type).data;
+        if (source is .handle_type(source_handle) && target is .handle_type(target_handle)) {
+            Bool same_element = self.store.types.same_type_ignoring_mutability(
+                source_handle.element, target_handle.element
+            );
+            if (same_element && cell.data is .reference(pointer)) {
+                if (self.memory.reference(result_type, pointer) is .some(result)) { return result; }
+                self.frame_error(frame, "comptime_invalid_pointer", "eval pointer target is dead or memory limit exceeded");
+                return null;
+            }
+            if (cell.data is .null_pointer) {
+                if (self.memory.null_pointer(result_type) is .some(result)) { return result; }
+                self.frame_error(frame, "comptime_memory_limit", "JIL eval memory limit exceeded");
+                return null;
+            }
+        }
+        self.frame_error(frame, "comptime_invalid_cast", "eval pointer cast cannot reinterpret pointee storage");
+        return null;
+    }
+
+    Int? layout_value(
+        Self&! self, frame_api.Frame& frame, jil.LayoutValueRvalue value, qid.TypeId result_type
+    ) {
+        Int result! = self.query.layout.target().aggregate_align;
+        if (value.kind != .max_align) {
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            qid.TypeId type_id = reader.type_id(value.type_id);
+            layout.LayoutId layout_id = database.layout_of_type(
+                self.query$.mut_ref(), self.store$.ref(), type_id
+            );
+            if (database.layout_has_errors(self.query$.ref())) {
+                self.frame_error(frame, "comptime_layout_failed", "JIL eval requires a valid concrete target layout");
+                return null;
+            }
+            result = self.query.layout.store().layout(layout_id).size;
+            if (value.kind == .align) { result = self.query.layout.store().layout(layout_id).align; }
+        }
+        return self.scalar_result(frame, integer.from_bits(self.store, self.query, result_type, UInt64(result)));
+    }
+
+    Int? operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
+        if (operand is .const_operand(constant)) { return self.constant(frame, constant); }
+        if (operand is .out_operand(out)) {
+            qid.TypeId reference_type = self.store.types.reference_type(self.place_type(frame, out.place), frame.span);
+            return self.reference(frame, out.place, reference_type);
+        }
+        if (operand is .copy_operand(copy)) { return self.read(frame, copy.place); }
+        if (operand is .move_operand(move)) {
+            Int? result = self.read(frame, move.place);
+            if (result == null) { return null; }
+            guard self.resolve_place(frame, move.place) is .some(address) else { return null; }
+            self.memory.clear_value(address);
+            return result;
+        }
+        self.frame_error(frame, "comptime_operand_not_supported", "JIL operand is not supported in eval");
+        return null;
+    }
+
+    Int? constant(Self&! self, frame_api.Frame& frame, jil.Const source) {
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        jil.Const constant = reader.constant(source);
+        if (constant.value is .float_value(number)) {
+            return self.scalar_result(frame, floating.from_number(self.store, constant.type_id, number.value));
+        }
+        if (constant.value is .int_value(number)) {
+            if (self.enum_constant(constant.type_id, number.bits) is .some(result)) {
+                return self.scalar_result(frame, result);
+            }
+            if (integer.from_bits(self.store, self.query, constant.type_id, number.bits) is .some(result)) {
+                return self.scalar_result(frame, result);
+            }
+        }
+        if (constant.value is .bool_value(boolean)) {
+            return self.scalar_result(frame, value.ComptimeValue(
+                type_id: constant.type_id, data: .bool_value(boolean.value)
+            ));
+        }
+        if (constant.value is .string_value(string) && !string.nul_terminated) {
+            // 静态字面量保存符号身份，不把宿主字符串地址带进编译期内存或产物。
+            return self.scalar_result(frame, value.ComptimeValue(
+                type_id: constant.type_id, data: .string_value(string.symbol_id)
+            ));
+        }
+        if (constant.value is .unit_value(_)) {
+            return self.scalar_result(frame, value.ComptimeValue(type_id: constant.type_id, data: .unit_value));
+        }
+        if (constant.value is .null_value(_)) {
+            return self.memory.null_pointer(constant.type_id);
+        }
+        self.frame_error(frame, "comptime_constant_not_supported", "JIL constant is not supported in eval");
+        return null;
+    }
+
+    value.ComptimeValue? enum_constant(Self&! self, qid.TypeId type_id, UInt64 bits) {
+        guard self.store.types.named_type_def(type_id) is .some(owner) else { return null; }
+        if (self.store.defs.get(owner).kind != .enum_def) { return null; }
+        Int index! = 0;
+        while (index < self.store.model.def_member_count(owner)) {
+            qid.DefId member = self.store.model.def_member_at(owner, index);
+            if (self.store.typeck.enum_case_value(member) is .some(tag)) {
+                if (UInt64(tag) == bits) {
+                    return value.ComptimeValue(type_id: type_id, data: .enum_case_value(member));
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Int? read(Self&! self, frame_api.Frame& frame, jil.Place place) {
+        guard self.resolve_place(frame, place) is .some(address) else { return null; }
+        return self.copy_value(frame, address);
+    }
+
+    Int? local(Self&! self, frame_api.Frame& frame, jil.LocalId local) {
+        return self.copy_value(frame, frame.locals.get(local.to_index()));
+    }
+
+    Int? copy_value(Self&! self, frame_api.Frame& frame, Int address) {
+        if (!self.memory.initialized(address)) {
+            self.frame_error(frame, "comptime_uninitialized_value",
+                "JIL eval read an uninitialized, moved or dead place");
+            return null;
+        }
+        if (self.memory.clone(self.store, self.query, address) is .some(result)) { return result; }
+        self.frame_error(frame, "comptime_memory_limit", "cannot copy value into JIL eval memory");
+        return null;
+    }
+
+    Bool write(Self&! self, frame_api.Frame&! frame, jil.Place place, Int result) {
+        guard self.resolve_place(frame, place) is .some(address) else { return false; }
+        if (self.memory.copy_into(self.store, self.query, address, result)) { return true; }
+        std.StringBuilder message! = std.StringBuilder();
+        message.append("cannot assign value to JIL eval storage: type ");
+        message.append(self.memory.get(result).type_id.to_index());
+        message.append(" -> ");
+        message.append(self.memory.get(address).type_id.to_index());
+        self.frame_error(frame, "comptime_invalid_write", message.slice());
+        return false;
+    }
+
+    qid.TypeId place_type(self, frame_api.Frame& frame, jil.Place place) {
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        return reader.place_type(frame.function.body$.ref(), place);
+    }
+
+    Int? resolve_place(Self&! self, frame_api.Frame& frame, jil.Place place) {
+        guard place.base is .local(local) else {
+            self.frame_error(frame, "comptime_global_not_supported",
+                "runtime global storage is not available during eval");
+            return null;
+        }
+        Int address! = frame.locals.get(local.to_index());
+        Int index! = 0;
+        while (index < place.projection.length) {
+            guard self.project(frame, address, place.projection[index]) is .some(child) else { return null; }
+            address = child;
+            index = index + 1;
+        }
+        if (self.memory.get(address).alive) { return address; }
+        std.StringBuilder message! = std.StringBuilder();
+        message.append("JIL eval address refers to expired storage: local ");
+        message.append(local.to_index());
+        self.frame_error(frame, "comptime_dead_storage", message.slice());
+        return null;
+    }
+
+    Int? project(Self&! self, frame_api.Frame& frame, Int address, jil.PlaceElem projection) {
+        if (!self.memory.get(address).alive) {
+            self.frame_error(frame, "comptime_dead_storage", "JIL eval address refers to expired storage");
+            return null;
+        }
+        Int? result! = null;
+        if (projection is .deref_projection(_)) {
+            if (self.memory.get(address).data is .reference(target)) { result = target; }
+        } else if (projection is .field_projection(field)) {
+            result = self.memory.field(self.store, self.query, address, field.field_def);
+        } else if (projection is .frame_field_projection(field)) {
+            result = self.memory.child(self.store, self.query, address, field.field_index);
+        } else if (projection is .constant_index_projection(item)) {
+            result = self.memory.child(self.store, self.query, address, item.offset);
+        } else if (projection is .index_projection(item)) {
+            guard self.scalar(frame, frame.locals.get(item.index_local.to_index())) is .some(index_value) else {
+                return null;
+            }
+            guard integer.bits(index_value) is .some(bits) else { return null; }
+            result = self.memory.child(self.store, self.query, address, Int(bits));
+        }
+        if (result != null) { return result; }
+        self.frame_error(frame, "comptime_invalid_projection",
+            "invalid, out of bounds or unsupported JIL memory projection");
+        return null;
+    }
+
+    Int? reference(Self&! self, frame_api.Frame& frame, jil.Place place, qid.TypeId type_id) {
+        guard self.resolve_place(frame, place) is .some(address) else { return null; }
+        if (self.memory.reference(type_id, address) is .some(result)) { return result; }
+        self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval reference");
+        return null;
+    }
+
+    Int? aggregate(Self&! self, frame_api.Frame&! frame, jil.AggregateRvalue aggregate, qid.TypeId type_id) {
+        if (aggregate.kind != .array && aggregate.kind != .tuple && aggregate.kind != .struct_value) {
+            self.frame_error(frame, "comptime_aggregate_not_supported", "JIL aggregate kind is not supported in eval");
+            return null;
+        }
+        guard self.memory.allocate(type_id) is .some(result) else {
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval aggregate");
+            return null;
+        }
+        if (!self.memory.ensure_aggregate(self.store, self.query, result)) {
+            self.frame_error(frame, "comptime_invalid_aggregate", "JIL aggregate requires a concrete supported shape");
+            return null;
+        }
+        Int index! = 0;
+        while (index < aggregate.fields.length) {
+            guard self.operand(frame, aggregate.fields[index]) is .some(item) else { return null; }
+            guard self.memory.child(self.store, self.query, result, index) is .some(child) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, child, item)) { return null; }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    value.ComptimeValue? scalar_operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
+        guard self.operand(frame, operand) is .some(address) else { return null; }
+        return self.scalar(frame, address);
+    }
+
+    value.ComptimeValue? scalar(Self&! self, frame_api.Frame& frame, Int address) {
+        memory_api.Cell cell = self.memory.get(address);
+        if (cell.alive) {
+            if (cell.data is .scalar(data)) { return value.ComptimeValue(type_id: cell.type_id, data: data); }
+        }
+        self.frame_error(frame, "comptime_expected_scalar", "JIL eval operation requires an initialized scalar");
+        return null;
+    }
+
+    Int? scalar_result(Self&! self, frame_api.Frame& frame, value.ComptimeValue? result) {
+        guard result is .some(value) else {
+            self.frame_error(frame, "comptime_invalid_operation", "JIL scalar operation failed");
+            return null;
+        }
+        if (self.memory.scalar(value) is .some(address)) { return address; }
+        self.frame_error(frame, "comptime_memory_limit", "JIL eval memory limit exceeded");
+        return null;
+    }
+
+    Bool? condition(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
+        guard self.scalar_operand(frame, operand) is .some(result) else { return null; }
+        if (result.data is .bool_value(boolean)) { return boolean; }
+        self.frame_error(frame, "comptime_condition_not_bool", "JIL branch condition is not Bool");
+        return null;
+    }
+
+    Bool tick(Self&! self, frame_api.Frame& frame, token.Span span) {
+        if (self.failed) { return false; }
+        if (self.steps <= 0) {
+            self.fail(self.frame_def(frame), span,
+                "comptime_branch_quota_exceeded", "JIL evaluation exceeded execution step quota");
+            return false;
+        }
+        self.steps = self.steps - 1;
+        return true;
+    }
+
+    qid.DefId frame_def(self, frame_api.Frame& frame) { return jil.function_provenance_def(frame.function.origin); }
+
+    Void frame_error(Self&! self, frame_api.Frame& frame, UInt8[]& code, UInt8[]& message) {
+        self.fail(self.frame_def(frame), frame.span, code, message);
+    }
+
+    Void fail(Self&! self, qid.DefId def_id, token.Span span, UInt8[]& code, UInt8[]& message) {
+        if (self.failed) { return; }
+        self.failed = true;
+        diagnostic.SourceRange range! = diagnostic.SourceRange();
+        if (self.store.defs.get(def_id).module_id is .some(module_id)) {
+            range = diagnostic.SourceRange(self.store.resolve.module_ref(module_id).source_id, span);
+        }
+        self.store.diagnostics.add(diagnostic.Diagnostic(
+            .error, .type_check, diagnostic.DiagnosticCode(code), range, message
+        ));
+    }
+}

@@ -54,6 +54,37 @@ public ConcreteFailure? concrete_failure(
 ) {
     Collector collector! = Collector(store);
     collector.collect_jil_store(jil_store);
+    return collector_failure(store, collector$.ref());
+}
+
+// 求值只要求本次实例具体化；共享 Store 中其他尚未准备的入口不属于本次验证范围。
+public ConcreteFailure? concrete_failure(
+    store_api.CompilerStore& store, jil.Store& jil_store, jil.MonoItem item
+) {
+    Collector collector! = Collector(store);
+    if (item is .source_instance(identity)) {
+        collector.collect_source_instance(jil_store, identity);
+    } else if (item is .generated_function(function_id)) {
+        jil.Function function = jil_store.program.function(function_id);
+        collector.collect_function(function$.ref());
+    } else {
+        assert(false);
+    }
+    return collector_failure(store, collector$.ref());
+}
+
+#doc
+    验证求值模板在本次绑定下的类型与常量，不复制具体化 CFG。
+#end
+public ConcreteFailure? expression_concrete_failure(
+    store_api.CompilerStore& store, jil.Function function, generic_bindings.GenericBindings& bindings
+) {
+    Collector collector! = Collector(store, true, bindings);
+    collector.collect_function(function$.ref());
+    return collector_failure(store, collector$.ref());
+}
+
+ConcreteFailure? collector_failure(store_api.CompilerStore& store, Collector& collector) {
     if (collector.symbolic_const is .some(param_def)) {
         return ConcreteFailure(
             type_id: null,
@@ -235,6 +266,8 @@ Void append_type_slice_closure(
 struct Collector: Movable {
     @life(a)
     store_api.CompilerStore& store;
+    @life(a)
+    generic_bindings.GenericBindings&? bindings;
     map.WyHashMap<qid.TypeId, Bool> seen!;
     list.ArrayList<qid.TypeId> items!;
     list.ArrayList<qid.TypeId> type_roots!;
@@ -255,8 +288,10 @@ struct Collector: Movable {
     Int symbolic_const_type_use!;
     Bool expand_type_closure;
 
-    init(self, store_api.CompilerStore& store, Bool expand_type_closure = true) {
+    init(self, store_api.CompilerStore& store, Bool expand_type_closure = true,
+        generic_bindings.GenericBindings&? bindings = null) {
         self.store = store;
+        self.bindings = bindings;
         self.expand_type_closure = expand_type_closure;
         self.seen = map.WyHashMap<qid.TypeId, Bool>();
         self.items = list.ArrayList<qid.TypeId>();
@@ -286,6 +321,7 @@ struct Collector: Movable {
         Int index! = 0;
         while (index < jil_store.program.functions.len()) {
             jil.Function& function = jil_store.program.functions.ref_at(index);
+            if (!jil_store.program.has_generated_mono_item(function.id)) { index = index + 1; continue; }
             if (!(function.origin is .source(_)
                 && !function.is_external
                 && !function.is_runtime_entry)) {
@@ -295,7 +331,8 @@ struct Collector: Movable {
         }
         index = 0;
         while (index < jil_store.program.globals.len()) {
-            self.collect_global(jil_store.program.globals.ref_at(index));
+            jil.Global& global = jil_store.program.globals.ref_at(index);
+            if (jil_store.program.global_is_runtime(global.id)) { self.collect_global(global); }
             index = index + 1;
         }
         index = 0;
@@ -306,6 +343,9 @@ struct Collector: Movable {
         }
     }
 
+    #doc
+        Source instance 与表达式共用带绑定的 Collector，保留类型及未绑定常量的失败来源。
+    #end
     Void collect_source_instance(Self&! self, jil.Store& jil_store, Int identity) {
         jil.InstanceKey instance = jil_store.program.function_instance_at(identity);
         if (!jil_store.program.has_source_function(instance.def_id)) { return; }
@@ -320,44 +360,49 @@ struct Collector: Movable {
                 instance.args,
                 empty$.ref()
             );
-        list.ArrayList<qid.TypeId> raw_items!;
-        list.ArrayList<qid.DefId?> raw_callees!;
-        list.ArrayList<Int> raw_type_uses!;
-        list.ArrayList<qid.TypeId> resolved! =
-            list.ArrayList<qid.TypeId>();
+        jil.Function source = jil_store.program.source_function(instance.def_id);
+        list.ArrayList<qid.TypeId> resolved_types!;
+        list.ArrayList<qid.TypeId> roots!;
+        list.ArrayList<qid.DefId?> callees!;
+        list.ArrayList<Int> type_uses!;
+        qid.DefId? symbolic_const!;
+        Int symbolic_use!;
         {
-            instance_reader.InstanceReader reader = instance_reader.InstanceReader(
-                self.store, bindings$.ref()
-            );
-            Collector raw! = Collector(self.store, false);
-            jil.Function source = jil_store.program.source_function(instance.def_id);
-            raw.collect_function(source$.ref());
-            resolved.reserve(raw.items.len());
-            Int index! = 0;
-            while (index < raw.items.len()) {
-                resolved.add(reader.type_id(raw.items.get(index)));
-                index = index + 1;
-            }
-            raw_items = raw.items.take();
-            raw_callees = raw.type_callees.take();
-            raw_type_uses = raw.type_uses.take();
+            Collector resolved! = Collector(self.store, false, bindings$.ref());
+            resolved.collect_function(source$.ref());
+            resolved_types = resolved.items.take();
+            roots = resolved.type_roots.take();
+            callees = resolved.type_callees.take();
+            type_uses = resolved.type_uses.take();
+            symbolic_const = resolved.symbolic_const;
+            symbolic_use = resolved.symbolic_const_type_use;
+        }
+        if (self.symbolic_const == null && symbolic_const != null) {
+            self.symbolic_const = symbolic_const;
+            self.symbolic_const_function = source.id;
+            self.symbolic_const_global = null;
+            self.symbolic_const_source_instance = identity;
+            self.symbolic_const_type_use = symbolic_use;
         }
         self.current_source_instance = identity;
+        self.current_function = source.id;
+        self.current_global = null;
         Int index! = 0;
-        while (index < resolved.len()) {
+        while (index < resolved_types.len()) {
             Int old_len = self.items.len();
-            qid.TypeId resolved_type = resolved.get(index);
-            self.current_callee = raw_callees.get(index);
-            self.current_type_use = raw_type_uses.get(index);
+            qid.TypeId resolved_type = resolved_types.get(index);
+            self.current_callee = callees.get(index);
+            self.current_type_use = type_uses.get(index);
             self.add(resolved_type);
             self.current_callee = null;
             if (resolved_type == self.store.types.invalid_type()
                 && self.items.len() > old_len) {
-                self.type_roots.set(old_len, raw_items.get(index));
+                self.type_roots.set(old_len, roots.get(index));
             }
             index = index + 1;
         }
         self.current_source_instance = null;
+        self.current_function = null;
         if (jil_store.program.instance_coroutine_frame(identity) is .some(frame)) {
             self.collect_coroutine_frame(frame);
         }
@@ -844,6 +889,12 @@ struct Collector: Movable {
     }
 
     Void record_symbolic_const(Self&! self, qid.DefId param_def) {
+        if (self.bindings is .some(bindings)) {
+            if (bindings.const_binding(param_def) is .some(value)
+                && !(value.data is .const_param_value(_))) { return; }
+            if (bindings.const_binding_def(param_def) is .some(binding)
+                && !symbolic_def(self.store, binding)) { return; }
+        }
         if (self.symbolic_const != null) { return; }
         self.symbolic_const = param_def;
         self.symbolic_const_function = self.current_function;
@@ -852,7 +903,12 @@ struct Collector: Movable {
         self.symbolic_const_type_use = self.current_type_use;
     }
 
-    Void add(Self&! self, qid.TypeId type_id) {
+    Void add(Self&! self, qid.TypeId raw_type) {
+        qid.TypeId type_id! = raw_type;
+        if (self.bindings is .some(bindings)) {
+            instance_reader.InstanceReader reader = instance_reader.InstanceReader(self.store, bindings);
+            type_id = reader.type_id(raw_type);
+        }
         if (self.expand_type_closure) {
             append_type_closure(self.store, type_id, self.seen$.mut_ref(), self.items$.mut_ref());
         } else {
@@ -861,7 +917,11 @@ struct Collector: Movable {
             self.items.add(type_id);
         }
         while (self.type_functions.len() < self.items.len()) {
-            self.type_roots.add(type_id);
+            if (type_id == self.store.types.invalid_type()) {
+                self.type_roots.add(raw_type);
+            } else {
+                self.type_roots.add(type_id);
+            }
             self.type_callees.add(self.current_callee);
             self.type_functions.add(self.current_function);
             self.type_globals.add(self.current_global);
