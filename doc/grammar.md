@@ -240,6 +240,8 @@ binding_name
 eval 块也可以出现在普通语句位置。块内普通变量及 const 都遵守所在 block 的词法作用域，
 不隐式发布到 namespace。局部 const 与模块 const 的初始化结果都必须是 comptime value；
 comptime block 可以返回这样的值供外部 const 初始化使用。import 的位置限制独立处理。
+const 初始化器须为常量表达式或显式 comptime block；普通 block 不因处于 const 初始化位置
+自动成为编译期 block。该语义要求不改变普通运行期 block 的语法。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 顶层变量只使用普通 global declaration。独立 destructure 是函数体内的语句，

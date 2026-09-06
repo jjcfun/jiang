@@ -730,6 +730,8 @@ comptime {
 const 可以在局部声明，名字只在所在词法作用域有效。初始化结果必须是 comptime value，
 可以由结果推导类型，也可以显式标注类型。comptime block 的求值结果也属于 comptime value；
 字面量和常量运算不必额外包一层 comptime。块内 const 不会自动变成外部声明。
+需要局部变量、赋值或循环等语句来计算初始化值时，必须显式写 `comptime { ... }`，
+不能用普通 `{ ... }` 初始化块隐式要求编译期执行。
 
 ```jiang
 const Int answer = comptime {

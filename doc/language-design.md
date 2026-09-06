@@ -1642,7 +1642,9 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - const 可以在模块或局部作用域中声明，遵守普通词法作用域。comptime 块及其条件分支中的
   const 仅在所在 block 内有效，不隐式提升或发布到外层 namespace。
 - `const foo = expr` 要求初始化结果是 comptime value；允许由初始化结果推导类型，也可显式
-  写出类型。字面量、常量运算及 comptime block 的求值结果均可用于初始化，不强制包一层 comptime。
+  写出类型。初始化使用常量表达式，或显式 comptime block 的求值结果。
+  字面量和常量运算不必包一层 comptime；包含局部变量、赋值、循环等语句的初始化计算必须
+  显式写 comptime block，普通 block 不因出现在 const 初始化位置就隐式进入编译期执行。
   普通运行期变量不能因被 const 初始化器引用就自动变成编译期值。
 - comptime block 可以返回值，外部 const 通过初始化表达式接收该结果，名字归属由外部声明
   的位置决定。局部计算使用同一次执行中的存储和生命周期；结果不得保留对已结束局部存储的引用。
