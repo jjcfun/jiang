@@ -12,6 +12,7 @@ import layout = "../../layout.jiang";
 import list = "../../support/list.jiang";
 import set = "../../support/set.jiang";
 import map = "../../support/map.jiang";
+import integer = "./integer.jiang";
 
 public enum CellData: Copyable {
     uninitialized,
@@ -288,6 +289,17 @@ public struct Memory: Movable {
         if (source.data is .optional_value(payload)) {
             return self.import_optional(store, query, address, payload);
         }
+        if (source.data is .enum_value(case_def, payload)) {
+            return self.import_enum(store, query, address, case_def, payload);
+        }
+        if (source.data is .error_union_value(is_error, payload)) {
+            Int active! = 1;
+            if (is_error) { active = 2; }
+            if (!self.select_payload(store, query, address, active)) { return null; }
+            guard self.child(store, query, address, 0) is .some(tag) else { return null; }
+            self.set_data(tag, .scalar(.bool_value(is_error)));
+            return self.import_payload(store, query, address, active, payload);
+        }
         if (source.data is .struct_value(aggregate)) {
             Int index! = 0;
             while (index < store.comptime_store.field_count(aggregate)) {
@@ -316,6 +328,33 @@ public struct Memory: Movable {
         self.set_data(tag, .scalar(.bool_value(count == 1)));
         if (count == 0) { return address; }
         guard self.child(store, query, address, 1) is .some(target) else { return null; }
+        value.ComptimeValue item = store.comptime_store.item_at(payload, 0);
+        if (!self.import_into(store, query, target, item)) { return null; }
+        return address;
+    }
+
+    #doc enum 按 case 身份恢复目标布局中的选中槽位，tag 使用目标整数类型。
+    Int? import_enum(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        Int address, qid.DefId case_def, value.ComptimeAggregateId payload
+    ) {
+        guard self.field(store, query, address, case_def) is .some(target) else { return null; }
+        guard self.get(address).data is .aggregate(start, _) else { return null; }
+        Int active = target - start;
+        if (!self.select_payload(store, query, address, active)) { return null; }
+        guard store.typeck.enum_case_value(case_def) is .some(tag) else { return null; }
+        guard integer.from_bits(store, query, self.get(start).type_id, UInt64(tag)) is .some(tag_value)
+            else { return null; }
+        self.set_data(start, .scalar(tag_value.data));
+        return self.import_payload(store, query, address, active, payload);
+    }
+
+    #doc tagged sum 驻留一个完整 payload，导入时由所选字段恢复省略的 TypeId。
+    Int? import_payload(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        Int address, Int active, value.ComptimeAggregateId payload
+    ) {
+        guard self.child(store, query, address, active) is .some(target) else { return null; }
         value.ComptimeValue item = store.comptime_store.item_at(payload, 0);
         if (!self.import_into(store, query, target, item)) { return null; }
         return address;
@@ -431,10 +470,16 @@ public struct Memory: Movable {
         if (store.types.get(cell.type_id).data is .optional(_)) {
             return self.export_optional(store, query, cell.type_id, start);
         }
+        if (store.types.get(cell.type_id).data is .error_union(_)) {
+            return self.export_error_union(store, query, cell.type_id, start);
+        }
         if (store.types.get(cell.type_id).data is .handle_type(handle) && handle.kind == .slice) {
             return self.export_string(store, cell.type_id, start);
         }
-        if (store.types.get(cell.type_id).data is .named(_)) {
+        if (store.types.get(cell.type_id).data is .named(named)) {
+            if (store.model.def_enum_has_payload_variants(named.def_id)) {
+                return self.export_enum(store, query, cell.type_id, start);
+            }
             return self.export_struct(store, query, cell.type_id, start, count);
         }
         list.ArrayList<value.ComptimeValue> items! = list.ArrayList<value.ComptimeValue>();
@@ -466,6 +511,42 @@ public struct Memory: Movable {
             payload.add(item);
         }
         return store.comptime_store.optional_value(type_id, payload.slice());
+    }
+
+    #doc error union 的 tag 决定唯一可导出的分支，未选中字段始终保持不活跃。
+    value.ComptimeValue? export_error_union(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        qid.TypeId type_id, Int start
+    ) {
+        guard self.get(start).data is .scalar(tag_data) else { return null; }
+        guard tag_data is .bool_value(is_error) else { return null; }
+        Int active! = 1;
+        if (is_error) { active = 2; }
+        guard self.export_value(store, query, start + active) is .some(payload) else { return null; }
+        return store.comptime_store.error_union_value(type_id, is_error, payload);
+    }
+
+    #doc enum 的数值 tag 转回稳定的 case 身份，仅固化该 case 的完整 payload。
+    value.ComptimeValue? export_enum(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        qid.TypeId type_id, Int start
+    ) {
+        guard self.get(start).data is .scalar(tag_data) else { return null; }
+        value.ComptimeValue tag = value.ComptimeValue(type_id: self.get(start).type_id, data: tag_data);
+        guard integer.bits(tag) is .some(bits) else { return null; }
+        layout.LayoutId id = database.layout_of_type(query$.mut_ref(), store$.ref(), type_id);
+        layout.TypeLayout shape = query.layout.store().layout(id);
+        Int index! = 1;
+        while (index < shape.fields.length) {
+            guard shape.fields[index].field_def is .some(case_def) else { return null; }
+            guard store.typeck.enum_case_value(case_def) is .some(case_tag) else { return null; }
+            if (bits == UInt64(case_tag)) {
+                guard self.export_value(store, query, start + index) is .some(payload) else { return null; }
+                return store.comptime_store.enum_value(type_id, case_def, payload);
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     #doc 只读字面量的子切片导出为字节符号；普通借用不自动变成静态值。
