@@ -126,9 +126,6 @@ public extend body_context.BodyLowerer {
         comptime_value.ComptimeValue const_value,
         qid.TypeId expected_type
     ) {
-        if (!self.comptime_value_needs_global_storage(const_value)) {
-            return false;
-        }
         if (self.lowerer.program.global_id_for_def(def_id) != null) {
             return true;
         }
@@ -194,13 +191,6 @@ public extend body_context.BodyLowerer {
         );
     }
 
-    public Bool comptime_value_needs_global_storage(self, comptime_value.ComptimeValue const_value) {
-        if (const_value.data is .struct_value(_)) { return true; }
-        if (const_value.data is .tuple_value(_)) { return true; }
-        if (const_value.data is .optional_value(_)) { return true; }
-        return const_value.data is .array_value(_);
-    }
-
     public jil.StaticValue? static_value_from_comptime(self,
         comptime_value.ComptimeValue const_value,
         qid.TypeId expected_type,
@@ -221,7 +211,46 @@ public extend body_context.BodyLowerer {
         if (const_value.data is .optional_value(payload)) {
             return self.static_optional_value(payload, expected_type, span);
         }
+        if (const_value.data is .enum_value(case_def, payload)) {
+            guard self.lowerer.store.types.named_type_def(expected_type) is .some(owner) else { return null; }
+            Int payload_index! = 1;
+            Int index! = 0;
+            while (index < self.lowerer.model.def_member_count(owner)) {
+                qid.DefId member = self.lowerer.model.def_member_at(owner, index);
+                if (member == case_def) {
+                    qid.TypeId tag_type = self.lowerer.store.types.int_type();
+                    return self.static_tagged_value(self.enum_case_int_const(case_def, tag_type, span),
+                        payload, self.variant_payload_type(case_def, expected_type), payload_index, span);
+                }
+                if (self.lowerer.store.defs.get(member).kind == .enum_case_def) { payload_index = payload_index + 1; }
+                index = index + 1;
+            }
+            return null;
+        }
+        if (const_value.data is .error_union_value(is_error, payload)) {
+            guard self.lowerer.store.types.get(expected_type).data is .error_union(union_type) else { return null; }
+            qid.TypeId payload_type! = union_type.value;
+            Int payload_index! = 1;
+            if (is_error) { payload_type = union_type.error; payload_index = 2; }
+            qid.TypeId bool_type = self.lowerer.store.types.bool_type();
+            return self.static_tagged_value(jil.Const(type_id: bool_type, span: span,
+                value: jil.bool_const_kind(jil.BoolConst(value: is_error))),
+                payload, payload_type, payload_index, span);
+        }
         return null;
+    }
+
+    #doc 静态 tagged sum 不物化未选中字段，后端按实际布局为剩余存储补零。
+    public jil.StaticValue? static_tagged_value(
+        self, jil.Const tag, comptime_value.ComptimeAggregateId payload,
+        qid.TypeId payload_type, Int payload_index, token.Span span
+    ) {
+        comptime_value.ComptimeValue item = self.lowerer.store.comptime_store.item_at(payload, 0);
+        guard self.static_value_from_comptime(item, payload_type, span) is .some(value) else { return null; }
+        list.ArrayList<jil.StaticField> fields! = list.ArrayList<jil.StaticField>(2);
+        fields.add(jil.StaticField(type_id: tag.type_id, value: jil.scalar_static_value(tag)));
+        fields.add(jil.StaticField(type_id: payload_type, value: value));
+        return jil.StaticValue.variant(payload_index, self.lowerer.storage.static_field_array(fields$.ref()));
     }
 
     #doc some 使用已有 tag/payload 静态字段布局；none 由 typed null 生成全零初始化器。
@@ -370,6 +399,33 @@ public extend body_context.BodyLowerer {
         );
     }
 
+    #doc enum 保留外层变体身份，仅展开构造参数对应的 payload tuple，不展开参数内部的 tuple。
+    public jil.AggregateRvalue? comptime_enum_aggregate(
+        Self&! self, qid.DefId case_def, comptime_value.ComptimeAggregateId payload,
+        qid.TypeId expected_type, token.Span span
+    ) {
+        qid.TypeId payload_type = self.variant_payload_type(case_def, expected_type);
+        comptime_value.ComptimeValue item = self.lowerer.store.comptime_store.item_at(payload, 0);
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>();
+        if (item.data is .tuple_value(items)) {
+            Int index! = 0;
+            while (index < self.lowerer.store.comptime_store.item_count(items)) {
+                comptime_value.ComptimeValue field = self.lowerer.store.comptime_store.item_at(items, index);
+                qid.TypeId field_type = self.sequence_aggregate_field_type(payload_type, index);
+                guard self.comptime_value_operand(field, field_type, span) is .some(operand) else { return null; }
+                fields.add(operand);
+                index = index + 1;
+            }
+        } else if (!(item.data is .unit_value)) {
+            guard self.comptime_value_operand(item, payload_type, span) is .some(operand) else { return null; }
+            fields.add(operand);
+        }
+        qid.TypeId tag_type = self.lowerer.store.types.int_type();
+        return jil.AggregateRvalue(kind: .enum_variant, def_id: case_def, type_id: expected_type,
+            tag: jil.const_operand_value(self.enum_case_int_const(case_def, tag_type, span)),
+            fields: self.lowerer.storage.operand_array(fields$.ref()));
+    }
+
     public jil.AggregateRvalue? comptime_struct_aggregate(Self&! self,
         comptime_value.ComptimeAggregateId aggregate,
         qid.TypeId expected_type,
@@ -493,6 +549,24 @@ public extend body_context.BodyLowerer {
             guard self.comptime_value_operand(item, optional.element, span) is .some(operand) else { return false; }
             self.builder.push_assign(destination, jil.optional_rvalue(jil.OptionalRvalue(
                 op: .make_some, value: operand
+            )), span);
+            return true;
+        }
+        if (const_value.data is .enum_value(case_def, payload)) {
+            guard self.comptime_enum_aggregate(case_def, payload, expected_type, span) is .some(aggregate)
+                else { return false; }
+            self.builder.push_assign(destination, self.aggregate_rvalue(aggregate, span), span);
+            return true;
+        }
+        if (const_value.data is .error_union_value(is_error, payload)) {
+            guard self.lowerer.store.types.get(expected_type).data is .error_union(union_type) else { return false; }
+            qid.TypeId payload_type! = union_type.value;
+            jil.ErrorUnionOp op! = .make_value;
+            if (is_error) { payload_type = union_type.error; op = .make_error; }
+            comptime_value.ComptimeValue item = self.lowerer.store.comptime_store.item_at(payload, 0);
+            guard self.comptime_value_operand(item, payload_type, span) is .some(operand) else { return false; }
+            self.builder.push_assign(destination, jil.error_union_rvalue(jil.ErrorUnionRvalue(
+                op: op, value: operand
             )), span);
             return true;
         }

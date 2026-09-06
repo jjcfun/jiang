@@ -15,6 +15,7 @@ import value = "../sema/comptime/value.jiang";
 import types = "../sema/type.jiang";
 import drop = "../sema/drop.jiang";
 import list = "../support/list.jiang";
+import map = "../support/map.jiang";
 import diagnostic = "../diagnostic.jiang";
 import token = "../syntax/token.jiang";
 import database = "../db.jiang";
@@ -77,6 +78,7 @@ struct Executor: Movable {
     Int depth_limit;
     Bool failed!;
     memory_api.Memory memory!;
+    map.WyHashMap<Int, Int> globals!;
 
     init(self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
         jil.Store& program, Int steps, Int depth_limit) {
@@ -88,6 +90,7 @@ struct Executor: Movable {
         self.depth_limit = depth_limit;
         self.failed = false;
         self.memory = memory_api.Memory();
+        self.globals = map.WyHashMap<Int, Int>();
     }
 
     value.ComptimeValue? evaluate(
@@ -923,6 +926,10 @@ struct Executor: Movable {
 
     Int? operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
         if (operand is .const_operand(constant)) { return self.constant(frame, constant); }
+        if (operand is .global_operand(global)) {
+            guard self.global_address(frame, global) is .some(address) else { return null; }
+            return self.copy_value(frame, address);
+        }
         if (operand is .out_operand(out)) {
             qid.TypeId reference_type = self.store.types.reference_type(self.place_type(frame, out.place), frame.span);
             return self.reference(frame, out.place, reference_type);
@@ -1044,14 +1051,41 @@ struct Executor: Movable {
         return self.resolve_place_prefix(frame, place, place.projection.length);
     }
 
+    #doc 只导入已发布的不可变常量；全局存储在一次求值中共享身份，不回头计算 initializer。
+    Int? global_address(Self&! self, frame_api.Frame& frame, jil.GlobalRef reference) {
+        Int index = reference.id.to_index();
+        if (self.globals.get(index) is .some(address)) { return address$.get(); }
+        jil.Global& global = self.program.program.globals.ref_at(index);
+        if (global.read_only && global.origin is .source(def_id)) {
+            if (self.store.comptime_store.const_value(def_id) is .some(constant)) {
+                reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+                value.ComptimeValue typed = value.ComptimeValue(
+                    type_id: reader.type_id(global.type_id), data: constant.data
+                );
+                guard self.memory.import_value(self.store, self.query, typed) is .some(address) else {
+                    self.frame_error(frame, "comptime_global_not_materializable", "cannot import constant global storage");
+                    return null;
+                }
+                self.memory.freeze(address);
+                self.globals.set(index, address);
+                return address;
+            }
+        }
+        self.frame_error(frame, "comptime_global_not_supported",
+            "eval requires a published constant global; runtime storage is not available");
+        return null;
+    }
+
     #doc 求值 projection 前缀，不复制 JIL projection；末尾取址可保留原元素指针的分配身份。
     Int? resolve_place_prefix(Self&! self, frame_api.Frame& frame, jil.Place place, Int count) {
-        guard place.base is .local(local) else {
-            self.frame_error(frame, "comptime_global_not_supported",
-                "runtime global storage is not available during eval");
-            return null;
+        Int address!;
+        if (place.base is .local(local)) {
+            address = frame.locals.get(local.to_index());
+        } else {
+            guard place.base is .global(global) else { return null; }
+            guard self.global_address(frame, global) is .some(global_address) else { return null; }
+            address = global_address;
         }
-        Int address! = frame.locals.get(local.to_index());
         Int index! = 0;
         while (index < count) {
             guard self.project(frame, address, place.projection[index]) is .some(child) else { return null; }
@@ -1059,10 +1093,7 @@ struct Executor: Movable {
             index = index + 1;
         }
         if (self.memory.get(address).alive) { return address; }
-        std.StringBuilder message! = std.StringBuilder();
-        message.append("JIL eval address refers to expired storage: local ");
-        message.append(local.to_index());
-        self.frame_error(frame, "comptime_dead_storage", message.slice());
+        self.frame_error(frame, "comptime_dead_storage", "JIL eval address refers to expired storage");
         return null;
     }
 

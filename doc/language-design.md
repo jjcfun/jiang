@@ -703,20 +703,19 @@ Task cancellation 不复用 panic。
 
 目标语言支持 `public import`，用于 re-export 被导入模块的 public API。
 
-顶层 `const` 是编译期常量声明。initializer 在 type check 后通过 sema 级 comptime evaluator
-求值，并记录到 `ComptimeStore`。当前支持 literal、`const` 引用、枚举 case、tuple/array/struct
-字面量、默认 struct constructor、字段访问、一元/二元表达式、`if`、block 尾表达式、普通 Jiang
-函数调用、自定义 `init`、泛型 struct constructor 和泛型函数调用。
+顶层 `const` 是编译期常量声明。initializer 经语义检查后按需进入 JIL，完成借用检查和析构展开，
+再由统一的 JIL 执行器求值；普通函数调用、局部存储和析构遵循与运行期相同的语言语义。
+求值结果保存为可复用的不可变值，不携带执行器的临时地址。
 
 `public const` 是模块公开接口的一部分。编译器在 interface artifact 中保存最终实例化后的
 declaration type 和 const payload；跨模块使用时由 importer 还原成 `ComptimeValue`，不重新执行
 定义模块的 initializer。value path 会先解析出真实 value root，再由 type check 验证后续 member
 chain，因此 `build.target.link_libc` 这类 public aggregate const 字段读取按普通字段访问处理。
 
-`ComptimeValue` 只存在于 sema、interface loading/building 和 Semantic Model->JIL lowering 之前。标量 const
-在 JIL 中降成 `jil.Const`，枚举 case 降成整数 tag const；复合 const 整体作为运行时值使用时按需
-materialize 成 readonly `jil.Global`，initializer 用 `jil.StaticValue` 表达。backend 只消费 JIL
-事实，不读取 `ComptimeValue`。
+常量作为运行期值使用时，由 JIL 表达其值构造或只读静态存储。enum 与 error union 保留 tag
+及所选分支的完整 payload；未选中分支不是有效值。取常量引用不会使它成为可变存储，引用的
+生命周期不受某次函数调用限制；复制到局部变量后的存储遵循该局部变量的生命周期和可变性。
+backend 只消费 JIL 事实，不重新执行源码初始化表达式。
 
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
 `recursive_const_initializer`；编译期执行受递归深度和执行步数配额限制，循环与调用共同消耗本次求值的
