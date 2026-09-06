@@ -487,6 +487,12 @@ struct Executor: Movable {
         }
         if (rvalue is .layout_value(layout_value)) { return self.layout_value(frame, layout_value, result_type); }
         if (rvalue is .aggregate_value(aggregate)) { return self.aggregate(frame, aggregate, result_type); }
+        if (rvalue is .optional_value(optional)) { return self.optional_value(frame, optional, result_type); }
+        if (rvalue is .error_union_value(error_union)) { return self.error_union_value(frame, error_union, result_type); }
+        if (rvalue is .discriminant_value(discriminant)) {
+            guard self.resolve_place(frame, discriminant.place) is .some(source) else { return null; }
+            return self.read_discriminant(frame, source, result_type);
+        }
         if (rvalue is .borrow_value(borrow)) { return self.reference(frame, borrow.place, result_type); }
         if (rvalue is .address_of_value(address)) { return self.reference(frame, address.place, result_type); }
         if (rvalue is .alloc_box_value(allocated)) {
@@ -525,10 +531,16 @@ struct Executor: Movable {
             guard self.operand(frame, binary.lhs) is .some(lhs) else { return null; }
             guard self.operand(frame, binary.rhs) is .some(rhs) else { return null; }
             Bool structural = binary.op == .structural_eq || binary.op == .structural_ne;
-            if (binary.op == .eq || binary.op == .ne || structural) {
-                if (self.reference_equal(lhs, rhs, structural) is .some(equal)) {
+            if (structural) {
+                guard self.structural_equal(frame, lhs, rhs) is .some(equal) else { return null; }
+                return self.scalar_result(frame, value.ComptimeValue(
+                    type_id: result_type, data: .bool_value(equal == (binary.op == .structural_eq))
+                ));
+            }
+            if (binary.op == .eq || binary.op == .ne) {
+                if (self.reference_equal(lhs, rhs) is .some(equal)) {
                     Bool result! = equal;
-                    if (binary.op == .ne || binary.op == .structural_ne) { result = !result; }
+                    if (binary.op == .ne) { result = !result; }
                     return self.scalar_result(frame, value.ComptimeValue(
                         type_id: result_type, data: .bool_value(result)
                     ));
@@ -797,14 +809,9 @@ struct Executor: Movable {
     }
 
     #doc 比较逻辑引用和 null，不把解释器 cell 编号转换成目标机器地址。
-    Bool? reference_equal(self, Int lhs, Int rhs, Bool structural) {
+    Bool? reference_equal(self, Int lhs, Int rhs) {
         memory_api.CellData left = self.memory.get(lhs).data;
         memory_api.CellData right = self.memory.get(rhs).data;
-        // optional 的两个 null 没有 payload；其他结构相等不能用地址相等替代。
-        if (structural) {
-            if (left is .null_pointer && right is .null_pointer) { return true; }
-            return null;
-        }
         if (left is .element_reference(storage, first, index)) {
             if (right is .null_pointer) { return false; }
             if (right is .element_reference(other, other_first, other_index)) {
@@ -815,7 +822,7 @@ struct Executor: Movable {
             }
             return null;
         }
-        if (right is .element_reference(_, _, _)) { return self.reference_equal(rhs, lhs, false); }
+        if (right is .element_reference(_, _, _)) { return self.reference_equal(rhs, lhs); }
         if (left is .null_pointer) {
             if (right is .null_pointer) { return true; }
             if (right is .reference(_)) { return false; }
@@ -825,6 +832,39 @@ struct Executor: Movable {
             if (right is .reference(other)) { return address == other; }
         }
         return null;
+    }
+
+    #doc 结构相等只比较有效字段；tag 不同即返回，不读取未选中 payload。
+    Bool? structural_equal(Self&! self, frame_api.Frame& frame, Int lhs, Int rhs) {
+        if (!self.tick(frame, frame.span)) { return null; }
+        memory_api.CellData left = self.memory.get(lhs).data;
+        memory_api.CellData right = self.memory.get(rhs).data;
+        if (left is .inactive) { return right is .inactive; }
+        if (right is .inactive) { return false; }
+        if (left is .aggregate(start, count)) {
+            guard right is .aggregate(other, other_count) else { return false; }
+            if (count != other_count) { return false; }
+            Int index! = 0;
+            while (index < count) {
+                guard self.structural_equal(frame, start + index, other + index) is .some(equal) else { return null; }
+                if (!equal) { return false; }
+                index = index + 1;
+            }
+            return true;
+        }
+        if (self.reference_equal(lhs, rhs) is .some(equal)) { return equal; }
+        guard self.scalar(frame, lhs) is .some(a) else { return null; }
+        guard self.scalar(frame, rhs) is .some(b) else { return null; }
+        if (a.data is .unit_value) { return b.data is .unit_value; }
+        value.ComptimeValue? result!;
+        if (a.data is .float_bits(_)) {
+            result = floating.binary(self.store, .eq, a, b, self.store.types.bool_type());
+        } else {
+            result = integer.binary(self.store, self.query, .eq, a, b, self.store.types.bool_type());
+        }
+        guard result is .some(value) else { return null; }
+        guard value.data is .bool_value(equal) else { return null; }
+        return equal;
     }
 
     Int? pointer_cast(Self&! self, frame_api.Frame&! frame, jil.Operand operand, qid.TypeId result_type) {
@@ -932,6 +972,9 @@ struct Executor: Movable {
             return self.scalar_result(frame, value.ComptimeValue(type_id: constant.type_id, data: .unit_value));
         }
         if (constant.value is .null_value(_)) {
+            if (self.store.types.get(constant.type_id).data is .optional(_)) {
+                return self.make_tagged_value(frame, constant.type_id, false, 0, null);
+            }
             return self.memory.null_pointer(constant.type_id);
         }
         self.frame_error(frame, "comptime_constant_not_supported", "JIL constant is not supported in eval");
@@ -1048,7 +1091,11 @@ struct Executor: Movable {
             guard integer.bits(index_value) is .some(bits) else { return null; }
             result = self.index_element(frame, address, Int(bits));
         }
-        if (result != null) { return result; }
+        if (result is .some(child)) {
+            if (!(self.memory.get(child).data is .inactive)) { return child; }
+            self.frame_error(frame, "comptime_inactive_payload", "cannot access an inactive JIL payload");
+            return null;
+        }
         if (self.failed) { return null; }
         self.frame_error(frame, "comptime_invalid_projection",
             "invalid, out of bounds or unsupported JIL memory projection");
@@ -1154,7 +1201,115 @@ struct Executor: Movable {
         return memory_api.CellData.reference(address);
     }
 
+    #doc 读取 sum 的 tag 不要求未选中或已移动的 payload 初始化。
+    Int? read_discriminant(Self&! self, frame_api.Frame& frame, Int source, qid.TypeId result_type) {
+        if (self.memory.get(source).data is .aggregate(_, _)) {
+            guard self.memory.child(self.store, self.query, source, 0) is .some(tag) else { return null; }
+            guard self.copy_value(frame, tag) is .some(result) else { return null; }
+            return self.use_value(frame, result, result_type);
+        }
+        guard self.scalar(frame, source) is .some(value) else { return null; }
+        if (value.data is .enum_case_value(case_def)) {
+            guard self.store.typeck.enum_case_value(case_def) is .some(tag) else { return null; }
+            return self.scalar_result(frame, integer.from_bits(self.store, self.query, result_type, UInt64(tag)));
+        }
+        return self.use_value(frame, source, result_type);
+    }
+
+    #doc copy 操作读取原字段，move 操作先按 JIL 消耗源值；不为读 tag 复制整个 payload。
+    Int? read_operand_field(
+        Self&! self, frame_api.Frame&! frame, jil.Operand operand, Int index, qid.TypeId result_type
+    ) {
+        Int source!;
+        if (operand is .copy_operand(copy)) {
+            guard self.resolve_place(frame, copy.place) is .some(address) else { return null; }
+            source = address;
+        } else {
+            guard self.operand(frame, operand) is .some(address) else { return null; }
+            source = address;
+        }
+        guard self.memory.child(self.store, self.query, source, index) is .some(field) else { return null; }
+        if (self.memory.get(field).data is .inactive) {
+            self.frame_error(frame, "comptime_inactive_payload", "cannot unwrap an inactive JIL payload");
+            return null;
+        }
+        guard self.copy_value(frame, field) is .some(result) else { return null; }
+        return self.use_value(frame, result, result_type);
+    }
+
+    #doc optional 与 error union 共用已有 tag/字段布局，非选中 payload 保持 inactive。
+    Int? make_tagged_value(
+        Self&! self, frame_api.Frame& frame, qid.TypeId type_id, Bool tag, Int active, Int? payload
+    ) {
+        guard self.memory.allocate(type_id) is .some(result) else { return null; }
+        if (!self.memory.select_payload(self.store, self.query, result, active)) { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(tag_cell) else { return null; }
+        self.memory.set_data(tag_cell, .scalar(.bool_value(tag)));
+        if (payload is .some(source)) {
+            guard self.memory.child(self.store, self.query, result, active) is .some(field) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, field, source)) {
+                self.frame_error(frame, "comptime_invalid_aggregate", "JIL payload does not match its field type");
+                return null;
+            }
+        }
+        return result;
+    }
+
+    Int? optional_value(
+        Self&! self, frame_api.Frame&! frame, jil.OptionalRvalue optional, qid.TypeId result_type
+    ) {
+        if (optional.op == .make_none) { return self.make_tagged_value(frame, result_type, false, 0, null); }
+        if (optional.op == .make_some) {
+            guard self.operand(frame, optional.value) is .some(payload) else { return null; }
+            return self.make_tagged_value(frame, result_type, true, 1, payload);
+        }
+        if (optional.op == .is_some) { return self.read_operand_field(frame, optional.value, 0, result_type); }
+        return self.read_operand_field(frame, optional.value, 1, result_type);
+    }
+
+    Int? error_union_value(
+        Self&! self, frame_api.Frame&! frame, jil.ErrorUnionRvalue error_union, qid.TypeId result_type
+    ) {
+        if (error_union.op == .make_value || error_union.op == .make_error) {
+            guard self.operand(frame, error_union.value) is .some(payload) else { return null; }
+            Int field! = 1;
+            if (error_union.op == .make_error) { field = 2; }
+            return self.make_tagged_value(frame, result_type, field == 2, field, payload);
+        }
+        Int field! = 0;
+        if (error_union.op == .unwrap_value) { field = 1; }
+        if (error_union.op == .unwrap_error) { field = 2; }
+        return self.read_operand_field(frame, error_union.value, field, result_type);
+    }
+
+    #doc enum 的 tag 与选中 payload 使用现有布局字段，其余重叠变体槽不参与初始化或复制。
+    Int? enum_variant(
+        Self&! self, frame_api.Frame&! frame, jil.AggregateRvalue aggregate, qid.TypeId type_id
+    ) {
+        guard self.memory.allocate(type_id) is .some(result) else { return null; }
+        guard aggregate.def_id is .some(case_def) else { return null; }
+        guard self.memory.field(self.store, self.query, result, case_def) is .some(payload) else { return null; }
+        guard self.memory.get(result).data is .aggregate(start, _) else { return null; }
+        if (!self.memory.select_payload(self.store, self.query, result, payload - start)) { return null; }
+        guard aggregate.tag is .some(tag_operand) else { return null; }
+        guard self.operand(frame, tag_operand) is .some(tag) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, start, tag)) { return null; }
+        if (aggregate.fields.length == 0) {
+            self.memory.set_data(payload, .scalar(.unit_value));
+            return result;
+        }
+        if (aggregate.fields.length == 1
+            && !(self.store.types.get(self.memory.get(payload).type_id).data is .tuple_type(_))) {
+            guard self.operand(frame, aggregate.fields[0]) is .some(source) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, payload, source)) { return null; }
+            return result;
+        }
+        if (!self.write_aggregate_fields(frame, payload, aggregate.fields)) { return null; }
+        return result;
+    }
+
     Int? aggregate(Self&! self, frame_api.Frame&! frame, jil.AggregateRvalue aggregate, qid.TypeId type_id) {
+        if (aggregate.kind == .enum_variant) { return self.enum_variant(frame, aggregate, type_id); }
         if (aggregate.kind != .array && aggregate.kind != .tuple && aggregate.kind != .struct_value) {
             self.frame_error(frame, "comptime_aggregate_not_supported", "JIL aggregate kind is not supported in eval");
             return null;
@@ -1167,14 +1322,19 @@ struct Executor: Movable {
             self.frame_error(frame, "comptime_invalid_aggregate", "JIL aggregate requires a concrete supported shape");
             return null;
         }
+        if (!self.write_aggregate_fields(frame, result, aggregate.fields)) { return null; }
+        return result;
+    }
+
+    Bool write_aggregate_fields(Self&! self, frame_api.Frame&! frame, Int target, jil.Operand[]& fields) {
         Int index! = 0;
-        while (index < aggregate.fields.length) {
-            guard self.operand(frame, aggregate.fields[index]) is .some(item) else { return null; }
-            guard self.memory.child(self.store, self.query, result, index) is .some(child) else { return null; }
-            if (!self.memory.copy_into(self.store, self.query, child, item)) { return null; }
+        while (index < fields.length) {
+            guard self.operand(frame, fields[index]) is .some(item) else { return false; }
+            guard self.memory.child(self.store, self.query, target, index) is .some(child) else { return false; }
+            if (!self.memory.copy_into(self.store, self.query, child, item)) { return false; }
             index = index + 1;
         }
-        return result;
+        return true;
     }
 
     value.ComptimeValue? scalar_operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
