@@ -481,7 +481,10 @@ struct Executor: Movable {
     }
 
     Int? rvalue(Self&! self, frame_api.Frame&! frame, jil.Rvalue rvalue, qid.TypeId result_type) {
-        if (rvalue is .use_value(use)) { return self.operand(frame, use.value); }
+        if (rvalue is .use_value(use)) {
+            guard self.operand(frame, use.value) is .some(source) else { return null; }
+            return self.use_value(frame, source, result_type);
+        }
         if (rvalue is .layout_value(layout_value)) { return self.layout_value(frame, layout_value, result_type); }
         if (rvalue is .aggregate_value(aggregate)) { return self.aggregate(frame, aggregate, result_type); }
         if (rvalue is .borrow_value(borrow)) { return self.reference(frame, borrow.place, result_type); }
@@ -492,11 +495,30 @@ struct Executor: Movable {
         if (rvalue is .alloc_value(allocated)) {
             return self.allocate_value(frame, allocated.value_type, allocated.value, result_type);
         }
+        if (rvalue is .alloc_array_value(allocated)) {
+            if (self.allocate_array(frame, allocated, result_type) is .some(result)) { return result; }
+            if (!self.failed) {
+                self.frame_error(frame, "comptime_memory_limit", "cannot create JIL allocation value");
+            }
+            return null;
+        }
+        if (rvalue is .slice_value(slice)) {
+            if (self.slice_value(frame, slice, result_type) is .some(result)) { return result; }
+            if (!self.failed) { self.frame_error(frame, "comptime_invalid_slice", "cannot create JIL slice value"); }
+            return null;
+        }
         if (rvalue is .free_value(freed)) { return self.release_value(frame, freed.pointer); }
         if (rvalue is .len_value(length)) {
             qid.TypeId type_id = self.place_type(frame, length.place);
             if (self.store.types.get(type_id).data is .array_type(array)) {
                 return self.scalar_result(frame, integer.from_bits(self.store, self.query, result_type, UInt64(array.count)));
+            }
+            if (self.slice_element_type(type_id) != null) {
+                guard self.resolve_place(frame, length.place) is .some(address) else { return null; }
+                guard self.memory.child(self.store, self.query, address, 1) is .some(count) else { return null; }
+                guard self.scalar(frame, count) is .some(value) else { return null; }
+                return self.scalar_result(frame, integer.from_bits(self.store, self.query, result_type,
+                    integer.bits(value)$.some()));
             }
         }
         if (rvalue is .binary_value(binary)) {
@@ -577,6 +599,33 @@ struct Executor: Movable {
         return null;
     }
 
+    #doc JIL use 可搬运同位宽整数；例如 slice 的 UInt 长度字段被读作语言层的 Int。
+    Int? use_value(Self&! self, frame_api.Frame& frame, Int source, qid.TypeId type_id) {
+        memory_api.Cell cell = self.memory.get(source);
+        if (self.store.types.same_type_ignoring_mutability(cell.type_id, type_id)) { return source; }
+        Int width = integer.width(self.store, self.query, cell.type_id);
+        if (width > 0 && width == integer.width(self.store, self.query, type_id)) {
+            guard self.scalar(frame, source) is .some(value) else { return null; }
+            guard integer.bits(value) is .some(bits) else { return null; }
+            return self.scalar_result(frame, integer.from_bits(self.store, self.query, type_id, bits));
+        }
+        if (self.slice_element_type(cell.type_id) is .some(source_element)
+            && self.slice_element_type(type_id) is .some(target_element)) {
+            if (self.store.types.same_type_ignoring_mutability(source_element, target_element)) {
+                guard self.memory.allocate(type_id) is .some(result) else { return null; }
+                Int index! = 0;
+                while (index < 2) {
+                    guard self.memory.child(self.store, self.query, source, index) is .some(from) else { return null; }
+                    guard self.memory.child(self.store, self.query, result, index) is .some(to) else { return null; }
+                    if (!self.memory.copy_into(self.store, self.query, to, from)) { return null; }
+                    index = index + 1;
+                }
+                return result;
+            }
+        }
+        return source;
+    }
+
     #doc 显式分配保留未初始化状态，让既有 JIL 构造逻辑直接写入 pointee，不额外复制 owning 对象。
     Int? allocate_value(
         Self&! self, frame_api.Frame&! frame, qid.TypeId value_type, jil.Operand? initializer, qid.TypeId result_type
@@ -603,12 +652,134 @@ struct Executor: Movable {
         return null;
     }
 
+    #doc slice 和 owning slice 共用 JIL 的双字段描述符，不把堆元素复制到描述符内。
+    qid.TypeId? slice_element_type(self, qid.TypeId type_id) {
+        guard self.store.types.get(type_id).data is .handle_type(handle) else { return null; }
+        if (handle.kind == .slice) { return handle.element; }
+        if (handle.kind != .owner_pointer) { return null; }
+        if (self.store.types.get(handle.element).data is .slice_value_type(slice)) { return slice.element; }
+        return null;
+    }
+
+    Int? allocate_array(
+        Self&! self, frame_api.Frame&! frame, jil.AllocArrayRvalue allocated, qid.TypeId result_type
+    ) {
+        guard self.scalar_operand(frame, allocated.count) is .some(value) else { return null; }
+        guard integer.bits(value) is .some(bits) else { return null; }
+        Int count = Int(bits);
+        reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+        qid.TypeId element = reader.type_id(allocated.element_type);
+        Bool sentinel! = false;
+        if (self.store.types.get(result_type).data is .handle_type(handle)) {
+            if (self.store.types.get(handle.element).data is .slice_value_type(slice)) {
+                sentinel = types.sentinel_has(slice.sentinel);
+            }
+        }
+        if (count < 0 || count >= self.memory.limit) {
+            self.frame_error(frame, "comptime_invalid_allocation",
+                "JIL allocation count is negative or exceeds eval quota");
+            return null;
+        }
+        Int storage_count! = count;
+        if (sentinel) { storage_count = storage_count + 1; }
+        layout.LayoutId shape = database.layout_of_type(self.query$.mut_ref(), self.store$.ref(), element);
+        if (database.layout_has_errors(self.query$.ref())) {
+            self.frame_error(frame, "comptime_layout_failed", "JIL allocation requires a concrete target layout");
+            return null;
+        }
+        Int size = self.query.layout.store().layout(shape).size;
+        UInt64 max_bytes! = UInt64(18446744073709551615);
+        if (self.query.layout.target().pointer_size == 4) { max_bytes = UInt64(4294967295); }
+        if (size > 0 && UInt64(storage_count) > max_bytes / UInt64(size)) {
+            self.frame_error(frame, "comptime_invalid_allocation", "JIL allocation size exceeds target address space");
+            return null;
+        }
+        guard self.memory.allocate_heap_sequence(element, storage_count) is .some(storage) else {
+            self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL eval array storage");
+            return null;
+        }
+        if (self.slice_element_type(result_type) != null) {
+            return self.slice_descriptor(frame, result_type, storage, 0, count);
+        }
+        return self.memory.element_reference(result_type, storage, 0);
+    }
+
+    Int? slice_descriptor(
+        Self&! self, frame_api.Frame& frame, qid.TypeId type_id, Int storage, Int start, Int count
+    ) {
+        guard self.memory.allocate(type_id) is .some(result) else { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(pointer) else { return null; }
+        guard self.memory.child(self.store, self.query, result, 1) is .some(length) else { return null; }
+        guard self.memory.get(storage).data is .aggregate(first, _) else { return null; }
+        self.memory.set_data(pointer, .element_reference(storage, first, start));
+        guard integer.from_bits(self.store, self.query, self.memory.get(length).type_id, UInt64(count))
+            is .some(value) else { return null; }
+        self.memory.set_data(length, .scalar(value.data));
+        return result;
+    }
+
+    #doc 切片借用原有元素存储；检查边界但不要求未被读取的元素已经初始化。
+    Int? slice_value(Self&! self, frame_api.Frame&! frame, jil.SliceRvalue slice, qid.TypeId result_type) {
+        guard self.resolve_place(frame, slice.base) is .some(base) else { return null; }
+        Int storage! = base;
+        Int offset! = 0;
+        Int count! = 0;
+        qid.TypeId base_type = self.memory.get(base).type_id;
+        if (self.slice_element_type(base_type) != null) {
+            guard self.memory.child(self.store, self.query, base, 0) is .some(pointer) else { return null; }
+            guard self.memory.get(pointer).data is .element_reference(root, first, index) else { return null; }
+            if (!self.sequence_live(frame, root, first)) { return null; }
+            storage = root;
+            offset = index;
+            guard self.memory.child(self.store, self.query, base, 1) is .some(length) else { return null; }
+            guard self.scalar(frame, length) is .some(value) else { return null; }
+            count = Int(integer.bits(value)$.some());
+        } else if (self.store.types.get(base_type).data is .array_type(array)) {
+            if (!self.memory.ensure_aggregate(self.store, self.query, base)) { return null; }
+            count = array.count;
+        } else if (self.memory.get(base).data is .element_reference(root, first, index)) {
+            if (!self.sequence_live(frame, root, first)) { return null; }
+            storage = root;
+            offset = index;
+            guard self.memory.get(root).data is .aggregate(_, size) else { return null; }
+            count = size - index;
+        } else {
+            self.frame_error(frame, "comptime_invalid_slice", "JIL slice requires array or sequence storage");
+            return null;
+        }
+        Int start! = 0;
+        Int end! = count;
+        if (slice.start is .some(operand)) {
+            guard self.scalar_operand(frame, operand) is .some(value) else { return null; }
+            start = Int(integer.bits(value)$.some());
+        }
+        if (slice.end is .some(operand)) {
+            guard self.scalar_operand(frame, operand) is .some(value) else { return null; }
+            end = Int(integer.bits(value)$.some());
+        }
+        if (start < 0 || end < start || end > count) {
+            self.frame_error(frame, "comptime_invalid_slice", "JIL slice bounds exceed source storage");
+            return null;
+        }
+        return self.slice_descriptor(frame, result_type, storage, offset + start, end - start);
+    }
+
     #doc 消费 free 指令；拒绝栈地址、内部字段地址和重复释放，不把逻辑地址传给宿主分配器。
     Int? release_value(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
         guard self.operand(frame, operand) is .some(pointer) else { return null; }
-        memory_api.CellData data = self.memory.get(pointer).data;
+        Int actual! = pointer;
+        if (self.slice_element_type(self.memory.get(pointer).type_id) != null) {
+            guard self.memory.child(self.store, self.query, pointer, 0) is .some(child) else { return null; }
+            actual = child;
+        }
+        memory_api.CellData data = self.memory.get(actual).data;
         if (data is .reference(target)) {
             if (!self.memory.release_heap(target)) {
+                self.frame_error(frame, "comptime_invalid_free", "JIL free requires a live allocation root");
+                return null;
+            }
+        } else if (data is .element_reference(storage, first, index)) {
+            if (index != 0 || !self.memory.sequence_live(storage, first) || !self.memory.release_heap(storage)) {
                 self.frame_error(frame, "comptime_invalid_free", "JIL free requires a live allocation root");
                 return null;
             }
@@ -630,6 +801,17 @@ struct Executor: Movable {
             if (left is .null_pointer && right is .null_pointer) { return true; }
             return null;
         }
+        if (left is .element_reference(storage, first, index)) {
+            if (right is .null_pointer) { return false; }
+            if (right is .element_reference(other, other_first, other_index)) {
+                return storage == other && first == other_first && index == other_index;
+            }
+            if (right is .reference(target)) {
+                return self.memory.sequence_element(storage, first, index) == target;
+            }
+            return null;
+        }
+        if (right is .element_reference(_, _, _)) { return self.reference_equal(rhs, lhs, false); }
         if (left is .null_pointer) {
             if (right is .null_pointer) { return true; }
             if (right is .reference(_)) { return false; }
@@ -654,6 +836,16 @@ struct Executor: Movable {
                 if (self.memory.reference(result_type, pointer) is .some(result)) { return result; }
                 self.frame_error(frame, "comptime_invalid_pointer", "eval pointer target is dead or memory limit exceeded");
                 return null;
+            }
+            if (same_element && cell.data is .element_reference(storage, first, index)) {
+                if (!self.sequence_live(frame, storage, first)) { return null; }
+                return self.memory.element_reference(result_type, storage, index);
+            }
+            if (cell.data is .reference(storage)
+                && self.store.types.get(source_handle.element).data is .array_type(array)
+                && self.store.types.same_type_ignoring_mutability(array.element, target_handle.element)) {
+                if (!self.memory.ensure_aggregate(self.store, self.query, storage)) { return null; }
+                return self.memory.element_reference(result_type, storage, 0);
             }
             if (cell.data is .null_pointer) {
                 if (self.memory.null_pointer(result_type) is .some(result)) { return result; }
@@ -820,6 +1012,10 @@ struct Executor: Movable {
         Int? result! = null;
         if (projection is .deref_projection(_)) {
             if (self.memory.get(address).data is .reference(target)) { result = target; }
+            if (self.memory.get(address).data is .element_reference(storage, first, index)) {
+                if (!self.sequence_live(frame, storage, first)) { return null; }
+                result = self.memory.sequence_element(storage, first, index);
+            }
         } else if (projection is .field_projection(field)) {
             result = self.memory.field(self.store, self.query, address, field.field_def);
         } else if (projection is .frame_field_projection(field)) {
@@ -831,12 +1027,38 @@ struct Executor: Movable {
                 return null;
             }
             guard integer.bits(index_value) is .some(bits) else { return null; }
-            result = self.memory.child(self.store, self.query, address, Int(bits));
+            result = self.index_element(frame, address, Int(bits));
         }
         if (result != null) { return result; }
         self.frame_error(frame, "comptime_invalid_projection",
             "invalid, out of bounds or unsupported JIL memory projection");
         return null;
+    }
+
+    #doc 动态索引访问 slice 的数据字段，常量字段 projection 仍访问描述符自身的布局字段。
+    Int? index_element(Self&! self, frame_api.Frame& frame, Int address, Int index) {
+        if (index < 0) { return null; }
+        Int base! = address;
+        if (self.slice_element_type(self.memory.get(address).type_id) != null) {
+            guard self.memory.child(self.store, self.query, address, 0) is .some(pointer) else { return null; }
+            base = pointer;
+        }
+        if (self.memory.get(base).data is .element_reference(storage, first, offset)) {
+            if (!self.sequence_live(frame, storage, first)) { return null; }
+            if (index > self.memory.limit - offset) { return null; }
+            return self.memory.sequence_element(storage, first, offset + index);
+        }
+        if (self.memory.get(base).data is .reference(target)) {
+            if (index == 0) { return target; }
+            return null;
+        }
+        return self.memory.child(self.store, self.query, base, index);
+    }
+
+    Bool sequence_live(Self&! self, frame_api.Frame& frame, Int storage, Int first) {
+        if (self.memory.sequence_live(storage, first)) { return true; }
+        self.frame_error(frame, "comptime_dead_storage", "JIL sequence storage has been released or replaced");
+        return false;
     }
 
     Int? reference(Self&! self, frame_api.Frame& frame, jil.Place place, qid.TypeId type_id) {
