@@ -721,7 +721,7 @@ check_public_alias_dependency() {
   printf '%s\n' \
     'public import middle = "./middle.jiang";' >"$fixture/api.jiang"
   printf '%s\n' \
-    'public import * = "./leaf.jiang";' >"$fixture/middle.jiang"
+    'public alias * = import "./leaf.jiang";' >"$fixture/middle.jiang"
   printf '%s\n' \
     'public struct Number {' \
     '    public Int value;' \
@@ -735,6 +735,17 @@ check_public_alias_dependency() {
   require_stat_eq "$WORK_DIR/public-alias-hot.log" artifact_emitted_units 0
   expect_exit "$WORK_DIR/public-alias-cold" 0
   expect_exit "$WORK_DIR/public-alias-hot" 0
+}
+
+check_member_alias_interface() {
+  local cache="$WORK_DIR/member-alias-cache"
+  local input="$ROOT_DIR/test/lang/import/run/alias_member_public.jiang"
+  check_only "$cache" "$WORK_DIR/member-alias-cold.log" "$input"
+  check_only "$cache" "$WORK_DIR/member-alias-hot.log" "$input"
+  require_stat_ge "$WORK_DIR/member-alias-hot.log" artifact_interface_hit 1
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/member-alias-run.log" \
+    "$WORK_DIR/member-alias-run" "$input"
+  expect_exit "$WORK_DIR/member-alias-run" 0
 }
 
 check_trait_interface() {
@@ -1025,6 +1036,7 @@ run_check shared_generic "shared generic callers" check_shared_generic_callers
 run_check release_units "release whole-package state" check_release_whole_package_state
 run_check global_only "global-only dependency" check_global_only_dependency
 run_check public_alias "public alias dependency" check_public_alias_dependency
+run_check member_alias "member alias interface ownership" check_member_alias_interface
 run_check trait_interface "trait interface" check_trait_interface
 run_check backend_emission "serial backend emission" check_backend_emission
 run_check concurrent "concurrent publication" check_concurrent_publish

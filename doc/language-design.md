@@ -767,10 +767,10 @@ import foo = "foo.jiang";
 如果默认名字不是合法 Jiang identifier，必须显式提供 alias。显式和默认 alias 走相同的 import
 target、可见性、循环检测、稳定身份和增量失效路径。
 
-`import * = path;` 不创建默认 module namespace，也不为目标模块的每个 public declaration 复制
+`alias * = import path;` 不创建默认 module namespace，也不为目标模块的每个 public declaration 复制
 alias `DefId`。它登记一条 wildcard namespace edge；lookup 按需查询目标 public namespace，并原样
 保留函数 overload candidates。extension member 也通过同一个 public namespace surface 可达。
-`public import *` re-export 同一条 edge。
+`public alias * = import path;` re-export 同一条 edge。
 
 本地 declaration binding 优先于 wildcard edge。多条 wildcard edge 按源码登记顺序查询；最终
 namespace validation 会枚举直接目标的 public binding，使未引用的同名导出也产生稳定冲突诊断。
