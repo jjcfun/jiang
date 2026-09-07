@@ -114,6 +114,9 @@ line/block header）：
   expression、statement、declaration/member、type、pattern 和 annotation 位置。
 - provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
 - DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
+- Provider 的 `declarations()` 只组合声明，不引入作用域或执行。`comptime_block()` 接收局部语句
+  和可选尾表达式，遵循普通 comptime 的词法作用域与求值规则；条件使用普通 `if_expression()` 组合，
+  不提供向外发布分支声明的专用 comptime-if 机制。
 
 provider 有两个阶段：
 
@@ -1629,10 +1632,10 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
   parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only
   AST/type system。
-- `comptime` block 内未执行的分支不参与 import graph、name resolve、type check 或 codegen。
-- 完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
-  之后的语义阶段会跳过未执行分支。
-- `comptime if` 的 condition 是普通表达式，必须能在编译期求值为 `Bool`。先登记当前 source 的
+- `comptime` block 内的普通分支遵循常规名字解析和类型检查；未执行分支不执行副作用，
+  其中的 import 表达式也不加载目标模块。不能借由未执行分支隐藏普通名字或类型错误。
+- 完整 parse `comptime` block，未执行分支里的语法错误仍然诊断。
+- comptime 中 `if` 的 condition 是普通表达式，必须能在编译期求值为 `Bool`。先登记当前 source 的
   普通声明，再按需检查并执行条件的依赖，求值结果决定需要发现的 import source；
   不要求先封闭整个 Sema，也不要求 LLVM/linker 同时渐进式化。
 - eval 可以读取已经发现 source 中的普通 const，并按需调用符合 comptime 安全边界的普通

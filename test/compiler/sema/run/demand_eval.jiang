@@ -30,6 +30,7 @@ import comptime_evaluator = "../../../../src/compiler/sema/comptime/evaluator.ji
 import sema_diagnostics = "../../../../src/compiler/sema/diagnostics.jiang";
 
 public Int run() {
+    check_comptime_failure_diagnostic();
     check_alias_callback();
     check_local_const_instances();
     check_local_const_instances(true);
@@ -64,6 +65,27 @@ public Int run() {
     check_string_const();
     check_condition_callback();
     return 0;
+}
+
+#doc
+    顶层 JIL 执行失败只保留具体诊断，重试不增加诊断或执行进度。
+#end
+public Void check_comptime_failure_diagnostic() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    UInt8[]& text = "comptime { assert(false); }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("comptime_failure_diagnostic", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(!resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    assert(ctx.store.diagnostics.len() == 1);
+    assert(has_diagnostic(ctx$.ref(), "comptime_assertion_failed"));
+    assert(!has_diagnostic(ctx$.ref(), "comptime_block_not_constant"));
+    assert(ctx.store.resolve.module_ref(graph.root_module).comptime_cursor == 0);
+    assert(!resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    assert(ctx.store.diagnostics.len() == 1);
+    assert(ctx.store.resolve.module_ref(graph.root_module).comptime_cursor == 0);
 }
 
 #doc 非 CLI 调用方使用同一个必填回调求得 namespace，重复 ensure 不重复发布 import。
@@ -189,12 +211,12 @@ Void check_init_defaults() {
 }
 
 #doc
-    Resolver 只请求调用方的条件值；替换求值能力后不隐式运行 typecheck 或生成 JIL。
+    Resolver 只请求整块求值；替换求值能力后不隐式运行 typecheck 或生成 JIL。
 #end
 Void check_condition_callback() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(literal_condition, use_source_artifacts: false);
-    UInt8[]& text = "comptime { if (true) { const Int chosen = 1; } else { import missing; } }";
+    UInt8[]& text = "comptime { const Int local = 1; } const Int chosen = 2;";
     source.SourceId source_id = ctx.store.sources.intern_virtual("condition_callback", text);
     syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
     module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
@@ -202,7 +224,7 @@ Void check_condition_callback() {
     qid.DefId chosen = named_def(ctx$.ref(), graph.root_module, "chosen");
     assert(ctx.store.model.declaration_sema_state(chosen) == .skeleton);
     assert(ctx.store.resolve.module_ref(graph.root_module).imports.len() == 0);
-    assert(ctx.jil.program.functions.len() == 0);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 0);
     assert(ctx.jil.program.source_function_count() == 0);
 }
 
@@ -308,16 +330,21 @@ Void check_const_cycle(UInt8[]& text) {
     assert(ctx.jil.storage.arena.used_bytes() == bytes);
 }
 
-#doc 用测试回调直接提供字面量条件，不启动编译求值调度。
+#doc 直接提供 core 导入字面量及测试块结果，不启动编译求值调度。
 value.ComptimeValue? literal_condition(
     context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
     module_graph.ModuleGraph&! graph, sem.NodeId root, qid.TypeId expected
 ) {
     assert(ctx.store.typeck.node_type(root) == null);
-    assert(expected == ctx.store.types.bool_type());
-    guard ctx.store.model.node(root).data is .literal(literal) else { assert(false); return null; }
-    guard literal.value is .bool_value(boolean) else { assert(false); return null; }
-    return value.ComptimeValue(type_id: expected, data: .bool_value(boolean));
+    if (expected == ctx.store.types.namespace_type()) {
+        guard ctx.store.model.node(root).data is .literal(literal) else { assert(false); return null; }
+        guard literal.value is .import_value(origin, path, file_path) else { assert(false); return null; }
+        return value.ComptimeValue(type_id: expected, data: .import_value(origin, path, file_path));
+    }
+    assert(expected == ctx.store.types.unit_type());
+    guard ctx.store.model.node(root).data is .block(block) else { assert(false); return null; }
+    assert(block.is_comptime);
+    return value.ComptimeValue(type_id: expected, data: .unit_value);
 }
 
 #doc
@@ -352,7 +379,7 @@ Void check_generic_expression() {
     if (second == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
     assert(second$.some().data is .int_value(8));
     assert(ctx.jil.storage.arena.used_bytes() == allocated);
-    assert(ctx.jil.program.functions.len() == 1);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 1);
     assert(ctx.jil.program.mono_item_count() == 0);
     jil_drop.elaborate_package(ctx.store$.mut_ref(), ctx.query.layout$.mut_ref(), ctx.jil$.mut_ref());
     assert(jil_verifier.verify(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), .backend_input, true));
@@ -363,7 +390,7 @@ Void check_generic_expression() {
     assert(compilation.evaluate_expression(
         ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), other_root, args.slice()
     ) != null);
-    assert(ctx.jil.program.functions.len() == 2);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 2);
     assert(backend_symbol.validate_unique_function_symbols(ctx$.ref(), ctx.jil$.ref()));
     codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx$.ref(), ctx.jil$.ref());
     assert(codegen_unit.statistics(units$.ref()).functions == 0);
@@ -536,9 +563,9 @@ Void check_conditional_import() {
     syntax.SyntaxResult dependency_ast! = syntax.parse_source(ctx$.mut_ref(), dependency_text, dependency);
     resolver.add_ast(dependency_ast.take_unit());
     std.StringBuilder text! = std.StringBuilder();
-    text.append("comptime { if (chosen != 7) { import missing_first; Int bad() { true } } ");
-    text.append("else if (enabled()) { import dep = selected_condition_dep; Int selected() { dep.number() } } ");
-    text.append("else { import missing_last; Int wrong() { false } } } ");
+    text.append("alias dep = if (chosen != 7) { import missing_first } ");
+    text.append("else if (enabled()) { import selected_condition_dep } else { import missing_last }; ");
+    text.append("Int selected() { dep.number() } comptime { assert(selected() == 9); } ");
     text.append("const Int chosen = calculate(); Int calculate() { 7 } Bool enabled() { chosen == 7 }");
     source.SourceId source_id = ctx.store.sources.intern_virtual("conditional_import_eval", text.slice());
     syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
@@ -548,10 +575,10 @@ Void check_conditional_import() {
     Bool prepared = resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref());
     if (!prepared) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
     assert(prepared);
-    assert(ctx.store.resolve.module_ref(module_id).comptime_items.len() == 2);
-    assert(ctx.store.resolve.module_ref(module_id).comptime_cursor == 2);
+    assert(ctx.store.resolve.module_ref(module_id).comptime_items.len() == 1);
+    assert(ctx.store.resolve.module_ref(module_id).comptime_cursor == 1);
     assert(ctx.store.resolve.module_ref(module_id).imports.len() == 1);
-    assert(ctx.store.resolve.module_ref(module_id).imports.get(0).target_module == null);
+    assert(ctx.store.resolve.module_ref(module_id).imports.get(0).target_module != null);
     qid.DefId selected = named_def(ctx$.ref(), module_id, "selected");
     list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
     list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
@@ -566,7 +593,9 @@ Void check_conditional_import() {
     assert(ctx.store.resolve.module_ref(module_id).imports.len() == 1);
 }
 
-// 独立条件入口与普通 const 共用 JIL；此处不经过尚未迁移的 top-level selector。
+#doc
+    Bool 条件复用普通表达式查询，按需加载依赖并复用 JIL 结果。
+#end
 Void check_source_condition(Bool expected) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
@@ -593,11 +622,21 @@ Void check_source_condition(Bool expected) {
     assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
     qid.ModuleId module_id = graph.root_module;
     assert(ctx.store.resolve.module_ref(module_id).imports.get(1).target_module == null);
-    Bool? result = resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition);
+    qid.DefId condition_def = named_def(ctx$.ref(), module_id, "condition");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), condition_def));
+    sem.NodeId expression_root = ctx.store.model.body_root(condition_def)$.some();
+    value.ComptimeValue? result = compilation.evaluate_source_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), expression_root, ctx.store.types.bool_type()
+    );
     if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
-    assert(result == expected);
+    guard result$.some().data is .bool_value(actual) else { assert(false); return; }
+    assert(actual == expected);
     Int bytes = ctx.jil.storage.arena.used_bytes();
-    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == expected);
+    value.ComptimeValue? repeated = compilation.evaluate_source_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), expression_root, ctx.store.types.bool_type()
+    );
+    guard repeated$.some().data is .bool_value(repeated_value) else { assert(false); return; }
+    assert(repeated_value == expected);
     assert(ctx.jil.storage.arena.used_bytes() == bytes);
     qid.DefId bad = named_def(ctx$.ref(), graph.root_module, "bad");
     assert(ctx.store.model.declaration_sema_state(bad) == .skeleton);
@@ -607,9 +646,11 @@ Void check_source_condition(Bool expected) {
     Int revision = ctx.store.resolve.module_ref(module_id).source_revision;
     ctx.store.resolve.reset_module(module_id, revision + 1, namespace_id);
     assert(ctx.store.resolve.module_ref(module_id).condition_roots.get(condition.to_index()) == null);
-    assert(ctx.store.resolve.module_ref(module_id).condition_values.get(condition.to_index()) == null);
 }
 
+#doc
+    条件类型不匹配由通用表达式查询诊断，失败重试不重复发布诊断。
+#end
 Void check_invalid_source_condition() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
@@ -626,11 +667,17 @@ Void check_invalid_source_condition() {
     module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), unit.take());
     assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
     qid.ModuleId module_id = graph.root_module;
-    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == null);
+    qid.DefId condition_def = named_def(ctx$.ref(), module_id, "condition");
+    assert(resolver.ensure_declaration_model(ctx$.mut_ref(), graph$.mut_ref(), condition_def));
+    sem.NodeId expression_root = ctx.store.model.body_root(condition_def)$.some();
+    assert(compilation.evaluate_source_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), expression_root, ctx.store.types.bool_type()
+    ) == null);
     assert(has_diagnostic(ctx$.ref(), "comptime_expression_type_mismatch"));
-    assert(ctx.store.resolve.module_ref(module_id).condition_values.get(condition.to_index()) == null);
     Int count = ctx.store.diagnostics.len();
-    assert(resolver.evaluate_source_condition(ctx$.mut_ref(), graph$.mut_ref(), module_id, condition) == null);
+    assert(compilation.evaluate_source_expression(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), expression_root, ctx.store.types.bool_type()
+    ) == null);
     assert(ctx.store.diagnostics.len() == count);
 }
 
@@ -897,7 +944,7 @@ Void check_nested_const() {
     assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
     assert(ctx.store.comptime_store.const_value(factor)$.some().data is .int_value(2));
     assert(ctx.jil.program.source_function_count() == 2);
-    assert(ctx.jil.program.functions.len() == 3);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 3);
     assert(!ctx.store.borrowck.generated_function_checked(pending.to_index()));
     assert(!ctx.jil.drop_elaboration.contains(pending));
     assert(ctx.jil.program.mono_item_count() == 0);
@@ -936,7 +983,7 @@ Void check_const_final_sweep() {
     assert(ctx.jil.program.has_source_function(sibling));
     ctx.begin_compilation();
     assert(ctx.jil.program.source_function_count() == 0);
-    assert(ctx.jil.program.functions.len() == 0);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 0);
     assert(!ctx.jil.program.has_query_identity());
 }
 
@@ -962,7 +1009,7 @@ Void check_const_consumer() {
     assert(ctx.store.comptime_store.has_const_value(chosen));
     assert(ctx.store.comptime_store.const_value(chosen)$.some().data is .int_value(7));
     assert(ctx.jil.program.source_function_count() == 1);
-    assert(ctx.jil.program.functions.len() == 1);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 1);
     assert(!ctx.jil.program.has_source_function(unused));
     assert(!ctx.store.typeck.signature_checked(unused));
     Int bytes = ctx.jil.storage.arena.used_bytes();
@@ -995,7 +1042,7 @@ Void check_expression() {
     assert(!ctx.store.comptime_store.has_const_value(chosen));
     assert(ctx.store.model.declaration_sema_state(unused) == .skeleton);
     assert(ctx.jil.program.source_function_count() == 1);
-    assert(ctx.jil.program.functions.len() == 1);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 1);
     assert(ctx.jil.program.mono_item_count() == 0);
     Int bytes = ctx.jil.storage.arena.used_bytes();
     assert(compilation.evaluate_expression(
@@ -1006,7 +1053,7 @@ Void check_expression() {
     assert(compilation.evaluate_expression(
         ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), binary.right, args.slice()
     )$.some().data is .int_value(1));
-    assert(ctx.jil.program.functions.len() == 2);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 2);
     assert(ctx.jil.program.mono_item_count() == 0);
     Int shared_bytes = ctx.jil.storage.arena.used_bytes();
     assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
@@ -1016,7 +1063,7 @@ Void check_expression() {
     assert(compilation.evaluate_expression(
         ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), root, args.slice(), boolean
     ) == null);
-    assert(ctx.jil.program.functions.len() == 2);
+    assert(module_generated_count(ctx$.ref(), graph.root_module) == 2);
     assert(has_diagnostic(ctx$.ref(), "comptime_expression_type_mismatch"));
 }
 
@@ -1156,6 +1203,22 @@ Void check_invalid_definition() {
         selected, generic_args.slice(), args.slice()
     ) == null);
     assert(ctx.store.diagnostics.len() == count);
+}
+
+#doc
+    只统计本用例模块生成的函数；core namespace alias 的独立求值不属于测试 root。
+#end
+Int module_generated_count(context.CompilerContext& ctx, qid.ModuleId module_id) {
+    Int count! = 0;
+    Int index! = 0;
+    while (index < ctx.jil.program.functions.len()) {
+        jil.Function function = ctx.jil.program.functions.get(index);
+        if (function.origin is .generated(origin) && origin.module_id == module_id) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
 }
 
 qid.DefId named_def(
