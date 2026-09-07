@@ -432,6 +432,8 @@ struct ModuleResolvePhase: Movable {
                 index = index + 1;
             }
             self.bind_core_declarations_if_ready();
+            if (!self.prepare_module_comptime(graph, core_module)) { return false; }
+            self.bind_core_declarations();
             if (!self.ensure_module_expression_aliases(graph, core_module)) { return false; }
             self.bind_core_declarations();
         }
@@ -441,6 +443,7 @@ struct ModuleResolvePhase: Movable {
                 module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
                 builder.ensure_declarations(std_source);
             }
+            if (!self.prepare_module_comptime(graph, std_module)) { return false; }
             self.bind_std_prelude_aliases();
         }
         if (!graph.ok || self.ctx.store.model.has_errors()) { return false; }
@@ -882,6 +885,15 @@ struct ModuleResolvePhase: Movable {
         Int end
     ) {
         Int index! = begin;
+        Bool changed! = false;
+        while (index < end) {
+            source_graph.SourceNode& node = self.ctx.store.source_dependencies.node(schedule.node_at(index));
+            if (node.source_dirty || node.dependency_candidate) { changed = true; break; }
+            index = index + 1;
+        }
+        // comptime 任务要求从源码重新求值，不等于源码或被观察的依赖发生变化。
+        if (!changed) { return; }
+        index = begin;
         while (index < end) {
             self.ctx.store.source_dependencies.mark_source_dirty(schedule.node_at(index));
             index = index + 1;
@@ -1090,6 +1102,10 @@ struct ModuleResolvePhase: Movable {
         source_graph.SourceNodeId node_id,
         qid.ModuleId module_id
     ) {
+        // 按需求值或 provider 要求重新读取源码，不等于输入失效；其中间接口可能还没有 const 值。
+        // 只传播源变化或依赖失效触发的重建，不能用干净模块的未完成接口替代上次已完成的接口。
+        source_graph.SourceNode& node = self.ctx.store.source_dependencies.node(node_id);
+        if (!node.source_dirty && !node.dependency_candidate) { return; }
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
         artifact.ModuleInterface& module_interface =
             self.ctx.store.artifacts.load_interface(module.source_id)$.some();
@@ -1497,6 +1513,7 @@ struct ModuleResolvePhase: Movable {
         if (module_progress == .interface_loaded) {
             return self.ensure_interface_declaration_facts(module_id, def_id);
         }
+        if (!self.prepare_module_comptime(graph, module_id)) { return false; }
         if (module_progress == .declarations_ready && !alias_skeleton) {
             if (!self.ensure_module_extend_members(graph, module_id)) { return false; }
             module_progress = self.module_state(module_id);
@@ -1574,12 +1591,57 @@ struct ModuleResolvePhase: Movable {
     Bool prepare_comptime_item(
         Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id, ast.AstId item
     ) {
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        ast.AstId expression! = item;
+        token.Span span! = token.Span();
+        def.Visibility? wildcard_visibility! = null;
+        {
+            guard self.owner.asts.get(source_id) is .some(unit) else { return false; }
+            span = unit.get(item).span;
+            if (unit.get(item).data is .top_level_decl(top)
+                && unit.get(top.body).data is .alias_decl(alias_decl) && alias_decl.flatten) {
+                expression = alias_decl.target$.some();
+                def.Visibility visibility = if top.modifiers.public_flag {
+                    .public_visibility
+                } else { .private_visibility };
+                wildcard_visibility = visibility;
+            }
+        }
         qid.DefId owner = self.ctx.store.resolve.module_ref(module_id).def_id;
-        guard self.lower_source_condition(graph, module_id, item, owner) is .some(root) else { return false; }
+        guard self.lower_source_condition(graph, module_id, expression, owner) is .some(root) else { return false; }
         RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
             module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate = self.owner.evaluate_expression;
-        return evaluate(self.ctx$.mut_ref(), self.owner$.mut_ref(), graph$.mut_ref(), root,
-            self.ctx.store.types.unit_type()) != null;
+        qid.TypeId expected = if wildcard_visibility != null {
+            self.ctx.store.types.namespace_type()
+        } else { self.ctx.store.types.unit_type() };
+        guard evaluate(self.ctx$.mut_ref(), self.owner$.mut_ref(), graph$.mut_ref(), root, expected)
+            is .some(value) else { return false; }
+        guard wildcard_visibility is .some(visibility) else { return true; }
+        if (value.data is .namespace_value(target)) {
+            qid.NamespaceId namespace_id = self.ctx.store.defs.get(target).owned_namespace_id$.some();
+            if (self.ctx.store.defs.get(target).kind == .module_def) {
+                qid.ModuleId target_module = self.ctx.store.defs.get(target).module_id$.some();
+                qid.SymbolId target_path = self.ctx.store.resolve.module_ref(target_module).path_symbol;
+                Int import_index = self.ctx.store.resolve.module_ref(module_id).imports.len();
+                self.ctx.store.resolve.add_import(module_id, store.ImportRecord(
+                    kind: .package_import, state: .resolved, span: span, visibility: visibility,
+                    flatten: true, expression_import: true, path_symbol: target_path,
+                    alias_symbol: null, target_module: target_module, alias_def: null));
+                return self.ensure_lookup_import_target(graph, module_id, import_index) != null;
+            }
+            qid.NamespaceId destination = self.ctx.store.resolve.module_ref(module_id).namespace_id;
+            self.ctx.store.resolve.add_wildcard_import(
+                destination, namespace_id, visibility, span);
+            return true;
+        }
+        guard value.data is .import_value(origin, path, file_path) else { return false; }
+        Int index = self.ctx.store.resolve.module_ref(module_id).imports.len();
+        self.ctx.store.resolve.add_import(module_id, store.ImportRecord(
+            kind: if file_path { .file_import } else { .package_import },
+            state: .unresolved, span: span,
+            visibility: visibility, flatten: true, expression_import: true,
+            path_symbol: path, alias_symbol: null, target_module: null, alias_def: null));
+        return self.ensure_lookup_import_target(graph, module_id, index) != null;
     }
 
     public sem.NodeId? lower_source_condition(
@@ -1670,17 +1732,22 @@ struct ModuleResolvePhase: Movable {
         qid.TypeId expected = self.ctx.store.types.namespace_type();
         guard evaluate(self.ctx$.mut_ref(), self.owner$.mut_ref(), graph$.mut_ref(), root, expected)
             is .some(value) else { return false; }
-        guard value.data is .import_value(origin, path, file_path) else { return false; }
-        Int index = self.ctx.store.resolve.module_ref(origin).imports.len();
-        store.ImportKind kind! = .package_import;
-        if (file_path) { kind = .file_import; }
-        self.ctx.store.resolve.add_import(origin, store.ImportRecord(
-            kind: kind, state: .unresolved, span: span, visibility: visibility, flatten: false,
-            expression_import: true,
-            path_symbol: path, alias_symbol: self.ctx.store.defs.get(def_id).name.symbol,
-            target_module: null, alias_def: def_id));
-        guard self.ensure_lookup_import_target(graph, origin, index) is .some(target_module) else { return false; }
-        qid.DefId target_def = self.ctx.store.resolve.module_ref(target_module).def_id;
+        qid.DefId target_def!;
+        if (value.data is .namespace_value(target)) {
+            target_def = target;
+        } else {
+            guard value.data is .import_value(origin, path, file_path) else { return false; }
+            Int index = self.ctx.store.resolve.module_ref(origin).imports.len();
+            store.ImportKind kind! = .package_import;
+            if (file_path) { kind = .file_import; }
+            self.ctx.store.resolve.add_import(origin, store.ImportRecord(
+                kind: kind, state: .unresolved, span: span, visibility: visibility, flatten: false,
+                expression_import: true,
+                path_symbol: path, alias_symbol: self.ctx.store.defs.get(def_id).name.symbol,
+                target_module: null, alias_def: def_id));
+            guard self.ensure_lookup_import_target(graph, origin, index) is .some(target_module) else { return false; }
+            target_def = self.ctx.store.resolve.module_ref(target_module).def_id;
+        }
         {
             guard self.owner.asts.get(source_id) is .some(unit) else { return false; }
             resolve_state.AstResolveState state! = resolve_state.AstResolveState(

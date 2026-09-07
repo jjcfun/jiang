@@ -589,13 +589,20 @@ check_shared_generic_callers() {
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/shared-generic-add.log" \
     "$WORK_DIR/shared-generic-add" "$fixture"
   require_stat_eq "$WORK_DIR/shared-generic-add.log" artifact_emitted_units 2
+  local added_mono_units
+  added_mono_units="$(($(stat_value "$WORK_DIR/shared-generic-add.log" artifact_linked_objects) - cold_linked))"
+  [ "$added_mono_units" -ge 0 ] && [ "$added_mono_units" -le 1 ] \
+    || fail "adding one generic call changed link unit count by ${added_mono_units}"
 
   perl -0pi -e \
     's/common\.identity<Int>\(4\) \+ common\.second<Int>\(1\) - 1/common.identity<Int>(4)/' \
     "$fixture/right.jiang"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/shared-generic-remove.log" \
     "$WORK_DIR/shared-generic-remove" "$fixture"
-  require_stat_eq "$WORK_DIR/shared-generic-remove.log" artifact_emitted_units 2
+  # 共享 identity 的首次访问者决定 mono 归属，不能依赖临时路径影响的模块遍历顺序。
+  # 若 second 独占新增 unit，移除时该 unit 退出链接；否则重建仍含 identity 的原 mono unit。
+  require_stat_eq "$WORK_DIR/shared-generic-remove.log" artifact_emitted_units "$((2 - added_mono_units))"
+  require_stat_eq "$WORK_DIR/shared-generic-remove.log" artifact_linked_objects "$cold_linked"
 
   printf '%s\n' \
     'public T identity<T>(T value) {' \
@@ -737,6 +744,47 @@ check_public_alias_dependency() {
   expect_exit "$WORK_DIR/public-alias-hot" 0
 }
 
+check_deferred_const_instances() {
+  local fixture="$WORK_DIR/deferred-const"
+  local cache="$WORK_DIR/deferred-const-cache"
+  local prefix="$WORK_DIR/deferred-const"
+  cp -R "$ROOT_DIR/test/compiler/fixture/deferred_const_cache" "$fixture"
+  check_only "$cache" "$prefix-check-cold.log" "$fixture/main.jiang"
+  check_only "$cache" "$prefix-check-hot.log" "$fixture/main.jiang"
+  require_stat_ge "$prefix-check-hot.log" artifact_interface_hit 1
+  compile_executable "$JIANGC" "$cache" "$prefix-cold.log" "$prefix-cold" "$fixture/main.jiang"
+  expect_exit "$prefix-cold" 68
+  compile_executable "$JIANGC" "$cache" "$prefix-hot.log" "$prefix-hot" "$fixture/main.jiang"
+  expect_exit "$prefix-hot" 68
+  require_stat_eq "$prefix-hot.log" artifact_emitted_units 0
+  cp "$fixture/library_changed.jiang" "$fixture/library.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-changed.log" "$prefix-changed" "$fixture/main.jiang"
+  expect_exit "$prefix-changed" 80
+  require_stat_ge "$prefix-changed.log" artifact_emitted_units 1
+  compile_executable "$JIANGC" "$cache" "$prefix-changed-hot.log" "$prefix-changed" "$fixture/main.jiang"
+  expect_exit "$prefix-changed" 80
+  require_stat_eq "$prefix-changed-hot.log" artifact_no_op_hits 1
+  cp "$ROOT_DIR/test/compiler/fixture/deferred_const_cache/library.jiang" "$fixture/library.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-restored.log" "$prefix-restored" "$fixture/main.jiang"
+  expect_exit "$prefix-restored" 68
+  cp "$fixture/library_helper_changed.jiang" "$fixture/library.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-helper.log" "$prefix-helper" "$fixture/main.jiang"
+  expect_exit "$prefix-helper" 74
+  cp "$fixture/library_failed.jiang" "$fixture/library.jiang"
+  local attempt
+  for attempt in 1 2; do
+    if compile_executable "$JIANGC" "$cache" "$prefix-failed-$attempt.log" \
+      "$prefix-failed" "$fixture/main.jiang"; then
+      fail "failed const instance unexpectedly compiled"
+    fi
+    grep -q 'comptime_assertion_failed' "$prefix-failed-$attempt.log" \
+      || fail "const instance failure diagnostic missing"
+  done
+  cp "$ROOT_DIR/test/compiler/fixture/deferred_const_cache/library.jiang" "$fixture/library.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-retry.log" "$prefix-retry" "$fixture/main.jiang"
+  expect_exit "$prefix-retry" 68
+}
+
 check_member_alias_interface() {
   local cache="$WORK_DIR/member-alias-cache"
   local input="$ROOT_DIR/test/lang/import/run/alias_member_public.jiang"
@@ -746,6 +794,91 @@ check_member_alias_interface() {
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/member-alias-run.log" \
     "$WORK_DIR/member-alias-run" "$input"
   expect_exit "$WORK_DIR/member-alias-run" 0
+}
+
+check_namespace_wildcard() {
+  local form="${1:-wildcard}"
+  local fixture="$WORK_DIR/namespace-$form"
+  local cache="$WORK_DIR/namespace-$form-cache"
+  local prefix="$WORK_DIR/namespace-$form"
+  cp -R "$ROOT_DIR/test/compiler/fixture/namespace_wildcard" "$fixture"
+  if [ "$form" = named ]; then
+    cp "$fixture/api_named.jiang" "$fixture/api.jiang"
+  fi
+  if [ "$form" = async ] || [ "$form" = global ] || [ "$form" = lambda ] \
+    || [ "$form" = trait ] || [ "$form" = trait_extension ] \
+    || [ "$form" = trait_extension_concrete ]; then
+    cp "$fixture/right_$form.jiang" "$fixture/right.jiang"
+  fi
+  if [ "$form" = async_unused ]; then
+    cp "$fixture/right_async.jiang" "$fixture/right.jiang"
+    cp "$fixture/main_async_unused.jiang" "$fixture/main.jiang"
+  fi
+  cp "$fixture/settings.jiang" "$fixture/settings_left.jiang"
+  local input="$fixture/main.jiang"
+  check_only "$cache" "$prefix-cold.log" "$input"
+  check_only "$cache" "$prefix-hot.log" "$input"
+  require_stat_ge "$prefix-hot.log" artifact_interface_hit 1
+  compile_executable "$JIANGC" "$cache" "$prefix-left.log" "$prefix-left" "$input"
+  expect_exit "$prefix-left" 41
+  cp "$fixture/settings_right.jiang" "$fixture/settings.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-right.log" "$prefix-right" "$input"
+  expect_exit "$prefix-right" 42
+  compile_executable "$JIANGC" "$cache" "$prefix-right-hot.log" "$prefix-right-hot" "$input"
+  expect_exit "$prefix-right-hot" 42
+  require_stat_eq "$prefix-right-hot.log" artifact_emitted_units 0
+  cp "$fixture/settings_left.jiang" "$fixture/settings.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-left-again.log" "$prefix-left-again" "$input"
+  expect_exit "$prefix-left-again" 41
+}
+
+check_namespace_named() {
+  check_namespace_wildcard named
+}
+
+check_namespace_async() {
+  check_namespace_wildcard async
+}
+
+check_namespace_async_unused() {
+  check_namespace_wildcard async_unused
+}
+
+check_namespace_lambda() {
+  check_namespace_wildcard lambda
+}
+
+check_namespace_global() {
+  check_namespace_wildcard global
+}
+
+check_namespace_trait() {
+  check_namespace_wildcard trait
+}
+
+check_namespace_trait_extension() {
+  check_namespace_wildcard trait_extension
+}
+
+check_namespace_trait_extension_concrete() {
+  check_namespace_wildcard trait_extension_concrete
+}
+
+check_attribute_alias_interface() {
+  local cache="$WORK_DIR/attribute-alias-cache"
+  local input="$ROOT_DIR/test/lang/generic/run/alias_attribute_import.jiang"
+  check_only "$cache" "$WORK_DIR/attribute-alias-cold.log" "$input"
+  check_only "$cache" "$WORK_DIR/attribute-alias-hot.log" "$input"
+  require_stat_ge "$WORK_DIR/attribute-alias-hot.log" artifact_interface_hit 1
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/attribute-alias-run.log" \
+    "$WORK_DIR/attribute-alias-run" "$input"
+  expect_exit "$WORK_DIR/attribute-alias-run" 0
+  local invalid="$ROOT_DIR/test/lang/generic/fail/alias_attribute_import_no_leak.jiang"
+  if check_only "$cache" "$WORK_DIR/attribute-alias-private.log" "$invalid"; then
+    fail "function attribute alias leaked into its module after interface restore"
+  fi
+  grep -q 'unresolved_type' "$WORK_DIR/attribute-alias-private.log" \
+    || fail "expected unresolved_type for function-local alias"
 }
 
 check_trait_interface() {
@@ -1032,11 +1165,22 @@ run_check recovery "corrupt cache recovery" check_corrupt_cache_recovery
 run_check compiler_build "compiler build identity" check_compiler_build_invalidation
 run_check object_contract "object contract and target" check_emit_object_contract_and_target
 run_check const_generic "const generic closure" check_cross_package_const_generic
+run_check deferred_const "deferred const instance restore and invalidation" check_deferred_const_instances
 run_check shared_generic "shared generic callers" check_shared_generic_callers
 run_check release_units "release whole-package state" check_release_whole_package_state
 run_check global_only "global-only dependency" check_global_only_dependency
 run_check public_alias "public alias dependency" check_public_alias_dependency
 run_check member_alias "member alias interface ownership" check_member_alias_interface
+run_check namespace_wildcard "namespace wildcard selection and invalidation" check_namespace_wildcard
+run_check namespace_named "named namespace selection and invalidation" check_namespace_named
+run_check namespace_async "cached async body selection and invalidation" check_namespace_async
+run_check namespace_async_unused "cached non-root async template dependency" check_namespace_async_unused
+run_check namespace_lambda "cached nested lambda body selection and invalidation" check_namespace_lambda
+run_check namespace_global "cached global storage selection and invalidation" check_namespace_global
+run_check namespace_trait "cached trait eval and drop dependencies" check_namespace_trait
+run_check namespace_trait_extension "cached extension trait default dispatch" check_namespace_trait_extension
+run_check namespace_trait_extension_concrete "cached concrete extension trait dispatch" check_namespace_trait_extension_concrete
+run_check attribute_alias "function attribute alias interface" check_attribute_alias_interface
 run_check trait_interface "trait interface" check_trait_interface
 run_check backend_emission "serial backend emission" check_backend_emission
 run_check concurrent "concurrent publication" check_concurrent_publish

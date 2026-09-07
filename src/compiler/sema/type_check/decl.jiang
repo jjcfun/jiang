@@ -1,4 +1,6 @@
-// 声明签名、where predicate 和 trait conformance 检查。
+#doc(module)
+    检查声明签名、where predicate、trait conformance 与值布局合法性，按需准备语义依赖。
+#end
 
 alias sem = import "../../sema/model.jiang";
 alias store_api = import "../../store.jiang";
@@ -12,6 +14,10 @@ alias set = import "../../support/set.jiang";
 alias string = import "../../support/string.jiang";
 alias table = import "../../support/table.jiang";
 alias token = import "../../syntax/token.jiang";
+alias diagnostic = import "../../diagnostic.jiang";
+alias diagnostic_helper = import "../../diagnostic/helper.jiang";
+alias database = import "../../db.jiang";
+alias comptime_value = import "../comptime/value.jiang";
 alias copy_semantics = import "../copy.jiang";
 alias generic_bindings = import "../generic/bindings.jiang";
 alias lifetime_shape = import "../lifetime_shape.jiang";
@@ -19,11 +25,6 @@ alias lifetime_shape_query = import "../lifetime_shape_query.jiang";
 alias types = import "../type.jiang";
 alias results_store = import "./store.jiang";
 alias type_ops_mod = import "./type_ops.jiang";
-
-struct EnumCaseLiteralValue: Copyable {
-    Bool ok;
-    Int value;
-}
 
 struct ResolvedLifetimePath: Copyable {
     qid.TypeId type_id;
@@ -593,10 +594,16 @@ public struct DeclCheck: Movable {
         self.ensure_definition_checked(def_id);
     }
 
-    // 调用者先保证被依赖声明的全部必要成员签名可用；此处复用最终 sweep 的同一组约束检查。
+    #doc 调用者先保证必要成员签名可用；缓存声明同样通过现有 trait 检查登记本次会话的方法关联。
     public Void ensure_definition_checked(Self&! self, qid.DefId def_id) {
-        if (self.def_is_from_interface_only_module(def_id)) { return; }
         if (!self.type_ops.state.ctx.store.typeck.begin_definition_validation(def_id)) { return; }
+        if (self.type_ops.state.ctx.store.model.extension_group_for_member(def_id) is .some(extension_index)) {
+            self.check_extension_trait_conformance(extension_index);
+        }
+        if (self.def_is_from_interface_only_module(def_id)) {
+            self.check_trait_conformance(def_id);
+            return;
+        }
         self.check_nominal_region_bindings(def_id);
         self.check_callable_overload_ambiguity(def_id);
         self.check_nominal_value_recursion(def_id);
@@ -847,7 +854,7 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        self.check_enum_case_values(def_id, underlying_type);
+        self.check_enum_case_values(def_id);
     }
 
     Void check_payload_enum_declaration(Self&! self, qid.DefId def_id) {
@@ -864,87 +871,134 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        self.check_enum_case_values(def_id, underlying_type);
+        self.check_enum_case_values(def_id);
     }
 
-    Void check_enum_case_values(Self&! self, qid.DefId enum_def, qid.TypeId underlying_type) {
+    Void check_enum_case_values(Self&! self, qid.DefId enum_def) {
         map.WyHashMap<Int, qid.DefId> seen! = map.WyHashMap<Int, qid.DefId>();
-        Int next_value! = 0;
+        Int? previous_value! = null;
         Int index! = 0;
         while (index < self.type_ops.state.ctx.store.model.def_member_count(enum_def)) {
             qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(enum_def, index);
             index = index + 1;
             def.DefKind member_kind = self.type_ops.state.ctx.store.defs.get(member_def).kind;
             if (member_kind != .enum_case_def) { continue; }
-            Int value = self.enum_case_value(member_def, next_value, underlying_type);
+            if (!self.ensure_enum_case_value(member_def, previous_value)) { return; }
+            Int value = self.type_ops.state.ctx.store.typeck.enum_case_value(member_def)$.some();
             if (seen.has(value)) {
                 self.type_ops.add_def_error(member_def, "duplicate enum case value", "duplicate_enum_case_value");
             }
             seen.set(value, member_def);
-            self.type_ops.state.ctx.store.typeck.set_enum_case_value(member_def, value);
-            next_value = value + 1;
+            previous_value = value;
         }
     }
 
-    Int enum_case_value(Self&! self, qid.DefId case_def, Int implicit_value, qid.TypeId underlying_type) {
-        if (!self.type_ops.state.ctx.store.model.has_def(case_def)) { return implicit_value; }
-        guard self.type_ops.state.ctx.store.model.def_enum_case_value(case_def)
-            is .some(value_id) else { return implicit_value; }
-        EnumCaseLiteralValue literal_value = self.enum_case_literal_int(value_id);
-        if (literal_value.ok) {
-            self.type_ops.state.ctx.store.typeck.set_node_type(value_id, underlying_type);
-            self.check_enum_case_value_range(value_id, literal_value.value, underlying_type);
-            return literal_value.value;
-        }
-        self.type_ops.add_node_error(
-            value_id,
-            "enum case value must be an integer literal",
-            "enum_case_value_not_integer_literal"
-        );
-        return implicit_value;
+    #doc 判别值复用 const query 的失败缓存和循环检测；成员引用可先于整个 enum 签名完成。
+    public Bool ensure_enum_case_value(Self&! self, qid.DefId case_def, Int? implicit_value = null) {
+        if (self.type_ops.state.ctx.store.typeck.enum_case_value(case_def) != null) { return true; }
+        return database.const_definition(self.type_ops.state.ctx.query$.ref(), case_def,
+            { [ref self, case_def, implicit_value] request =>
+                self.compute_enum_case_value(case_def, implicit_value, request) });
     }
 
-    EnumCaseLiteralValue enum_case_literal_int(self, sem.NodeId node_id) {
-        sem.Node node = self.type_ops.state.ctx.store.model.node(node_id);
-        if (node.data is .literal(literal)) {
-            if (literal.value is .int_value(int_value)) {
-                return EnumCaseLiteralValue (ok: true, value: Int(int_value.bits));
-            }
+    Bool? compute_enum_case_value(Self&! self, qid.DefId case_def, Int? implicit_value,
+        database.ConstDefinitionRequest request) {
+        if (request == .cycle) {
+            self.type_ops.add_def_error(case_def, "cyclic enum discriminant dependency", "comptime_dependency_cycle");
+            return false;
         }
-        if (node.data is .unary(unary)) {
-            if (unary.op == .negate) {
-                EnumCaseLiteralValue nested = self.enum_case_literal_int(unary.value);
-                if (nested.ok) {
-                    return EnumCaseLiteralValue (ok: true, value: 0 - nested.value);
-                }
-            }
+        guard self.enum_case_value(case_def, implicit_value) is .some(value) else {
+            if (self.type_ops.state.ctx.store.diagnostics.has_errors()) { return false; }
+            return null;
         }
-        return EnumCaseLiteralValue (ok: false, value: 0);
+        qid.DefId owner = self.type_ops.state.ctx.store.defs.get(case_def).owner_def$.some();
+        qid.TypeId underlying = self.type_ops.enum_underlying_type(owner);
+        if (!self.check_enum_case_value_range(case_def, value, underlying)) { return false; }
+        Int bits!;
+        if (value.data is .int_value(number)) { bits = number; }
+        else { guard value.data is .uint_value(number) else { return false; } bits = Int(number); }
+        self.type_ops.state.ctx.store.typeck.set_enum_case_value(case_def, bits);
+        return true;
     }
 
-    Void check_enum_case_value_range(Self&! self, sem.NodeId value_id, Int value, qid.TypeId underlying_type) {
-        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(underlying_type);
-        guard info.data is .int_type(int_type) else { return; }
-        if (int_type.bits == 0) { return; }
-        if (int_type.signed) {
-            Int max = self.pow2(int_type.bits - 1) - 1;
-            Int min = 0 - self.pow2(int_type.bits - 1);
-            if (value >= min && value <= max) { return; }
-        } else {
-            Int max = self.pow2(int_type.bits) - 1;
-            if (value >= 0 && value <= max) { return; }
-        }
-        self.type_ops.add_node_error(value_id, "enum case value is out of range", "enum_case_value_out_of_range");
-    }
-
-    Int pow2(self, Int bits) {
-        Int value! = 1;
+    #doc 隐式值只依赖前一个 variant，显式值不强迫提前完成其他成员。
+    comptime_value.ComptimeValue? implicit_enum_case_value(Self&! self, qid.DefId case_def, Int? previous_value) {
+        qid.DefId owner = self.type_ops.state.ctx.store.defs.get(case_def).owner_def$.some();
+        qid.TypeId underlying = self.type_ops.enum_underlying_type(owner);
+        if (previous_value is .some(value)) { return self.increment_enum_value(case_def, underlying, value); }
+        qid.DefId? previous! = null;
         Int index! = 0;
-        while (index < bits) {
-            value = value * 2;
+        while (index < self.type_ops.state.ctx.store.model.def_member_count(owner)) {
+            qid.DefId member = self.type_ops.state.ctx.store.model.def_member_at(owner, index);
+            if (member == case_def) { break; }
+            if (self.type_ops.state.ctx.store.defs.get(member).kind == .enum_case_def) { previous = member; }
             index = index + 1;
         }
-        return value;
+        guard previous is .some(member) else {
+            return comptime_value.ComptimeValue(type_id: underlying, data: .int_value(0));
+        }
+        if (!self.ensure_enum_case_value(member)) { return null; }
+        return self.increment_enum_value(case_def, underlying,
+            self.type_ops.state.ctx.store.typeck.enum_case_value(member)$.some());
+    }
+
+    #doc 按底层类型解释已发布位模式，递增最大值在加法前拒绝，避免宿主整数回绕。
+    comptime_value.ComptimeValue? increment_enum_value(Self&! self, qid.DefId case_def,
+        qid.TypeId underlying, Int previous) {
+        guard self.type_ops.state.ctx.store.types.get(underlying).data is .int_type(type) else { return null; }
+        UInt64 maximum = self.enum_integer_max(type);
+        if (UInt64(previous) == maximum) { self.enum_range_error(case_def); return null; }
+        if (type.signed) {
+            return comptime_value.ComptimeValue(type_id: underlying, data: .int_value(previous + 1));
+        }
+        return comptime_value.ComptimeValue(type_id: underlying, data: .uint_value(UInt64(previous) + UInt64(1)));
+    }
+
+    #doc 显式判别值只请求共享 JIL 求值；失败不发布隐式值，范围规则仍由 enum 检查负责。
+    comptime_value.ComptimeValue? enum_case_value(Self&! self, qid.DefId case_def, Int? implicit_value) {
+        guard self.type_ops.state.ctx.store.model.def_enum_case_value(case_def)
+            is .some(value_id) else {
+                return self.implicit_enum_case_value(case_def, implicit_value);
+            }
+        guard self.type_ops.state.evaluate_expression(value_id) is .some(result) else { return null; }
+        if (!(result.data is .int_value(_)) && !(result.data is .uint_value(_))) {
+            self.type_ops.add_node_error(value_id,
+                "enum case value must be a compile-time integer", "enum_case_value_not_integer");
+            return null;
+        }
+        return result;
+    }
+
+    #doc 显式和隐式判别值在发布前共用范围检查，失败不写入成员值表。
+    Bool check_enum_case_value_range(Self&! self, qid.DefId case_def,
+        comptime_value.ComptimeValue value, qid.TypeId underlying_type) {
+        types.TypeInfo info = self.type_ops.state.ctx.store.types.get(underlying_type);
+        guard info.data is .int_type(int_type) else { return false; }
+        UInt64 maximum = self.enum_integer_max(int_type);
+        if (value.data is .uint_value(number) && number <= maximum) { return true; }
+        if (value.data is .int_value(number)) {
+            if (number >= 0 && UInt64(number) <= maximum) { return true; }
+            if (number < 0 && int_type.signed && number >= -Int(maximum) - 1) { return true; }
+        }
+        self.enum_range_error(case_def);
+        return false;
+    }
+
+    #doc 原始位模式只在范围验证后写入旧成员值表，不要求计算可溢出的 2^64。
+    UInt64 enum_integer_max(self, types.IntType type) {
+        Int bits = if (type.bits == 0) { self.type_ops.state.ctx.query.layout.target().pointer_size * 8 }
+            else { type.bits };
+        if (!type.signed && bits == 64) { return UInt64(18446744073709551615); }
+        Int magnitude = if (type.signed) { bits - 1 } else { bits };
+        return (UInt64(1) << UInt64(magnitude)) - UInt64(1);
+    }
+
+    Void enum_range_error(Self&! self, qid.DefId case_def) {
+        if (self.type_ops.state.ctx.store.model.def_enum_case_value(case_def) is .some(value_id)) {
+            self.type_ops.add_node_error(value_id, "enum case value is out of range", "enum_case_value_out_of_range");
+        } else {
+            self.type_ops.add_def_error(case_def, "enum case value is out of range", "enum_case_value_out_of_range");
+        }
     }
 
     Void check_trait_refs(Self&! self, qid.DefId def_id) {
@@ -6761,6 +6815,7 @@ public struct DeclCheck: Movable {
         return state$.get();
     }
 
+    #doc 值布局环沿字段检查返回时附加来源位置，不维护第二份递归状态。
     Void check_nominal_member_value_recursion(Self&! self, qid.DefId def_id, def.DefKind owner_kind) {
         if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
         Int index! = 0;
@@ -6768,7 +6823,14 @@ public struct DeclCheck: Movable {
             qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
             index = index + 1;
             if (!self.member_participates_in_value_layout(owner_kind, member_def)) { continue; }
+            Int diagnostic_begin = self.type_ops.state.ctx.store.diagnostics.len();
             self.check_value_type_recursion(self.type_ops.type_for_def(member_def));
+            if (self.type_ops.state.ctx.store.diagnostics.len() == diagnostic_begin) { continue; }
+            guard self.type_ops.state.ctx.store.source_map.def_span(member_def) is .some(loc) else { continue; }
+            guard loc.source_id is .some(source_id) else { continue; }
+            diagnostic_helper.add_related_since(self.type_ops.state.ctx.store.diagnostics$.mut_ref(),
+                diagnostic_begin, "recursive_value_type", diagnostic.SourceRange(source_id, loc.span),
+                "field requires this value layout");
         }
     }
 
@@ -6832,8 +6894,9 @@ public struct DeclCheck: Movable {
         }
     }
 
+    #doc 源码与缓存 extension 共用 trait 检查，登记本次会话的具体方法关联。
     Void check_extension_trait_conformance(Self&! self, Int extension_index) {
-        if (self.extension_conformance_is_interface_only(extension_index)) { return; }
+        if (!self.type_ops.state.ctx.store.typeck.begin_extension_validation(extension_index)) { return; }
         qid.DefId target_owner =
             self.type_ops.state.ctx.store.model.extension_group_target_owner(extension_index);
         def.DefKind target_kind = self.type_ops.state.ctx.store.defs.get(target_owner).kind;
@@ -6877,11 +6940,6 @@ public struct DeclCheck: Movable {
             "unsafe_extension_requires_sendable"
         );
         false
-    }
-
-    Bool extension_conformance_is_interface_only(self, Int extension_index) {
-        qid.ModuleId module_id = self.type_ops.state.ctx.store.model.extension_group_module(extension_index);
-        return self.type_ops.state.ctx.store.resolve.module_ref(module_id).interface_only;
     }
 
     Bool extension_conformance_is_core_intrinsic(self, Int extension_index) {
@@ -7102,8 +7160,7 @@ public struct DeclCheck: Movable {
     }
 
     Bool trait_method_has_default(self, qid.DefId trait_method) {
-        guard self.type_ops.state.ctx.store.model.def(trait_method) is .some(trait_model) else { return false; }
-        return trait_model.body != null;
+        return self.type_ops.state.ctx.store.model.function_has_body_definition(trait_method);
     }
 
     Void check_trait_method_implemented(Self&! self, qid.DefId impl_def, qid.DefId trait_method) {
@@ -7162,6 +7219,8 @@ public struct DeclCheck: Movable {
     ) {
         if (!self.type_ops.state.ctx.store.model.has_function_signature(trait_method)) { return false; }
         if (!self.type_ops.state.ctx.store.model.has_function_signature(impl_method)) { return false; }
+        self.ensure_signature_checked(trait_method);
+        self.ensure_signature_checked(impl_method);
         guard self.type_ops.state.ctx.store.defs.get(trait_method).owner_def is .some(trait_def) else { return false; }
         qid.TypeId self_type = self.impl_self_type(impl_def);
         sem.EffectSet trait_effect_set =

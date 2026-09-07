@@ -330,6 +330,13 @@ Int* ptr = unsafe {
 ### 数组（Array）
 
 数组的长度是类型的一部分，必须在编译期就确定，所以数组类型不支持运行时改变长度。
+长度可以使用非负整数字面量、const 泛型参数或已求值的 const 名字。名字遵循普通词法作用域，
+同名运行期变量不会因为外层存在 const 而被当成常量。
+
+```jiang
+const Int count = 3;
+Int[count] values = [1, 2, 3];
+```
 
 #### 不可变数组
 
@@ -733,6 +740,8 @@ const 可以在局部声明，名字只在所在词法作用域有效。初始�
 具名导入写作 `alias foo = import "foo.jiang";`；展开模块公开名字写作
 `alias * = import "foo.jiang";`，加 `public` 可将这些名字继续转导出。
 展开仍遵守可见性和重名冲突规则，不复制目标声明。
+wildcard 的右侧也可以是已有 namespace、限定 namespace 路径或返回 namespace 的条件表达式，
+例如 `alias * = provider;`；只有选中结果的公开名字参与展开。
 
 ```jiang
 alias provider = if (build.target.os == .macos) {
@@ -746,6 +755,9 @@ alias provider = if (build.target.os == .macos) {
 不能放在这个局部 block 中。alias 声明本身要求直接处于 namespace 中。
 整个 const 初始化表达式都在编译期求值，可以直接使用函数调用和包含局部变量、赋值、
 循环的普通 block，不需要额外写 comptime。依赖泛型参数时，在具体实例中求值。
+
+非 const 的全局变量也使用静态初始化：初始化器必须产生可物化的编译期值，不能读取或修改
+运行期全局状态。初始化时共用编译期求值与借用、析构规则；这不妨碍可变全局变量在运行期被修改。
 
 ```jiang
 const Int answer = {
@@ -2128,6 +2140,9 @@ Int a = 1, b = 2, c = 3;
 ### 枚举类型（Enum）
 
 `enum` 既可以表示整数枚举，也可以表示带 payload 的代数数据类型：
+
+显式枚举值可以是编译期整数表达式，包括 const 名字和函数调用；结果必须在底层整数范围内且不重复。
+省略的枚举值从前一项递增。
 
 ```c
 // 定义枚举类型，枚举值默认从0开始，底层类型为Int32

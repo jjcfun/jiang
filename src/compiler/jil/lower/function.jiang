@@ -19,6 +19,7 @@ alias jil = import "../model.jiang";
 alias jil_diagnostics = import "../diagnostics.jiang";
 alias instance_reader = import "../instance_reader.jiang";
 alias jil_references = import "../references.jiang";
+alias type_requirements = import "../type_requirements.jiang";
 alias drop_elaborate = import "../drop_elaborate.jiang";
 alias coroutine_frame_layout = import "../coroutine/frame_layout.jiang";
 alias coroutine_task_abi = import "../coroutine/task_abi.jiang";
@@ -47,9 +48,25 @@ alias lower_support = import "./support.jiang";
 alias lower_task = import "./task.jiang";
 alias lower_trait_object = import "./trait_object.jiang";
 
-struct TemplateAsyncDependency: Copyable {
-    qid.DefId target_def;
+public struct TemplateAsyncDependency: Copyable {
+    public qid.DefId target_def;
     Bool task;
+}
+
+#doc 读取源码 JIL 中尚待物化的异步调用依赖，供 body 准备与 frame 派生共用。
+public list.ArrayList<TemplateAsyncDependency> template_async_dependencies(jil.Function source) {
+    list.ArrayList<TemplateAsyncDependency> result! = list.ArrayList<TemplateAsyncDependency>();
+    Int index! = 0;
+    while (index < source.body.blocks.length) {
+        jil.Terminator terminator = source.body.blocks[index].terminator;
+        index = index + 1;
+        guard terminator.kind is .call_term(call) else { continue; }
+        if (!call.deferred_async_direct && call.deferred_async_task == null) { continue; }
+        guard call.callee is .direct_function(function_ref) else { continue; }
+        guard function_ref.target is .source(target_def) else { continue; }
+        result.add(TemplateAsyncDependency(target_def: target_def, task: call.deferred_async_task != null));
+    }
+    return result;
 }
 
 public extend lower_context.Context {
@@ -133,9 +150,9 @@ public extend lower_context.Context {
         Int member_count = model_def.members.len();
         Bool omit_process_entry = self.omit_process_entry_function(model_def);
         Bool emission_root = model_def.decl.link_symbol != null;
-        self.lower_async_lambda_members(
-            instance_query, layouts, def_id, member_count, generic_count
-        );
+        if (!self.is_lowerable_function_decl(decl_kind)) {
+            self.lower_async_lambda_members(instance_query, layouts, def_id, member_count, generic_count);
+        }
         if (self.is_lowerable_function_decl(decl_kind)) {
             if (omit_process_entry) {
                 // Dynamic libraries share runtime facilities but do not own a process entry.
@@ -160,6 +177,7 @@ public extend lower_context.Context {
         }
     }
 
+    #doc 动态库不发射平台进程入口；条件 alias 选出的 entry 模块才拥有这些定义。
     public Bool omit_process_entry_function(self, sem.Def& model_def) {
         if (self.output_kind != .dynamic_library) { return false; }
         if (model_def.decl.link_symbol == null) { return false; }
@@ -168,7 +186,13 @@ public extend lower_context.Context {
         }
         def.DefRecord record = self.store.defs.get(model_def.def_id);
         guard record.module_id is .some(module_id) else { return false; }
-        return module_id == startup_module;
+        qid.NamespaceId startup_namespace = self.store.resolve.module_ref(startup_module).namespace_id;
+        guard self.store.symbols.find("entry") is .some(entry_symbol) else { return false; }
+        guard self.store.resolve.first_binding(startup_namespace, entry_symbol, .namespace_name)
+            is .some(entry_alias) else { return false; }
+        guard self.store.model.def_alias_target(entry_alias.def_id) is .some(entry_def) else { return false; }
+        guard self.store.defs.get(entry_def).module_id is .some(entry_module) else { return false; }
+        return entry_module == module_id;
     }
 
     public Void lower_async_lambda_members(
@@ -239,6 +263,7 @@ public extend lower_context.Context {
         return self.program.source_function(function_def).args.length == 0;
     }
 
+    #doc 单函数需求与 package 遍历共用模板入口，先准备该函数内嵌的异步 lambda。
     public Void lower_template(
         Self&! self,
         database.JilInstanceQuery& instance_query,
@@ -246,6 +271,12 @@ public extend lower_context.Context {
         qid.DefId function_def
     ) {
         if (self.program.has_source_function(function_def)) { return; }
+        if (!self.model.has_def(function_def)) { return; }
+        Int member_count = self.model.def_member_count(function_def);
+        Int generic_count = self.generic_param_count(self.model.def_ref(function_def));
+        self.lower_async_lambda_members(
+            instance_query, layouts, function_def, member_count, generic_count
+        );
         guard self.model.def(function_def) is .some(model_def) else { return; }
         database.SourceJilKey query_key = database.SourceJilKey(
             self.program.query_identity, function_def
@@ -446,7 +477,7 @@ public extend lower_context.Context {
         jil.InstanceKey instance = self.program.function_instance_at(identity);
         if (!self.program.has_source_function(instance.def_id)) { return; }
         generic_bindings.GenericBindings empty! = generic_bindings.GenericBindings();
-        generic_bindings.GenericBindings substitutions =
+        generic_bindings.GenericBindings substitutions! =
             generic_bindings.bindings_for_instance(
                 self.store.defs$.ref(),
                 self.store.model$.ref(),
@@ -455,6 +486,11 @@ public extend lower_context.Context {
                 instance.args,
                 empty$.ref()
             );
+        instance_reader.bind_eval_constants(self.store, self.program$.ref(), instance.def_id, substitutions$.mut_ref());
+        if (self.model.has_body(instance.def_id)) {
+            self.lower_function_with_substitution(
+                body_query, layouts, instance.def_id, substitutions$.ref(), instance.args);
+        }
         jil.Function function = self.program.source_function(instance.def_id);
         jil_references.References references =
             jil_references.collect_instance_function_refs(
@@ -637,7 +673,9 @@ public extend lower_context.Context {
             return;
         }
         if (!self.model.has_body(function_def)) {
-            self.ensure_external_function(function_def);
+            if (!self.generic_args_are_concrete(args)) { return; }
+            Int identity = self.program.function_instance_identity(self.storage, function_def, args);
+            self.program.mark_source_instance(identity);
             return;
         }
         if (args.length == 0) {
@@ -782,6 +820,8 @@ public extend lower_context.Context {
             index = index + 1;
             if (self.body_has_deferred_async_operation(source.body)) {
                 self.program.mark_error();
+                jil_diagnostics.add_coroutine_not_ready(self.store, self.diagnostics$.mut_ref(),
+                    jil.function_provenance_def(source.origin), "async operations remain deferred after template lowering");
             }
         }
     }
@@ -849,7 +889,7 @@ public extend lower_context.Context {
         }
         active.set(key, true);
         list.ArrayList<TemplateAsyncDependency> dependencies =
-            self.template_async_dependencies(function_def);
+            template_async_dependencies(self.program.source_function(function_def));
         if (!self.materialize_template_async_dependencies(
             body_query, layouts, dependencies$.ref(), active, complete
         )) {
@@ -890,31 +930,6 @@ public extend lower_context.Context {
             )) { return false; }
         }
         return true;
-    }
-
-    list.ArrayList<TemplateAsyncDependency> template_async_dependencies(
-        self,
-        qid.DefId function_def
-    ) {
-        list.ArrayList<TemplateAsyncDependency> result! =
-            list.ArrayList<TemplateAsyncDependency>();
-        jil.Function source = self.program.source_function(function_def);
-        Int index! = 0;
-        while (index < source.body.blocks.length) {
-            jil.Terminator terminator = source.body.blocks[index].terminator;
-            index = index + 1;
-            guard terminator.kind is .call_term(call) else { continue; }
-            if (!call.deferred_async_direct && call.deferred_async_task == null) {
-                continue;
-            }
-            guard call.callee is .direct_function(function_ref) else { continue; }
-            guard function_ref.target is .source(target_def) else { continue; }
-            result.add(TemplateAsyncDependency(
-                target_def: target_def,
-                task: call.deferred_async_task != null
-            ));
-        }
-        return result;
     }
 
     @life(return: (self, self))
@@ -1189,8 +1204,7 @@ public extend lower_context.Context {
         if (self.program.source_instance_is_finalized(identity)) { return true; }
         jil.InstanceKey instance = self.program.function_instance_at(identity);
         if (!self.program.has_source_function(instance.def_id)) {
-            self.program.mark_source_instance_finalized(identity);
-            return true;
+            return false;
         }
         jil.Function source = instance_reader.source_instance_function(
             self.store, self.program$.ref(), identity
@@ -1258,6 +1272,8 @@ public extend lower_context.Context {
             guard self.program.source_function(function_def).coroutine_frame
                 is .some(logical_frame) else {
                 self.program.mark_error();
+                jil_diagnostics.add_coroutine_not_ready(self.store, self.diagnostics$.mut_ref(),
+                    function_def, "source frame is unavailable during instance finalization");
                 return;
             }
             jil.CoroutineFrameLayout frame! =
@@ -1343,10 +1359,10 @@ public extend lower_context.Context {
         qid.DefId function_def,
         types.GenericArg[]& args
     ) {
-        if (self.program.has_source_instance(function_def, args)) { return; }
         if (!self.generic_args_are_concrete(args)) { return; }
         self.ensure_external_source_function(function_def);
         if (!self.program.has_source_function(function_def)) { return; }
+        if (self.program.has_source_instance(function_def, args)) { return; }
         Int identity = self.program.function_instance_identity(
             self.storage, function_def, args
         );
@@ -1430,11 +1446,6 @@ public extend lower_context.Context {
     }
 
     public Void ensure_external_function(Self&! self, qid.DefId function_def) {
-        if (self.program.has_source_instance(
-            function_def, self.storage.empty_generic_args()
-        )) {
-            return;
-        }
         if (self.def_is_trait_member(function_def)) {
             return;
         }
@@ -1469,6 +1480,7 @@ public extend lower_context.Context {
             if (args[index] is .type_arg(value)) {
                 if (!self.type_is_concrete(value.value)) { return false; }
             } else if (args[index] is .const_arg(value)) {
+                if (value.value.data is .const_param_value(_)) { return false; }
                 if (!self.type_is_concrete(value.value.type_id)) { return false; }
             }
             index = index + 1;
@@ -1476,19 +1488,24 @@ public extend lower_context.Context {
         return true;
     }
 
+    #doc 复用具体类型约束并递归检查嵌套实参，未绑定 const 不提前登记运行期实例。
     public Bool type_is_concrete(self, qid.TypeId type_id) {
+        if (!type_requirements.concrete_type(self.store, type_id)) { return false; }
         types.TypeInfo info = self.store.types.get(type_id);
         if (info.data is .named(named)) {
-            if (self.store.defs.get(named.def_id).kind == .generic_param_def) {
-                return false;
-            }
-            return self.type_args_are_concrete(named.type_args);
+            return self.generic_args_are_concrete(named.args);
         }
         if (info.data is .handle_type(handle)) {
             return self.type_is_concrete(handle.element);
         }
         if (info.data is .optional(optional)) {
             return self.type_is_concrete(optional.element);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.type_is_concrete(error_union.value) && self.type_is_concrete(error_union.error);
+        }
+        if (info.data is .slice_value_type(slice)) {
+            return self.type_is_concrete(slice.element);
         }
         if (info.data is .array_type(array_type)) {
             return self.type_is_concrete(array_type.element);
@@ -1497,7 +1514,24 @@ public extend lower_context.Context {
             return self.type_args_are_concrete(tuple_type.items);
         }
         if (info.data is .closure_environment_type(environment)) {
-            return self.type_args_are_concrete(environment.capture_types);
+            return self.generic_args_are_concrete(environment.args) &&
+                self.type_args_are_concrete(environment.capture_types);
+        }
+        if (info.data is .function_type(function)) {
+            if (!self.type_args_are_concrete(function.params)) { return false; }
+            if (!self.type_is_concrete(function.result)) { return false; }
+            if (function.effects.domain is .some(domain)) {
+                return self.type_is_concrete(domain.domain_type);
+            }
+        }
+        if (info.data is .task_state_type(state)) {
+            return self.type_is_concrete(state.result) && self.type_args_are_concrete(state.field_types);
+        }
+        if (info.data is .task_type(task)) {
+            if (!self.type_is_concrete(task.result) || !self.type_is_concrete(task.state_type)) { return false; }
+            if (task.domain is .some(domain)) {
+                return self.type_is_concrete(domain.domain_type);
+            }
         }
         return true;
     }

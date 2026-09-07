@@ -15,13 +15,21 @@ import type_ops = "../../../../src/compiler/sema/type_check/type_ops.jiang";
 import body_check = "../../../../src/compiler/sema/type_check/body.jiang";
 import value = "../../../../src/compiler/sema/comptime/value.jiang";
 import reporter = "../../../../src/compiler/diagnostic/reporter.jiang";
+import std;
+alias string = import "../../../../src/compiler/support/string.jiang";
 
 public Int run() {
+    check_enum_cycle_failure();
+    check_value_layout_cycle("struct A { A value; }", 1);
+    check_value_layout_cycle("struct A { B b; } struct B { A a; }", 2);
+    check_bodyless_declaration();
+    check_extension_pattern_query_order(false);
+    check_extension_pattern_query_order(true);
     check_demand_lifetime_signature();
     context.CompilerContext ctx! = context.CompilerContext();
     module_graph.ModuleGraph^ graph = lower_text_to_model(
         ctx$.mut_ref(), "single_body_query",
-        "Int chosen() { helper() } Int helper() { 1 } Int sibling() { 2 } Int bad() { true }"
+        "Int chosen() { helper() } Int helper() { 1 } Int helper(Int x) { x } Int sibling() { 2 } Int bad() { true }"
     );
     Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId, qid.TypeId?> evaluate =
         { [ref graph] eval_ctx, root, target =>
@@ -30,6 +38,7 @@ public Int run() {
     qid.DefId sibling = find_named_function_def(ctx$.ref(), graph.root_module, "sibling");
     qid.DefId bad = find_named_function_def(ctx$.ref(), graph.root_module, "bad");
     qid.DefId helper = find_named_function_def(ctx$.ref(), graph.root_module, "helper");
+    qid.DefId overload = find_named_function_def(ctx$.ref(), graph.root_module, "helper", 1);
     qid.DefId module_def = ctx.store.resolve.module_ref(graph.root_module).def_id;
     sem.NodeId chosen_root = ctx.store.model.body_root(chosen)$.some();
     sem.NodeId sibling_root = ctx.store.model.body_root(sibling)$.some();
@@ -52,6 +61,8 @@ public Int run() {
     assert(ctx.store.typeck.node_type(chosen_root) != null);
     assert(ctx.store.typeck.signature_checked(chosen));
     assert(ctx.store.typeck.signature_checked(helper));
+    assert(ctx.store.typeck.signature_checked(overload));
+    assert(ctx.store.typeck.node_type(ctx.store.model.body_root(overload)$.some()) == null);
     assert(!ctx.store.typeck.signature_checked(sibling));
     assert(ctx.store.typeck.node_type(ctx.store.model.body_root(helper)$.some()) == null);
     assert(ctx.store.typeck.node_type(sibling_root) == null);
@@ -81,6 +92,109 @@ public Int run() {
     assert(!compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
     assert(ctx.store.diagnostics.len() == diagnostic_count);
     return 0;
+}
+
+#doc 判别值循环失败不得发布替代值，重复检查复用失败诊断。
+Void check_enum_cycle_failure() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.mut_ref(), "enum_cycle_failure",
+        "enum Tag { first = Int(Tag.last), last = Int(Tag.first), }");
+    assert(!compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId owner = find_named_function_def(ctx$.ref(), graph.root_module, "Tag");
+    Int index! = 0;
+    while (index < ctx.store.model.def_member_count(owner)) {
+        assert(ctx.store.typeck.enum_case_value(ctx.store.model.def_member_at(owner, index)) == null);
+        index = index + 1;
+    }
+    Int count = ctx.store.diagnostics.len();
+    Bool cycle! = false;
+    index = 0;
+    while (index < count) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, "comptime_dependency_cycle")) { cycle = true; }
+        index = index + 1;
+    }
+    assert(cycle);
+    assert(!compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    assert(ctx.store.diagnostics.len() == count);
+}
+
+#doc 值布局循环必须保留构成环的字段位置，不能只定位到名义类型声明。
+Void check_value_layout_cycle(UInt8[]& text, Int fields) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.mut_ref(), "value_layout_cycle", text);
+    assert(!compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    Bool found! = false;
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, "recursive_value_type")) {
+            found = true;
+            assert(ctx.store.diagnostics.get(index).related.len() == fields);
+            Int field! = 0;
+            while (field < fields) {
+                assert(ctx.store.diagnostics.get(index).related.ref_at(field).range.source_id != null);
+                field = field + 1;
+            }
+        }
+        index = index + 1;
+    }
+    assert(found);
+}
+
+#doc 纯签名声明无需恢复不存在的实现；重复请求仍完成正常签名检查。
+Void check_bodyless_declaration() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.mut_ref(), "bodyless_declaration", "Int declaration(Int value);"
+    );
+    qid.DefId declaration = find_named_function_def(ctx$.ref(), graph.root_module, "declaration");
+    assert(!ctx.store.model.function_has_body_definition(declaration));
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), declaration));
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), declaration));
+    assert(ctx.store.typeck.signature_checked(declaration));
+    assert(!ctx.store.model.has_body(declaration));
+    assert(ctx.store.diagnostics.len() == 0);
+}
+
+#doc 提前查询 extension 模式中的类型，不应改变后续普通签名和重载检查结果。
+Void check_extension_pattern_query_order(Bool query_patterns) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct Holder<T> { T value; } extend <T> Holder<T> { ");
+    text.append("Int marker(self, Int a) { self.marker(a, 1) } Int marker(self, Int a, Int b) { a + b } } ");
+    text.append("Int chosen() { Holder<Int> h = Holder<Int>(value: 0); h.marker(41) }");
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.mut_ref(),
+        if (query_patterns) { "extension_pattern_query_early" } else { "extension_pattern_query_normal" },
+        text.slice()
+    );
+    Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId, qid.TypeId?> evaluate =
+        { [ref graph] eval_ctx, root, target =>
+            compilation.evaluate_checked_expression(eval_ctx, graph$.ref(), root, target) };
+    if (query_patterns) {
+        check_state.CheckState state! = check_state.CheckState(ctx$.mut_ref(), graph.root_module, evaluate$.ref());
+        type_ops.TypeOps ops! = type_ops.TypeOps(state$.mut_ref());
+        Int group! = 0;
+        while (group < state.ctx.store.model.extension_group_len()) {
+            Int index! = 0;
+            while (index < state.ctx.store.model.extension_where_predicate_count(group)) {
+                sem.WherePredicate predicate = state.ctx.store.model.extension_where_predicate_at(group, index);
+                if (predicate is .equal(equal)) {
+                    check_named_pattern(ops$.mut_ref(), equal.subject);
+                    check_named_pattern(ops$.mut_ref(), equal.value);
+                }
+                index = index + 1;
+            }
+            group = group + 1;
+        }
+    }
+    Bool checked = compilation.check_model_package(ctx$.mut_ref(), graph$.ref());
+    if (!checked) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(checked);
+}
+
+Void check_named_pattern(type_ops.TypeOps&! ops, sem.NodeId pattern) {
+    guard ops.state.ctx.store.model.node(pattern).data is .named_type_ref(named) else { return; }
+    if (ops.state.ctx.store.defs.get(named.def_id).domain == .type_name) { ops.check_type_ref(pattern); }
 }
 
 Void check_demand_lifetime_signature() {
@@ -122,13 +236,20 @@ module_graph.ModuleGraph^ lower_text_to_model(
     return graph$.move();
 }
 
-qid.DefId find_named_function_def(context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name) {
+#doc 按源码顺序定位同名声明，供重载的独立签名与 body 状态断言使用。
+qid.DefId find_named_function_def(
+    context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name, Int occurrence = 0
+) {
     qid.DefId module_def = ctx.store.resolve.module_ref(module_id).def_id;
     qid.SymbolId symbol = ctx.store.symbols.find(name)$.some();
     Int index! = 0;
+    Int found! = 0;
     while (index < ctx.store.model.def_member_count(module_def)) {
         qid.DefId item = ctx.store.model.def_member_at(module_def, index);
-        if (ctx.store.defs.get(item).name.symbol == symbol) { return item; }
+        if (ctx.store.defs.get(item).name.symbol == symbol) {
+            if (found == occurrence) { return item; }
+            found = found + 1;
+        }
         index = index + 1;
     }
     assert(false);

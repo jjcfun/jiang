@@ -191,7 +191,7 @@ import_path <- string_lit / ident
 
 import_expr <- "import" import_path
 
-alias_decl  <- "alias" "*" "=" import_expr ";"
+alias_decl  <- "alias" "*" "=" expr ";"
              / "alias" name ("=" alias_target)? ";"
 
 alias_target

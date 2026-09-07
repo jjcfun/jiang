@@ -22,6 +22,7 @@ import types = "../../../../src/compiler/sema/type.jiang";
 import sem = "../../../../src/compiler/sema/model.jiang";
 import string = "../../../../src/compiler/support/string.jiang";
 import std;
+alias diagnostic = import "../../../../src/compiler/diagnostic.jiang";
 import backend_symbol = "../../../../src/compiler/backend/symbol.jiang";
 import codegen_unit = "../../../../src/compiler/backend/codegen_unit.jiang";
 import type_requirements = "../../../../src/compiler/jil/type_requirements.jiang";
@@ -30,6 +31,15 @@ import comptime_evaluator = "../../../../src/compiler/sema/comptime/evaluator.ji
 import sema_diagnostics = "../../../../src/compiler/sema/diagnostics.jiang";
 
 public Int run() {
+    check_trait_dependency();
+    check_trait_dependency(true);
+    check_trait_dependency(false, true);
+    check_trait_dependency(true, true);
+    check_trait_dependency(true, false, true);
+    check_trait_dependency(true, true, true);
+    check_runtime_global_initializer();
+    check_runtime_coroutine_phase_order();
+    check_runtime_coroutine_phase_order(true);
     check_member_alias_identity();
     check_comptime_failure_diagnostic();
     check_alias_callback();
@@ -52,7 +62,8 @@ public Int run() {
     check_const_query_outcome(false);
     check_const_query_outcome(true);
     check_const_cycle("const Int chosen = chosen;");
-    check_const_cycle("const Int chosen = other; const Int other = chosen;");
+    check_const_cycle("const Int chosen = other; const Int other = chosen;", 2);
+    check_const_cycle("const Int chosen = other; const Int other = third; const Int third = chosen;", 3);
     check_const_cycle("const Int chosen = read(); Int read() { chosen }");
     check_nested_const();
     check_const_final_sweep();
@@ -66,6 +77,162 @@ public Int run() {
     check_string_const();
     check_condition_callback();
     return 0;
+}
+
+#doc 未 seal 时沿 vtable 推进方法和析构依赖；重复求值复用 JIL/静态表且不发布运行期根。
+Void check_trait_dependency(Bool extension = false, Bool default_method = false, Bool generic_owner = false) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("trait Value { Int value(self); ");
+    if (default_method) { text.append("Int twice(self) { self.value() + self.value() } "); }
+    text.append("} struct Resource");
+    if (generic_owner) { text.append("<T>"); }
+    text.append(": ");
+    if (!extension) { text.append("Value, "); }
+    text.append("Movable { Int*! drops; ");
+    if (generic_owner) { text.append("T item; "); }
+    if (!extension) { text.append("Int value(self) { answer() } "); }
+    text.append("deinit(self) { unsafe { self.drops$.set(self.drops$.get() + 1); } } } ");
+    if (extension) {
+        if (generic_owner) { text.append("extend <T> Resource<T>"); } else { text.append("extend Resource"); }
+        text.append(": Value { Int value(self) { ");
+        if (generic_owner) { text.append("T$.size() + answer() - 8"); } else { text.append("answer()"); }
+        text.append(" } } ");
+    }
+    text.append("Int answer() { 42 } Int sibling() { true } ");
+    text.append("Int selected() { Int drops! = 0; { ");
+    text.append("Int*! ptr = unsafe { drops$.mut_ptr() }; ");
+    if (generic_owner) {
+        text.append("Value.Any^ any = Value$.new(Resource<Int64>(item: 0, drops: ptr)); ");
+    } else {
+        text.append("Value.Any^ any = Value$.new(Resource(drops: ptr)); ");
+    }
+    if (default_method) { text.append("assert(any.twice() == 84); "); }
+    text.append("assert(any.value() == 42); } drops }");
+    UInt8[]& name = if (generic_owner) {
+        if (default_method) { "demand_eval_generic_extension_default" } else { "demand_eval_generic_extension" }
+    } else if (extension) {
+        if (default_method) { "demand_eval_extension_default" } else { "demand_eval_extension" }
+    } else {
+        if (default_method) { "demand_eval_trait_default" } else { "demand_eval_trait" }
+    };
+    source.SourceId root = ctx.store.sources.intern_virtual(name, text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), root);
+    assert(!parsed.has_errors());
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    qid.DefId answer = named_def(ctx$.ref(), graph.root_module, "answer");
+    qid.DefId sibling = named_def(ctx$.ref(), graph.root_module, "sibling");
+    assert(ctx.store.model.declaration_sema_state(selected) == .skeleton);
+    assert(ctx.store.model.declaration_sema_state(answer) == .skeleton);
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    value.ComptimeValue? result = compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice());
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(result != null);
+    assert(result$.some().data is .int_value(1));
+    assert(ctx.store.model.declaration_sema_state(answer) == .body_ready);
+    assert(ctx.jil.program.has_source_function(answer));
+    assert(ctx.store.model.declaration_sema_state(sibling) == .skeleton);
+    assert(!ctx.jil.program.has_source_function(sibling));
+    assert(ctx.jil.program.mono_item_count() == 0);
+    assert(ctx.jil.program.runtime_global_count() == 0);
+    Int globals = ctx.jil.program.globals.len();
+    Int functions = ctx.jil.program.functions.len();
+    Int bytes = ctx.jil.storage.arena.used_bytes();
+    assert(globals > 0);
+    assert(compilation.evaluate_function(
+        ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice()
+    )$.some().data is .int_value(1));
+    assert(ctx.jil.program.globals.len() == globals && ctx.jil.program.functions.len() == functions);
+    assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    assert(ctx.jil.program.mono_item_count() == 0 && ctx.jil.program.runtime_global_count() == 0);
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+#doc 全局初始化填入原存储槽，重复准备不重新执行，编译期 helper 不成为运行期实例。
+public Void check_runtime_global_initializer() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    UInt8[]& text = "Int initial(){40+2} Int value! = initial(); Int main(){value}";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("runtime_global_initializer", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId initial = named_def(ctx$.ref(), graph.root_module, "initial");
+    qid.DefId value_def = named_def(ctx$.ref(), graph.root_module, "value");
+    jil_lower.begin_runtime_package(ctx$.mut_ref(), graph$.ref());
+    jil.GlobalId global = ctx.jil.program.global_id_for_def(value_def)$.some();
+    assert(ctx.jil.program.globals.get(global.to_index()).initializer == null);
+    assert(compilation.prepare_runtime_eval(ctx$.mut_ref(), graph$.ref()));
+    assert(ctx.jil.program.global_id_for_def(value_def)$.some() == global);
+    jil.Global storage = ctx.jil.program.globals.get(global.to_index());
+    assert(!storage.read_only);
+    guard storage.initializer$.some() is .scalar(constant) else { assert(false); return; }
+    guard constant.value is .int_value(integer) else { assert(false); return; }
+    assert(integer.bits == 42);
+    Int functions = ctx.jil.program.functions.len();
+    Int globals = ctx.jil.program.globals.len();
+    assert(compilation.prepare_runtime_eval(ctx$.mut_ref(), graph$.ref()));
+    assert(ctx.jil.program.functions.len() == functions && ctx.jil.program.globals.len() == globals);
+    jil_lower.finish_runtime_package(ctx$.mut_ref(), graph$.ref());
+    assert(!ctx.jil.program.has_errors());
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    assert(!ctx.jil.program.has_source_instance(initial, args.slice()));
+}
+
+#doc 引用发现和语义需求准备不提前消费 frame；协程派生不反向改写语义模型。
+public Void check_runtime_coroutine_phase_order(Bool unused = false) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("async Int calculate(){42} ");
+    if (unused) {
+        text.append("Int unused(){coroutine.sync(main_domain){calculate()}} Int main(){42}");
+    } else {
+        text.append("Int main(){coroutine.sync(main_domain){calculate()}}");
+    }
+    source.SourceId source_id = ctx.store.sources.intern_virtual("runtime_coroutine_phase_order", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    assert(compilation.check_model_package(ctx$.mut_ref(), graph$.ref()));
+    qid.DefId calculate = named_def(ctx$.ref(), graph.root_module, "calculate");
+    if (unused) {
+        resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+        ctx.store.model.def_mut_ref(calculate).body = null;
+    }
+    jil_lower.begin_runtime_package(ctx$.mut_ref(), graph$.ref());
+    assert(!ctx.jil.program.has_errors());
+    assert(ctx.jil.program.has_source_function(calculate) != unused);
+    if (!unused) { assert(ctx.jil.program.source_function(calculate).coroutine_frame == null); }
+    assert(!ctx.jil.program.has_source_resume_template(calculate, .standard));
+    assert(compilation.prepare_runtime_eval(ctx$.mut_ref(), graph$.ref()));
+    assert(ctx.jil.program.has_source_function(calculate));
+    assert(ctx.jil.program.source_function(calculate).coroutine_frame == null);
+    Int definitions = ctx.store.model.def_len();
+    Int nodes = ctx.store.model.def_ref(calculate).nodes.len();
+    jil_lower.finish_runtime_package(ctx$.mut_ref(), graph$.ref());
+    assert(!ctx.jil.program.has_errors());
+    assert(ctx.jil.program.source_function(calculate).coroutine_frame != null);
+    assert(ctx.jil.program.has_source_resume_template(calculate, .standard));
+    assert(ctx.store.model.def_len() == definitions);
+    assert(ctx.store.model.def_ref(calculate).nodes.len() == nodes);
+    assert(compilation.prepare_runtime_eval(ctx$.mut_ref(), graph$.ref()));
+    assert(jil_verifier.verify(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), .lower_output, true));
+    if (unused) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        assert(!ctx.jil.program.has_source_instance(calculate, args.slice()));
+        qid.DefId unused_def = named_def(ctx$.ref(), graph.root_module, "unused");
+        assert(!ctx.jil.program.has_source_instance(unused_def, args.slice()));
+    }
 }
 
 #doc
@@ -205,10 +372,17 @@ Void check_local_const_cycle() {
     assert(compilation.evaluate_function(ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
         selected, generic_args.slice(), args.slice()) == null);
     assert(has_diagnostic(ctx$.ref(), "comptime_dependency_cycle"));
+    Int cycle! = 0;
+    while (!string.equal(ctx.store.diagnostics.get(cycle).code.text, "comptime_dependency_cycle")) {
+        cycle = cycle + 1;
+    }
+    assert(ctx.store.diagnostics.get(cycle).range.source_id == source_id);
+    assert(ctx.store.diagnostics.get(cycle).related.len() == 1);
     Int diagnostics = ctx.store.diagnostics.len();
     assert(compilation.evaluate_function(ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
         selected, generic_args.slice(), args.slice()) == null);
     assert(ctx.store.diagnostics.len() == diagnostics && ctx.jil.program.globals.empty());
+    assert(ctx.store.diagnostics.get(cycle).related.len() == 1);
 }
 
 #doc
@@ -339,7 +513,7 @@ Void check_const_query_outcome(Bool fail) {
 #doc
     initializer 检查和 JIL callee 准备中的 const 重入均给出循环诊断，失败后重复请求不追加事实。
 #end
-Void check_const_cycle(UInt8[]& text) {
+Void check_const_cycle(UInt8[]& text, Int context_count = 1) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
         compilation.evaluate_source_expression, use_source_artifacts: false
@@ -355,12 +529,34 @@ Void check_const_cycle(UInt8[]& text) {
         reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
     }
     assert(has_diagnostic(ctx$.ref(), "recursive_const_initializer"));
+    assert_const_cycle_context(ctx$.mut_ref(), source_id, context_count);
     assert(!ctx.store.comptime_store.has_const_value(chosen));
     Int count = ctx.store.diagnostics.len();
     Int bytes = ctx.jil.storage.arena.used_bytes();
     assert(!compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), chosen));
     assert(ctx.store.diagnostics.len() == count);
     assert(ctx.jil.storage.arena.used_bytes() == bytes);
+    assert_const_cycle_context(ctx$.mut_ref(), source_id, context_count);
+}
+
+#doc 关联位置按依赖返回顺序给出完整 const 链，缓存失败重试不能追加同一批说明。
+Void assert_const_cycle_context(context.CompilerContext&! ctx, source.SourceId source_id, Int context_count) {
+    Int diagnostic_index! = 0;
+    while (diagnostic_index < ctx.store.diagnostics.len()) {
+        diagnostic.Diagnostic& item = ctx.store.diagnostics.get(diagnostic_index);
+        diagnostic_index = diagnostic_index + 1;
+        if (!string.equal(item.code.text, "recursive_const_initializer")) { continue; }
+        assert(item.related.len() == context_count);
+        Int note! = 0;
+        while (note < context_count) {
+            UInt8[]& name = if (context_count - note == 3) { "while evaluating const third" }
+                else if (context_count - note == 2) { "while evaluating const other" }
+                else { "while evaluating const chosen" };
+            assert(string.equal(item.related.ref_at(note).message.bytes(), name));
+            assert(item.related.ref_at(note).range.source_id == source_id);
+            note = note + 1;
+        }
+    }
 }
 
 #doc 直接提供 core 导入字面量及测试块结果，不启动编译求值调度。

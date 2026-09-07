@@ -372,6 +372,8 @@ unsafe {
 ```
 
 数组长度是类型的一部分；slice 长度是运行时值。
+数组类型中的具名长度按普通词法绑定解析，可引用 const 泛型参数或已求值的 const，
+结果必须是非负整数；不会绕过局部遮蔽去寻找外层同名常量。
 
 ## 所有权、implicit copy 和析构
 
@@ -773,6 +775,8 @@ target、可见性、循环检测、稳定身份和增量失效路径。
 alias `DefId`。它登记一条 wildcard namespace edge；lookup 按需查询目标 public namespace，并原样
 保留函数 overload candidates。extension member 也通过同一个 public namespace surface 可达。
 `public alias * = import path;` re-export 同一条 edge。
+wildcard alias 的目标可以是任意求得 namespace 的编译期表达式，包括已有 namespace 的限定路径
+和条件选择；求值结果统一按 namespace 身份展开，路径访问仍遵守可见性规则。
 
 本地 declaration binding 优先于 wildcard edge。多条 wildcard edge 按源码登记顺序查询；最终
 namespace validation 会枚举直接目标的 public binding，使未引用的同名导出也产生稳定冲突诊断。
@@ -1186,6 +1190,8 @@ enum variant 的外部可见性由外层类型是否 public 控制。
 - module/package/import alias 使用 namespace domain。
 - 顶层类型、trait 和 associated type 使用 type namespace。
 - 函数、全局变量、builtin value 和普通方法使用 value namespace。
+- 全局变量使用静态初始化；有初始化器时必须产生可物化的编译期值，共用 JIL 求值及 borrow/drop
+  语义，不引入运行期模块初始化顺序，也不允许初始化器读取运行期全局状态。存储在运行期是否可变由声明决定。
 - 字段和 enum case 使用 member namespace。
 - 每个 type namespace provider 拥有自己的 member/type/value 子 namespace，供 `Type.member`
   路径继续解析；`struct`、`enum`、builtin type 和大部分语法糖类型都属于
@@ -1208,6 +1214,8 @@ enum 使用 variant-first 语法，无 payload variant 不需要写 `Void`。cas
 存在 method 或嵌套 nominal 成员时，用 `;` 分隔。
 payload variant 保留整数 enum 的 underlying type、隐式递增值和显式 discriminant；variant 上的
 `@life` 等语义注解使用统一的 lowering 和检查管线。
+显式 discriminant 是编译期整数表达式，可引用 const 或调用编译期可执行函数；求值结果仍须满足
+底层整数范围且不能重复。未指定的后续 variant 从前一个判别值递增。
 值到整数的转换使用目标整数类型构造表达式；无 payload 整数 enum 保留
 `Type.init?(integer)` 查找已声明 case 的能力。
 

@@ -512,9 +512,8 @@ struct Lower: Movable {
             );
         }
         ast.AstId? previous_extension_target = self.current_extension_target;
-        if (binding_owner.to_index() == owner_def.to_index()) {
-            self.current_extension_target = extend_decl.target_type;
-        }
+        // receiver 和 Self 保留扩展目标的实参，不能退回原 nominal 声明的另一组泛型参数。
+        self.current_extension_target = extend_decl.target_type;
         self.lower_member_range(extend_decl.members);
         self.current_extension_target = previous_extension_target;
         if (existing_extension == null) {
@@ -825,7 +824,7 @@ struct Lower: Movable {
         }
         guard array_type.count_symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
         if (array_type.count_kind == .const_name) {
-            return self.lower_extend_const_name_pattern(symbol, span);
+            return self.lower_const_name_arg(symbol, span);
         }
         return self.lower_extend_int_pattern(self.array_count_value(array_type), span);
     }
@@ -840,7 +839,7 @@ struct Lower: Movable {
         if (kind == .bool_true) { return self.lower_extend_bool_pattern(true, span); }
         if (kind == .bool_false) { return self.lower_extend_bool_pattern(false, span); }
         guard symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
-        if (kind == .const_name) { return self.lower_extend_const_name_pattern(symbol, span); }
+        if (kind == .const_name) { return self.lower_const_name_arg(symbol, span); }
         if (kind == .char_value) {
             sem.LiteralValue literal = .char_value(self.char_symbol_value(symbol));
             return self.add_node(.literal(sem.Literal(value: literal)), span);
@@ -852,8 +851,11 @@ struct Lower: Movable {
         return self.add_node(.literal(sem.Literal(value: .bool_value(value))), span);
     }
 
-    sem.NodeId lower_extend_const_name_pattern(Self&! self, qid.SymbolId symbol, token.Span span) {
-        guard self.env.lookup_def(symbol, .value_name) is .some(def_id) else {
+    #doc
+        常量名字复用具名泛型实参节点，保留解析后的声明身份。
+    #end
+    sem.NodeId lower_const_name_arg(Self&! self, qid.SymbolId symbol, token.Span span) {
+        guard self.resolved_symbol_def(symbol, .value_name) is .some(def_id) else {
             return self.add_invalid_node(span);
         }
         list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>();
@@ -1084,6 +1086,7 @@ struct Lower: Movable {
         sem.FunctionSignature signature = sem.FunctionSignature (
             has_receiver: true,
             receiver_mode: .ref_receiver,
+            has_body: true,
             params: params.slice(),
             param_symbols: param_symbols.slice(),
             exclusive_symbols: exclusive_symbols.slice(),
@@ -1242,6 +1245,7 @@ struct Lower: Movable {
         sem.FunctionSignature signature = sem.FunctionSignature (
             has_receiver: true,
             receiver_mode: .mutable_ref_receiver,
+            has_body: true,
             params: params.slice(),
             param_symbols: param_symbols.slice(),
             exclusive_symbols: exclusive_symbols.slice(),
@@ -1454,6 +1458,7 @@ struct Lower: Movable {
         sem.EffectSet effects = self.lower_function_effects(function_decl.effects, extern_kind);
         sem.FunctionSignature signature = sem.FunctionSignature (
             has_receiver: has_receiver,
+            has_body: function_decl.body != null,
             receiver_mode: receiver_mode,
             params: params.slice(),
             param_symbols: param_symbols.slice(),
@@ -1483,6 +1488,15 @@ struct Lower: Movable {
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = function_def;
         self.enter_existing_generic_scope_for_owner(function_def, function_decl.generics);
+        Int alias_index! = 0;
+        while (alias_index < self.state.ctx.store.model.def_member_count(function_def)) {
+            qid.DefId member = self.state.ctx.store.model.def_member_at(function_def, alias_index);
+            def.DefRecord record = self.state.ctx.store.defs.get(member);
+            if (record.kind == .alias_def) {
+                self.env.define(record.name.symbol, record.domain, member, record.name.span);
+            }
+            alias_index = alias_index + 1;
+        }
         if (self.state.ctx.store.defs.get(function_def).owner_def is .some(owner_def)) {
             self.define_self_type(owner_def);
         }
@@ -1548,7 +1562,7 @@ struct Lower: Movable {
             include_receiver
         );
         self.record_callable_stable_def(def_id, disambiguator);
-        self.record_callable_generic_params(def_id);
+        self.record_callable_local_symbols(def_id);
     }
 
     Void record_callable_stable_def(
@@ -1579,7 +1593,8 @@ struct Lower: Movable {
         );
     }
 
-    Void record_callable_generic_params(Self&! self, qid.DefId callable_def) {
+    #doc callable 身份确定后发布泛型参数和 annotation alias 的局部稳定身份。
+    Void record_callable_local_symbols(Self&! self, qid.DefId callable_def) {
         guard self.state.ctx.store.incremental.stable_id_for_def(callable_def)
             is .some(owner) else {
             return;
@@ -1588,9 +1603,15 @@ struct Lower: Movable {
         store.PackageRecord& package_record = self.state.ctx.store.resolve.package_ref(module.package_id);
         sem.Def& callable = self.state.ctx.store.model.def_ref(callable_def);
         Int index! = 0;
-        while (index < callable.generic_params.len()) {
-            qid.DefId param_def = callable.generic_params.get(index);
+        while (index < callable.generic_params.len() + callable.members.len()) {
+            qid.DefId param_def = if index < callable.generic_params.len() {
+                callable.generic_params.get(index)
+            } else { callable.members.get(index - callable.generic_params.len()) };
             def.DefRecord param = self.state.ctx.store.defs.get(param_def);
+            if (param.kind != .generic_param_def && param.kind != .alias_def) {
+                index = index + 1;
+                continue;
+            }
             self.state.ctx.store.incremental.record_symbol(
                 self.state.ctx.store.symbols$.mut_ref(),
                 qkey.StableSymbolKey (
@@ -3592,7 +3613,8 @@ struct Lower: Movable {
         if (self.state.value_path_resolution(path_id) is .some(resolution)) {
             return self.lower_resolved_value_path(path, resolution);
         }
-        if (path.segments.length > 1 && self.resolved_value_def_for_expr(path_id) == null) {
+        if (path.segments.length > 1 && self.resolved_value_def_for_expr(path_id) == null
+            && self.resolved_namespace_def_for_expr(path_id) == null) {
             return self.lower_member_path(path);
         }
         return self.lower_name_ref(path_id);
@@ -4071,6 +4093,9 @@ struct Lower: Movable {
             return self.lower_named_type_ref(type_id, named_type);
         }
         if (node.data is .array_type(array_type)) {
+            if (array_type.count_kind == .const_name) {
+                return self.lower_named_count_array(array_type, node.span);
+            }
             sem.NodeId element = self.lower_type_ref(array_type.element);
             sem.ArrayTypeRef lowered = sem.ArrayTypeRef (
                 element: element,
@@ -4167,6 +4192,23 @@ struct Lower: Movable {
             && text[4] == UInt8(101)
             && text[5] == UInt8(110)
             && text[6] == UInt8(116);
+    }
+
+    #doc
+        具名数组长度复用 builtin 泛型实参，保留词法绑定并共用 const 求值和模板编码。
+    #end
+    sem.NodeId lower_named_count_array(Self&! self, ast.ArrayTypeData array_type, token.Span span) {
+        list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>();
+        args.add(self.lower_type_ref(array_type.element));
+        args.add(self.lower_const_name_arg(array_type.count_symbol_id$.some(), array_type.count_span));
+        qid.DefId owner! = self.state.ctx.store.resolve.core_types.array_type$.some();
+        if (array_type.sentinel_kind != .none) {
+            owner = self.state.ctx.store.resolve.core_types.sentinel_array_type$.some();
+            args.add(self.lower_extend_sentinel_pattern(
+                array_type.sentinel_kind, array_type.sentinel_symbol_id, array_type.sentinel_span
+            ));
+        }
+        return self.add_named_type_node(owner, args$.move(), span);
     }
 
     sem.NodeId lower_named_type_ref(Self&! self, ast.AstId type_id, ast.NamedTypeData named_type) {
@@ -4315,6 +4357,17 @@ struct Lower: Movable {
     }
 
     sem.NodeId lower_name_ref(Self&! self, ast.AstId expr_id) {
+        if (self.resolved_value_def_for_expr(expr_id) == null
+            && self.resolved_namespace_def_for_expr(expr_id) is .some(namespace_def)) {
+            qid.DefId owner! = namespace_def;
+            if (self.state.ctx.store.defs.get(namespace_def).kind == .import_alias_def) {
+                qid.NamespaceId namespace_id = self.state.ctx.store.defs.get(namespace_def).owned_namespace_id$.some();
+                qid.ModuleId module_id = self.state.ctx.store.resolve.namespaces.get(namespace_id).module_id$.some();
+                owner = self.state.ctx.store.resolve.module_ref(module_id).def_id;
+            }
+            return self.add_node(.literal(sem.Literal(value: .namespace_value(owner))),
+                self.state.unit.get(expr_id).span);
+        }
         guard self.resolved_value_def_for_expr(expr_id) is .some(def_id) else {
             return self.add_invalid_node(self.state.unit.get(expr_id).span);
         }
@@ -4447,6 +4500,13 @@ struct Lower: Movable {
 
     qid.DefId? resolved_name_def(Self&! self, ast.AstId name_id, def.NameDomain domain) {
         guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
+        return self.resolved_symbol_def(symbol, domain);
+    }
+
+    #doc
+        按当前词法环境和 namespace 查询名字，供普通名字与类型中的常量名字共同使用。
+    #end
+    qid.DefId? resolved_symbol_def(Self&! self, qid.SymbolId symbol, def.NameDomain domain) {
         if (self.env.lookup_def(symbol, domain) is .some(local_def)) {
             return local_def;
         }

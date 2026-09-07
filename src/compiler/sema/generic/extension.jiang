@@ -1,0 +1,1078 @@
+#doc(module)
+    extension 目标模式的泛型匹配与实参绑定。只读 Semantic Model 和已检查结果，
+    缺失事实通过请求字段交还 Sema 补齐；JIL 实例化复用同一算法，不执行语义分析。
+#end
+
+alias compiler_store = import "../../store.jiang";
+alias qid = import "../../id.jiang";
+alias sem = import "../model.jiang";
+alias def = import "../../resolve/def.jiang";
+alias list = import "../../support/list.jiang";
+alias types = import "../type.jiang";
+alias generic_bindings = import "./bindings.jiang";
+alias comptime_value = import "../comptime/value.jiang";
+
+@region(a)
+public struct ExtensionMatcher: Movable {
+    @life(a)
+    compiler_store.CompilerStore& store;
+    public sem.NodeId? pending_type_ref! = null;
+    public qid.DefId? pending_parameter! = null;
+    public qid.DefId? pending_constant! = null;
+
+    public init(self, compiler_store.CompilerStore& store) { self.store = store; }
+
+    #doc 只报告缺失事实，不在匹配器中隐式推进 typecheck。
+    qid.TypeId? type_ref(Self&! self, sem.NodeId node) {
+        guard self.store.typeck.node_type(node) is .some(type_id) else {
+            self.pending_type_ref = node;
+            return null;
+        }
+        return type_id;
+    }
+
+    qid.TypeId? parameter_type(Self&! self, qid.DefId def_id) {
+        if (self.store.typeck.def_type(def_id) is .some(type_id)) { return type_id; }
+        if (self.store.types.builtin_type_for_def(def_id) is .some(type_id)) { return type_id; }
+        if (self.store.types.named_type_for_def(def_id) is .some(type_id)) { return type_id; }
+        self.pending_parameter = def_id;
+        return null;
+    }
+
+    Bool same_type(self, qid.TypeId lhs, qid.TypeId rhs) {
+        return self.store.types.same_type(lhs, rhs);
+    }
+
+    Bool same_type_ignoring_mutability(self, qid.TypeId lhs, qid.TypeId rhs) {
+        return self.store.types.same_type_ignoring_mutability(lhs, rhs);
+    }
+
+    comptime_value.ComptimeValue? const_value_for_expected_type(
+        Self&! self, sem.NodeId node, qid.TypeId expected_type
+    ) {
+        comptime_value.ComptimeValue? result = self.known_const_value_for_expected_type(node, expected_type);
+        if (result != null) { return result; }
+        if (self.const_pattern_def(node) is .some(def_id)
+            && self.store.model.has_def(def_id) && self.store.model.def_is_const(def_id)) {
+            self.pending_constant = def_id;
+        }
+        return null;
+    }
+
+    qid.DefId? const_pattern_def(self, sem.NodeId node_id) {
+        sem.Node node = self.store.model.node(node_id);
+        if (node.data is .named_type_ref(named)) { return named.def_id; }
+        if (node.data is .name_ref(name) && name is .def_ref(def_id)) { return def_id; }
+        return self.store.typeck.member_selection(node_id);
+    }
+
+    public Void append_extension_binding_args_for_member(
+        Self&! self,
+        list.ArrayList<types.GenericArg>&! args,
+        qid.TypeId type_id,
+        qid.DefId member_def
+    ) {
+        guard self.store.model.extension_group_for_member(member_def) is .some(extension_index) else {
+            return;
+        }
+        qid.DefId binding_owner = self.store.model.extension_group_binding_owner(extension_index);
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        if (binding_owner.to_index() == target_owner.to_index()) { return; }
+        generic_bindings.GenericBindings bindings = self.extension_bindings_for_member(type_id, member_def);
+        Int index! = 0;
+        while (index < self.generic_param_count(binding_owner)) {
+            qid.DefId param_def = self.generic_param_at(binding_owner, index);
+            self.append_extension_binding_arg(args, bindings$.ref(), param_def);
+            index = index + 1;
+        }
+    }
+
+    public generic_bindings.GenericBindings extension_bindings_for_member(
+        Self&! self,
+        qid.TypeId type_id,
+        qid.DefId member_def
+    ) {
+        generic_bindings.GenericBindings bindings! = generic_bindings.GenericBindings();
+        guard self.store.model.extension_group_for_member(member_def) is .some(extension_index) else {
+            return bindings;
+        }
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        list.ArrayList<types.GenericArg> args = self.namespace_provider_args(type_id, target_owner);
+        assert(self.bind_extension_target_patterns(extension_index, args$.ref(), bindings$.mut_ref()),
+            "selected extension member requires complete generic bindings");
+        return bindings;
+    }
+
+    public Bool bind_extension_target_patterns(
+        Self&! self,
+        Int extension_index,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        Int pass! = 0;
+        Int predicate_count = self.store.model.extension_where_predicate_count(extension_index);
+        while (pass < predicate_count) {
+            if (!self.bind_extension_equal_pass(extension_index, args, bindings)) { return false; }
+            pass = pass + 1;
+        }
+        return self.extension_bindings_complete(extension_index, bindings);
+    }
+
+    public Bool bind_extension_equal(
+        Self&! self,
+        Int extension_index,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings&! bindings,
+        sem.WhereEqual equal
+    ) {
+        if (!self.bind_extension_owner_equal(extension_index, args, bindings, equal)) { return false; }
+        guard self.extension_equal_type_param(equal.subject) is .some(param_def) else { return true; }
+        if (!self.extension_type_param(extension_index, param_def)) { return true; }
+        if (bindings.type_binding(param_def) is .some(actual)) {
+            return self.bind_extension_type_pattern(actual, equal.value, extension_index, bindings);
+        }
+        guard self.extension_substituted_type(equal.value, bindings) is .some(expected) else { return false; }
+        if (self.type_is_unbound_extension_param(expected, extension_index, bindings)) { return true; }
+        bindings.set_type(param_def, expected);
+        return true;
+    }
+
+    public list.ArrayList<types.GenericArg> namespace_provider_args(self, qid.TypeId actual_type, qid.DefId provider_def) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        if (!self.type_matches_namespace_provider(actual_type, provider_def)) {
+            return args;
+        }
+        types.TypeInfo info = self.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            self.append_ordered_generic_args(args$.mut_ref(), named.args);
+            return args;
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.error_union_constructor_args(error_union);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.array_constructor_args(provider_def, array_type);
+        }
+        if (info.data is .handle_type(handle)) {
+            return self.handle_constructor_args(actual_type, provider_def, handle);
+        }
+        if (info.data is .slice_value_type(slice_type)) {
+            return self.slice_value_constructor_args(provider_def, slice_type);
+        }
+        self.append_single_owner_arg(args$.mut_ref(), actual_type, provider_def);
+        return args;
+    }
+
+    public comptime_value.ComptimeValue? known_const_value_for_expected_type(
+        self,
+        sem.NodeId arg_ref,
+        qid.TypeId expected_type
+    ) {
+        if (self.const_generic_param_ref(arg_ref) is .some(const_param)) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .const_param_value(const_param));
+        }
+        if (self.const_generic_resolved_value(arg_ref, expected_type) is .some(const_value)) {
+            return const_value;
+        }
+        return self.const_generic_literal_value(arg_ref, expected_type);
+    }
+
+    public Int generic_param_count(self, qid.DefId def_id) {
+        guard self.store.model.def(def_id) is .some(model_def) else { return 0; }
+        return model_def.generic_params.len();
+    }
+
+    qid.DefId generic_param_at(self, qid.DefId def_id, Int index) {
+        guard self.store.model.def(def_id) is .some(model_def) else { return def_id; }
+        return model_def.generic_params.get(index);
+    }
+
+    Void append_extension_binding_arg(
+        self,
+        list.ArrayList<types.GenericArg>&! args,
+        generic_bindings.GenericBindings& bindings,
+        qid.DefId param_def
+    ) {
+        if (bindings.type_binding(param_def) is .some(type_id)) {
+            args.add(types.generic_type_param_arg(param_def, type_id));
+            return;
+        }
+        if (bindings.const_binding(param_def) is .some(value)) {
+            args.add(types.generic_const_param_arg(param_def, value, bindings.const_binding_def(param_def)));
+        }
+    }
+
+    Bool bind_extension_equal_pass(
+        Self&! self,
+        Int extension_index,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        Int index! = 0;
+        while (index < self.store.model.extension_where_predicate_count(extension_index)) {
+            sem.WherePredicate predicate =
+                self.store.model.extension_where_predicate_at(extension_index, index);
+            if (predicate is .equal(equal)) {
+                if (!self.bind_extension_equal(extension_index, args, bindings, equal)) { return false; }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool extension_bindings_complete(
+        self,
+        Int extension_index,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        qid.DefId binding_owner = self.store.model.extension_group_binding_owner(extension_index);
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        if (binding_owner.to_index() == target_owner.to_index()) { return true; }
+        Int index! = 0;
+        while (index < self.generic_param_count(binding_owner)) {
+            qid.DefId param_def = self.generic_param_at(binding_owner, index);
+            def.DefRecord record = self.store.defs.get(param_def);
+            if (record.domain == .type_name && !bindings.has_type(param_def)) { return false; }
+            if (record.domain == .value_name && !bindings.has_const(param_def)) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool bind_extension_owner_equal(
+        Self&! self,
+        Int extension_index,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings&! bindings,
+        sem.WhereEqual equal
+    ) {
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        if (self.const_generic_param_ref(equal.subject) is .some(param_def)) {
+            guard self.ordered_generic_param_index(target_owner, param_def) != null else { return true; }
+            guard self.extension_const_arg_for_param(target_owner, args, param_def)
+                is .some(actual) else { return false; }
+            return self.bind_extension_const_pattern(actual, equal.value, extension_index, bindings);
+        }
+        guard self.extension_equal_type_param(equal.subject) is .some(param_def) else { return true; }
+        guard self.ordered_generic_param_index(target_owner, param_def) is .some(index) else { return true; }
+        guard self.type_ref(equal.subject) is .some(subject) else { return false; }
+        if (!self.has_type_arguments(args)) {
+            return self.bind_extension_type_pattern(subject, equal.value, extension_index, bindings);
+        }
+        if (index >= args.len()) { return false; }
+        guard args.get(index) is .type_arg(actual) else { return false; }
+        return self.bind_extension_type_pattern(actual.value, equal.value, extension_index, bindings);
+
+    }
+
+    #doc 泛型 owner 的符号视图可以没有具体实参；此时匹配继续使用声明参数，不能视作不适用。
+    Bool has_type_arguments(self, list.ArrayList<types.GenericArg>& args) {
+        Int index! = 0;
+        while (index < args.len()) {
+            if (args.get(index) is .type_arg(_)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    qid.DefId? extension_equal_type_param(self, sem.NodeId type_ref) {
+        sem.Node node = self.store.model.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        def.DefRecord record = self.store.defs.get(named.def_id);
+        if (record.kind != .generic_param_def || record.domain != .type_name) { return null; }
+        return named.def_id;
+    }
+
+    public Bool extension_type_param(self, Int extension_index, qid.DefId param_def) {
+        qid.DefId binding_owner = self.store.model.extension_group_binding_owner(extension_index);
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        if (binding_owner.to_index() == target_owner.to_index()) { return false; }
+        Int index! = 0;
+        while (index < self.generic_param_count(binding_owner)) {
+            qid.DefId candidate = self.generic_param_at(binding_owner, index);
+            if (candidate.to_index() == param_def.to_index()) {
+                return self.store.defs.get(candidate).domain == .type_name;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool bind_extension_type_pattern(
+        Self&! self,
+        qid.TypeId actual,
+        sem.NodeId pattern_ref,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        sem.Node pattern = self.store.model.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) { return true; }
+        if (pattern.data is .named_type_ref(named)) {
+            if (self.extension_type_param(extension_index, named.def_id)) {
+                return self.bind_extension_type_param(actual, named.def_id, bindings);
+            }
+            return self.bind_extension_named_pattern(actual, pattern_ref, extension_index, bindings);
+        }
+        if (pattern.data is .layered_type_ref(layered)) {
+            return self.bind_extension_layered_pattern(actual, layered, extension_index, bindings);
+        }
+        if (pattern.data is .array_type_ref(array_type)) {
+            return self.bind_extension_array_pattern(actual, array_type, extension_index, bindings);
+        }
+        guard self.type_ref(pattern_ref) is .some(pattern_type) else { return false; }
+        qid.TypeId expected = generic_bindings.substitute_type(
+            self.store.types$.ref(),
+            pattern_type,
+            bindings
+        );
+        return self.same_type_ignoring_mutability(actual, expected);
+    }
+
+    public qid.TypeId? extension_substituted_type(
+        Self&! self,
+        sem.NodeId type_ref,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        guard self.type_ref(type_ref) is .some(type_id) else { return null; }
+        return generic_bindings.substitute_type(self.store.types$.ref(), type_id, bindings);
+    }
+
+    Bool type_is_unbound_extension_param(
+        self,
+        qid.TypeId type_id,
+        Int extension_index,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        guard info.data is .named(named) else { return false; }
+        if (!self.extension_type_param(extension_index, named.def_id)) { return false; }
+        return !bindings.has_type(named.def_id);
+    }
+
+    public Bool type_matches_namespace_provider(self, qid.TypeId actual_type, qid.DefId provider_def) {
+        types.TypeInfo info = self.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            return named.def_id.to_index() == provider_def.to_index();
+        }
+        if (self.actual_type_has_builtin_constructor(info, provider_def)) {
+            return true;
+        }
+        guard self.store.types.type_owner_def(actual_type) is .some(owner_def) else { return false; }
+        return owner_def.to_index() == provider_def.to_index();
+    }
+
+    Void append_ordered_generic_args(
+        self,
+        list.ArrayList<types.GenericArg>&! args,
+        types.GenericArg[]& ordered_args
+    ) {
+        Int index! = 0;
+        while (index < ordered_args.length) {
+            args.add(ordered_args[index]);
+            index = index + 1;
+        }
+    }
+
+    list.ArrayList<types.GenericArg> error_union_constructor_args(self, types.ErrorUnionType error_union) {
+        // T@E lowers to error_union, but namespace/provider matching
+        // still needs the source-level ordered owner args.
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>(2);
+        args.add(types.generic_type_arg(error_union.value));
+        args.add(types.generic_type_arg(error_union.error));
+        return args;
+    }
+
+    list.ArrayList<types.GenericArg> array_constructor_args(self,
+        qid.DefId constructor_def,
+        types.ArrayType array_type
+    ) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        args.add(types.generic_type_arg(array_type.element));
+        args.add(self.constructor_const_arg(constructor_def, 1, self.array_count_comptime_value(array_type)));
+        if (self.is_sentinel_array_builtin_type_def(constructor_def)) {
+            guard array_type.sentinel is .some(sentinel) else { return args; }
+            args.add(self.constructor_const_arg(constructor_def, 2, self.sentinel_comptime_value(sentinel)));
+        }
+        return args;
+    }
+
+    list.ArrayList<types.GenericArg> handle_constructor_args(
+        self,
+        qid.TypeId actual_type,
+        qid.DefId constructor_def,
+        types.HandleType handle
+    ) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        args.add(types.generic_type_arg(self.namespace_provider_type_arg(actual_type, constructor_def, 0)));
+        return args;
+    }
+
+    list.ArrayList<types.GenericArg> slice_value_constructor_args(self,
+        qid.DefId constructor_def,
+        types.SliceValueType slice_type
+    ) {
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+        args.add(types.generic_type_arg(slice_type.element));
+        if (self.is_sentinel_slice_builtin_type_def(constructor_def)) {
+            guard slice_type.sentinel is .some(sentinel) else { return args; }
+            args.add(self.constructor_const_arg(constructor_def, 1, self.sentinel_comptime_value(sentinel)));
+        }
+        return args;
+    }
+
+    Void append_single_owner_arg(self,
+        list.ArrayList<types.GenericArg>&! args,
+        qid.TypeId actual_type,
+        qid.DefId provider_def
+    ) {
+        if (!self.actual_type_has_single_owner_arg(actual_type, provider_def)) {
+            return;
+        }
+        args.add(types.generic_type_arg(self.namespace_provider_type_arg(actual_type, provider_def, 0)));
+    }
+
+    public qid.DefId? const_generic_param_ref(self, sem.NodeId arg_ref) {
+        sem.Node arg = self.store.model.node(arg_ref);
+        if (arg.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            if (self.generic_param_is_value_param(def_id)) {
+                return def_id;
+            }
+            return null;
+        }
+        guard arg.data is .named_type_ref(named) else { return null; }
+        if (self.generic_param_is_value_param(named.def_id)) {
+            return named.def_id;
+        }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? const_generic_resolved_value(self, sem.NodeId arg_ref, qid.TypeId expected_type) {
+        // const generic 实参不一定是字面量，也可能是 enum case 或 const global。
+        // 这些名字在 resolve 阶段已经指向 def，这里按 expected type 转成 comptime 值。
+        sem.Node arg = self.store.model.node(arg_ref);
+        if (arg.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            return self.known_const_generic_def_value(def_id, expected_type);
+        }
+        if (arg.data is .named_type_ref(named)) {
+            return self.known_const_generic_def_value(named.def_id, expected_type);
+        }
+        if (arg.data is .member_access(member)) {
+            if (self.store.typeck.member_selection(arg_ref) is .some(member_def)) {
+                return self.known_const_generic_def_value(member_def, expected_type);
+            }
+            if (self.expected_enum_case_member(expected_type, member.member_symbol) is .some(case_def)) {
+                return comptime_value.ComptimeValue(type_id: expected_type, data: .enum_case_value(case_def));
+            }
+            return null;
+        }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? const_generic_literal_value(self, sem.NodeId arg_ref, qid.TypeId expected_type) {
+        sem.Node arg = self.store.model.node(arg_ref);
+        guard arg.data is .literal(literal) else { return null; }
+        if (literal.value is .int_value(int_value)) {
+            // 整数字面量没有固定 signedness，必须根据 const 参数的 expected type
+            // 生成 int_value 或 uint_value；sentinel 的 S 也是按元素类型 T 推导。
+            return self.const_generic_integer_literal(expected_type, int_value.bits);
+        }
+        if (literal.value is .bool_value(bool_value)) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .bool_value(bool_value));
+        }
+        if (literal.value is .char_value(char_value)) {
+            if (self.type_is_uint8(expected_type)) {
+                return comptime_value.ComptimeValue(type_id: expected_type, data: .uint_value(UInt64(char_value)));
+            }
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .char_value(UInt64(char_value)));
+        }
+        return null;
+    }
+
+    public Int? ordered_generic_param_index(self, qid.DefId generic_owner, qid.DefId generic_param) {
+        Int offset! = 0;
+        if (self.store.defs.get(generic_owner).owner_def is .some(owner_def)) {
+            if (self.ordered_generic_param_index_in_owner(owner_def, generic_param, 0) is .some(owner_index)) {
+                return owner_index;
+            }
+            offset = self.generic_param_count(owner_def);
+        }
+        return self.ordered_generic_param_index_in_owner(generic_owner, generic_param, offset);
+    }
+
+    comptime_value.ComptimeValue? extension_const_arg_for_param(
+        self,
+        qid.DefId target_owner,
+        list.ArrayList<types.GenericArg>& args,
+        qid.DefId param_def
+    ) {
+        guard self.ordered_generic_param_index(target_owner, param_def) is .some(index) else {
+            return null;
+        }
+        if (index < 0 || index >= args.len()) { return null; }
+        guard args.get(index) is .const_arg(const_arg) else { return null; }
+        return const_arg.value;
+    }
+
+    Bool bind_extension_const_pattern(
+        Self&! self,
+        comptime_value.ComptimeValue actual,
+        sem.NodeId pattern_ref,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        sem.Node pattern = self.store.model.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) { return true; }
+        if (pattern.data is .literal(literal)) {
+            return self.literal_matches_const_value(literal.value, actual);
+        }
+        if (self.const_generic_param_ref(pattern_ref) is .some(param_def)) {
+            if (self.extension_const_param(extension_index, param_def)) {
+                if (bindings.const_binding(param_def) is .some(bound)) {
+                    return self.const_value_matches(bound, actual);
+                }
+                guard self.parameter_type(param_def) is .some(param_type) else { return false; }
+                qid.TypeId expected = generic_bindings.substitute_type(
+                    self.store.types$.ref(),
+                    param_type,
+                    bindings
+                );
+                if (self.type_is_unbound_extension_param(expected, extension_index, bindings)) { return true; }
+                if (!self.same_type(expected, actual.type_id)) { return false; }
+                bindings.set_const(param_def, actual);
+                return true;
+            }
+        }
+        guard self.const_value_for_expected_type(pattern_ref, actual.type_id) is .some(expected) else {
+            return false;
+        }
+        return self.const_value_matches(expected, actual);
+    }
+
+    Bool bind_extension_type_param(
+        Self&! self,
+        qid.TypeId actual,
+        qid.DefId param_def,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (bindings.type_binding(param_def) is .some(bound)) {
+            return self.same_type_ignoring_mutability(actual, bound);
+        }
+        bindings.set_type(param_def, actual);
+        return true;
+    }
+
+    Bool bind_extension_named_pattern(
+        Self&! self,
+        qid.TypeId actual,
+        sem.NodeId pattern_ref,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        guard self.named_type_ref_def(pattern_ref) is .some(pattern_def) else { return false; }
+        Int arg_count = self.named_type_ref_arg_count(pattern_ref);
+        if (arg_count == 0) {
+            guard self.type_ref(pattern_ref) is .some(expected) else { return false; }
+            return self.same_type_ignoring_mutability(actual, expected);
+        }
+        if (!self.type_matches_namespace_provider(actual, pattern_def)) { return false; }
+        list.ArrayList<types.GenericArg> actual_args = self.namespace_provider_args(actual, pattern_def);
+        if (actual_args.len() != arg_count) { return false; }
+        Int index! = 0;
+        while (index < arg_count) {
+            types.GenericArg arg = actual_args.get(index);
+            sem.NodeId arg_pattern = self.named_type_ref_arg_at(pattern_ref, index);
+            if (!self.bind_extension_generic_arg_pattern(
+                arg,
+                arg_pattern,
+                extension_index,
+                bindings
+            )) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool bind_extension_layered_pattern(
+        Self&! self,
+        qid.TypeId actual,
+        sem.LayeredTypeRef pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        types.TypeInfo info = self.store.types.get(actual);
+        if (pattern.kind == .mutable_type) {
+            return self.bind_extension_type_pattern(actual, pattern.element, extension_index, bindings);
+        }
+        if (pattern.kind == .optional_type) {
+            guard info.data is .optional(optional) else { return false; }
+            return self.bind_extension_type_pattern(optional.element, pattern.element, extension_index, bindings);
+        }
+        if (pattern.kind == .slice) {
+            guard info.data is .slice_value_type(slice_type) else { return false; }
+            if (!self.bind_extension_sentinel_pattern(
+                slice_type.sentinel,
+                pattern,
+                extension_index,
+                bindings
+            )) {
+                return false;
+            }
+            return self.bind_extension_type_pattern(
+                slice_type.element,
+                pattern.element,
+                extension_index,
+                bindings
+            );
+        }
+        if (pattern.kind == .reference) {
+            return self.bind_extension_reference_pattern(actual, pattern.element, extension_index, bindings);
+        }
+        guard info.data is .handle_type(handle) else { return false; }
+        if (!self.extension_handle_kind_matches(pattern.kind, handle.kind)) { return false; }
+        if (!self.bind_extension_type_pattern(handle.element, pattern.element, extension_index, bindings)) {
+            return false;
+        }
+        return self.bind_extension_sentinel_pattern(handle.sentinel, pattern, extension_index, bindings);
+    }
+
+    Bool bind_extension_array_pattern(
+        Self&! self,
+        qid.TypeId actual,
+        sem.ArrayTypeRef pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        types.TypeInfo info = self.store.types.get(actual);
+        guard info.data is .array_type(array_type) else { return false; }
+        if (!self.bind_extension_type_pattern(array_type.element, pattern.element, extension_index, bindings)) {
+            return false;
+        }
+        if (!self.bind_extension_array_count(array_type, pattern, extension_index, bindings)) { return false; }
+        return self.bind_extension_array_sentinel(array_type.sentinel, pattern, extension_index, bindings);
+    }
+
+    Bool actual_type_has_builtin_constructor(self, types.TypeInfo info, qid.DefId constructor_def) {
+        if (info.data is .optional(_)) {
+            return self.is_option_builtin_type_def(constructor_def);
+        }
+        if (info.data is .error_union(_)) {
+            return self.is_result_builtin_type_def(constructor_def);
+        }
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) { return self.is_reference_builtin_type_def(constructor_def); }
+            if (handle.kind == .owner_pointer) { return self.is_box_builtin_type_def(constructor_def); }
+            if (handle.kind == .raw_pointer) { return self.is_raw_pointer_builtin_type_def(constructor_def); }
+            if (handle.kind == .slice) { return self.is_reference_builtin_type_def(constructor_def); }
+        }
+        if (info.data is .slice_value_type(array_type)) {
+            if (types.sentinel_has(array_type.sentinel)) {
+                return self.is_sentinel_slice_builtin_type_def(constructor_def);
+            }
+            return self.is_slice_builtin_type_def(constructor_def);
+        }
+        if (info.data is .array_type(array_type)) {
+            if (types.sentinel_has(array_type.sentinel)) {
+                return self.is_sentinel_array_builtin_type_def(constructor_def);
+            }
+            return self.is_array_builtin_type_def(constructor_def);
+        }
+        return false;
+    }
+
+    types.GenericArg constructor_const_arg(
+        self,
+        qid.DefId constructor_def,
+        Int index,
+        comptime_value.ComptimeValue value
+    ) {
+        guard self.store.model.def(constructor_def) is .some(owner_model) else {
+            return types.generic_const_arg(value);
+        }
+        if (index < 0 || index >= owner_model.generic_params.len()) {
+            return types.generic_const_arg(value);
+        }
+        return types.generic_const_param_arg(owner_model.generic_params.get(index), value);
+    }
+
+    public comptime_value.ComptimeValue array_count_comptime_value(self, types.ArrayType array_type) {
+        qid.TypeId int_type = self.store.types.int_type();
+        if (array_type.count_param is .some(param_def)) {
+            return comptime_value.ComptimeValue(type_id: int_type, data: .const_param_value(param_def));
+        }
+        return comptime_value.ComptimeValue(type_id: int_type, data: .int_value(array_type.count));
+    }
+
+    public Bool is_sentinel_array_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.sentinel_array_type, def_id);
+    }
+
+    comptime_value.ComptimeValue sentinel_comptime_value(self, types.Sentinel sentinel) {
+        return sentinel.value;
+    }
+
+    public qid.TypeId namespace_provider_type_arg(self, qid.TypeId actual_type, qid.DefId provider_def, Int index) {
+        types.TypeInfo info = self.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            return named.type_args[index];
+        }
+        if (index != 0) {
+            return self.store.types.invalid_type();
+        }
+        if (info.data is .optional(optional)) {
+            return optional.element;
+        }
+        if (info.data is .error_union(error_union)) {
+            if (index == 0) { return error_union.value; }
+            if (index == 1) { return error_union.error; }
+            return self.store.types.invalid_type();
+        }
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .slice && self.is_reference_builtin_type_def(provider_def)) {
+                return self.store.types.slice_value_type_with_sentinel(
+                    handle.element,
+                    handle.sentinel,
+                    info.span
+                );
+            }
+            return handle.element;
+        }
+        if (info.data is .slice_value_type(array_type)) {
+            return array_type.element;
+        }
+        if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        return self.store.types.invalid_type();
+    }
+
+    public Bool is_sentinel_slice_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.sentinel_slice_type, def_id);
+    }
+
+    public Bool actual_type_has_single_owner_arg(self, qid.TypeId actual_type, qid.DefId constructor_def) {
+        types.TypeInfo info = self.store.types.get(actual_type);
+        if (info.data is .optional(_)) {
+            return self.is_option_builtin_type_def(constructor_def);
+        }
+        if (info.data is .error_union(_)) {
+            return false;
+        }
+        if (info.data is .handle_type(_)) {
+            return self.is_handle_constructor_builtin_type_def(constructor_def);
+        }
+        if (info.data is .slice_value_type(_)) {
+            return self.is_slice_builtin_type_def(constructor_def)
+                || self.is_sentinel_slice_builtin_type_def(constructor_def);
+        }
+        if (info.data is .array_type(_)) {
+            return self.is_array_builtin_type_def(constructor_def)
+                || self.is_sentinel_array_builtin_type_def(constructor_def);
+        }
+        return false;
+    }
+
+    public Bool generic_param_is_value_param(self, qid.DefId def_id) {
+        def.DefRecord record = self.store.defs.get(def_id);
+        return record.kind == .generic_param_def && record.domain == .value_name;
+    }
+
+    public comptime_value.ComptimeValue? known_const_generic_def_value(self,
+        qid.DefId def_id,
+        qid.TypeId expected_type
+    ) {
+        if (self.store.defs.get(def_id).kind == .enum_case_def) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .enum_case_value(def_id));
+        }
+        if (self.store.comptime_store.const_value(def_id) is .some(value)) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: value.data);
+        }
+        if (self.store.typeck.deferred_const_initializer(def_id) != null) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .const_param_value(def_id));
+        }
+        return null;
+    }
+
+    qid.DefId? expected_enum_case_member(self, qid.TypeId expected_type, qid.SymbolId member_symbol) {
+        types.TypeInfo expected_info = self.store.types.get(expected_type);
+        guard expected_info.data is .named(named) else { return null; }
+        if (self.store.defs.get(named.def_id).kind != .enum_def) { return null; }
+        guard self.store.model.def(named.def_id) is .some(enum_model) else { return null; }
+        Int index! = 0;
+        while (index < enum_model.members.len()) {
+            qid.DefId member_def = enum_model.members.get(index);
+            def.DefRecord record = self.store.defs.get(member_def);
+            if (record.kind == .enum_case_def && record.name.symbol == member_symbol) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public comptime_value.ComptimeValue? const_generic_integer_literal(self, qid.TypeId expected_type, UInt64 bits) {
+        types.TypeInfo expected_info = self.store.types.get(expected_type);
+        guard expected_info.data is .int_type(int_type) else { return null; }
+        if (int_type.signed) {
+            return comptime_value.ComptimeValue(type_id: expected_type, data: .int_value(Int(bits)));
+        }
+        return comptime_value.ComptimeValue(type_id: expected_type, data: .uint_value(bits));
+    }
+
+    public Bool type_is_uint8(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        guard info.data is .int_type(int_type) else { return false; }
+        return int_type.bits == 8 && !int_type.signed;
+    }
+
+    Int? ordered_generic_param_index_in_owner(self, qid.DefId generic_owner, qid.DefId generic_param, Int offset) {
+        guard self.store.model.def(generic_owner) is .some(model_def) else { return null; }
+        Int index! = 0;
+        while (index < model_def.generic_params.len()) {
+            qid.DefId member_def = model_def.generic_params.get(index);
+            if (member_def.to_index() == generic_param.to_index()) {
+                return offset + index;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool literal_matches_const_value(self, sem.LiteralValue literal, comptime_value.ComptimeValue actual) {
+        if (literal is .int_value(int_value)) {
+            if (int_value.bits < 0) { return false; }
+            return types.comptime_value_as_uint64(actual) == UInt64(int_value.bits);
+        }
+        if (literal is .bool_value(bool_value)) {
+            guard actual.data is .bool_value(actual_bool) else { return false; }
+            return bool_value == actual_bool;
+        }
+        if (literal is .char_value(char_value)) {
+            guard actual.data is .char_value(actual_char) else { return false; }
+            return UInt64(char_value) == actual_char;
+        }
+        return false;
+    }
+
+    Bool extension_const_param(self, Int extension_index, qid.DefId param_def) {
+        qid.DefId binding_owner = self.store.model.extension_group_binding_owner(extension_index);
+        qid.DefId target_owner = self.store.model.extension_group_target_owner(extension_index);
+        if (binding_owner.to_index() == target_owner.to_index()) { return false; }
+        Int index! = 0;
+        while (index < self.generic_param_count(binding_owner)) {
+            qid.DefId candidate = self.generic_param_at(binding_owner, index);
+            if (candidate.to_index() == param_def.to_index()) {
+                return self.store.defs.get(candidate).domain == .value_name;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public Bool const_value_matches(self, comptime_value.ComptimeValue value, comptime_value.ComptimeValue actual) {
+        if (types.comptime_value_equal(value, actual)) { return true; }
+        if (value.data is .int_value(int_value)) {
+            if (int_value < 0) { return false; }
+            return types.comptime_value_as_uint64(actual) == UInt64(int_value);
+        }
+        if (value.data is .uint_value(uint_value)) {
+            return types.comptime_value_as_uint64(actual) == uint_value;
+        }
+        return false;
+    }
+
+    public qid.DefId? named_type_ref_def(self, sem.NodeId node_id) {
+        sem.NodeData data = self.store.model.node(node_id).data;
+        guard data is .named_type_ref(named) else { return null; }
+        return named.def_id;
+    }
+
+    Int named_type_ref_arg_count(self, sem.NodeId type_ref) {
+        sem.Node node = self.store.model.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return 0; }
+        return named.args.length;
+    }
+
+    public sem.NodeId named_type_ref_arg_at(self, sem.NodeId type_ref, Int index) {
+        sem.Node node = self.store.model.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return type_ref; }
+        return named.args[index];
+    }
+
+    Bool bind_extension_generic_arg_pattern(
+        Self&! self,
+        types.GenericArg actual,
+        sem.NodeId pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (actual is .type_arg(type_arg)) {
+            return self.bind_extension_type_pattern(type_arg.value, pattern, extension_index, bindings);
+        }
+        guard actual is .const_arg(const_arg) else { return false; }
+        return self.bind_extension_const_pattern(const_arg.value, pattern, extension_index, bindings);
+    }
+
+    Bool bind_extension_sentinel_pattern(
+        Self&! self,
+        types.Sentinel? actual,
+        sem.LayeredTypeRef pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (pattern.sentinel_kind == .none) { return actual == null; }
+        guard actual is .some(sentinel) else { return false; }
+        if (pattern.sentinel_kind == .wildcard) { return true; }
+        if (pattern.sentinel_kind == .const_name) {
+            guard self.extension_param_for_symbol(extension_index, pattern.sentinel_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(sentinel.value, param_def, extension_index, bindings);
+        }
+        return types.comptime_value_as_uint64(sentinel.value) == pattern.sentinel_value;
+    }
+
+    Bool bind_extension_reference_pattern(
+        Self&! self,
+        qid.TypeId actual,
+        sem.NodeId element_pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        types.TypeInfo info = self.store.types.get(actual);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind == .reference) {
+            return self.bind_extension_type_pattern(handle.element, element_pattern, extension_index, bindings);
+        }
+        if (handle.kind != .slice) { return false; }
+        qid.TypeId slice_type = self.store.types.slice_value_type_with_sentinel(
+            handle.element, handle.sentinel, info.span
+        );
+        return self.bind_extension_type_pattern(slice_type, element_pattern, extension_index, bindings);
+    }
+
+    Bool extension_handle_kind_matches(self, sem.TypeLayerKind pattern, types.HandleTypeKind actual) {
+        if (pattern == .reference) { return actual == .reference; }
+        if (pattern == .owner_pointer) { return actual == .owner_pointer; }
+        if (pattern == .raw_pointer) { return actual == .raw_pointer; }
+        return pattern == .slice && actual == .slice;
+    }
+
+    Bool bind_extension_array_count(
+        Self&! self,
+        types.ArrayType actual,
+        sem.ArrayTypeRef pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (pattern.count_kind == .inferred) { return true; }
+        comptime_value.ComptimeValue value = self.array_count_comptime_value(actual);
+        if (pattern.count_kind == .const_name) {
+            guard self.extension_param_for_symbol(extension_index, pattern.count_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(value, param_def, extension_index, bindings);
+        }
+        return types.comptime_value_as_uint64(value) == pattern.count_value;
+    }
+
+    Bool bind_extension_array_sentinel(
+        Self&! self,
+        types.Sentinel? actual,
+        sem.ArrayTypeRef pattern,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (pattern.sentinel_kind == .none) { return actual == null; }
+        guard actual is .some(sentinel) else { return false; }
+        if (pattern.sentinel_kind == .wildcard) { return true; }
+        if (pattern.sentinel_kind == .const_name) {
+            guard self.extension_param_for_symbol(extension_index, pattern.sentinel_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(sentinel.value, param_def, extension_index, bindings);
+        }
+        return types.comptime_value_as_uint64(sentinel.value) == pattern.sentinel_value;
+    }
+
+    public Bool is_option_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.option_type, def_id);
+    }
+
+    public Bool is_result_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.result_type, def_id);
+    }
+
+    public Bool is_reference_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.ref_type, def_id);
+    }
+
+    public Bool is_box_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.box_type, def_id);
+    }
+
+    public Bool is_raw_pointer_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.raw_pointer_type, def_id);
+    }
+
+    public Bool is_slice_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.slice_type, def_id);
+    }
+
+    public Bool is_array_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.store.resolve.core_types.array_type, def_id);
+    }
+
+    public Bool core_type_def_matches(self, qid.DefId? expected!, qid.DefId actual) {
+        guard expected is .some(def_id) else { return false; }
+        return def_id.to_index() == actual.to_index();
+    }
+
+    Bool is_handle_constructor_builtin_type_def(self, qid.DefId def_id) {
+        return self.is_reference_builtin_type_def(def_id)
+            || self.is_box_builtin_type_def(def_id)
+            || self.is_raw_pointer_builtin_type_def(def_id);
+    }
+
+    qid.DefId? extension_param_for_symbol(
+        self,
+        Int extension_index,
+        UInt64 symbol_index,
+        def.NameDomain domain
+    ) {
+        qid.DefId binding_owner = self.store.model.extension_group_binding_owner(extension_index);
+        Int index! = 0;
+        while (index < self.generic_param_count(binding_owner)) {
+            qid.DefId param_def = self.generic_param_at(binding_owner, index);
+            def.DefRecord record = self.store.defs.get(param_def);
+            if (record.domain == domain && record.name.symbol.to_index() == Int(symbol_index)) {
+                return param_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool bind_extension_const_param(
+        Self&! self,
+        comptime_value.ComptimeValue actual,
+        qid.DefId param_def,
+        Int extension_index,
+        generic_bindings.GenericBindings&! bindings
+    ) {
+        if (bindings.const_binding(param_def) is .some(bound)) {
+            return self.const_value_matches(bound, actual);
+        }
+        guard self.parameter_type(param_def) is .some(param_type) else { return false; }
+        qid.TypeId expected = generic_bindings.substitute_type(
+            self.store.types$.ref(),
+            param_type,
+            bindings
+        );
+        if (self.type_is_unbound_extension_param(expected, extension_index, bindings)) { return true; }
+        if (!self.same_type(expected, actual.type_id)) { return false; }
+        bindings.set_const(param_def, actual);
+        return true;
+    }
+
+}

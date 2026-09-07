@@ -1,6 +1,7 @@
-// Semantic Model package 到 JIL Store 的 lowering。
-//
-// 本模块只提供稳定入口和 package 调度；具体 lowering 由同目录职责模块实现。
+#doc(module)
+    Semantic Model package 到 JIL Store 的 lowering。
+    引用发现与协程派生分步推进，编译层可在两步之间补齐语义需求。
+#end
 
 alias context = import "../../context.jiang";
 alias compiler_store = import "../../store.jiang";
@@ -37,7 +38,7 @@ public alias lower_type_support = import "./type_support.jiang";
 public alias lower_pattern = import "./pattern.jiang";
 public alias lower_domain_executor = import "./domain_executor.jiang";
 
-#doc 从已有运行期队列游标继续处理新全局值的引用，复用实例 lowering 和 finalization。
+#doc 从已有运行期队列游标继续发现引用；frame 就绪前不进行实例 finalization。
 public Void close_runtime_references(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph,
     Int global_begin, Int item_begin) {
     qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
@@ -51,12 +52,77 @@ public Void close_runtime_references(context.CompilerContext&! ctx, module_graph
         );
         Int globals! = global_begin;
         Int items! = item_begin;
-        Int finalized! = item_begin;
-        list.ArrayList<jil.MonoItem> pending! = list.ArrayList<jil.MonoItem>();
-        lowerer.close_referenced_instances(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref(),
-            globals$.mut_ref(), items$.mut_ref(), finalized$.mut_ref(), pending$.mut_ref());
+        lowerer.discover_referenced_instances(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref(),
+            globals$.mut_ref(), items$.mut_ref());
     }
     ctx.store.diagnostics.append(diagnostics$.move());
+}
+
+#doc 发布 package 的初始模板和运行期需求，允许编译层随后补齐缓存 body。
+public Void begin_runtime_package(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
+    assert(!ctx.jil.program.is_frozen());
+    if (!ctx.jil.program.has_query_identity()) {
+        ctx.jil.program.bind_query_identity(ctx.query.allocate_jil_store_identity());
+    }
+    ctx.jil.program.main_domain_def = ctx.store.resolve.core_values.main_domain;
+    qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    {
+        lower_context.Context lowerer! = lower_context.Context(
+            ctx.store$.ref(), ctx.output, ctx.store.model$.ref(), ctx.store.typeck$.ref(), graph,
+            ctx.query.source_jil$.ref(), ctx.query.trait_vtable$.ref(), ctx.query.lifetime_shape$.mut_ref(),
+            closure_env_symbol, ctx.jil.storage$.ref(), ctx.jil.program$.mut_ref(),
+            ctx.jil.drop_elaboration$.mut_ref(), diagnostics$.mut_ref()
+        );
+        lowerer.begin_package(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref());
+    }
+    ctx.store.diagnostics.append(diagnostics$.move());
+}
+
+#doc 所需 body 已可用后完成协程和实例派生，复用整包入口的同一套 lowering。
+public Void finish_runtime_package(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
+    qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    {
+        lower_context.Context lowerer! = lower_context.Context(
+            ctx.store$.ref(), ctx.output, ctx.store.model$.ref(), ctx.store.typeck$.ref(), graph,
+            ctx.query.source_jil$.ref(), ctx.query.trait_vtable$.ref(), ctx.query.lifetime_shape$.mut_ref(),
+            closure_env_symbol, ctx.jil.storage$.ref(), ctx.jil.program$.mut_ref(),
+            ctx.jil.drop_elaboration$.mut_ref(), diagnostics$.mut_ref()
+        );
+        lowerer.finish_package(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref());
+    }
+    ctx.store.diagnostics.append(diagnostics$.move());
+}
+
+#doc 初始化模型已恢复并检查后填入原有全局存储槽；不请求 Sema 或另建声明身份。
+public Bool ensure_checked_global(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, jil.GlobalId global_id,
+    comptime_value.ComptimeValue? evaluated = null
+) {
+    jil.Global global = ctx.jil.program.globals.get(global_id.to_index());
+    guard global.origin is .source(owner) else { return true; }
+    qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
+    diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
+    Bool ready! = false;
+    {
+        lower_context.Context lowerer! = lower_context.Context(
+            ctx.store$.ref(), ctx.output, ctx.store.model$.ref(), ctx.store.typeck$.ref(), graph,
+            ctx.query.source_jil$.ref(), ctx.query.trait_vtable$.ref(), ctx.query.lifetime_shape$.mut_ref(),
+            closure_env_symbol, ctx.jil.storage$.ref(), ctx.jil.program$.mut_ref(),
+            ctx.jil.drop_elaboration$.mut_ref(), diagnostics$.mut_ref()
+        );
+        body.BodyBuilder builder! = body.BodyBuilder(ctx.jil.storage$.ref(), global.span, false);
+        body.BodyLowerer values! = body.BodyLowerer(
+            lowerer$.mut_ref(), ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref(), builder$.mut_ref(),
+            jil.BodyId.from_index(owner.to_index()), ctx.store.model.def_ref(owner),
+            ctx.jil.storage.empty_generic_args(), global.span
+        );
+        ready = values.ensure_runtime_global_storage(
+            ctx.store.model.def_type_ref(owner)$.some(), owner, global.type_id, evaluated);
+    }
+    ctx.store.diagnostics.append(diagnostics$.move());
+    return ready && !ctx.jil.program.has_errors();
 }
 
 #doc 将已求值的实例结果发布为只读静态存储；复用常量转换，不执行表达式或建立运行期根。
@@ -120,8 +186,7 @@ public Bool ensure_eval_metadata(
     jil.MonoItem item, references.References& dependencies
 ) {
     assert(!output.program.is_frozen());
-    if (dependencies.raw_fn_vtables.empty() && dependencies.trait_vtables.empty()
-        && dependencies.runtime_domain_descriptors.empty() && !dependencies.has_closures()) { return true; }
+    if (eval_metadata_ready(output.program$.ref(), dependencies)) { return !output.program.has_errors(); }
     jil.Function function;
     types.GenericArg[]& args! = output.storage.empty_generic_args();
     if (item is .source_instance(identity)) {
@@ -147,6 +212,36 @@ public Bool ensure_eval_metadata(
     }
     store.diagnostics.append(diagnostics$.move());
     return !output.program.has_errors();
+}
+
+#doc 查询既有表身份，避免重复求值为了命中缓存仍创建 BodyBuilder 并占用 JIL arena。
+Bool eval_metadata_ready(jil.Program& program, references.References& dependencies) {
+    Int index! = 0;
+    while (index < dependencies.raw_fn_vtables.len()) {
+        if (program.raw_fn_vtable_global(dependencies.raw_fn_vtables.get(index)) == null) { return false; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < dependencies.trait_vtables.len()) {
+        if (program.trait_vtable_global(dependencies.trait_vtables.get(index).key) == null) { return false; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < dependencies.runtime_domain_descriptors.len()) {
+        qid.TypeId domain = dependencies.runtime_domain_descriptors.get(index).domain_type;
+        if (program.runtime_domain_executor_descriptor(domain) == null) { return false; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < dependencies.functions.len()) {
+        references.FunctionReference& reference = dependencies.functions.ref_at(index);
+        if (reference.closure is .some(closure)) {
+            if (program.closure_vtable_global(closure.lambda_def, reference.args.slice(),
+                closure.environment_storage == .heap) == null) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
 }
 
 public Void lower_package_into(
@@ -363,6 +458,14 @@ public extend lower_context.Context {
         database.JilInstanceQuery& instance_query,
         database.LayoutQuery&! layouts
     ) {
+        self.begin_package(instance_query, layouts);
+        self.finish_package(instance_query, layouts);
+    }
+
+    #doc 初始 JIL 保留尚待派生的异步操作，仅发现实例引用，不读取尚未生成的 frame。
+    public Void begin_package(
+        Self&! self, database.JilInstanceQuery& instance_query, database.LayoutQuery&! layouts
+    ) {
         // 先为 source function 建立可含泛型参数的 generic JIL。具体实例由
         // runtime roots 和实例视图中的函数引用驱动，不再维护全量实例集合。
         Int module_index! = 0;
@@ -371,9 +474,19 @@ public extend lower_context.Context {
             self.lower_def_tree(instance_query, layouts, module.def_id);
             module_index = module_index + 1;
         }
-        self.materialize_template_async_operations(instance_query, layouts);
-        self.prepare_template_coroutine_resume_functions();
         self.lower_runtime_entry(instance_query, layouts);
+        Int globals! = 0;
+        Int items! = 0;
+        self.discover_referenced_instances(instance_query, layouts, globals$.mut_ref(), items$.mut_ref());
+    }
+
+    #doc 引用需要的源码 body 就绪后再做 frame、confinement、resume 和 ABI finalization。
+    public Void finish_package(
+        Self&! self, database.JilInstanceQuery& instance_query, database.LayoutQuery&! layouts
+    ) {
+        self.materialize_template_async_operations(instance_query, layouts);
+        if (self.program.has_errors()) { return; }
+        self.prepare_template_coroutine_resume_functions();
         Int referenced_global_cursor! = 0;
         Int mono_item_cursor! = 0;
         Int finalization_cursor! = 0;
@@ -442,6 +555,22 @@ public extend lower_context.Context {
         }
     }
 
+    #doc 发现当前实例和全局值的传递引用；缺失的 source body 留给编译层处理。
+    Void discover_referenced_instances(
+        Self&! self, database.JilInstanceQuery& instance_query, database.LayoutQuery&! layouts,
+        Int&! referenced_global_cursor, Int&! mono_item_cursor
+    ) {
+        while (mono_item_cursor$.get() < self.program.mono_item_count()
+            || referenced_global_cursor$.get() < self.program.runtime_global_count()) {
+            self.lower_global_references(instance_query, layouts, referenced_global_cursor);
+            while (mono_item_cursor$.get() < self.program.mono_item_count()) {
+                jil.MonoItem item = self.program.mono_item_at(mono_item_cursor$.get());
+                mono_item_cursor$.set(mono_item_cursor$.get() + 1);
+                self.lower_mono_item_references(instance_query, layouts, item);
+            }
+        }
+    }
+
     Void close_referenced_instances(
         Self&! self,
         database.JilInstanceQuery& instance_query,
@@ -453,16 +582,7 @@ public extend lower_context.Context {
     ) {
         Bool continue_closure! = true;
         while (continue_closure) {
-            self.lower_global_references(
-                instance_query, layouts, referenced_global_cursor
-            );
-            while (mono_item_cursor$.get() < self.program.mono_item_count()) {
-                jil.MonoItem item = self.program.mono_item_at(
-                    mono_item_cursor$.get()
-                );
-                mono_item_cursor$.set(mono_item_cursor$.get() + 1);
-                self.lower_mono_item_references(instance_query, layouts, item);
-            }
+            self.discover_referenced_instances(instance_query, layouts, referenced_global_cursor, mono_item_cursor);
             Bool finalized = self.finalize_instance_functions(
                 instance_query,
                 layouts,

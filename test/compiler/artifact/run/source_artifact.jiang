@@ -82,6 +82,10 @@ public Int run() {
     check_interface_builder_exports_private_member_skeletons();
     check_interface_builder_exports_generic_signature_and_template();
     check_interface_builder_exports_private_generic_template();
+    check_ordinary_body_restores_nested_lambdas();
+    check_global_initializer_body_demand();
+    check_body_decode_failure_publication(false);
+    check_body_decode_failure_publication(true);
     check_interface_roundtrip_preserves_generic_layout();
     check_interface_roundtrip_preserves_payload_enum_schema();
     check_interface_roundtrip_preserves_extension_group();
@@ -467,12 +471,22 @@ Void check_interface_roundtrip_preserves_extension_group() {
 }
 
 Void check_interface_roundtrip_preserves_trait_conformance() {
-    UInt8[]& name = "interface_trait_conformance";
+    check_trait_conformance_roundtrip(false);
+    check_trait_conformance_roundtrip(true);
+}
+
+#doc nominal 和 extension 两种实现都需在接口恢复后重建方法关联，普通 body 仍按需加载。
+Void check_trait_conformance_roundtrip(Bool extension) {
+    UInt8[]& name = if (extension) { "interface_extension_conformance" } else { "interface_trait_conformance" };
     std.StringBuilder source_text! = std.StringBuilder();
     source_text.append("public trait Writer{Void write(Self&! self,UInt8[]& bytes);");
     source_text.append("Void write(Self&! self,UInt8 value);");
     source_text.append("Void write(Self&! self,UInt64 value){self.write(UInt8(value));}}");
-    source_text.append("public struct WriterImpl:Writer{");
+    if (extension) {
+        source_text.append("public struct WriterImpl{} public extend WriterImpl:Writer{");
+    } else {
+        source_text.append("public struct WriterImpl:Writer{");
+    }
     source_text.append("public Void write(Self&! self,UInt8[]& bytes){}");
     source_text.append("public Void write(Self&! self,UInt8 value){}}");
     UInt8[]& text = source_text.slice();
@@ -491,7 +505,7 @@ Void check_interface_roundtrip_preserves_trait_conformance() {
 
     artifact.ModuleInterface& module_interface =
         source_ctx.store.artifacts.load_interface(source_id)$.some();
-    assert(module_interface.generic_templates.len() == 1);
+    assert(module_interface.generic_templates.len() == 3);
     source_fingerprint.SourceSectionImage image =
         source_fingerprint.encode_module_interface_section(source_ctx$.ref(), module_interface);
     source_fingerprint.SourceSectionImage templates =
@@ -528,13 +542,19 @@ Void check_interface_roundtrip_preserves_trait_conformance() {
         "build/test-cache/jiang_interface_trait_conformance"
     );
     qid.ModuleId loaded_module = builder.ensure_module(loaded_source);
-    interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(
-        loaded_ctx$.mut_ref(),
-        module_states$.mut_ref(),
-        declaration_defs$.mut_ref()
-    );
-    loader.load_module_interface(loaded_module, decoded$.ref());
-    loader.load_module_interface_templates(decoded$.ref());
+    {
+        interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(
+            loaded_ctx$.mut_ref(), module_states$.mut_ref(), declaration_defs$.mut_ref());
+        loader.load_module_interface_skeletons(loaded_module, decoded$.ref());
+    }
+    reset_skeleton_fingerprints(loaded_ctx$.mut_ref(), decoded$.ref());
+    {
+        interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(
+            loaded_ctx$.mut_ref(), module_states$.mut_ref(), declaration_defs$.mut_ref());
+        loader.load_module_interface(loaded_module, decoded$.ref());
+        loader.load_module_interface_templates(decoded$.ref());
+    }
+    assert_loaded_fingerprints(loaded_ctx$.ref(), decoded$.ref());
     loaded_ctx.store.resolve.set_module_interface_only(loaded_module, true);
     store.ModuleRecord& module_record = loaded_ctx.store.resolve.module_ref(loaded_module);
     module_graph.ModuleGraph^ loaded_graph! =
@@ -542,6 +562,83 @@ Void check_interface_roundtrip_preserves_trait_conformance() {
     loaded_graph.add_module(loaded_module);
     assert(compilation.check_model_package(loaded_ctx$.mut_ref(), loaded_graph$.ref()));
     assert_loaded_trait_default_body_facts(loaded_ctx$.ref(), loaded_module);
+    fingerprint.fingerprint_module(loaded_ctx$.mut_ref(), loaded_module);
+    Int template_index! = 0;
+    while (template_index < decoded.generic_templates.len()) {
+        artifact.GenericTemplate& body_template = decoded.generic_templates.ref_at(template_index);
+        qkey.StableSymbolId stable = body_template.owner_stable_id;
+        assert(loaded_ctx.store.incremental.body_fingerprint(stable) == body_template.body_fingerprint);
+        template_index = template_index + 1;
+    }
+    loaded_ctx.store.artifacts.store_interface(loaded_source, decoded);
+    assert_ordinary_body_demand(loaded_ctx$.mut_ref(), loaded_graph$.ref(), loaded_module);
+}
+
+#doc 模拟源码签名先登记 stable ID、随后选择缓存接口；不能因已有身份而漏恢复指纹。
+Void reset_skeleton_fingerprints(context.CompilerContext&! ctx, artifact.ModuleInterface& module_interface) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        qkey.StableSymbolId stable = module_interface.declarations.get(index).stable_id;
+        qid.DefId def_id = ctx.store.incremental.current_def_for_stable(stable)$.some();
+        assert(!ctx.store.model.has_body(def_id));
+        Int record_index = ctx.store.incremental.stable_to_record.get(stable)$.some()$.get();
+        qkey.StableSymbolKey key = ctx.store.incremental.records.get(record_index).key;
+        assert(ctx.store.incremental.record_symbol(ctx.store.symbols$.mut_ref(), key, def_id) == stable);
+        assert(!ctx.store.incremental.fingerprints_loaded(stable));
+        ctx.store.incremental.set_signature_fingerprint(stable, qkey.Fingerprint128());
+        ctx.store.incremental.set_body_fingerprint(stable, qkey.Fingerprint128());
+        ctx.query.invalidate_def_fingerprints(stable);
+        ctx.query.def_signature(stable, { => qkey.Fingerprint128() });
+        ctx.query.def_body(stable, { => qkey.Fingerprint128() });
+        index = index + 1;
+    }
+}
+
+#doc 接口恢复同时发布 store 和 query 的签名及 body 指纹，不依赖本次会话节点编号。
+Void assert_loaded_fingerprints(context.CompilerContext& ctx, artifact.ModuleInterface& module_interface) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        qkey.StableSymbolId stable = declaration.stable_id;
+        assert(ctx.store.incremental.fingerprints_loaded(stable));
+        assert(ctx.store.incremental.signature_fingerprint(stable) == declaration.signature_fingerprint);
+        assert(ctx.store.incremental.body_fingerprint(stable) == declaration.body_fingerprint);
+        assert(ctx.query.def_signature(stable, { => qkey.Fingerprint128() }) == declaration.signature_fingerprint);
+        assert(ctx.query.def_body(stable, { => qkey.Fingerprint128() }) == declaration.body_fingerprint);
+        index = index + 1;
+    }
+}
+
+#doc 普通方法 body 按需恢复并检查；同级未请求方法保持只有签名，重复请求不追加节点。
+Void assert_ordinary_body_demand(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, qid.ModuleId module_id
+) {
+    qid.NamespaceId namespace_id = ctx.store.resolve.module_ref(module_id).namespace_id;
+    qid.DefId owner = ctx.store.resolve.first_binding(
+        namespace_id, ctx.store.symbols.find("WriterImpl")$.some(), .type_name)$.some().def_id;
+    qid.SymbolId name = ctx.store.symbols.find("write")$.some();
+    list.ArrayList<qid.DefId> methods! = list.ArrayList<qid.DefId>();
+    Int index! = 0;
+    while (index < ctx.store.model.def_member_count(owner)) {
+        qid.DefId member = ctx.store.model.def_member_at(owner, index);
+        if (ctx.store.defs.get(member).name.symbol == name) { methods.add(member); }
+        index = index + 1;
+    }
+    assert(methods.len() == 2);
+    qid.DefId first = methods.get(0);
+    qid.DefId second = methods.get(1);
+    assert(ctx.store.defs.get(first).associated_trait_member != null);
+    assert(ctx.store.defs.get(second).associated_trait_member != null);
+    assert(ctx.store.model.function_has_body_definition(first));
+    assert(ctx.store.model.function_has_body_definition(second));
+    assert(!ctx.store.model.has_body(first) && !ctx.store.model.has_body(second));
+    assert(compilation.ensure_body_checked(ctx, graph, first));
+    assert(ctx.store.model.has_body(first) && !ctx.store.model.has_body(second));
+    assert(ctx.store.typeck.node_type(ctx.store.model.body_root(first)$.some()) != null);
+    Int count = ctx.store.model.def_ref(first).nodes.len();
+    assert(compilation.ensure_body_checked(ctx, graph, first));
+    assert(ctx.store.model.def_ref(first).nodes.len() == count);
+    assert(!ctx.store.model.has_body(second));
 }
 
 Void assert_loaded_trait_default_body_facts(
@@ -606,6 +703,7 @@ Void count_default_body_facts(
     }
 }
 
+#doc builtin extension 模板跨会话恢复时，类型和 const 参数都使用启动期登记的稳定身份。
 Void check_interface_roundtrip_preserves_builtin_extension_body_facts() {
     UInt8[]& name = "interface_builtin_extension_body";
     std.StringBuilder source_text! = std.StringBuilder();
@@ -613,6 +711,14 @@ Void check_interface_roundtrip_preserves_builtin_extension_body_facts() {
     source_text.append("public extend Int{");
     source_text.append("public Void hash<H:Writer>(self,H&! writer){");
     source_text.append("writer.write(unsafe{self$.get()});}}");
+    source_text.append("public extend<T> T?{public Int marker(self){1}}");
+    source_text.append("public extend<T> T&{public Int marker(self){2}}");
+    source_text.append("public extend<T> T^{public Int marker(self){3}}");
+    source_text.append("public extend<T> T*{public Int marker(self){4}}");
+    source_text.append("public extend<T> T[]{public Int marker(self){5}}");
+    source_text.append("public extend<T,S:const T> T[:S]{public Int marker(self){6}}");
+    source_text.append("public extend<T,N:const Int> T[N]{public Int marker(self){7}}");
+    source_text.append("public extend<T,N:const Int,S:const T> T[N:S]{public Int marker(self){8}}");
     UInt8[]& text = source_text.slice();
     context.CompilerContext source_ctx! = context.CompilerContext();
     source.SourceId source_id =
@@ -629,8 +735,8 @@ Void check_interface_roundtrip_preserves_builtin_extension_body_facts() {
 
     artifact.ModuleInterface& module_interface =
         source_ctx.store.artifacts.load_interface(source_id)$.some();
-    assert(module_interface.extension_groups.len() == 1);
-    assert(module_interface.generic_templates.len() == 1);
+    assert(module_interface.extension_groups.len() == 9);
+    assert(module_interface.generic_templates.len() == 9);
     source_fingerprint.SourceSectionImage interface_image =
         source_fingerprint.encode_module_interface_section(source_ctx$.ref(), module_interface);
     source_fingerprint.SourceSectionImage template_image =
@@ -695,6 +801,13 @@ Void check_loaded_builtin_extension_body_facts(
     graph.add_module(module_id);
     assert(compilation.check_model_package(ctx, graph$.ref()));
     assert_builtin_extension_body_facts(ctx, module_id);
+    Int template_index! = 0;
+    while (template_index < module_interface.generic_templates.len()) {
+        qkey.StableSymbolId stable = module_interface.generic_templates.ref_at(template_index).owner_stable_id;
+        qid.DefId restored = ctx.store.incremental.current_def_for_stable(stable)$.some();
+        assert(ctx.store.model.def_ref(restored).body != null);
+        template_index = template_index + 1;
+    }
 }
 
 Void assert_builtin_extension_body_facts(
@@ -1907,6 +2020,12 @@ Void check_tagged_const_codec() {
     );
     success_decl.is_const = true;
     module_interface.add_declaration(success_decl);
+    artifact.InterfaceDeclSummary null_decl! = artifact.InterfaceDeclSummary(
+        stable_id(7, 8), .global_def, .value_name, .public_visibility, ctx.store.symbols.intern("null_pointer"), null
+    );
+    null_decl.is_const = true;
+    module_interface.add_declaration(null_decl);
+    module_interface.set_const_value(stable_id(7, 8), artifact.InterfaceConstValue(data: .null_pointer));
     module_interface.set_const_value(stable_id(1, 2), artifact.InterfaceConstValue(
         data: .error_union_value(true, error)
     ));
@@ -1931,6 +2050,7 @@ Void check_tagged_const_codec() {
     guard decoded.const_value(stable_id(5, 6))$.some().data is .error_union_value(false, success)
         else { assert(false); return; }
     assert(success.length == 1 && success[0].data is .int_value(17));
+    assert(decoded.const_value(stable_id(7, 8))$.some().data is .null_pointer);
     source_fingerprint.SourceSectionImage encoded_again =
         source_fingerprint.encode_module_interface_section(restored$.ref(), decoded$.ref());
     assert(string.equal(section.bytes.slice(), encoded_again.bytes.slice()));
@@ -2154,7 +2274,10 @@ Void assert_interface_function_returns_decl(
 #end
 public Void check_import_expression_roundtrip() {
     context.CompilerContext ctx! = context.CompilerContext();
-    UInt8[]& text = "alias selected = if (true) { import build } else { import \"missing.jiang\" };";
+    std.StringBuilder source_text! = std.StringBuilder();
+    source_text.append("alias dependency = import build; alias selected = if (true) { dependency } ");
+    source_text.append("else { if (true) { import build } else { import \"missing.jiang\" } };");
+    UInt8[]& text = source_text.slice();
     source.SourceId source_id = ctx.store.sources.intern_virtual("import_expression_artifact", text);
     syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
     module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver(compilation.evaluate_source_expression);
@@ -2197,6 +2320,13 @@ public Void check_import_expression_roundtrip() {
     assert(model_template.decode_expression(restored_ctx.store$.mut_ref(), restored_owner, payload.slice()) != null);
     assert_import_literals(restored_ctx$.ref(), restored_owner, restored_base, restored_graph.root_module);
     Int valid_node_count = restored_ctx.store.model.def_ref(restored_owner).nodes.len();
+    qid.DefId restored_target = restored_ctx.store.model.def_alias_target(restored_owner)$.some();
+    assert(restored_target != ctx.store.model.def_alias_target(owner)$.some());
+    qid.NamespaceId target_namespace = restored_ctx.store.defs.get(restored_target).owned_namespace_id$.some();
+    restored_ctx.store.defs.set_owned_namespace(restored_target, null);
+    assert(model_template.decode_expression(restored_ctx.store$.mut_ref(), restored_owner, payload.slice()) == null);
+    assert(restored_ctx.store.model.def_ref(restored_owner).nodes.len() == valid_node_count);
+    restored_ctx.store.defs.set_owned_namespace(restored_target, target_namespace);
     assert(model_template.decode_expression(
         restored_ctx.store$.mut_ref(), restored_owner, payload.slice()[..payload.len() - 1]) == null);
     assert(restored_ctx.store.model.def_ref(restored_owner).nodes.len() == valid_node_count);
@@ -2205,11 +2335,17 @@ public Void check_import_expression_roundtrip() {
 }
 
 #doc
-    每份表达式保存 package 和 file 两种导入，未选中文件仍只保存路径，不加载目标模块。
+    表达式保存两种导入及已解析 namespace；后者使用恢复会话的真实目标身份。
 #end
 Void assert_import_literals(context.CompilerContext& ctx, qid.DefId owner, Int first, qid.ModuleId module_id) {
     Int index! = first;
     Int imports! = 0;
+    Int namespaces! = 0;
+    qid.DefId dependency = ctx.store.resolve.lookup_namespace(
+        ctx.store.resolve.module_ref(module_id).namespace_id,
+        ctx.store.symbols.find("dependency")$.some(), .namespace_name, false
+    )$.some().def_id;
+    qid.DefId namespace_target = ctx.store.model.def_alias_target(dependency)$.some();
     while (index < ctx.store.model.def_ref(owner).nodes.len()) {
         sem.Node node = ctx.store.model.def_ref(owner).nodes.get(index);
         if (node.data is .literal(literal) && literal.value is .import_value(origin, path, file_path)) {
@@ -2218,9 +2354,14 @@ Void assert_import_literals(context.CompilerContext& ctx, qid.DefId owner, Int f
             assert(string.equal(ctx.store.symbols.text(path), expected));
             imports = imports + 1;
         }
+        if (node.data is .literal(literal) && literal.value is .namespace_value(target)) {
+            assert(target == namespace_target);
+            namespaces = namespaces + 1;
+        }
         index = index + 1;
     }
     assert(imports == 2);
+    assert(namespaces == 1);
 }
 
 qkey.StableSymbolId stable_decl_named(artifact.ModuleInterface& module_interface, qid.SymbolId symbol) {
@@ -2394,6 +2535,140 @@ public Void check_interface_builder_exports_private_generic_template() {
     guard captured_node.data is .name_ref(captured_ref) else { assert(false); return; }
     guard captured_ref is .def_ref(captured_def) else { assert(false); return; }
     assert(captured_def == ctx.store.model.body_local_at(use_def, 0).def_id);
+}
+
+#doc 失败的 body 解码保留原模型与局部身份，依赖就绪后可以使用相同 payload 重试。
+public Void check_body_decode_failure_publication(Bool absent) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    std.StringBuilder text_builder! = std.StringBuilder();
+    text_builder.append("Int apply(Fn<Int> action){action()} Int extra(){1} ");
+    text_builder.append("public Int answer(){Int value=40; apply{[value]=>value+1}+extra()}");
+    UInt8[]& text = text_builder.slice();
+    source.SourceId source_id = ctx.store.sources.intern_virtual("body_decode_failure_publication", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver(compilation.evaluate_source_expression);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+    qid.DefId owner = first_function_def_named(ctx$.ref(), graph.root_module, "answer");
+    qid.DefId extra = first_function_def_named(ctx$.ref(), graph.root_module, "extra");
+    qid.DefId lambda = first_lambda_member(ctx$.ref(), owner);
+    list.ArrayList<UInt8> payload = artifact.copy_bytes(model_template.encode_body(ctx$.ref(),
+        ctx.store.model.def_ref(owner)));
+    Int locals = ctx.store.model.body_local_count(owner);
+    qid.DefId first_local = ctx.store.model.body_local_at(owner, 0).def_id;
+    if (absent) { ctx.store.model.def_mut_ref(owner).body = null; }
+    sem.NodeId? root = ctx.store.model.body_root(owner);
+    Int nodes = ctx.store.model.def_ref(owner).nodes.len();
+    Int definitions = ctx.store.defs.len();
+    ctx.store.model.def_mut_ref(lambda).decl.is_lambda_function = false;
+    Int index! = 0;
+    while (index < 4) {
+        Int length = if index == 0 { 0 } else if index == 1 { 40 }
+            else if index == 2 { payload.len() / 2 } else { payload.len() - 1 };
+        assert(!model_template.decode_body(ctx.store$.mut_ref(), owner, payload.slice()[0..length]));
+        assert(ctx.store.model.body_root(owner) == root);
+        assert(ctx.store.model.def_ref(owner).nodes.len() == nodes && ctx.store.defs.len() == definitions);
+        assert(!ctx.store.model.def_is_lambda_function(lambda));
+        index = index + 1;
+    }
+    list.ArrayList<UInt8> trailing! = artifact.copy_bytes(payload.slice());
+    trailing.add(0);
+    assert(!model_template.decode_body(ctx.store$.mut_ref(), owner, trailing.slice()));
+    qkey.StableSymbolId stable = ctx.store.incremental.stable_id_for_def(extra)$.some();
+    Int record = ctx.store.incremental.stable_to_record.get(stable)$.some()$.get();
+    ctx.store.incremental.stable_to_record.remove(stable);
+    model_template.TemplateDecodeResult failed = model_template.decode_body_result(
+        ctx.store$.mut_ref(), owner, payload.slice());
+    assert(!failed.ok && failed.missing_stable_id == stable);
+    assert(ctx.store.model.body_root(owner) == root);
+    assert(ctx.store.model.def_ref(owner).nodes.len() == nodes && ctx.store.defs.len() == definitions);
+    assert(!ctx.store.model.def_is_lambda_function(lambda));
+    assert(ctx.store.source_map.def_span(qid.DefId.from_index(definitions)) == null);
+    if (!absent) { assert(ctx.store.model.body_local_at(owner, 0).def_id == first_local); }
+    ctx.store.incremental.stable_to_record.set(stable, record);
+    assert(model_template.decode_body(ctx.store$.mut_ref(), owner, payload.slice()));
+    assert(ctx.store.model.body_root(owner) != root && ctx.store.model.body_local_count(owner) == locals);
+    assert(ctx.store.defs.len() == definitions + locals && ctx.store.model.def_is_lambda_function(lambda));
+    assert(ctx.store.source_map.def_span(qid.DefId.from_index(definitions)) != null);
+}
+
+#doc 全局初始化与无初始化器共用模板格式；按需恢复不推进同级存储，损坏的空 body 不被接受。
+Void check_global_initializer_body_demand() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    UInt8[]& text = "public Int value! =42; public Int zero!; public Int untouched! =17;";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("global_initializer_body_demand", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver(compilation.evaluate_source_expression);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+    assert(ctx.store.artifacts.load_interface(source_id)$.some().generic_templates.len() == 3);
+    qid.NamespaceId names = ctx.store.resolve.module_ref(graph.root_module).namespace_id;
+    qid.DefId value = ctx.store.resolve.first_binding(
+        names, ctx.store.symbols.find("value")$.some(), .value_name)$.some().def_id;
+    qid.DefId zero = ctx.store.resolve.first_binding(
+        names, ctx.store.symbols.find("zero")$.some(), .value_name)$.some().def_id;
+    qid.DefId untouched = ctx.store.resolve.first_binding(
+        names, ctx.store.symbols.find("untouched")$.some(), .value_name)$.some().def_id;
+    ctx.store.model.def_mut_ref(value).body = null;
+    ctx.store.model.def_mut_ref(untouched).body = null;
+    ctx.store.resolve.set_module_interface_only(graph.root_module, true);
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), value));
+    assert(ctx.store.typeck.node_type(ctx.store.model.body_root(value)$.some()) != null);
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), zero));
+    assert(!ctx.store.model.has_body(zero) && !ctx.store.model.has_body(untouched));
+    Int count = ctx.store.model.def_ref(value).nodes.len();
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), value));
+    assert(ctx.store.model.def_ref(value).nodes.len() == count);
+    qkey.StableSymbolId stable = ctx.store.incremental.stable_id_for_def(zero)$.some();
+    list.ArrayList<UInt8> payload = artifact.copy_bytes(
+        ctx.store.artifacts.load_generic_template(stable)$.some().payload.slice());
+    list.ArrayList<UInt8> broken! = artifact.copy_bytes(payload.slice());
+    broken.truncate(payload.len() - 1);
+    assert(!model_template.decode_body(ctx.store$.mut_ref(), zero, broken.slice()));
+    broken.add(0);
+    broken.add(0);
+    assert(!model_template.decode_body(ctx.store$.mut_ref(), zero, broken.slice()));
+    assert(model_template.decode_body(ctx.store$.mut_ref(), zero, payload.slice()));
+    assert(!ctx.store.model.has_body(zero));
+}
+
+#doc 外层普通 body 的恢复包含嵌套 lambda，保留未请求的同级函数，并且重复请求不重复解码。
+Void check_ordinary_body_restores_nested_lambdas() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("Int apply(Fn<Int> action){action()} Int unused(){0} ");
+    text.append("public Int answer(){Int value=40; apply{[value]=>apply{[value]=>value+2}}}");
+    source.SourceId source_id = ctx.store.sources.intern_virtual("ordinary_nested_lambda_demand", text.slice());
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text.slice(), source_id);
+    assert(!parsed.has_errors());
+    module_resolver.ModuleResolver resolver! = module_resolver.ModuleResolver(compilation.evaluate_source_expression);
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(ctx$.mut_ref(), graph$.ref()));
+    resolver.finalize_module_graph_model(ctx$.mut_ref(), graph$.ref());
+    qid.DefId owner = first_function_def_named(ctx$.ref(), graph.root_module, "answer");
+    qid.DefId outer = first_lambda_member(ctx$.ref(), owner);
+    qid.DefId inner = first_lambda_member(ctx$.ref(), outer);
+    qid.DefId unused = first_function_def_named(ctx$.ref(), graph.root_module, "unused");
+    assert(ctx.store.model.function_has_body_definition(outer));
+    assert(ctx.store.model.function_has_body_definition(inner));
+    ctx.store.model.def_mut_ref(owner).body = null;
+    ctx.store.model.def_mut_ref(outer).body = null;
+    ctx.store.model.def_mut_ref(inner).body = null;
+    ctx.store.model.def_mut_ref(unused).body = null;
+    assert(ctx.store.model.function_has_body_definition(outer));
+    assert(ctx.store.model.function_has_body_definition(inner));
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), owner));
+    assert(ctx.store.model.has_body(outer) && ctx.store.model.has_body(inner));
+    assert(ctx.store.typeck.node_type(ctx.store.model.body_root(inner)$.some()) != null);
+    assert(!ctx.store.model.has_body(unused));
+    Int count = ctx.store.model.def_ref(inner).nodes.len();
+    assert(compilation.ensure_body_checked(ctx$.mut_ref(), graph$.ref(), owner));
+    assert(ctx.store.model.def_ref(inner).nodes.len() == count);
+    assert(!ctx.store.model.has_body(unused));
 }
 
 qid.DefId first_lambda_member(context.CompilerContext& ctx, qid.DefId owner_def) {

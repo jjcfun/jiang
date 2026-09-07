@@ -90,12 +90,13 @@ enum TemplateLiteralKind {
     null_value = 6,
     unit_value = 7,
     import_value = 8,
+    namespace_value = 9,
 }
 
 @life()
 public UInt8[]& encode_body(context.CompilerContext& ctx, sem.Def& model_def) {
     TemplateWriter writer! = TemplateWriter(ctx);
-    writer.write_bytes("jiang.sem-template.v12");
+    writer.write_bytes("jiang.sem-template.v13");
     writer.write_def(model_def.def_id);
     writer.write_body(model_def);
     if (!writer.ok) {
@@ -111,7 +112,7 @@ public UInt8[]& encode_expression(
     sem.NodeId root
 ) {
     TemplateWriter writer! = TemplateWriter(ctx);
-    writer.write_bytes("jiang.sem-expression.v9");
+    writer.write_bytes("jiang.sem-expression.v10");
     writer.write_def(model_def.def_id);
     writer.write_model_id(root);
     writer.write_nodes(model_def);
@@ -142,7 +143,10 @@ public TemplateDecodeResult decode_body_result(
     }
     reader.skip_owner_def();
     if (!reader.read_bool()) {
-        reader.ok = false;
+        if (store.model.def_decl_kind(owner_def) != .global_decl || reader.offset != bytes.length) {
+            reader.ok = false;
+        }
+        if (reader.ok) { store.model.def_mut_ref(owner_def).body = null; }
         return reader.decode_result();
     }
 
@@ -151,9 +155,14 @@ public TemplateDecodeResult decode_body_result(
     sem.NodeId root = reader.read_model_id();
     sem.Body body! = sem.Body(owner_def, root);
     reader.read_locals(body$.mut_ref());
-    reader.load_body(body);
     reader.read_nodes();
-    if (!reader.ok) { return reader.decode_result(); }
+    reader.finish_nodes(root);
+    if (!reader.ok) {
+        reader.discard_nodes();
+        return reader.decode_result();
+    }
+    reader.publish_body(body);
+    reader.publish_lambdas();
     return reader.decode_result();
 }
 
@@ -163,16 +172,18 @@ public sem.NodeId? decode_expression(
     UInt8[]& bytes
 ) {
     TemplateReader reader! = TemplateReader(store, owner_def, bytes);
-    if (!reader.read_magic("jiang.sem-expression.v9")) { return null; }
+    if (!reader.read_magic("jiang.sem-expression.v10")) { return null; }
     reader.skip_owner_def();
     Int node_base = store.model.def_ref(owner_def).nodes.len();
     reader.begin_nodes(node_base);
     sem.NodeId root = reader.read_model_id();
     reader.read_nodes();
+    reader.finish_nodes(root);
     if (!reader.ok) {
         reader.discard_nodes();
         return null;
     }
+    reader.publish_lambdas();
     return root;
 }
 
@@ -207,6 +218,7 @@ struct TemplateReader: Movable {
     Int node_base!;
     Bool ok!;
     qkey.StableSymbolId? missing_stable_id!;
+    Int? pending_local_count!;
 
     init(self, store_api.CompilerStore&! store, qid.DefId owner_def, UInt8[]& bytes) {
         self.defs = store.defs$.mut_ref();
@@ -221,18 +233,47 @@ struct TemplateReader: Movable {
         self.node_base = 0;
         self.ok = true;
         self.missing_stable_id = null;
+        self.pending_local_count = null;
     }
 
     TemplateDecodeResult decode_result(self) {
         return TemplateDecodeResult(ok: self.ok, missing_stable_id: self.missing_stable_id);
     }
 
-    Void load_body(Self&! self, sem.Body body) {
+    #doc 解码成功后才创建局部声明并替换 body；读取期间独占 DefStore，预定的局部编号不会变化。
+    Void publish_body(Self&! self, sem.Body body) {
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            sem.Local local = body.locals.get_index(index);
+            qid.DefId created = self.create_local_def(local.symbol);
+            assert(created == local.def_id);
+            index = index + 1;
+        }
         sem_store.load_body_into_defs(self.model_defs, self.owner_def, body);
     }
 
+    #doc lambda 属性与节点一起提交，损坏 payload 不修改其他声明的属性。
+    Void publish_lambdas(Self&! self) {
+        Int index! = self.node_base;
+        Int count = self.model_defs.get(self.owner_def)$.some().nodes.len();
+        while (index < count) {
+            sem.Node node = self.model_defs.get(self.owner_def)$.some().nodes.get(index);
+            index = index + 1;
+            guard node.data is .lambda_expr(lambda) else { continue; }
+            self.model_defs.get_mut(lambda.function_def)$.some().decl.is_lambda_function = true;
+        }
+    }
+
+    #doc 只接受完整 payload 和本次解码范围内的根节点。
+    Void finish_nodes(Self&! self, sem.NodeId root) {
+        Int count = self.model_defs.get(self.owner_def)$.some().nodes.len();
+        if (self.offset != self.bytes.length || root.local_index < self.node_base || root.local_index >= count) {
+            self.ok = false;
+        }
+    }
+
     Bool read_header(Self&! self) {
-        return self.read_magic("jiang.sem-template.v12");
+        return self.read_magic("jiang.sem-template.v13");
     }
 
     Bool read_magic(Self&! self, UInt8[]& magic) {
@@ -247,7 +288,7 @@ struct TemplateReader: Movable {
     }
 
     Void skip_owner_def(Self&! self) {
-        self.read_def();
+        if (self.read_def() != self.owner_def) { self.ok = false; }
     }
 
     Void begin_nodes(Self&! self, Int node_base) {
@@ -264,10 +305,11 @@ struct TemplateReader: Movable {
 
     Void read_locals(Self&! self, sem.Body&! body) {
         Int count = self.read_int();
+        self.pending_local_count = count;
         Int index! = 0;
-        while (index < count) {
+        while (self.ok && index < count) {
             TemplateLocal local = self.read_template_local();
-            qid.DefId def_id = self.create_local_def(local.symbol);
+            qid.DefId def_id = qid.DefId.from_index(self.defs.len() + index);
             body.add_local_with_borrow_binding(
                 local.kind,
                 local.symbol,
@@ -319,9 +361,10 @@ struct TemplateReader: Movable {
     Void read_nodes(Self&! self) {
         Int count = self.read_int();
         Int index! = 0;
-        while (index < count) {
+        while (self.ok && index < count) {
             sem.NodeId node_id = self.read_model_id();
             sem.NodeData data = self.read_node_data();
+            if (!self.ok) { return; }
             if (node_id.owner_def != self.owner_def || node_id.local_index != self.node_base + index) {
                 self.ok = false;
                 return;
@@ -620,6 +663,15 @@ struct TemplateReader: Movable {
             }
             return sem.Literal(value: .import_value(module_id, path, file_path));
         }
+        if (kind == .namespace_value) {
+            qid.DefId owner = self.read_def();
+            if (!self.ok) { return sem.Literal(value: .unit_value()); }
+            if (self.defs.get(owner).owned_namespace_id == null) {
+                self.ok = false;
+                return sem.Literal(value: .unit_value());
+            }
+            return sem.Literal(value: .namespace_value(owner));
+        }
         self.ok = false;
         return sem.Literal (value: .unit_value());
     }
@@ -629,10 +681,7 @@ struct TemplateReader: Movable {
         list.ArrayList<sem.LambdaParam> params = self.read_lambda_param_list();
         list.ArrayList<sem.LambdaCapture> captures = self.read_lambda_capture_list();
         qid.DefId function_def = self.read_def();
-        if (self.ok) {
-            sem.Def&! function = self.model_defs.get_mut(function_def)$.some();
-            function.decl.is_lambda_function = true;
-        }
+        if (self.ok && !self.model_defs.has(function_def)) { self.ok = false; }
         return sem.Lambda (
             param_count: param_count,
             params: self.freeze_lambda_params(params),
@@ -1101,8 +1150,23 @@ struct TemplateReader: Movable {
             self.ok = false;
             return qid.DefId.from_index(0);
         }
+        if (owner_def == self.owner_def && self.pending_local_count is .some(count)) {
+            if (local_index >= 0 && local_index < count) {
+                return qid.DefId.from_index(self.defs.len() + local_index);
+            }
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
+        if (!self.model_defs.has(owner_def)) {
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
         sem.Def& owner_model = self.model_defs.get(owner_def)$.some();
         guard owner_model.body is .some(ref _ body) else {
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
+        if (local_index < 0 || local_index >= body.locals.len()) {
             self.ok = false;
             return qid.DefId.from_index(0);
         }
@@ -1494,6 +1558,11 @@ struct TemplateWriter: Movable {
             self.write_def(self.ctx.store.resolve.module_ref(origin).def_id);
             self.write_symbol(path);
             self.write_bool(file_path);
+            return;
+        }
+        if (literal.value is .namespace_value(owner)) {
+            self.write_int(Int(TemplateLiteralKind.namespace_value));
+            self.write_def(owner);
             return;
         }
         self.write_int(Int(TemplateLiteralKind.unit_value));
@@ -1922,6 +1991,7 @@ TemplateLiteralKind? literal_kind_from_int(Int value) {
     if (value == Int(TemplateLiteralKind.null_value)) { return TemplateLiteralKind.null_value; }
     if (value == Int(TemplateLiteralKind.unit_value)) { return TemplateLiteralKind.unit_value; }
     if (value == Int(TemplateLiteralKind.import_value)) { return TemplateLiteralKind.import_value; }
+    if (value == Int(TemplateLiteralKind.namespace_value)) { return TemplateLiteralKind.namespace_value; }
     return null;
 }
 
