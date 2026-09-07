@@ -66,6 +66,7 @@ public struct BodyCheck: Movable {
     qid.DefId? current_body_def!;
     qid.TypeId? expression_result_type!;
     qid.DefId? expression_owner!;
+    Int comptime_depth!;
 
     public init(self, type_ops_mod.TypeOps type_ops) {
         self.type_ops = type_ops;
@@ -78,6 +79,7 @@ public struct BodyCheck: Movable {
         self.current_body_def = null;
         self.expression_result_type = null;
         self.expression_owner = null;
+        self.comptime_depth = 0;
     }
 
     qid.TypeId check_pattern(
@@ -461,23 +463,21 @@ public struct BodyCheck: Movable {
 
     qid.TypeId check_global_body(Self&! self, qid.DefId def_id, sem.NodeId root) {
         Bool is_const = self.type_ops.state.ctx.store.model.def_is_const(def_id);
-        guard self.type_ops.state.ctx.store.model.def_type_ref(def_id) is .some(type_ref) else {
-            qid.TypeId type_id = self.check_node(root);
-            if (is_const) {
-                self.check_const_initializer(def_id, root);
+        qid.TypeId? expected! = null;
+        if (self.type_ops.state.ctx.store.model.def_type_ref(def_id) is .some(type_ref)) {
+            if (!self.type_ops.type_ref_is_inferred_array(type_ref)) {
+                expected = self.type_ops.check_value_type_ref(type_ref);
             }
-            return type_id;
         }
-        if (self.type_ops.type_ref_is_inferred_array(type_ref)) {
-            qid.TypeId type_id = self.check_node(root);
-            if (is_const) {
-                self.check_const_initializer(def_id, root);
-            }
-            return type_id;
+        if (is_const) { self.comptime_depth = self.comptime_depth + 1; }
+        qid.TypeId type_id!;
+        if (expected is .some(target)) {
+            type_id = self.check_node_expected(root, target);
+        } else {
+            type_id = self.check_node(root);
         }
-        qid.TypeId expected = self.type_ops.check_value_type_ref(type_ref);
-        qid.TypeId type_id = self.check_node_expected(root, expected);
         if (is_const) {
+            self.comptime_depth = self.comptime_depth - 1;
             self.check_const_initializer(def_id, root);
         }
         return type_id;
@@ -739,6 +739,7 @@ public struct BodyCheck: Movable {
         }
         type_id = self.project_await_task_type(node_id, type_id);
         self.type_ops.state.ctx.store.typeck.set_node_type(node_id, type_id);
+        if (kind == .block) { self.check_comptime_block_value(node_id, type_id); }
         return type_id;
     }
 
@@ -840,6 +841,7 @@ public struct BodyCheck: Movable {
         if (kind == .block) {
             qid.TypeId type_id = self.check_block_expected(node_id, expected_type);
             self.type_ops.state.ctx.store.typeck.set_node_type(node_id, type_id);
+            self.check_comptime_block_value(node_id, type_id);
             return type_id;
         }
         if (kind == .array_literal) {
@@ -2346,7 +2348,56 @@ public struct BodyCheck: Movable {
         return null;
     }
 
+    #doc 显式 block 在类型就绪后请求既有 JIL 求值；泛型值仍在实例准备时执行。
+    Void check_comptime_block_value(Self&! self, sem.NodeId node_id, qid.TypeId type_id) {
+        guard self.type_ops.state.ctx.store.model.node(node_id).data is .block(block) else { return; }
+        if (!block.is_comptime || self.comptime_depth > 0
+            || self.type_ops.state.ctx.store.typeck.has_errors()) { return; }
+        if (self.type_ops.state.evaluate_expression(node_id, type_id) != null) { return; }
+        if (self.owner_has_generic_parameters(node_id.owner_def)
+            && !self.type_ops.state.ctx.store.diagnostics.has_errors()) { return; }
+        self.type_ops.add_node_error(node_id, "comptime block must produce a comptime value",
+            "comptime_block_not_constant");
+    }
+
     qid.TypeId check_block(Self&! self, sem.NodeId node_id) {
+        return self.check_block_context(node_id, null);
+    }
+
+    qid.TypeId check_block_expected(Self&! self, sem.NodeId node_id, qid.TypeId expected_type) {
+        return self.check_block_context(node_id, expected_type);
+    }
+
+    #doc 编译期块保存和恢复返回上下文，内层块只检查类型并共享外层执行状态。
+    qid.TypeId check_block_context(Self&! self, sem.NodeId node_id, qid.TypeId? expected) {
+        guard self.type_ops.state.ctx.store.model.node(node_id).data is .block(block) else {
+            return self.type_ops.state.ctx.store.types.invalid_type();
+        }
+        qid.DefId? saved_owner = self.expression_owner;
+        qid.TypeId? saved_result = self.expression_result_type;
+        if (block.is_comptime) {
+            self.comptime_depth = self.comptime_depth + 1;
+            self.expression_owner = node_id.owner_def;
+            self.expression_result_type = expected;
+        }
+        qid.TypeId actual!;
+        if (expected is .some(type_id)) {
+            actual = self.check_block_contents_expected(node_id, type_id);
+        } else {
+            actual = self.check_block_contents(node_id);
+        }
+        if (block.is_comptime) {
+            if (self.type_ops.is_never_type(actual) && self.expression_result_type is .some(type_id)) {
+                actual = type_id;
+            }
+            self.comptime_depth = self.comptime_depth - 1;
+            self.expression_owner = saved_owner;
+            self.expression_result_type = saved_result;
+        }
+        return actual;
+    }
+
+    qid.TypeId check_block_contents(Self&! self, sem.NodeId node_id) {
         sem.EffectSet effects = self.type_ops.state.ctx.store.model.node_block_effects(node_id);
         self.check_effect_set(effects);
         self.check_cross_domain_block_captures(node_id, effects);
@@ -2374,7 +2425,7 @@ public struct BodyCheck: Movable {
         return self.type_ops.state.ctx.store.types.unit_type();
     }
 
-    qid.TypeId check_block_expected(Self&! self, sem.NodeId node_id, qid.TypeId expected_type) {
+    qid.TypeId check_block_contents_expected(Self&! self, sem.NodeId node_id, qid.TypeId expected_type) {
         sem.EffectSet effects = self.type_ops.state.ctx.store.model.node_block_effects(node_id);
         self.check_effect_set(effects);
         self.check_cross_domain_block_captures(node_id, effects);
@@ -2883,6 +2934,12 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_return(Self&! self, sem.NodeId node_id, sem.Return return_stmt) {
+        if (self.comptime_depth > 0 && self.expression_owner == node_id.owner_def
+            && self.expression_result_type == null) {
+            qid.TypeId inferred! = self.type_ops.state.ctx.store.types.unit_type();
+            if (return_stmt.value is .some(value)) { inferred = self.check_node(value); }
+            self.expression_result_type = inferred;
+        }
         qid.TypeId expected! = self.success_result_type(self.type_ops.function_result_type(node_id.owner_def));
         if (self.expression_owner == node_id.owner_def && self.expression_result_type is .some(result_type)) {
             expected = result_type;
@@ -4933,7 +4990,9 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_let(Self&! self, sem.NodeId node_id, sem.Let let_stmt) {
+        if (let_stmt.is_const) { self.comptime_depth = self.comptime_depth + 1; }
         qid.TypeId result = self.check_local_binding(node_id, let_stmt);
+        if (let_stmt.is_const) { self.comptime_depth = self.comptime_depth - 1; }
         if (!let_stmt.is_const || self.type_ops.state.ctx.store.typeck.has_errors()) { return result; }
         sem.Local local = self.type_ops.state.ctx.store.model.body_local_at(
             node_id.owner_def, let_stmt.local_id.to_index());
@@ -4945,6 +5004,7 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "const requires an initializer", "const_requires_initializer");
             return result;
         }
+        if (self.comptime_depth > 0) { return result; }
         self.check_const_initializer(local.def_id, initializer, self.owner_has_generic_parameters(node_id.owner_def));
         return result;
     }
