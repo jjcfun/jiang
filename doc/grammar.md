@@ -189,10 +189,16 @@ import_alias
 
 import_path <- string_lit / ident
 
+import_expr <- "import" import_path
+
 alias_decl  <- "alias" name ("=" alias_target)? ";"
 
 alias_target
-            <- escaped_ident
+            <- comptime_expr
+             / if_expr
+             / block
+             / import_expr
+             / escaped_ident
              / path
              / type
 
@@ -237,11 +243,14 @@ binding_name
 `eval`、`generate` 仅在选项位置有特殊含义，不是保留关键字。未知 kind、多个 kind 和空选项均诊断。
 `[eval]` 表示语义分析期间所需的求值；`[generate]` 表示输入完整通过语义检查后的生成任务，
 两者不能隐式互换。
+alias 必须直接处于 namespace 中，右侧隐式编译期求值。import_expr 返回 namespace；
+独立 import_decl 使用默认或显式名字绑定模块，并额外要求直接处于 module namespace。
+局部 block 中的独立 import 声明由统一声明位置检查诊断，不能穿透 block 发布名字。
 eval 块也可以出现在普通语句位置。块内普通变量及 const 都遵守所在 block 的词法作用域，
 不隐式发布到 namespace。局部 const 与模块 const 的初始化结果都必须是 comptime value；
 comptime block 可以返回这样的值供外部 const 初始化使用。import 的位置限制独立处理。
-const 初始化器须为常量表达式或显式 comptime block；普通 block 不因处于 const 初始化位置
-自动成为编译期 block。该语义要求不改变普通运行期 block 的语法。
+const 初始化器是隐式 comptime 上下文，允许普通表达式及 block 表达式，结果必须在编译期
+求得；依赖泛型参数时按具体实例求值。该语义要求不改变普通运行期 block 的语法。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 顶层变量只使用普通 global declaration。独立 destructure 是函数体内的语句，
@@ -608,6 +617,7 @@ var_decl_stmt
 destructure_stmt
             <- "(" (destructure_binding ("," destructure_binding)*)? ")"
                "=" expr ";"
+
 
 destructure_binding
             <- tuple_pattern

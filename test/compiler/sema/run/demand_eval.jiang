@@ -30,6 +30,10 @@ import comptime_evaluator = "../../../../src/compiler/sema/comptime/evaluator.ji
 import sema_diagnostics = "../../../../src/compiler/sema/diagnostics.jiang";
 
 public Int run() {
+    check_alias_callback();
+    check_local_const_instances();
+    check_local_const_instances(true);
+    check_local_const_cycle();
     check_init_defaults();
     check_demand();
     check_invalid_definition();
@@ -62,13 +66,103 @@ public Int run() {
     return 0;
 }
 
+#doc 非 CLI 调用方使用同一个必填回调求得 namespace，重复 ensure 不重复发布 import。
+public Void check_alias_callback() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    UInt8[]& text = "alias selected = if (true) { import build } else { import missing };";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("alias_callback", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected", .alias_name);
+    assert(resolver.ensure_declaration_signature(ctx$.mut_ref(), graph$.mut_ref(), selected));
+    assert(ctx.store.defs.get(selected).domain == .namespace_name);
+    assert(ctx.store.model.def_alias_target(selected) != null);
+    Int imports = ctx.store.resolve.module_ref(graph.root_module).imports.len();
+    assert(imports == 1);
+    assert(resolver.ensure_declaration_signature(ctx$.mut_ref(), graph$.mut_ref(), selected));
+    assert(ctx.store.resolve.module_ref(graph.root_module).imports.len() == imports);
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+#doc 从未封闭 graph 自动推进泛型局部 const 依赖，不由测试预先 lower、执行或发布结果。
+Void check_local_const_instances(Bool type_parameter = false) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    UInt8[]& text! = "Int selected<N: const Int>() { const Int a = N + 1; const b = a * 2; b }";
+    if (type_parameter) {
+        text = "Int selected<T>() { const Int a = T$.size(); const b = a * 2; b }";
+    }
+    source.SourceId source_id = ctx.store.sources.intern_virtual("local_const_instances", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    Int index! = 0;
+    while (index < 3) {
+        Int n! = 2;
+        if (index == 1) { n = 7; }
+        generic_args.clear();
+        Int expected! = (n + 1) * 2;
+        if (type_parameter) {
+            qid.TypeId argument! = ctx.store.types.int8_type();
+            expected = 2;
+            if (index == 1) { argument = ctx.store.types.int64_type(); expected = 16; }
+            generic_args.add(types.generic_type_arg(argument));
+        } else {
+            generic_args.add(types.generic_const_arg(value.ComptimeValue(
+                type_id: ctx.store.types.int_type(), data: .int_value(n))));
+        }
+        value.ComptimeValue? result = compilation.evaluate_function(
+            ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(), selected, generic_args.slice(), args.slice());
+        if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+        assert(result != null);
+        guard result$.some().data is .int_value(actual) else { assert(false); return; }
+        assert(actual == expected);
+        if (index == 0) { assert(ctx.jil.program.globals.len() == 2); }
+        else { assert(ctx.jil.program.globals.len() == 4); }
+        index = index + 1;
+    }
+    assert(ctx.jil.program.runtime_global_count() == 0 && ctx.jil.program.mono_item_count() == 0);
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+#doc 泛型 const 经函数调用回到自身时按表达式实例检测循环；失败请求不重复报告或执行。
+Void check_local_const_cycle() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
+        compilation.evaluate_source_expression, use_source_artifacts: false);
+    UInt8[]& text = "Int selected<N: const Int>() { const Int a = selected<N>(); a }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual("local_const_cycle", text);
+    syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx$.mut_ref(), parsed.take_unit());
+    assert(resolver.prepare_root_entry_environment(ctx$.mut_ref(), graph$.mut_ref()));
+    qid.DefId selected = named_def(ctx$.ref(), graph.root_module, "selected");
+    list.ArrayList<types.GenericArg> generic_args! = list.ArrayList<types.GenericArg>();
+    generic_args.add(types.generic_const_arg(value.ComptimeValue(
+        type_id: ctx.store.types.int_type(), data: .int_value(2))));
+    list.ArrayList<value.ComptimeValue> args! = list.ArrayList<value.ComptimeValue>();
+    assert(compilation.evaluate_function(ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()) == null);
+    assert(has_diagnostic(ctx$.ref(), "comptime_dependency_cycle"));
+    Int diagnostics = ctx.store.diagnostics.len();
+    assert(compilation.evaluate_function(ctx$.mut_ref(), resolver$.mut_ref(), graph$.mut_ref(),
+        selected, generic_args.slice(), args.slice()) == null);
+    assert(ctx.store.diagnostics.len() == diagnostics && ctx.jil.program.globals.empty());
+}
+
 #doc
     按需求值显式 init，字段默认表达式及其调用依赖必须先准备，再执行用户语句。
 #end
 Void check_init_defaults() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder text! = std.StringBuilder();
     text.append("Int initial() { 123 } struct Options { Int number! = initial(); ");
@@ -118,7 +212,7 @@ Void check_condition_callback() {
 Void check_const_lowering_requires_value() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int chosen = 1 + 2; Int selected() { chosen }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("const_lowering_requires_value", text);
@@ -145,7 +239,7 @@ Void check_const_lowering_requires_value() {
 Void check_const_query_outcome(Bool fail) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int chosen = 7;";
     source.SourceId source_id = ctx.store.sources.intern_virtual("const_query_outcome", text);
@@ -193,7 +287,7 @@ Void check_const_query_outcome(Bool fail) {
 Void check_const_cycle(UInt8[]& text) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     source.SourceId source_id = ctx.store.sources.intern_virtual("const_cycle", text);
     syntax.SyntaxResult parsed! = syntax.parse_source(ctx$.mut_ref(), text, source_id);
@@ -215,14 +309,15 @@ Void check_const_cycle(UInt8[]& text) {
 }
 
 #doc 用测试回调直接提供字面量条件，不启动编译求值调度。
-Bool? literal_condition(
+value.ComptimeValue? literal_condition(
     context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
-    module_graph.ModuleGraph&! graph, sem.NodeId root
+    module_graph.ModuleGraph&! graph, sem.NodeId root, qid.TypeId expected
 ) {
     assert(ctx.store.typeck.node_type(root) == null);
+    assert(expected == ctx.store.types.bool_type());
     guard ctx.store.model.node(root).data is .literal(literal) else { assert(false); return null; }
-    guard literal.value is .bool_value(value) else { assert(false); return null; }
-    return value;
+    guard literal.value is .bool_value(boolean) else { assert(false); return null; }
+    return value.ComptimeValue(type_id: expected, data: .bool_value(boolean));
 }
 
 #doc
@@ -231,7 +326,7 @@ Bool? literal_condition(
 Void check_generic_expression() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "Int bytes<T>() { T$.size() } Int other<T>() { T$.size() }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("generic_expression_eval", text);
@@ -280,7 +375,7 @@ Void check_generic_expression() {
 Void check_generic_expression_dependencies() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder text! = std.StringBuilder();
     text.append("struct Box<T>: Movable { Int*! total; T? marker; ");
@@ -329,7 +424,7 @@ Void check_generic_expression_dependencies() {
 Void check_unbound_expression() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "Int selected<A: const Int, B: const Int>() { A }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("unbound_expression", text);
@@ -354,7 +449,7 @@ Void check_unbound_expression() {
 Void check_source_const_bindings(Int mode) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "Int selected<A: const Int, B: const Int>() { A }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("source_const_bindings", text);
@@ -413,7 +508,7 @@ Void check_source_const_bindings(Int mode) {
 Void check_string_const() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const UInt8[]& version = \"33.0\"; @life() UInt8[]& selected() { version }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("string_const_eval", text);
@@ -434,7 +529,7 @@ Void check_string_const() {
 Void check_conditional_import() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& dependency_text = "public Int number() { 9 }";
     source.SourceId dependency = ctx.store.sources.intern_virtual("selected_condition_dep", dependency_text);
@@ -475,7 +570,7 @@ Void check_conditional_import() {
 Void check_source_condition(Bool expected) {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& dependency_text = "public Int number() { 7 }";
     source.SourceId dependency = ctx.store.sources.intern_virtual("source_condition_dep", dependency_text);
@@ -518,7 +613,7 @@ Void check_source_condition(Bool expected) {
 Void check_invalid_source_condition() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int condition = 7;";
     source.SourceId source_id = ctx.store.sources.intern_virtual("invalid_source_condition", text);
@@ -542,7 +637,7 @@ Void check_invalid_source_condition() {
 Void check_nested_resolver_demand() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& dependency_text = "public Int number() { inner() } Int inner() { 6 }";
     source.SourceId dependency = ctx.store.sources.intern_virtual("nested_eval_dep", dependency_text);
@@ -582,7 +677,7 @@ Void check_nested_resolver_demand() {
 Void check_partial_drop() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder text! = std.StringBuilder();
     text.append("struct Resource: Movable { ");
@@ -687,7 +782,7 @@ Void check_partial_drop() {
 Void check_drop_dependency() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder text! = std.StringBuilder();
     text.append("struct Resource: Movable { Int value; Int*! drops; ");
@@ -768,7 +863,7 @@ Void check_drop_dependency() {
 Void check_nested_const() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.String source_text = string.concat(
         "const Int chosen = twice(3) + 1; Int twice(Int n) { identity<Int>(n * factor) } ",
@@ -811,7 +906,7 @@ Void check_nested_const() {
 Void check_const_final_sweep() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int sibling() { 4 }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("const_final_sweep", text);
@@ -848,7 +943,7 @@ Void check_const_final_sweep() {
 Void check_const_consumer() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int unused() { true }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("demand_const_consumer", text);
@@ -878,7 +973,7 @@ Void check_const_consumer() {
 Void check_expression() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "const Int chosen = twice(3) + 1; Int twice(Int n) { n * 2 } Int unused() { true }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("demand_eval_expression", text);
@@ -928,7 +1023,7 @@ Void check_expression() {
 Void check_expression_runtime_parameter() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     UInt8[]& text = "Int chosen(Int n) { n } Int local() { Int x = 3; x }";
     source.SourceId source_id = ctx.store.sources.intern_virtual("demand_eval_runtime_parameter", text);
@@ -972,7 +1067,7 @@ Bool has_diagnostic(context.CompilerContext& ctx, UInt8[]& code) {
 Void check_demand() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder dependency_source! = std.StringBuilder();
     dependency_source.append("struct Pair { public Int value; } ");
@@ -1028,7 +1123,7 @@ Void check_demand() {
 Void check_invalid_definition() {
     context.CompilerContext ctx! = context.CompilerContext();
     resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(
-        compilation.evaluate_condition, use_source_artifacts: false
+        compilation.evaluate_source_expression, use_source_artifacts: false
     );
     std.StringBuilder text! = std.StringBuilder();
     text.append("struct Resource { Int value; } struct Invalid: Copyable { Resource resource; } ");

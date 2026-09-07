@@ -710,13 +710,7 @@ Pair replace_left(Pair pair!) {
 ```jiang
 import build;
 
-comptime {
-    if (build.mode == .debug) {
-        Int validation_level() { 2 }
-    } else {
-        Int validation_level() { 1 }
-    }
-}
+const Int validation_level = if (build.mode == .debug) { 2 } else { 1 };
 ```
 
 构建模式只能由 `jiang --mode debug|release` 选择，程序不能在源码中修改它。
@@ -729,12 +723,28 @@ comptime {
 
 const 可以在局部声明，名字只在所在词法作用域有效。初始化结果必须是 comptime value，
 可以由结果推导类型，也可以显式标注类型。comptime block 的求值结果也属于 comptime value；
-字面量和常量运算不必额外包一层 comptime。块内 const 不会自动变成外部声明。
-需要局部变量、赋值或循环等语句来计算初始化值时，必须显式写 `comptime { ... }`，
-不能用普通 `{ ... }` 初始化块隐式要求编译期执行。
+字面量和常量运算不必额外包一层 comptime。comptime block 有自己的词法作用域，
+其中的 const 和局部变量不发布到外部 namespace；需要带出的结果通过返回值接收。
+这些位置共用一套 comptime 处理和求值逻辑，声明与 import 的位置合法性由类型检查判断，
+并不因此分成两套执行模式。
+
+条件导入通过 alias 接收 namespace 值，alias 初始化隐式在编译期执行：
 
 ```jiang
-const Int answer = comptime {
+alias provider = if (build.target.os == .macos) {
+    import "os/macos.jiang"
+} else {
+    import "os/other.jiang"
+};
+```
+
+分支中的 import 是尾表达式，不加分号；加分号会形成独立导入声明，要求直接处于 module namespace，
+不能放在这个局部 block 中。alias 声明本身要求直接处于 namespace 中。
+整个 const 初始化表达式都在编译期求值，可以直接使用函数调用和包含局部变量、赋值、
+循环的普通 block，不需要额外写 comptime。依赖泛型参数时，在具体实例中求值。
+
+```jiang
+const Int answer = {
     Int count! = 0;
     count = count + 1;
     count + 41
@@ -746,6 +756,8 @@ Int main() {
     answer - expected
 }
 ```
+
+const 声明只绑定一个名字，不支持 const 解构。可以先保存一个聚合常量，再读取其成员。
 
 ### 进程级 panic
 

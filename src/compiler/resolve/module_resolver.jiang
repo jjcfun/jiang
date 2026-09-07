@@ -16,6 +16,7 @@ import incremental_fingerprint = "../incremental/fingerprint.jiang";
 import source_graph = "../incremental/source_graph.jiang";
 import system_time = "../system/time.jiang";
 import sem = "../sema/model.jiang";
+import comptime_value = "../sema/comptime/value.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
 import source = "../source.jiang";
@@ -67,8 +68,8 @@ public struct ModelTiming: Copyable {
 // 跨 graph discovery、lang preparation 和 model lowering 保存的 owned state。
 // CompilerContext 只由每次操作创建的 ModuleResolvePhase 临时借用。
 public struct ModuleResolver: Movable {
-    RawFn<Bool?, context.CompilerContext&!, ModuleResolver&!, module_graph.ModuleGraph&!, sem.NodeId>
-        evaluate_condition;
+    RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
+        module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate_expression;
     map.WyHashMap<source.SourceId, ast.AstUnit> asts!;
     map.WyHashMap<qid.ModuleId, module_graph_builder.ModuleResolvePassState> module_states!;
     map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId> declaration_defs!;
@@ -85,15 +86,15 @@ public struct ModuleResolver: Movable {
     driver_options.CompileMode mode;
 
     public init(self,
-        RawFn<Bool?, context.CompilerContext&!, ModuleResolver&!, module_graph.ModuleGraph&!, sem.NodeId>
-            evaluate_condition,
+        RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
+            module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate_expression,
         UInt8[]& artifact_cache_dir = "build/cache",
         UInt64? compiler_version_hash = null,
         Bool use_source_artifacts = true,
         driver_options.CompileMode? mode = null,
         Bool timing_enabled = false
     ) {
-        self.evaluate_condition = evaluate_condition;
+        self.evaluate_expression = evaluate_expression;
         self.asts = map.WyHashMap<source.SourceId, ast.AstUnit>();
         self.module_states = map.WyHashMap<qid.ModuleId, module_graph_builder.ModuleResolvePassState>();
         self.declaration_defs = map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>();
@@ -142,10 +143,12 @@ public struct ModuleResolver: Movable {
             root = phase.lower_source_condition(graph, module_id, condition);
         }
         guard root is .some(node) else { return null; }
-        RawFn<Bool?, context.CompilerContext&!, ModuleResolver&!, module_graph.ModuleGraph&!, sem.NodeId> evaluate =
-            self.evaluate_condition;
-        guard evaluate(ctx$.mut_ref(), self$.mut_ref(), graph$.mut_ref(), node)
-            is .some(value) else { return null; }
+        RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
+            module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate = self.evaluate_expression;
+        qid.TypeId expected = ctx.store.types.bool_type();
+        guard evaluate(ctx$.mut_ref(), self$.mut_ref(), graph$.mut_ref(), node, expected)
+            is .some(result) else { return null; }
+        guard result.data is .bool_value(value) else { assert(false); return null; }
         ctx.store.resolve.set_condition_value(module_id, condition.to_index(), value);
         return value;
     }
@@ -387,10 +390,11 @@ struct ModuleResolvePhase: Movable {
         Int index! = 0;
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
-            if (self.ctx.store.resolve.module_ref(module_id).comptime_items.len() > 0) {
+            if (self.ctx.store.resolve.module_ref(module_id).has_comptime) {
                 source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
                 self.ensure_declarations(source_id);
                 if (!self.prepare_module_comptime(graph, module_id)) { graph.ok = false; return; }
+                if (!self.ensure_module_expression_aliases(graph, module_id)) { graph.ok = false; return; }
             }
             Int import_index! = 0;
             while (import_index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
@@ -405,6 +409,31 @@ struct ModuleResolvePhase: Movable {
         }
         module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
         builder.finish_module_graph(graph);
+    }
+
+    #doc 封闭模块图前发现表达式 alias 选中的模块，避免在固定的源码调度之外新增依赖。
+    Bool ensure_module_expression_aliases(
+        Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id
+    ) {
+        qid.DefId owner = self.ctx.store.resolve.module_ref(module_id).def_id;
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        Int index! = 0;
+        while (index < self.ctx.store.model.def_member_count(owner)) {
+            qid.DefId member = self.ctx.store.model.def_member_at(owner, index);
+            index = index + 1;
+            if (self.ctx.store.defs.get(member).kind != .alias_def) { continue; }
+            guard self.owner.declaration_items.get(member) is .some(item) else { continue; }
+            Bool expression! = false;
+            {
+                guard self.owner.asts.get(source_id) is .some(unit) else { continue; }
+                guard unit.get(item$.get()).data is .top_level_decl(top) else { continue; }
+                guard unit.get(top.body).data is .alias_decl(alias_decl) else { continue; }
+                guard alias_decl.target is .some(target) else { continue; }
+                expression = name_resolver.alias_expression(unit.get(target).data);
+            }
+            if (expression && !self.ensure_declaration_signature(graph, member)) { return false; }
+        }
+        return true;
     }
 
     public Bool prepare_root_entry_environment(
@@ -1606,7 +1635,8 @@ struct ModuleResolvePhase: Movable {
     }
 
     public sem.NodeId? lower_source_condition(
-        Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id, ast.AstId condition
+        Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id, ast.AstId condition,
+        qid.DefId? owner_def = null
     ) {
         if (self.ctx.store.resolve.module_ref(module_id).condition_roots.get(condition.to_index()) is .some(found)) {
             return found$.get();
@@ -1635,7 +1665,7 @@ struct ModuleResolvePhase: Movable {
                     pending_index = state.pending_import_index;
                     pending_declaration = state.pending_declaration;
                 } else if (!state.ctx.store.model.has_errors()) {
-                    root = model_lower.lower_source_expression(state$.mut_ref(), condition);
+                    root = model_lower.lower_source_expression(state$.mut_ref(), condition, owner_def);
                 }
             }
             if (pending_module is .some(import_module)) {
@@ -1654,6 +1684,58 @@ struct ModuleResolvePhase: Movable {
         return null;
     }
 
+    #doc
+        alias 表达式先求得导入引用，再发现选中模块；未选中路径不加入 import graph。
+        求值期间不持有 AST 借用，结果发布复用 NameResolver 的普通 alias 绑定。
+    #end
+    Bool ensure_alias_expression(Self&! self, module_graph.ModuleGraph&! graph,
+        qid.ModuleId module_id, qid.NamespaceId namespace_id, ast.AstId item_id, qid.DefId def_id) {
+        if (self.ctx.store.defs.get(def_id).kind != .alias_def
+            || self.ctx.store.model.def_alias_target(def_id) != null) { return true; }
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        ast.AliasData declaration!;
+        ast.AstId expression!;
+        token.Span span!;
+        def.Visibility visibility!;
+        {
+            guard self.owner.asts.get(source_id) is .some(unit) else { return false; }
+            guard unit.get(item_id).data is .top_level_decl(top) else { return true; }
+            guard unit.get(top.body).data is .alias_decl(alias_decl) else { return true; }
+            guard alias_decl.target is .some(target) else { return true; }
+            if (!name_resolver.alias_expression(unit.get(target).data)) { return true; }
+            declaration = alias_decl;
+            expression = target;
+            span = unit.get(top.body).span;
+            visibility = self.ctx.store.defs.get(def_id).visibility;
+        }
+        guard self.lower_source_condition(graph, module_id, expression, def_id) is .some(root) else { return false; }
+        RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
+            module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate = self.owner.evaluate_expression;
+        qid.TypeId expected = self.ctx.store.types.namespace_type();
+        guard evaluate(self.ctx$.mut_ref(), self.owner$.mut_ref(), graph$.mut_ref(), root, expected)
+            is .some(value) else { return false; }
+        guard value.data is .import_value(origin, path, file_path) else { return false; }
+        Int index = self.ctx.store.resolve.module_ref(origin).imports.len();
+        store.ImportKind kind! = .package_import;
+        if (file_path) { kind = .file_import; }
+        self.ctx.store.resolve.add_import(origin, store.ImportRecord(
+            kind: kind, state: .unresolved, span: span, visibility: visibility, flatten: false,
+            path_symbol: path, alias_symbol: self.ctx.store.defs.get(def_id).name.symbol,
+            target_module: null, alias_def: def_id));
+        guard self.ensure_lookup_import_target(graph, origin, index) is .some(target_module) else { return false; }
+        qid.DefId target_def = self.ctx.store.resolve.module_ref(target_module).def_id;
+        {
+            guard self.owner.asts.get(source_id) is .some(unit) else { return false; }
+            resolve_state.AstResolveState state! = resolve_state.AstResolveState(
+                self.ctx$.mut_ref(), unit, self.owner.declaration_defs$.mut_ref(),
+                self.owner.declaration_items$.mut_ref(), self.owner.declaration_containers$.mut_ref(),
+                module_id, namespace_id);
+            name_resolver.NameResolver resolver! = name_resolver.NameResolver(state$.mut_ref());
+            resolver.bind_expression_alias(def_id, declaration.name, target_def, visibility, span);
+        }
+        return !self.ctx.store.model.has_errors();
+    }
+
     Bool resolve_and_lower_declaration(
         Self&! self,
         source.SourceId source_id,
@@ -1665,6 +1747,7 @@ struct ModuleResolvePhase: Movable {
         Bool signature_only,
         module_graph.ModuleGraph&! graph
     ) {
+        if (!self.ensure_alias_expression(graph, module_id, namespace_id, item_id, def_id)) { return false; }
         while (true) {
             qid.ModuleId? pending_module! = null;
             Int pending_index! = -1;

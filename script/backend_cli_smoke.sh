@@ -24,6 +24,18 @@ assert_file_matches() {
   return 1
 }
 
+# 平台模块只能发布所选入口，不能同时带入其他 ABI 的入口符号。
+assert_startup_entry() {
+  local path="$1"
+  local expected="$2"
+  local entries
+  entries="$(grep -E '^define .*@(main|__main_void|_start)\(' "$path" | sed -E 's/.*@([^ (]+)\(.*/\1/' || true)"
+  if [ "$entries" != "$expected" ]; then
+    echo "unexpected startup entry in $path: expected '$expected', got '$entries'" >&2
+    return 1
+  fi
+}
+
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
 
@@ -227,6 +239,7 @@ fi
 
 "$compiler_bin" --target arm64-apple-macosx --emit-llvm -o "$macos_target_ll" "$sample"
 test -s "$macos_target_ll"
+assert_startup_entry "$macos_target_ll" main
 grep -q 'target triple = "arm64-apple-macosx11.0.0"' "$macos_target_ll"
 grep -q 'target datalayout = ' "$macos_target_ll"
 "$compiler_bin" --target arm64-apple-macosx --emit-obj -o "$macos_target_obj" "$sample"
@@ -239,6 +252,7 @@ fi
 
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$linux_target_ll" "$sample"
 test -s "$linux_target_ll"
+assert_startup_entry "$linux_target_ll" main
 grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$linux_target_ll"
 grep -q 'target datalayout = ' "$linux_target_ll"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$linux_target_obj" "$sample"
@@ -247,6 +261,7 @@ assert_file_matches "$linux_target_obj" "ELF 64-bit.*x86-64"
 
 "$compiler_bin" --target aarch64-unknown-linux-gnu --emit-llvm -o "$linux_aarch64_target_ll" "$sample"
 test -s "$linux_aarch64_target_ll"
+assert_startup_entry "$linux_aarch64_target_ll" main
 grep -q 'target triple = "aarch64-unknown-linux-gnu"' "$linux_aarch64_target_ll"
 grep -q 'target datalayout = ' "$linux_aarch64_target_ll"
 "$compiler_bin" --target aarch64-unknown-linux-gnu --emit-obj -o "$linux_aarch64_target_obj" "$sample"
@@ -260,6 +275,7 @@ grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_ll"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
   --emit-llvm -o "$system_fs_linux_no_libc_ll" "$system_fs_sample"
 test -s "$system_fs_linux_no_libc_ll"
+assert_startup_entry "$system_fs_linux_no_libc_ll" _start
 grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_no_libc_ll"
 if grep -Eq "^declare .*@(getenv|posix_spawn|opendir|memcpy|memset)\\b" "$system_fs_linux_no_libc_ll"; then
   echo "unexpected hosted/libc symbol in linux no-libc system provider LLVM output" >&2
@@ -268,6 +284,7 @@ fi
 
 "$compiler_bin" --target x86_64-pc-windows-msvc --emit-llvm -o "$windows_target_ll" "$sample"
 test -s "$windows_target_ll"
+assert_startup_entry "$windows_target_ll" main
 grep -q 'target triple = "x86_64-pc-windows-msvc"' "$windows_target_ll"
 grep -q 'target datalayout = ' "$windows_target_ll"
 "$compiler_bin" --target x86_64-pc-windows-msvc --emit-obj -o "$windows_target_obj" "$sample"
@@ -276,6 +293,7 @@ assert_file_matches "$windows_target_obj" "COFF"
 
 "$compiler_bin" --target wasm32-unknown-unknown --emit-llvm -o "$wasm_target_ll" "$sample"
 test -s "$wasm_target_ll"
+assert_startup_entry "$wasm_target_ll" ""
 grep -q 'target triple = "wasm32-unknown-unknown"' "$wasm_target_ll"
 grep -q 'target datalayout = ' "$wasm_target_ll"
 "$compiler_bin" --target wasm32-unknown-unknown --emit-obj -o "$wasm_target_obj" "$sample"
@@ -284,6 +302,7 @@ assert_file_matches "$wasm_target_obj" "WebAssembly"
 
 "$compiler_bin" --target wasm32-wasi --emit-llvm -o "$wasi_target_ll" "$sample"
 test -s "$wasi_target_ll"
+assert_startup_entry "$wasi_target_ll" __main_void
 grep -q 'target triple = "wasm32-wasip1"' "$wasi_target_ll"
 grep -q 'target datalayout = ' "$wasi_target_ll"
 "$compiler_bin" --target wasm32-wasi --emit-obj -o "$wasi_target_obj" "$sample"

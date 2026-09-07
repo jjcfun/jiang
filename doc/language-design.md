@@ -1639,15 +1639,21 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
   函数。依赖尚未由当前 source-selection 路径选中的 declaration 时，不猜测分支；对应查询状态输出
   不可达或依赖循环诊断。
 - eval 不隐式执行 IO，不读取运行期变量；在编译期执行内部声明、初始化和修改的局部变量不属于运行期状态。
-- const 可以在模块或局部作用域中声明，遵守普通词法作用域。comptime 块及其条件分支中的
-  const 仅在所在 block 内有效，不隐式提升或发布到外层 namespace。
+- comptime 在各个位置使用统一的处理和求值流程，并具有自己的普通词法作用域；块内 const
+  和局部变量不发布到外部 namespace。结果通过块的返回值带出，外部声明决定绑定位置。
+  声明位置由统一语义检查判断，不为 import 和 alias 分别维护作用域解析流程。
+- alias 声明必须直接位于 namespace 中，初始化表达式隐式在编译期求值。
+  `import "path"` 表达式产生 namespace 值，可作为 if 分支或 comptime block 的结果。
+  独立的 `import "foo.jiang";` 默认绑定名字 foo，额外要求直接位于 module namespace；
+  该规则不限制初始化表达式内部的 import 求值。独立 import 不因位于 comptime 中而穿透局部作用域。
 - `const foo = expr` 要求初始化结果是 comptime value；允许由初始化结果推导类型，也可显式
-  写出类型。初始化使用常量表达式，或显式 comptime block 的求值结果。
-  字面量和常量运算不必包一层 comptime；包含局部变量、赋值、循环等语句的初始化计算必须
-  显式写 comptime block，普通 block 不因出现在 const 初始化位置就隐式进入编译期执行。
+  写出类型。整个初始化表达式处于隐式 comptime 上下文，函数调用和包含局部变量、赋值、
+  循环的 block 表达式也在编译期执行，不要求额外写 comptime。
+  依赖泛型参数的初始化表达式在具体实例中求值，不同实例不共享一个具体结果。
   普通运行期变量不能因被 const 初始化器引用就自动变成编译期值。
 - comptime block 可以返回值，外部 const 通过初始化表达式接收该结果，名字归属由外部声明
   的位置决定。局部计算使用同一次执行中的存储和生命周期；结果不得保留对已结束局部存储的引用。
+- const 声明只绑定单个名字，不支持 const 解构；聚合常量可通过成员读取参与后续常量计算。
 - import 的位置要求独立于 const 和 comptime 块的词法作用域规则；不能用 import 的限制
   禁止局部编译期计算。
 - eval、普通 const、数组长度、const generic 和 enum discriminant 共用 JIL 求值，generate 也复用
@@ -1659,19 +1665,18 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 ```jiang
 import build;
 
-comptime {
-    if (build.target.os == .macos) {
-        import provider = "os/macos.jiang";
-    } else if (build.target.os == .linux) {
-        import provider = "os/linux.jiang";
-    } else {
-        import provider = "os/unsupported.jiang";
-    }
-}
+alias provider = if (build.target.os == .macos) {
+    import "os/macos.jiang"
+} else if (build.target.os == .linux) {
+    import "os/linux.jiang"
+} else {
+    import "os/unsupported.jiang"
+};
 ```
 
-这里 `if` 仍然是普通 Jiang `if`，区别只是它处在 `comptime` block 内，因此 condition
-必须能 const eval 为 `Bool`。
+这里 `if` 是普通 Jiang 表达式；alias 初始化隐式编译期求值，condition 必须能求得 Bool。
+只有选中的导入路径进入模块依赖图。分支末尾加分号会形成独立导入声明，因所在位置是局部
+block 而诊断，不把这种写法解释成静默丢弃 namespace 值。
 
 编译器提供 `build` virtual package 承载本次构建的编译期信息。`build` 下直接平铺常用 facts，
 不引入 `BuildInfo` 总结构。目标形态包括 `build.target`、后续的 `build.mode`、
