@@ -114,6 +114,8 @@ line/block header）：
   expression、statement、declaration/member、type、pattern 和 annotation 位置。
 - provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
 - DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
+- Provider 的 `import_expression()` 接收包名或文件路径字面量，构造返回 namespace 的表达式；
+  可用于条件分支和 `alias_declaration()` 的表达式目标，构造时不加载导入模块。
 - Provider 的 `declarations()` 只组合声明，不引入作用域或执行。`comptime_block()` 接收局部语句
   和可选尾表达式，遵循普通 comptime 的词法作用域与求值规则；条件使用普通 `if_expression()` 组合，
   不提供向外发布分支声明的专用 comptime-if 机制。

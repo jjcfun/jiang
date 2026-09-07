@@ -2907,6 +2907,11 @@ provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider
 取得生成结果。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续走普通
 resolve、type check、JIL 和 backend。
 
+`Parser.import_expression(span, package_name)` 或 `Parser.import_expression(span, string_path)`
+构造返回 namespace 的导入表达式；文件路径使用字符串字面量的内容，不包含源码引号。
+结果可交给 `if_expression()`、`comptime_block()` 或 `alias_declaration()`，
+模块加载和编译期求值仍由普通编译流程完成，不在 Provider 构造语法时执行。
+
 当前限制：
 
 - 只支持 block invocation：`#alias { ... }`
