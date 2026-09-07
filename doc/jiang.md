@@ -730,6 +730,10 @@ const 可以在局部声明，名字只在所在词法作用域有效。初始�
 
 条件导入通过 alias 接收 namespace 值，alias 初始化隐式在编译期执行：
 
+具名导入写作 `alias foo = import "foo.jiang";`；展开模块公开名字写作
+`alias * = import "foo.jiang";`，加 `public` 可将这些名字继续转导出。
+展开仍遵守可见性和重名冲突规则，不复制目标声明。
+
 ```jiang
 alias provider = if (build.target.os == .macos) {
     import "os/macos.jiang"

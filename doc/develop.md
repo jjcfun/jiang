@@ -73,6 +73,28 @@ previous stable
 release 分支保留自己的线性提交历史；bootstrap 分支只提供编译下一阶段所需的过渡编译器。
 各阶段必须使用独立 build 目录，不混用编译产物。
 
+### 固定自举输入与重复构建
+
+每个阶段使用固定的源码 commit/tag，并保留种子编译器、LLVM/linker 的版本及文件哈希。
+分支名、未提交的工作区和临时编译器路径不能单独标识可复现输入。构建期间不要修改源码。
+
+导入表达式迁移使用 `bootstrap/0.5.4` 过渡阶段：该阶段保留 stable 可编译的系统模块语法，
+由 0.5.3 stable 构建；下一阶段使用其 `0.5.4-bootstrap` 产物：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+BUILD_DIR="$PWD/build/repro-a" \
+COMPILER_BUILD_MODE=release BOOTSTRAP_DEPTH=stable VERIFY=none \
+bash script/build_next.sh
+```
+
+重复构建时更换为独立的 `BUILD_DIR`，保持其余输入一致；逐阶段比较同名产物。
+`jiangc.next` 和 `jiangc` 的不同文件名可能影响平台签名，不能用二者直接比较代替同名重建验证。
+逐字节比较失败时应定位差异，不默认忽略签名或其他元数据。
+`VERIFY=none` 仅用于分离构建验证与测试执行，不替代正式发布的完整测试。
+可复现构建也不等于无后门证明，不能替代独立工具链验证。
+
 ### 0.5.3 enum ADT 过渡
 
 0.5.3 用 payload enum 替代普通 tagged union，并在 compiler 源码中使用 builtin `#doc`。
