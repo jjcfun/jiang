@@ -5,6 +5,28 @@
 
 ## 常规开发
 
+### 0.5.4 导入表达式过渡
+
+`bootstrap/0.5.4` 保留上一阶段的系统模块写法，提供下一阶段使用的导入表达式和 JIL 求值能力。
+从安装的 0.5.3 stable 构建本阶段，LLVM 使用项目固定的 22.1.8 工具链：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.3 \
+COMPILER_BUILD_MODE=release VERIFY=none bash script/build_next.sh
+```
+
+本阶段输出版本为 `0.5.4-bootstrap`。在下一阶段的独立 worktree 中构建并自编译：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+COMPILER_BUILD_MODE=release BOOTSTRAP_DEPTH=stable VERIFY=none \
+bash script/build_next.sh
+```
+
+复现时必须使用固定的源码 commit/tag，不能把分支名或留存的临时二进制当作固定输入。
+两个阶段不共享构建目录；上述 `VERIFY=none` 只跳过测试，不代表已经满足发布验证门槛。
+
 当前 0.5.3 release 源码已经使用 builtin `#doc`，使用 `bootstrap/0.5.3` 产出的 next：
 
 ```bash

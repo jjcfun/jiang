@@ -1,8 +1,7 @@
-// Semantic Model generic body template 的 artifact 编解码。
-//
-// `.ji` 里的 generic template 不能保存 session-local ID。这里编码 owner-local
-// Semantic Model graph：NodeId 只写 local_index，外部 DefId 写 stable id，local DefId
-// 通过 symbol 重建。span/source offset 不进入 payload。
+#doc(module)
+    Semantic Model 泛型 body 的 artifact 编解码；节点保存 owner-local 编号，声明保存
+    stable id，局部引用保存所属函数及 local 编号。span/source offset 不进入 payload。
+#end
 
 import context = "../context.jiang";
 import sem = "../sema/model.jiang";
@@ -95,7 +94,7 @@ enum TemplateLiteralKind {
 @life()
 public UInt8[]& encode_body(context.CompilerContext& ctx, sem.Def& model_def) {
     TemplateWriter writer! = TemplateWriter(ctx);
-    writer.write_bytes("jiang.sem-template.v8");
+    writer.write_bytes("jiang.sem-template.v10");
     writer.write_def(model_def.def_id);
     writer.write_body(model_def);
     if (!writer.ok) {
@@ -111,7 +110,7 @@ public UInt8[]& encode_expression(
     sem.NodeId root
 ) {
     TemplateWriter writer! = TemplateWriter(ctx);
-    writer.write_bytes("jiang.sem-expression.v5");
+    writer.write_bytes("jiang.sem-expression.v7");
     writer.write_def(model_def.def_id);
     writer.write_model_id(root);
     writer.write_nodes(model_def);
@@ -151,9 +150,9 @@ public TemplateDecodeResult decode_body_result(
     sem.NodeId root = reader.read_model_id();
     sem.Body body! = sem.Body(owner_def, root);
     reader.read_locals(body$.mut_ref());
+    reader.load_body(body);
     reader.read_nodes();
     if (!reader.ok) { return reader.decode_result(); }
-    reader.load_body(body);
     return reader.decode_result();
 }
 
@@ -163,7 +162,7 @@ public sem.NodeId? decode_expression(
     UInt8[]& bytes
 ) {
     TemplateReader reader! = TemplateReader(store, owner_def, bytes);
-    if (!reader.read_magic("jiang.sem-expression.v5")) { return null; }
+    if (!reader.read_magic("jiang.sem-expression.v7")) { return null; }
     reader.skip_owner_def();
     Int node_base = store.model.def_ref(owner_def).nodes.len();
     reader.begin_nodes(node_base);
@@ -229,7 +228,7 @@ struct TemplateReader: Movable {
     }
 
     Bool read_header(Self&! self) {
-        return self.read_magic("jiang.sem-template.v8");
+        return self.read_magic("jiang.sem-template.v10");
     }
 
     Bool read_magic(Self&! self, UInt8[]& magic) {
@@ -600,13 +599,15 @@ struct TemplateReader: Movable {
         list.ArrayList<sem.LambdaParam> params = self.read_lambda_param_list();
         list.ArrayList<sem.LambdaCapture> captures = self.read_lambda_capture_list();
         qid.DefId function_def = self.read_def();
-        sem.NodeId body = self.read_model_id();
+        if (self.ok) {
+            sem.Def&! function = self.model_defs.get_mut(function_def)$.some();
+            function.decl.is_lambda_function = true;
+        }
         return sem.Lambda (
             param_count: param_count,
             params: self.freeze_lambda_params(params),
             captures: self.freeze_lambda_captures(captures),
-            function_def: function_def,
-            body: body
+            function_def: function_def
         );
     }
 
@@ -643,7 +644,8 @@ struct TemplateReader: Movable {
     sem.Let read_let(Self&! self) {
         sem.LocalId local_id = sem.LocalId.from_index(self.read_int());
         sem.NodeId? initializer = self.read_optional_model_id();
-        return sem.Let (local_id: local_id, initializer: initializer);
+        Bool is_const = self.read_bool();
+        return sem.Let (local_id: local_id, initializer: initializer, is_const: is_const);
     }
 
     sem.Destructure read_destructure(Self&! self) {
@@ -1062,7 +1064,19 @@ struct TemplateReader: Movable {
             self.ok = false;
             return qid.DefId.from_index(0);
         }
-        return self.create_local_def(self.read_symbol());
+        qkey.StableSymbolId owner = qkey.StableSymbolId(self.read_u64(), self.read_u64());
+        Int local_index = self.read_int();
+        guard self.incremental.current_def_for_stable(owner) is .some(owner_def) else {
+            self.missing_stable_id = owner;
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
+        sem.Def& owner_model = self.model_defs.get(owner_def)$.some();
+        guard owner_model.body is .some(ref _ body) else {
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
+        return body.locals.get_index(local_index).def_id;
     }
 
     qid.SymbolId read_symbol(Self&! self) {
@@ -1444,6 +1458,7 @@ struct TemplateWriter: Movable {
             self.write_int(Int(TemplateLiteralKind.null_value));
             return;
         }
+        if (literal.value is .import_value(_, _, _)) { self.ok = false; }
         self.write_int(Int(TemplateLiteralKind.unit_value));
     }
 
@@ -1466,13 +1481,13 @@ struct TemplateWriter: Movable {
             capture_index = capture_index + 1;
         }
         self.write_def(lambda.function_def);
-        self.write_model_id(lambda.body);
     }
 
     Void write_let(Self&! self, sem.Let let_stmt) {
         self.write_tag(Int(TemplateNodeTag.let_stmt));
         self.write_int(let_stmt.local_id.to_index());
         self.write_optional_model_id(let_stmt.initializer);
+        self.write_bool(let_stmt.is_const);
     }
 
     Void write_destructure(Self&! self, sem.Destructure destructure) {
@@ -1705,7 +1720,21 @@ struct TemplateWriter: Movable {
             return;
         }
         self.write_bool(false);
-        self.write_symbol(self.ctx.store.defs.get(def_id).name.symbol);
+        guard self.ctx.store.defs.get(def_id).owner_def is .some(owner) else {
+            self.ok = false;
+            return;
+        }
+        guard self.ctx.store.incremental.stable_id_for_def(owner) is .some(owner_stable) else {
+            self.ok = false;
+            return;
+        }
+        guard self.ctx.store.model.local_for_def(owner, def_id) is .some(local) else {
+            self.ok = false;
+            return;
+        }
+        self.write_u64(owner_stable.low);
+        self.write_u64(owner_stable.high);
+        self.write_int(local.to_index());
     }
 
     Void write_optional_symbol(Self&! self, qid.SymbolId? symbol_id) {

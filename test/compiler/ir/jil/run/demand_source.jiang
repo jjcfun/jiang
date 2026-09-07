@@ -1,6 +1,6 @@
 #doc(module)
     验证单函数检查与 source JIL 缓存、最终 sweep 复用及生成函数/静态表的运行期可达性。
-    不提前执行 JIL，也不把缓存中的适配器当成发射根。
+    实例常量按需执行、物化并隔离结果，不把编译期缓存中的函数或 global 当成发射根。
 #end
 
 import context = "../../../../../src/compiler/context.jiang";
@@ -13,17 +13,176 @@ import source = "../../../../../src/compiler/source.jiang";
 import syntax = "../../../../../src/compiler/syntax.jiang";
 import compilation = "../../../../../src/compiler/analysis.jiang";
 import references = "../../../../../src/compiler/jil/references.jiang";
+import bindings_api = "../../../../../src/compiler/sema/generic/bindings.jiang";
+import reporter = "../../../../../src/compiler/diagnostic/reporter.jiang";
+import types = "../../../../../src/compiler/sema/type.jiang";
+import comptime_value = "../../../../../src/compiler/sema/comptime/value.jiang";
+import backend_symbol = "../../../../../src/compiler/backend/symbol.jiang";
+import eval = "../../../../../src/compiler/jil/eval.jiang";
+import borrow = "../../../../../src/compiler/borrow_check.jiang";
+import drop_elaborate = "../../../../../src/compiler/jil/drop_elaborate.jiang";
 import token = "../../../../../src/compiler/syntax/token.jiang";
 import list = "../../../../../src/compiler/support/list.jiang";
 import std;
 
 public Int run() {
+    check_eval_dependency();
+    check_deferred_const_source("Int selected<N: const Int>() { const Int a = N + 1; const b = a * 2; b }", 2);
+    check_deferred_const_source("Int selected<T>() { const Int bytes = T$.size(); bytes }", 1);
     check_demand_and_sweep();
     check_invalid_body_is_not_lowered();
     check_generated_reachability();
     check_raw_fn_table_cache();
     check_closure_metadata();
     return 0;
+}
+
+#doc 合法泛型 const 在模板阶段保留已检查的初始化器与 JIL 依赖，不发布实例具体值。
+Void check_deferred_const_source(UInt8[]& text, Int expected) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.mut_ref(), "deferred_const_source", text);
+    qid.DefId selected = find_def(ctx$.ref(), graph.root_module, "selected");
+    jil.Store program! = jil.Store(true);
+    Bool ready = compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), program$.mut_ref(), selected);
+    if (!ready) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    assert(ready && !ctx.store.diagnostics.has_errors());
+    Int count! = 0;
+    Int index! = 0;
+    while (index < ctx.store.model.body_local_count(selected)) {
+        qid.DefId local = ctx.store.model.body_local_at(selected, index).def_id;
+        if (ctx.store.typeck.deferred_const_initializer(local) != null) {
+            assert(ctx.store.comptime_store.const_value(local) == null);
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    assert(count == expected);
+    references.References dependencies = references.collect_function_refs(program.program.source_function(selected));
+    assert(dependencies.eval_expressions.len() >= expected);
+    assert(dependencies.generated_functions.empty());
+    assert(program.program.mono_item_count() == 0);
+    assert(!program.program.has_pending_generated_functions());
+    if (expected == 2) {
+        Int dependency_index! = 0;
+        while (dependency_index < dependencies.eval_expressions.len()) {
+            jil.FunctionId expression = dependencies.eval_expressions.get(dependency_index);
+            dependency_index = dependency_index + 1;
+            references.References inputs = references.collect_function_refs(program.program.function(expression));
+            if (!inputs.eval_expressions.empty()) {
+                check_eval_result_cache(ctx$.mut_ref(), graph$.ref(), program$.mut_ref(),
+                    selected, inputs.eval_expressions.get(0));
+                return;
+            }
+        }
+        assert(false);
+    }
+}
+
+#doc 具体值索引复用函数实例身份，读取和发布都不会把编译期值自动提升为运行期发射根。
+Void check_eval_result_cache(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph,
+    jil.Store&! program, qid.DefId owner,
+    jil.FunctionId expression) {
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    qid.DefId parameter = ctx.store.model.def_generic_param_at(owner, 0);
+    args.add(types.generic_const_param_arg(parameter, comptime_value.ComptimeValue(
+        type_id: ctx.store.types.int_type(), data: .int_value(2))));
+    Int first = program.program.function_instance_identity(program.storage$.ref(), owner, args.slice());
+    comptime_value.ComptimeValue first_value = evaluate_test_expression(ctx, program, owner, expression, args.slice());
+    jil.GlobalId first_global = lower.materialize_eval_result(ctx.store$.mut_ref(), ctx.query$.mut_ref(),
+        ctx.output, graph, program, expression, first, first_value)$.some();
+    Int globals = program.program.globals.len();
+    assert(lower.materialize_eval_result(ctx.store$.mut_ref(), ctx.query$.mut_ref(),
+        ctx.output, graph, program, expression, first, first_value) == first_global);
+    assert(program.program.globals.len() == globals);
+    assert(program.program.eval_result_global(expression, args.slice()) == first_global);
+    args.set(0, types.generic_const_param_arg(parameter, comptime_value.ComptimeValue(
+        type_id: ctx.store.types.int_type(), data: .int_value(7))));
+    Int second = program.program.function_instance_identity(program.storage$.ref(), owner, args.slice());
+    assert(first != second);
+    assert(program.program.eval_result_global(expression, args.slice()) == null);
+    comptime_value.ComptimeValue second_value = evaluate_test_expression(ctx, program, owner, expression, args.slice());
+    jil.GlobalId second_global = lower.materialize_eval_result(ctx.store$.mut_ref(), ctx.query$.mut_ref(),
+        ctx.output, graph, program, expression, second, second_value)$.some();
+    assert(program.program.eval_result_global(expression, args.slice()) == second_global);
+    assert(program.program.eval_result_global(expression, first) == first_global);
+    std.String first_name = backend_symbol.global_symbol_name_for_ref(ctx, program,
+        jil.GlobalRef(id: first_global, type_id: ctx.store.types.int_type()));
+    std.String second_name = backend_symbol.global_symbol_name_for_ref(ctx, program,
+        jil.GlobalRef(id: second_global, type_id: ctx.store.types.int_type()));
+    assert(first_name != second_name);
+    references.References dependencies = references.collect_function_refs(program.program.source_function(owner));
+    Int index! = 0;
+    while (index < dependencies.eval_expressions.len()) {
+        jil.FunctionId dependent = dependencies.eval_expressions.get(index);
+        index = index + 1;
+        if (dependent == expression) { continue; }
+        check_eval_result_read(ctx, program, owner, dependent,
+            program.program.function_instance_at(first).args, 6);
+        check_eval_result_read(ctx, program, owner, dependent,
+            program.program.function_instance_at(second).args, 16);
+    }
+    assert(program.program.mono_item_count() == 0 && program.program.runtime_global_count() == 0);
+}
+
+#doc 后续初始化器通过实例绑定读取前一常量的静态结果，不重新执行或混用其他实例的值。
+Void check_eval_result_read(context.CompilerContext&! ctx, jil.Store&! program, qid.DefId owner,
+    jil.FunctionId expression, types.GenericArg[]& args, Int expected) {
+    comptime_value.ComptimeValue value = evaluate_test_expression(ctx, program, owner, expression, args);
+    guard value.data is .int_value(actual) else { assert(false); return; }
+    assert(actual == expected);
+}
+
+#doc 测试显式准备 borrow/drop 后调用同一执行器，返回真实表达式结果供物化或断言使用。
+comptime_value.ComptimeValue evaluate_test_expression(context.CompilerContext&! ctx, jil.Store&! program,
+    qid.DefId owner, jil.FunctionId expression, types.GenericArg[]& args) {
+    assert(borrow.run_function(ctx.store$.mut_ref(), ctx.query$.mut_ref(), program$.ref(),
+        .generated(jil.GeneratedFunctionTarget(id: expression, provenance_def: owner))));
+    bindings_api.GenericBindings empty! = bindings_api.GenericBindings();
+    bindings_api.GenericBindings bindings = bindings_api.bindings_for_instance(
+        ctx.store.defs$.ref(), ctx.store.model$.ref(), ctx.store.types$.ref(), owner, args, empty$.ref());
+    list.ArrayList<jil.FunctionId> glues = drop_elaborate.prepare_expression_drop_glues(
+        ctx.store$.ref(), ctx.query.layout$.mut_ref(), program.storage$.ref(), program.program$.mut_ref(),
+        program.drop_elaboration$.mut_ref(), expression, bindings$.ref());
+    assert(glues.empty());
+    comptime_value.ComptimeValue? result = eval.evaluate_expression(ctx, program$.ref(), expression, args);
+    if (result == null) { reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref()); }
+    return result$.some();
+}
+
+#doc 延迟求值是独立的值依赖，不能被收集成需要运行期发射的 generated 函数调用。
+Void check_eval_dependency() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.mut_ref(), "eval_dependency", "Int main() { 0 }");
+    qid.DefId main_def = find_def(ctx$.ref(), graph.root_module, "main");
+    jil.Store program! = jil.Store(true);
+    assert(compilation.ensure_source_function(ctx$.mut_ref(), graph$.ref(), program$.mut_ref(), main_def));
+    jil.Function function! = program.program.source_function(main_def);
+    jil.FunctionId expression = jil.FunctionId.from_index(17);
+    list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
+    statements.add(jil.Statement(span: function.span, kind: .assign_stmt(jil.AssignStatement(
+        destination: jil.local_place(function.body.return_local, program.storage.empty_projection()),
+        value: .use_value(jil.UseRvalue(value: .eval_operand(expression, ctx.store.types.int_type())))
+    ))));
+    jil.Block original = function.body.blocks[0];
+    jil.Block block = jil.Block(id: original.id, span: original.span,
+        statements: program.storage.statement_array(statements$.ref()), terminator: original.terminator);
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>();
+    blocks.add(block);
+    function = jil.function_with_body(function, jil.Body(
+        id: function.body.id, span: function.body.span, locals: function.body.locals,
+        blocks: program.storage.block_array(blocks$.ref()), entry: function.body.entry,
+        return_local: function.body.return_local
+    ));
+    references.References raw = references.collect_function_refs(function);
+    assert(raw.eval_expressions.len() == 1 && raw.eval_expressions.get(0) == expression);
+    assert(raw.functions.empty() && raw.generated_functions.empty());
+    bindings_api.GenericBindings bindings! = bindings_api.GenericBindings();
+    references.References concrete = references.collect_instance_function_refs(
+        ctx.store$.ref(), bindings$.ref(), function
+    );
+    assert(concrete.eval_expressions.len() == 1 && concrete.eval_expressions.get(0) == expression);
+    assert(concrete.functions.empty() && concrete.generated_functions.empty());
+    assert(program.program.mono_item_count() == 0);
 }
 
 #doc 闭包求值元数据不成为运行期根；重复准备复用表，最终 sweep 只发射实际调用的闭包。
@@ -280,7 +439,7 @@ module_graph.ModuleGraph^ lower_text_to_model(
     source.SourceId source_id = ctx.store.sources.intern_virtual(name, text);
     syntax.SyntaxResult parsed! = syntax.parse_source(ctx, text, source_id);
     assert(!parsed.has_errors());
-    resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_condition);
+    resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_source_expression);
     module_graph.ModuleGraph^ graph = resolver.build_module_graph(ctx, parsed.take_unit());
     assert(graph.ok);
     assert(resolver.lower_module_graph_to_model(ctx, graph$.ref()));

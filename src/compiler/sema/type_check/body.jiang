@@ -64,6 +64,8 @@ public struct BodyCheck: Movable {
     sem.NodeId? catch_value_call!;
     types.EffectSet current_effects!;
     qid.DefId? current_body_def!;
+    qid.TypeId? expression_result_type!;
+    qid.DefId? expression_owner!;
 
     public init(self, type_ops_mod.TypeOps type_ops) {
         self.type_ops = type_ops;
@@ -74,6 +76,8 @@ public struct BodyCheck: Movable {
         self.catch_value_call = null;
         self.current_effects = types.EffectSet();
         self.current_body_def = null;
+        self.expression_result_type = null;
+        self.expression_owner = null;
     }
 
     qid.TypeId check_pattern(
@@ -479,7 +483,7 @@ public struct BodyCheck: Movable {
         return type_id;
     }
 
-    Void check_const_initializer(Self&! self, qid.DefId def_id, sem.NodeId root) {
+    Void check_const_initializer(Self&! self, qid.DefId def_id, sem.NodeId root, Bool allow_deferred = false) {
         // JIL 不执行已经出错的程序；继续检查其他 body，但不把前置错误重复诊断为 const 非常量。
         if (self.type_ops.state.ctx.store.typeck.has_errors()) { return; }
         comptime_evaluator.ComptimeEvaluator evaluator! =
@@ -487,9 +491,13 @@ public struct BodyCheck: Movable {
         if (evaluator.ensure_const_value(def_id, root) is .some(_)) {
             return;
         }
+        if (allow_deferred && !self.type_ops.state.ctx.store.diagnostics.has_errors()) {
+            self.type_ops.state.ctx.store.typeck.defer_const_initializer(def_id, root);
+            return;
+        }
         self.type_ops.add_node_error(
             root,
-            "const initializer must be a compile-time literal",
+            "const initializer must produce a comptime value",
             "const_initializer_not_constant"
         );
     }
@@ -581,6 +589,8 @@ public struct BodyCheck: Movable {
     }
 
     public qid.TypeId check_expression(Self&! self, sem.NodeId root, qid.TypeId? expected) {
+        self.expression_owner = root.owner_def;
+        self.expression_result_type = expected;
         guard expected is .some(type_id) else { return self.check_node(root); }
         qid.TypeId actual = self.check_node_expected(root, type_id);
         if (!self.type_ops.value_assignable_to_expected(type_id, root, actual)) {
@@ -2873,7 +2883,10 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_return(Self&! self, sem.NodeId node_id, sem.Return return_stmt) {
-        qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(node_id.owner_def));
+        qid.TypeId expected! = self.success_result_type(self.type_ops.function_result_type(node_id.owner_def));
+        if (self.expression_owner == node_id.owner_def && self.expression_result_type is .some(result_type)) {
+            expected = result_type;
+        }
         if (return_stmt.value is .some(value)) {
             qid.TypeId value_type = self.check_node_expected(value, expected);
             self.type_ops.expect_value_assignable(
@@ -4920,6 +4933,36 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_let(Self&! self, sem.NodeId node_id, sem.Let let_stmt) {
+        qid.TypeId result = self.check_local_binding(node_id, let_stmt);
+        if (!let_stmt.is_const || self.type_ops.state.ctx.store.typeck.has_errors()) { return result; }
+        sem.Local local = self.type_ops.state.ctx.store.model.body_local_at(
+            node_id.owner_def, let_stmt.local_id.to_index());
+        if (local.mutable_binding) {
+            self.type_ops.add_node_error(node_id, "const binding cannot be mutable", "mutable_const_binding");
+            return result;
+        }
+        guard let_stmt.initializer is .some(initializer) else {
+            self.type_ops.add_node_error(node_id, "const requires an initializer", "const_requires_initializer");
+            return result;
+        }
+        self.check_const_initializer(local.def_id, initializer, self.owner_has_generic_parameters(node_id.owner_def));
+        return result;
+    }
+
+    #doc 沿已有 owner 链识别函数、成员及 trait 模板的实例参数，不另建泛型环境索引。
+    Bool owner_has_generic_parameters(self, qid.DefId owner) {
+        qid.DefId? pending! = owner;
+        while (pending is .some(current)) {
+            def.DefRecord record = self.type_ops.state.ctx.store.defs.get(current);
+            if (record.kind == .trait_def) { return true; }
+            if (self.type_ops.state.ctx.store.model.has_def(current)
+                && self.type_ops.state.ctx.store.model.def_generic_param_count(current) > 0) { return true; }
+            pending = record.owner_def;
+        }
+        return false;
+    }
+
+    qid.TypeId check_local_binding(Self&! self, sem.NodeId node_id, sem.Let let_stmt) {
         // let/local 的类型属于绑定本身，后续 name_ref.local 会从同一个
         // local def 读取这里写入的 TypeId。
         qid.TypeId value_type! = self.type_ops.state.ctx.store.types.unit_type();
@@ -5605,6 +5648,7 @@ public struct BodyCheck: Movable {
         self.check_pattern(destructure.pattern, initializer_type);
         return self.type_ops.state.ctx.store.types.unit_type();
     }
+
 
     Bool pattern_range_has_mutable_borrow(self, sem.NodeId[]& patterns) {
         Int index! = 0;
