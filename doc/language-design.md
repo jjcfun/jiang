@@ -45,7 +45,7 @@ UInt8[]& read_source(UInt8[]& file_path) {
     return file_path;
 }
 
-import store = "token_store.jiang";
+alias store = import "token_store.jiang";
 ```
 
 ## 词法
@@ -705,9 +705,9 @@ Task cancellation 不复用 panic。
 顶层声明包括：
 
 - `import name;`
-- `import alias = "path.jiang";`
+- `alias alias = import "path.jiang";`
 - `public import name;`
-- `public import alias = "path.jiang";`
+- `public alias alias = import "path.jiang";`
 - `alias Name = Type;`
 - `alias Name;`
 - `public alias exported = module.symbol;`
@@ -758,14 +758,14 @@ trait associated item 也可以使用同一形式表达编译期值约束，例�
 
 ```jiang
 import dep;
-import dep = "foo/bar.jiang";
+alias dep = import "foo/bar.jiang";
 ```
 
 `import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它会优先按当前 package
 manifest 的 `[dependencies]` alias 解析到依赖 package root；未命中 dependency 时，再按当前
 编译上下文中已登记的 module/package 名称解析。
 
-`import dep = "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
+`alias dep = import "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
 当前 import 所在源文件的目录为基准，绝对路径按原路径规范化。编译器只加载字面路径
 本身，不隐式补 `.jiang`，也不尝试目录入口 `mod.jiang`。
 
@@ -780,7 +780,7 @@ file import 省略 alias 时，默认使用路径 basename 去掉最后一个扩
 
 ```jiang
 import "foo.jiang";
-import foo = "foo.jiang";
+alias foo = import "foo.jiang";
 ```
 
 如果默认名字不是合法 Jiang identifier，必须显式提供 alias。显式和默认 alias 走相同的 import
@@ -1816,7 +1816,7 @@ if block is .some(Int dead!) {
 
 - `import` 只导入当前模块使用，不做 re-export。
 - `import dep;` 按 module/package 名称解析，并绑定模块命名空间 `dep`。
-- `import alias = "path.jiang";` 按当前文件目录相对路径解析，并绑定模块命名空间 `alias`。
+- `alias alias = import "path.jiang";` 按当前文件目录相对路径解析，并绑定模块命名空间 `alias`。
 - file import 必须显式写出目标文件路径，不隐式补扩展名或目录入口。
 - 被导入模块的 public API 通过 `module.Name` 访问，不默认平铺到当前模块。
 - `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块

@@ -38,7 +38,7 @@ UInt8[]& read_source(UInt8[]& file_path) {
     return file_path;
 }
 
-import store = "token_store.jiang";
+alias store = import "token_store.jiang";
 ```
 
 这样可以稳定区分类型和值：
@@ -2852,16 +2852,16 @@ public import "utils/math.jiang";
 math.max(100, 200);
 
 // 3.导入模块，并使用snake_case别名作为模块名
-public import math_utils = "utils/math.jiang";
+public alias math_utils = import "utils/math.jiang";
 math_utils.max(100, 200);
 
 // 4.导入模块后，可以通过alias为模块中的公开符号创建本地别名
-import math_utils = "utils/math.jiang";
+alias math_utils = import "utils/math.jiang";
 alias maximum = math_utils.max;
 maximum(100, 200);
 
 // 5.public alias会在当前模块中重新导出该符号
-import math_utils = "utils/math.jiang";
+alias math_utils = import "utils/math.jiang";
 public alias max = math_utils.max;
 public alias min = math_utils.min;
 
@@ -2871,9 +2871,9 @@ public alias min = math_utils.min;
 
 - `import "utils/math.jiang";` 会导入整个模块，并默认使用文件名 `math` 作为模块名
 - `public import "utils/math.jiang";` 会在导入模块的同时，将模块名 `math` 对外导出
-- 显式 `import alias = "..."` 中的 `alias` 约定使用 snake_case
-- `import math_utils = "utils/math.jiang";` 会导入模块并使用 snake_case 别名 `math_utils` 作为模块名
-- `public import math_utils = "utils/math.jiang";` 会导入模块并使用 `math_utils` 作为公开模块名
+- 显式 `alias alias = import "..."` 中的 `alias` 约定使用 snake_case
+- `alias math_utils = import "utils/math.jiang";` 会导入模块并使用 snake_case 别名 `math_utils` 作为模块名
+- `public alias math_utils = import "utils/math.jiang";` 会导入模块并使用 `math_utils` 作为公开模块名
 - `alias maximum = math_utils.max;` 会为符号创建一个当前模块内可见的别名
 - `public alias max = math_utils.max;` 会为符号创建一个公开别名，使其他模块可以通过当前模块访问该符号
 
@@ -3093,7 +3093,7 @@ struct SqlProvider: std.jiang.syntax.Provider {
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
 ```c
-import math_utils = "utils/math.jiang";
+alias math_utils = import "utils/math.jiang";
 
 alias maximum = math_utils.max;
 public alias minimum = math_utils.min;

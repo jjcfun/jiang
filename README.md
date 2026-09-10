@@ -14,15 +14,15 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 ## 安装发行版
 
-Jiang 0.5.3 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
+Jiang 0.5.4 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
 
 ```bash
-cd jiang-0.5.3-<platform>
+cd jiang-0.5.4-<platform>
 ./install.sh
 ```
 
 默认安装到 `~/.jiang`，主命令是 `jiang`；如有需要，把 `~/.jiang/bin` 加入 `PATH`。
-安装包和 SHA-256 校验文件见 [Jiang 0.5.3 release](https://github.com/jjcfun/jiang/releases/tag/0.5.3)。
+安装包和 SHA-256 校验文件见 [Jiang 0.5.4 release](https://github.com/jjcfun/jiang/releases/tag/0.5.4)。
 
 
 
@@ -79,48 +79,34 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.3 release 把普通 tagged union 迁移为 payload enum，并在 compiler 源码中使用 builtin
-`#doc`。0.5.2 stable 不能直接解析 release 编译器源码，因此冷启动使用一个最小过渡阶段：
+当前 0.5.4 源码使用显式入口、定义级反射与生成能力。严格冷启动链为：
 
 ```text
-0.5.2 stable
-  -> bootstrap/0.5.3 next
-  -> release/0.5.3 next
-  -> release/0.5.3 stable
+0.5.3 stable
+  -> bootstrap/0.5.4 next
+  -> release/0.5.4 next
+  -> release/0.5.4 stable
 ```
 
-先在 bootstrap worktree 中用已安装的 0.5.2 stable 只生成 next：
+先按[编译器开发流程](doc/develop.md)构建固定的 bootstrap 阶段，再在 release worktree 中运行：
 
 ```bash
-cd ../bootstrap-0.5.3
-bash ./script/build_next.sh
-```
-
-然后在 release worktree 中直接用 bootstrap next 构建 release next：
-
-```bash
-cd ../jiang
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
-bash ./script/build_next.sh
-```
-
-默认产出 `build/bin/jiangc.next` 并运行完整验证。需要进一步生成 release stable 时，使用：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+COMPILER_BUILD_MODE=release BOOTSTRAP_CHECK_MODE=strict \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
+
+产出 `build/bin/jiangc.next` 与 `build/bin/jiangc`，并运行完整验证。
 
 构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
-`build/bin/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。
+`build/bin/jiangc.next --version` 的输出。
 
-破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。其中记录 0.5.3 的完整
+破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。其中记录各版本的完整
 冷启动链、各阶段产物边界和历史版本复现流程。
 
 正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
@@ -231,7 +217,8 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
-- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)（当前版本）
+- [Jiang 0.5.4 release notes](doc/releases/0.5.4.md)（当前源码版本）
+- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)
 - [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)（上一版本）
 - [架构文档](doc/architecture.md)
 - [编译器开发流程](doc/develop.md)

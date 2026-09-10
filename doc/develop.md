@@ -5,30 +5,19 @@
 
 ## 常规开发
 
-当前 0.5.3 release 源码已经使用 builtin `#doc`，使用 `bootstrap/0.5.3` 产出的 next：
+当前 0.5.4 release 源码使用固定 `bootstrap/0.5.4` 阶段的 `0.5.4-bootstrap` 编译器：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+COMPILER_BUILD_MODE=release BOOTSTRAP_CHECK_MODE=strict \
+BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-发布后的常规开发应改用已安装的 0.5.3 stable。在下一版分支更新默认
-bootstrap 版本前，显式指定：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN="${JIANG_HOME:-$HOME/.jiang}/versions/0.5.3/bin/jiang" \
-bash ./script/build_next.sh
-```
-
-脚本会校验 bootstrap compiler 版本。需要使用其他兼容编译器时，可以显式指定：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=<version> \
-BOOTSTRAP_BIN=/path/to/compatible/jiangc \
-bash ./script/build_next.sh
-```
+bootstrap 阶段从 0.5.3 stable 开始，并须完成自身严格自举。固定各阶段源码与种子身份后，
+再构建 release 的 next 和 stable；不能用未记录的开发产物替换种子。
+发布后的后续开发可改用已安装的 0.5.4 stable，并显式设置 `BOOTSTRAP_RELEASE_VERSION=0.5.4`。
 
 bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
 清理该目录；current compiler 使用独立的
@@ -45,8 +34,8 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.3 \
-BOOTSTRAP_BIN=../bootstrap-0.5.3/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
