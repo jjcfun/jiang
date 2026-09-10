@@ -840,7 +840,7 @@ struct ModuleResolvePhase: Movable {
                 is .some(module_id) else {
                 return false;
             }
-            self.bind_import_aliases(module_id);
+            self.refresh_import_aliases(module_id);
             if (use_source) {
                 self.ctx.store.resolve.set_module_interface_only(module_id, false);
                 db.begin_source_observations(
@@ -3112,7 +3112,7 @@ struct ModuleResolvePhase: Movable {
                 index = index + 1;
                 continue;
             }
-            self.bind_import_aliases(module_id);
+            self.refresh_import_aliases(module_id);
             if (self.load_interface_without_source_schedule(module_id)) {
                 self.set_module_state(module_id, .interface_loaded);
             } else {
@@ -3461,11 +3461,6 @@ struct ModuleResolvePhase: Movable {
         self.ctx.store.model.mark_error();
     }
 
-    Void resolve_module_references(Self&! self, resolve_state.AstResolveState&! state) {
-        name_resolver.NameResolver resolver! = name_resolver.NameResolver(state);
-        resolver.resolve_references();
-    }
-
     public qid.ModuleId ensure_module(Self&! self, source.SourceId source_id) {
         module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
         return builder.ensure_module(source_id);
@@ -3502,188 +3497,18 @@ struct ModuleResolvePhase: Movable {
         self.owner.module_states.set(module_id, state);
     }
 
-    Void bind_import_aliases(Self&! self, qid.ModuleId module_id) {
-        Int import_count = self.ctx.store.resolve.module_ref(module_id).imports.len();
+    #doc 发现阶段已建立 alias 身份；目标模块恢复或重置后，只刷新它所指向的 namespace。
+    Void refresh_import_aliases(Self&! self, qid.ModuleId module_id) {
         Int index! = 0;
-        while (index < import_count) {
-            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(module_id).imports.get(index);
-            if (import_record.alias_def is .some(alias_def)) {
-                if (import_record.target_module is .some(target_module)) {
-                    self.refresh_import_alias_namespace(alias_def, target_module);
-                    self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
-                }
-                index = index + 1;
-                continue;
-            }
-            if (import_record.target_module is .some(target_module)) {
-                if (!import_record.flatten && !import_record.expression_import) {
-                    self.record_import_resolution(module_id, index, target_module);
-                }
-            }
-            index = index + 1;
+        while (index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+            store.ImportRecord record = self.ctx.store.resolve.module_ref(module_id).imports.get(index);
+            index += 1;
+            if (record.flatten || record.expression_import) { continue; }
+            guard record.target_module is .some(target) else { continue; }
+            qid.DefId alias_def = record.alias_def$.some();
+            qid.NamespaceId target_namespace = self.ctx.store.resolve.module_ref(target).namespace_id;
+            self.ctx.store.defs.set_owned_namespace(alias_def, target_namespace);
+            self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
         }
     }
-
-    // 兼容旧 artifact/import summary：若 graph discovery 尚未创建 alias
-    // skeleton，则在 declaration pass 补建；常规源码路径会复用已有 DefId。
-    Void record_import_resolution(Self&! self,
-        qid.ModuleId module_id,
-        Int import_index,
-        qid.ModuleId target_module
-    ) {
-        store.ImportRecord import_record = self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
-        Bool duplicate = self.import_alias_has_conflict(module_id, import_record);
-        qid.DefId alias_def = self.create_import_alias(
-            module_id,
-            import_record,
-            target_module,
-            duplicate
-        );
-        self.ctx.store.resolve.set_import_resolution(module_id, import_index, target_module, alias_def);
-        self.refresh_import_alias_namespace(alias_def, target_module);
-    }
-
-    // import alias 是目标 module namespace 的一个 view。target module 如果在
-    // artifact load/reset 后换了 namespace，这里同步 alias 的 namespace 指向。
-    Void refresh_import_alias_namespace(Self&! self, qid.DefId alias_def, qid.ModuleId target_module) {
-        qid.NamespaceId target_namespace = self.ctx.store.resolve.module_ref(target_module).namespace_id;
-        self.ctx.store.defs.set_owned_namespace(alias_def, target_namespace);
-    }
-
-    qid.DefId create_import_alias(Self&! self,
-        qid.ModuleId module_id,
-        store.ImportRecord import_record,
-        qid.ModuleId target_module,
-        Bool duplicate
-    ) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        qid.DefId module_def = module.def_id;
-        qid.NamespaceId namespace_id = module.namespace_id;
-        source.SourceId source_id = module.source_id;
-        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record$.ref());
-        qid.NamespaceId target_namespace = self.ctx.store.resolve.module_ref(target_module).namespace_id;
-        qid.DefId alias_def = self.ctx.store.defs.create(
-            .import_alias_def,
-            .namespace_name,
-            import_record.visibility,
-            def.Name (symbol: alias_symbol, span: import_record.span),
-            module_def,
-            module_id,
-            namespace_id,
-            target_namespace
-        );
-        self.ctx.store.model.declare_def(alias_def, .import_alias_decl);
-        self.ctx.store.model.add_member(module_def, alias_def);
-        self.ctx.store.source_map.set_def_span(alias_def, source_id, import_record.span);
-        self.record_import_alias_stable_key(module_id, alias_def, alias_symbol, import_record.span);
-        if (duplicate) {
-            return alias_def;
-        }
-
-        self.ctx.store.resolve.bind_name(
-            namespace_id,
-            alias_symbol,
-            .namespace_name,
-            alias_def,
-            import_record.visibility,
-            import_record.span
-        );
-        return alias_def;
-    }
-
-    qid.SymbolId import_alias_symbol(Self&! self, store.ImportRecord& import_record) {
-        if (import_record.alias_symbol is .some(explicit_alias)) {
-            return explicit_alias;
-        }
-        if (import_record.kind == .file_import) {
-            return self.default_file_import_alias(import_record.path_symbol);
-        }
-        return import_record.path_symbol;
-    }
-
-    qid.SymbolId default_file_import_alias(Self&! self, qid.SymbolId path_symbol) {
-        UInt8[]& text = self.ctx.store.symbols.text(path_symbol);
-        Int name_start! = 0;
-        Int index! = 0;
-        while (index < text.length) {
-            if (text[index] == 47) {
-                name_start = index + 1;
-            }
-            index = index + 1;
-        }
-
-        std.String name! = std.String.from_valid_utf8(string.trim_extension(text[name_start..text.length]));
-        if (name.byte_length() == 0) {
-            return path_symbol;
-        }
-        return self.ctx.store.symbols.intern(name.bytes());
-    }
-
-    Void record_import_alias_stable_key(Self&! self,
-        qid.ModuleId module_id,
-        qid.DefId alias_def,
-        qid.SymbolId alias_symbol,
-        token.Span span
-    ) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        qid.PackageId package_id = module.package_id;
-        qid.SymbolId module_path = module.path_symbol;
-        qid.DefId module_def = module.def_id;
-        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
-        qkey.StableSymbolId? owner = self.ctx.store.incremental.stable_id_for_def(module_def);
-        self.ctx.store.incremental.record_symbol(
-            self.ctx.store.symbols$.ref(),
-            qkey.StableSymbolKey (
-                kind: qkey.StableSymbolKind.module_symbol,
-                package_name: package_name,
-                module_path: module_path,
-                owner: owner,
-                name: alias_symbol,
-                domain: def.NameDomain.namespace_name
-            ),
-            alias_def
-        );
-    }
-
-    // `import foo;` 的默认 alias 是 `foo`，`import bar = "x";`
-    // 的 alias 是显式名字 `bar`。两者都进入当前 module namespace，
-    // 因此需要和已有 namespace/type/value 名字查重。
-    // 即使重复也会继续创建 alias DefId，方便 SourceMap/diagnostic
-    // 保留当前位置；只是不会 bind 成 lookup winner。
-    Bool import_alias_has_conflict(Self&! self,
-        qid.ModuleId module_id,
-        store.ImportRecord import_record
-    ) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        qid.NamespaceId namespace_id = module.namespace_id;
-        source.SourceId source_id = module.source_id;
-        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record$.ref());
-        if (self.first_import_alias_conflict(namespace_id, alias_symbol) is .some(existing)) {
-            UInt8[]& name = self.ctx.store.symbols.text(alias_symbol);
-            diagnostics.add_duplicate_def(
-                self.ctx.store.diagnostics$.mut_ref(),
-                source_id,
-                import_record.span,
-                existing.span,
-                name
-            );
-            self.ctx.store.model.mark_error();
-            return true;
-        }
-        return false;
-    }
-
-    namespace.BindingEntry? first_import_alias_conflict(Self&! self,
-        qid.NamespaceId namespace_id,
-        qid.SymbolId alias_symbol
-    ) {
-        if (self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .namespace_name) is .some(existing)) {
-            return existing;
-        }
-        if (self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .type_name) is .some(existing)) {
-            return existing;
-        }
-        return self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, .value_name);
-    }
-
 }
