@@ -23,7 +23,7 @@ def main():
     work.mkdir(parents=True, exist_ok=False)
     for name in ("app", "tool", "helper", "logs"):
         (work / name).mkdir()
-    (work / "app/package.ini").write_text("[package]\nname=input\nroot=main.jiang\n")
+    (work / "app/package.ini").write_text("[package]\nname=input\nroot=main.jiang\n[dependencies]\ntools=../tool\n[generate.models]\npackage=tools\n")
     (work / "app/main.jiang").write_text("struct Input { Int value; }\n")
     (work / "tool/package.ini").write_text(
         "[package]\nname=generator\nroot=main.jiang\n[dependencies]\nhelper=../helper\n"
@@ -58,7 +58,7 @@ Void emit(reflect.Module root) {
 
     def command(output):
         return [str(compiler), "--artifact-cache-dir", str(cache), "generate", str(work / "app"),
-                "--generator", str(work / "tool"), "-o", str(output)]
+                "--name", "models", "-o", str(output)]
 
     def verify(name, output, expected, hit, stored=True, revision="one"):
         assert (output / "payload").read_bytes() == expected, name

@@ -24,8 +24,9 @@
 每个 root、每种角色至多一个显式入口；`lang` 和 `generate` 入口可以保持私有。
 生成入口是非泛型、同步的 `Void (reflect.Module)` 函数。
 
-package 可以配置多个命名生成任务，每次选择其中一个；命令行可选择输入和生成器。
-生成器与输入分别有自己的 root，可以来自不同 package。普通 build/check 不自动运行生成任务。
+默认执行输入包 root 的生成入口；命名别名可选择注册依赖的 package root 或本包内部文件。
+依赖位置统一在 dependencies 注册，Lang 与 generate 配置仅引用别名；生成配置不覆盖输入 root。
+生成器与输入可以来自不同 package。普通 build/check 不自动运行生成任务。
 
 ```text
 选择输入和生成器

@@ -957,6 +957,14 @@ Lang factory 的 `declaration_meta(span, expr)` 返回附着到后续声明的 a
 `declaration_meta(decl, span, expr)` 向已有声明追加，`module_meta(span, expr)` 返回独立模块项，
 可直接放入 Provider 的声明集合。它们与原生语法产生同一类附着，不在 Provider 进程内执行 metadata 表达式。
 
+### 生成器来源
+
+`jiang generate` 默认执行输入包 root 的 `@entry(generate)`；没有入口时报错，不自动选择第三方工具。
+`[dependencies]` 统一注册包；`[lang.<name>] package` 和 `[generate.<name>] package` 引用依赖别名。
+命名生成器也可用 `module` 指定本包内部文件，与 `package` 互斥。每个所选 root 只允许一个生成入口。
+`--name` 选择别名，输入始终是本包 root；不提供 `--generator` 路径覆盖或任务输入 root 覆盖。
+Lang 别名可复用同包的生成入口，显式同名 generate 配置优先；普通 build/check 不执行生成器。
+
 ### 模块反射
 
 `reflect.Module` 是编译器发放的只读模块句柄，支持身份比较；`name()` 返回源码名称。

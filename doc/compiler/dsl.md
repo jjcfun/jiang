@@ -119,7 +119,7 @@ callback 写同一个 `AstUnit`；两条路径复用同一 token、span、diagno
 registry：
 
 ```text
-dependency alias -> package id -> provider dylib -> Provider.Any
+language alias -> registered dependency -> package id -> provider dylib -> Provider.Any
 ```
 
 宿主层负责 Provider 的入口适配、按需构建、加载和生命周期管理；语法调用通过统一的 Provider 契约完成。
@@ -128,25 +128,27 @@ Provider root 可以使用其他 Lang，也可以是独立 Lang 源文件；宿�
 
 ## 独立源文件扩展名
 
-Lang package 可以声明独立源文件的扩展名；未声明时使用引入该 Provider 的依赖别名：
+Lang package 可以声明独立源文件的扩展名；未声明时使用引入该 Provider 的语言别名：
 
 ```ini
 [lang]
 extensions = schema, sch
 ```
 
-使用方可以按直接依赖别名覆盖整组扩展名，覆盖只作用于当前包：
+使用方通过语言别名引用注册依赖，并可覆盖整组扩展名；覆盖只作用于当前包：
 
 ```ini
 [dependencies]
-schema = ../schema_lang
+tools = ../schema_lang
 
 [lang.schema]
+package = tools
 extensions = model, schema
 ```
 
 扩展名使用逗号分隔，不带前导点。空项、重复配置和多个 Provider 的有效映射冲突均报错；
-`.jiang` 保留原生解析。扩展名覆盖不改变 `#schema` 使用的依赖别名。
+`.jiang` 保留原生解析。`#schema` 使用语言别名，普通 `import tools` 使用依赖别名。
+省略 package 时沿用同名依赖；未显式配置的 Lang 依赖继续使用其依赖名作为默认语言名。
 
 普通文件 import 和生成输入都使用文件所属包的有效映射，例如 `import "models.schema"`。
 整份文件传给同一个 Provider：`Input.delimiter = .none`、`body_start = 0`，`Source` 保留原始文件内容和身份。

@@ -930,7 +930,33 @@ Void emit(reflect.Module root) {
 }
 ```
 
-通过 `jiang generate ./app --generator ./tools/generate.jiang -o ./generated` 选择输入和生成器。
+`jiang generate ./app` 默认执行本包 root 中的入口，并将本包 root module 传入。
+本包没有生成入口时会报错，不会自动选择依赖中的生成器。
+
+命名生成器在 `package.ini` 中配置，两种来源互斥：
+
+```ini
+[dependencies]
+tools = ../schema-tools
+
+[lang.schema]
+package = tools
+extensions = schema, model
+
+[generate.models]
+package = tools
+
+[generate.docs]
+module = src/generate/docs.jiang
+```
+
+`jiang generate ./app --name models` 从注册依赖 `tools` 的 package root 查找 `@entry(generate)`；
+`jiang generate ./app --name docs` 从本包文件 `src/generate/docs.jiang` 查找该入口。
+`package` 只接受依赖别名，`module` 只接受本包相对文件路径；两者不能同时填写，也不能都省略。
+输入始终是本包 root，不在生成配置中另外指定输入 root。
+默认输出到 `app/build/generated`，可以用 `-o` 指定相对当前工作目录的输出目录。
+若 Lang 包同时提供生成入口，可直接使用语言别名（如 `--name schema`）；同名 generate 配置优先。
+
 入口在输入与生成器完成语义检查后调用一次，成功后发布本次输出；普通 build/check 不自动执行生成器。
 入口可以声明 `unsafe`，但不能声明 `async`，unsafe 也不扩大编译期可执行操作的范围。
 `generate.read(path)` 相对生成器入口文件读取资源快照；同一轮读取总量最多 64 MiB，重复路径只计一次，
@@ -3024,7 +3050,7 @@ resolve、type check、JIL 和 backend。
 结果可交给 `if_expression()`、`comptime_block()` 或 `alias_declaration()`，
 模块加载和编译期求值仍由普通编译流程完成，不在 Provider 构造语法时执行。
 
-独立 Lang 文件通过普通文件 import 加载，也可以直接作为 `generate` 的输入：
+独立 Lang 文件通过普通文件 import 加载，也可以设为 package root，作为 `generate` 的输入：
 
 ```jiang
 alias models = import "models.schema";
