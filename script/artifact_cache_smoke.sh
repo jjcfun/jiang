@@ -293,6 +293,40 @@ check_hidden_caller_coverage() {
   expect_exit "$output" 8
 }
 
+# 从接口读取到实现签名时，函数值和构造调用必须按需恢复 body，不能当成 extern。
+check_cached_callable_values() {
+  local fixture="$WORK_DIR/callable-values"
+  local cache="$WORK_DIR/callable-values-cache"
+  local output="$WORK_DIR/callable-values-app"
+  mkdir -p "$fixture"
+  cat >"$fixture/dep.jiang" <<'JIANG'
+public Int first() { return 1; }
+public Int second() { return 2; }
+public struct Number {
+    public Int value;
+    public init(self, Int value) { self.value = value; }
+}
+JIANG
+  printf '%s\n' 'alias dep = import "./dep.jiang";' \
+    'Int main() { return dep.first(); }' >"$fixture/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/callable-cold.log" "$output" "$fixture/main.jiang"
+  expect_exit "$output" 1
+  printf '%s\n' 'alias dep = import "./dep.jiang";' \
+    'Int main() { RawFn<Int> callback = dep.second; return callback(); }' >"$fixture/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/callable-changed.log" "$output" "$fixture/main.jiang"
+  require_stat_ge "$WORK_DIR/callable-changed.log" artifact_interface_hit 1
+  expect_exit "$output" 2
+  printf '%s\n' 'alias dep = import "./dep.jiang";' \
+    'Int main() { RawFn<Int> callback = dep.second; return callback() + dep.Number(3).value; }' \
+    >"$fixture/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/callable-init.log" "$output" "$fixture/main.jiang"
+  require_stat_ge "$WORK_DIR/callable-init.log" artifact_interface_hit 1
+  expect_exit "$output" 5
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/callable-hot.log" "$output" "$fixture/main.jiang"
+  require_stat_eq "$WORK_DIR/callable-hot.log" artifact_emitted_units 0
+  expect_exit "$output" 5
+}
+
 check_metadata_only_change() {
   local fixture="$WORK_DIR/metadata-fixture"
   local input="$fixture/package/run/source_dependency_app"
@@ -1328,6 +1362,7 @@ command -v nm >/dev/null 2>&1 || fail "missing nm"
 run_check cold_hot "cold/hot and profiles" check_cold_hot_and_profiles
 run_check invalidation "dependency invalidation" check_dependency_invalidation
 run_check coverage "hidden caller object coverage" check_hidden_caller_coverage
+run_check callable_values "cached function values and constructors" check_cached_callable_values
 run_check metadata "mtime-only source change" check_metadata_only_change
 run_check check_codegen "--check and codegen transition" check_check_then_codegen
 run_check import_graph "import graph changes" check_import_graph_changes
