@@ -128,7 +128,6 @@ printf 'LLVM %s at %s\n' "$LLVM_VERSION" "$LLVM_ROOT"
 if [ "$RELEASE_SMOKE_BUILD" = "1" ]; then
   printf '\n== release smoke: stable compiler ==\n'
   COMPILER_BUILD_MODE="$COMPILER_BUILD_MODE" \
-  BOOTSTRAP_CHECK_MODE=audit \
   BOOTSTRAP_DEPTH=stable \
   VERIFY=none \
     bash ./script/build_next.sh

@@ -10,7 +10,7 @@
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
 BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
-COMPILER_BUILD_MODE=release BOOTSTRAP_CHECK_MODE=strict \
+COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
@@ -117,17 +117,8 @@ bootstrap 只需生成 `build/bin/jiangc.next`，不生成 stable。release work
 release next；生成的 next 随后以 strict 模式编译 stable。audit 仅是 bootstrap 交接内部使用的
 过渡能力，release 编译器不提供切换检查模式的命令行参数，也不能将 audit 结果作为验证证据。
 
-`BOOTSTRAP_DEPTH=stable` 以严格检查构建 self-host candidate；任意借用或 lifetime 诊断
-都会阻止候选生成。使用以下门槛验证：
-
-```bash
-BOOTSTRAP_CHECK_MODE=audit \
-BOOTSTRAP_DEPTH=stable \
-VERIFY=full \
-bash ./script/build_next.sh
-```
-
-release candidate 只有在严格自举成功后才具备发布验证资格。
+上述 audit 机制仅用于重现 0.5.2 历史阶段，应使用对应版本脚本。当前编译器和构建脚本
+不提供非严格模式；release candidate 必须严格自举成功后才能进入发布验证。
 
 ## Linux 首次 hosted port seed
 

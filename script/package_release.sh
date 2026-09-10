@@ -152,7 +152,7 @@ configure_target
 
 if [ ! -x "$JIANGC_BIN" ]; then
   echo "missing compiler: $JIANGC_BIN" >&2
-  echo "run: BOOTSTRAP_CHECK_MODE=audit BOOTSTRAP_DEPTH=stable VERIFY=full \\" >&2
+  echo "run: BOOTSTRAP_DEPTH=stable VERIFY=full \\" >&2
   echo "  bash ./script/build_next.sh" >&2
   exit 2
 fi

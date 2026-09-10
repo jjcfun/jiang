@@ -93,7 +93,7 @@ macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
 BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
-COMPILER_BUILD_MODE=release BOOTSTRAP_CHECK_MODE=strict \
+COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
