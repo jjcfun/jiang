@@ -1,0 +1,227 @@
+#doc(module)
+    将包字段与具名子块展开为普通 PackageInfo 常量声明；表达式交给 Jiang parser，求值留在语义阶段。
+#end
+
+import std;
+alias syntax = import "../../std/jiang/syntax.jiang";
+alias string = import "../../compiler/support/string.jiang";
+
+public struct Provider: Movable, syntax.Provider {
+    std.Vector<std.jiang.Token<std.jiang.TokenKind>> tokens!;
+
+    public init(self) {
+        self.tokens = std.Vector<std.jiang.Token<std.jiang.TokenKind>>();
+    }
+
+    public syntax.ScanResult scan(Self&! self, syntax.Input input, syntax.SyntaxContext&! context) {
+        syntax.ScanResult result = syntax.scan_default(context, input);
+        if (result.status != .error) { self.tokens = syntax.take_scanned_tokens(context); }
+        return result;
+    }
+
+    public syntax.Ast parse(Self&! self, syntax.Input input, syntax.SyntaxContext&! context) {
+        std.Vector<std.jiang.Token<std.jiang.TokenKind>> tokens! =
+            std.Vector<std.jiang.Token<std.jiang.TokenKind>>(self.tokens.length());
+        Int index! = 0;
+        while (index < self.tokens.length()) {
+            tokens.append(self.tokens[index]);
+            index = index + 1;
+        }
+        _ parser! = syntax.Parser<std.jiang.TokenKind>(context, input.source, tokens$.move(), .eof());
+        syntax.Ast result!;
+        {
+            PackageParser package! = PackageParser(parser$.mut_ref(), input.name_span);
+            result = package.parse();
+        }
+        return result;
+    }
+}
+
+@region(a)
+struct PackageParser: Movable {
+    @life(a)
+    syntax.Parser<std.jiang.TokenKind>&! parser;
+    syntax.Span span;
+    std.String namespace_name;
+    std.Vector<syntax.Decl> declarations!;
+
+    init(self, syntax.Parser<std.jiang.TokenKind>&! parser, syntax.Span span) {
+        self.parser = parser;
+        self.span = span;
+        std.StringBuilder name! = std.StringBuilder();
+        name.append("__package_std_");
+        name.append(span.start);
+        self.namespace_name = name.into_string();
+        self.declarations = std.Vector<syntax.Decl>();
+    }
+
+    syntax.Ast parse(Self&! self) {
+        syntax.Ident std_name = self.parser.identifier(self.span, "std");
+        syntax.Ident alias_name = self.parser.identifier(self.span, self.namespace_name.bytes());
+        self.declarations.append(self.parser.package_import(self.span, std_name, alias_name));
+        std.Vector<syntax.Argument> fields! = std.Vector<syntax.Argument>();
+        std.Vector<syntax.Expr> languages! = std.Vector<syntax.Expr>();
+        std.Vector<syntax.Expr> generators! = std.Vector<syntax.Expr>();
+        std.Vector<std.String> names! = std.Vector<std.String>();
+        while (!self.parser.at_end()) {
+            _ token = self.parser.advance();
+            std.String name = std.String.from_valid_utf8(self.parser.token_text(token));
+            if (string.equal(name.bytes(), "lang")) {
+                languages.append(self.parse_alias("PackageLang", token.span));
+            } else if (string.equal(name.bytes(), "generate")) {
+                generators.append(self.parse_alias("PackageGenerate", token.span));
+            } else {
+                self.check_duplicate(names$.mut_ref(), name.bytes(), token.span);
+                syntax.Expr value!;
+                if (string.equal(name.bytes(), "dependencies")) {
+                    value = self.parse_dependencies();
+                } else {
+                    self.parser.expect(.assign());
+                    value = self.parser.parse_expression();
+                    self.parser.expect(.semicolon());
+                }
+                fields.append(self.parser.named_argument(token.span, token.span, name.bytes(), value));
+            }
+        }
+        if (languages.length() > 0) {
+            _ value = self.array_slice("PackageLang", languages.slice());
+            fields.append(self.parser.named_argument(self.span, self.span, "lang", value));
+        }
+        if (generators.length() > 0) {
+            _ value = self.array_slice("PackageGenerate", generators.slice());
+            fields.append(self.parser.named_argument(self.span, self.span, "generate", value));
+        }
+        syntax.Expr initializer = self.construct("PackageInfo", self.span, fields.slice());
+        syntax.Type inferred = self.package_type("PackageInfo", self.span);
+        self.declarations.append(self.parser.global_declaration(
+            self.span, self.span, "info", inferred, initializer, true, false, true));
+        return self.parser.declarations(self.span, self.declarations.slice());
+    }
+
+    syntax.Expr parse_dependencies(Self&! self) {
+        self.parser.expect(.left_brace());
+        std.Vector<syntax.Expr> values! = std.Vector<syntax.Expr>();
+        std.Vector<std.String> names! = std.Vector<std.String>();
+        while (!self.parser.at_end() && !self.parser.at(.right_brace())) {
+            _ token = self.parser.expect_identifier();
+            if (token.presence == .missing) { self.parser.advance(); continue; }
+            std.String name = std.String.from_valid_utf8(self.parser.token_text(token));
+            self.check_duplicate(names$.mut_ref(), name.bytes(), token.span);
+            self.parser.expect(.assign());
+            syntax.Expr path = self.parser.parse_expression();
+            self.parser.expect(.semicolon());
+            syntax.Expr label = self.parser.literal(token.span, .string_literal, name.bytes());
+            syntax.Argument[2] fields = [
+                self.parser.named_argument(token.span, token.span, "name", label),
+                self.parser.named_argument(token.span, token.span, "path", path),
+            ];
+            values.append(self.construct("PackageDependency", token.span, fields[..]));
+        }
+        self.parser.expect(.right_brace());
+        return self.array_slice("PackageDependency", values.slice());
+    }
+
+    syntax.Expr parse_alias(Self&! self, UInt8[]& type_name, syntax.Span span) {
+        syntax.Expr name! = self.parser.literal(span, .string_literal, "");
+        if (!self.parser.at(.left_brace())) {
+            _ token = self.parser.expect_identifier();
+            name = self.parser.literal(token.span, .string_literal, self.parser.token_text(token));
+        } else if (string.equal(type_name, "PackageGenerate")) {
+            self.parser.error(span, "package_generate_requires_name");
+        }
+        self.parser.expect(.left_brace());
+        std.Vector<syntax.Argument> fields! = std.Vector<syntax.Argument>();
+        fields.append(self.parser.named_argument(span, span, "name", name));
+        std.Vector<std.String> names! = std.Vector<std.String>();
+        names.append(std.String.from_valid_utf8("name"));
+        while (!self.parser.at_end() && !self.parser.at(.right_brace())) {
+            _ token = self.parser.advance();
+            std.String field = std.String.from_valid_utf8(self.parser.token_text(token));
+            self.check_duplicate(names$.mut_ref(), field.bytes(), token.span);
+            self.parser.expect(.assign());
+            syntax.Expr value!;
+            if (string.equal(field.bytes(), "package")) {
+                _ alias_token = self.parser.expect_identifier();
+                value = self.parser.literal(alias_token.span, .string_literal, self.parser.token_text(alias_token));
+            } else if (string.equal(field.bytes(), "extensions")) {
+                value = self.parse_extensions();
+            } else {
+                value = self.parser.parse_expression();
+            }
+            self.parser.expect(.semicolon());
+            fields.append(self.parser.named_argument(token.span, token.span, field.bytes(), value));
+        }
+        self.parser.expect(.right_brace());
+        return self.construct(type_name, span, fields.slice());
+    }
+
+    syntax.Expr parse_extensions(Self&! self) {
+        self.parser.expect(.left_bracket());
+        std.Vector<syntax.Expr> values! = std.Vector<syntax.Expr>();
+        while (!self.parser.at_end() && !self.parser.at(.right_bracket())) {
+            values.append(self.parser.parse_expression());
+            if (!self.parser.match(.comma())) { break; }
+        }
+        self.parser.expect(.right_bracket());
+        return self.array_slice("", values.slice());
+    }
+
+    syntax.Path type_path(Self&! self, UInt8[]& type_name, syntax.Span span) {
+        syntax.Ident[3] segments = [
+            self.parser.identifier(span, self.namespace_name.bytes()),
+            self.parser.identifier(span, "jiang"),
+            self.parser.identifier(span, type_name),
+        ];
+        return self.parser.path(span, segments[..]);
+    }
+
+    syntax.Type package_type(Self&! self, UInt8[]& type_name, syntax.Span span) {
+        syntax.Path path = self.type_path(type_name, span);
+        syntax.Type[0] arguments = [];
+        return self.parser.named_type(span, path, arguments[..]);
+    }
+
+    syntax.Expr construct(Self&! self, UInt8[]& type_name, syntax.Span span, syntax.Argument[]& fields) {
+        syntax.Path path = self.type_path(type_name, span);
+        syntax.Expr callee = self.parser.path_expression(span, path);
+        return self.parser.call(span, callee, fields);
+    }
+
+    #doc 私有数组常量提供切片的静态存储；只有 info 进入模块的公开导出面。
+    syntax.Expr array_slice(Self&! self, UInt8[]& type_name, syntax.Expr[]& values) {
+        syntax.Type element!;
+        if (type_name.length == 0) {
+            syntax.Type byte = self.parser.named_type(self.span, self.span, "UInt8");
+            syntax.Type slice = self.parser.layered_type(self.span, byte, .slice);
+            element = self.parser.layered_type(self.span, slice, .reference);
+        } else {
+            element = self.package_type(type_name, self.span);
+        }
+        UInt8[]^ count = string.int_text(values.length);
+        syntax.Expr length = self.parser.int_literal(self.span, count[..]);
+        syntax.Type array_type = self.parser.array_type(self.span, element, self.span, length);
+        syntax.Expr array = self.parser.array(self.span, values);
+        std.StringBuilder builder! = std.StringBuilder();
+        builder.append("__package_data_");
+        builder.append(self.span.start);
+        builder.append("_");
+        builder.append(self.declarations.length());
+        std.String name = builder.into_string();
+        self.declarations.append(self.parser.global_declaration(
+            self.span, self.span, name.bytes(), array_type, array, true));
+        syntax.Expr items = self.parser.name(self.span, name.bytes());
+        return self.parser.slice(self.span, items, null, null);
+    }
+
+    Void check_duplicate(Self&! self, std.Vector<std.String>&! names, UInt8[]& name, syntax.Span span) {
+        Int index! = 0;
+        while (index < names.length()) {
+            if (string.equal(names.slice()[index].bytes(), name)) {
+                self.parser.error(span, "package_duplicate_field");
+                return;
+            }
+            index = index + 1;
+        }
+        names.append(std.String.from_valid_utf8(name));
+    }
+}
