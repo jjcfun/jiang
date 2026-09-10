@@ -2258,23 +2258,31 @@ public struct TypeOps: Movable {
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.NodeId pattern_ref
+        sem.NodeId pattern_ref,
+        list.ArrayList<types.GenericArg>&? bindings = null
     ) {
         sem.Node pattern = self.state.ctx.store.model.node(pattern_ref);
         if (pattern.data is .infer_type_ref()) {
             return true;
         }
         if (pattern.data is .named_type_ref(named)) {
+            if (bindings is .some(args)) {
+                return self.named_where_type_pattern_matches_with_args(
+                    actual_type, generic_owner, args, type_args, pattern_ref, named);
+            }
             return self.named_where_type_pattern_matches(actual_type, generic_owner, type_args, pattern_ref, named);
         }
         if (pattern.data is .layered_type_ref(layered)) {
-            return self.layered_where_type_pattern_matches(actual_type, generic_owner, type_args, layered);
+            return self.layered_where_type_pattern_matches(actual_type, generic_owner, type_args, layered, bindings);
         }
         if (pattern.data is .array_type_ref(array_type)) {
-            return self.array_where_type_pattern_matches(actual_type, generic_owner, type_args, array_type);
+            return self.array_where_type_pattern_matches(actual_type, generic_owner, type_args, array_type, bindings);
         }
         if (pattern.data is .tuple_type_ref(tuple_type)) {
-            return self.tuple_where_type_pattern_matches(actual_type, generic_owner, type_args, tuple_type);
+            return self.tuple_where_type_pattern_matches(actual_type, generic_owner, type_args, tuple_type, bindings);
+        }
+        if (pattern.data is .errorable_type_ref(errorable)) {
+            return self.errorable_where_type_pattern_matches(actual_type, generic_owner, type_args, errorable, bindings);
         }
         qid.TypeId expected_type = self.substituted_where_type_ref(generic_owner, type_args, pattern_ref);
         return self.same_type_ignoring_mutability(actual_type, expected_type);
@@ -2318,14 +2326,7 @@ public struct TypeOps: Movable {
         sem.NodeId pattern_ref
     ) {
         list.ArrayList<qid.TypeId> type_args = self.type_args_from_generic_args(args);
-        sem.Node pattern = self.state.ctx.store.model.node(pattern_ref);
-        if (pattern.data is .infer_type_ref()) {
-            return true;
-        }
-        if (pattern.data is .named_type_ref(named)) {
-            return self.named_where_type_pattern_matches_with_args(actual_type, generic_owner, args, type_args$.ref(), pattern_ref, named);
-        }
-        return self.where_type_pattern_matches(actual_type, generic_owner, type_args$.ref(), pattern_ref);
+        return self.where_type_pattern_matches(actual_type, generic_owner, type_args$.ref(), pattern_ref, args);
     }
 
     Bool named_where_type_pattern_matches_with_args(Self&! self,
@@ -2347,7 +2348,7 @@ public struct TypeOps: Movable {
         if (self.is_const_arg_builtin_type_def(named.def_id)) {
             return self.const_arg_builtin_pattern_matches_with_args(actual_type, generic_owner, args, type_args, named);
         }
-        return self.constructor_where_type_pattern_matches(actual_type, generic_owner, type_args, named);
+        return self.constructor_where_type_pattern_matches(actual_type, generic_owner, type_args, named, args);
     }
 
     Bool const_arg_builtin_pattern_matches_with_args(Self&! self,
@@ -2391,7 +2392,8 @@ public struct TypeOps: Movable {
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.NamedTypeRef named
+        sem.NamedTypeRef named,
+        list.ArrayList<types.GenericArg>&? bindings = null
     ) {
         if (self.is_const_arg_builtin_type_def(named.def_id)) {
             return self.const_arg_builtin_pattern_matches(actual_type, generic_owner, type_args, named);
@@ -2402,6 +2404,17 @@ public struct TypeOps: Movable {
         if (!self.namespace_provider_arg_count_matches(actual_type, named.def_id, named.args.length)) {
             return false;
         }
+        // 名义实参必须按原始混合顺序读取；type_args 投影不包含 const 槽。
+        if (self.state.ctx.store.types.get(actual_type).data is .named(actual)) {
+            Int index! = 0;
+            while (index < named.args.length) {
+                if (!self.where_generic_arg_pattern_matches(
+                    actual.args[index], generic_owner, type_args, named.args[index], bindings
+                )) { return false; }
+                index = index + 1;
+            }
+            return true;
+        }
         Int index! = 0;
         while (index < named.args.length) {
             qid.TypeId actual_arg = self.namespace_provider_type_arg(actual_type, named.def_id, index);
@@ -2411,6 +2424,21 @@ public struct TypeOps: Movable {
             index = index + 1;
         }
         return true;
+    }
+
+    Bool where_generic_arg_pattern_matches(Self&! self,
+        types.GenericArg actual,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        sem.NodeId pattern,
+        list.ArrayList<types.GenericArg>&? bindings
+    ) {
+        if (actual is .type_arg(type)) {
+            return self.where_type_pattern_matches(type.value, generic_owner, type_args, pattern, bindings);
+        }
+        guard actual is .const_arg(value) else { return false; }
+        if (bindings is .some(args)) { return self.const_pattern_matches_with_args(pattern, args, value.value); }
+        return self.const_pattern_matches(pattern, value.value);
     }
 
     Bool const_arg_builtin_pattern_matches(Self&! self,
@@ -2554,8 +2582,15 @@ public struct TypeOps: Movable {
                 return self.const_pattern_param_matches(named.def_id, types.sentinel_const_param(actual));
             }
         }
-        guard pattern.data is .literal(literal) else { return false; }
-        return self.literal_matches_const_value(literal.value, actual);
+        if (self.known_const_value_for_expected_type(pattern_ref, actual.type_id) is .some(expected)) {
+            return self.const_value_matches(expected, actual);
+        }
+        if (pattern.data is .literal(literal)) {
+            if (literal.value is .null_value || literal.value is .unit_value) {
+                return self.literal_matches_const_value(literal.value, actual);
+            }
+        }
+        return false;
     }
 
     Bool const_pattern_param_matches(self, qid.DefId expected_param, qid.DefId? actual_param) {
@@ -2668,41 +2703,44 @@ public struct TypeOps: Movable {
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.LayeredTypeRef layered
+        sem.LayeredTypeRef layered,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         if (layered.kind == .optional_type) {
-            return self.optional_where_type_pattern_matches(actual_type, generic_owner, type_args, layered.element);
+            return self.optional_where_type_pattern_matches(actual_type, generic_owner, type_args, layered.element, bindings);
         }
         if (layered.kind == .reference) {
-            return self.reference_where_type_pattern_matches(actual_type, generic_owner, type_args, layered.element);
+            return self.reference_where_type_pattern_matches(actual_type, generic_owner, type_args, layered.element, bindings);
         }
         if (layered.kind == .slice) {
-            return self.slice_value_where_type_pattern_matches(actual_type, generic_owner, type_args, layered);
+            return self.slice_value_where_type_pattern_matches(actual_type, generic_owner, type_args, layered, bindings);
         }
-        return self.handle_where_type_pattern_matches(actual_type, generic_owner, type_args, layered);
+        return self.handle_where_type_pattern_matches(actual_type, generic_owner, type_args, layered, bindings);
     }
 
     Bool optional_where_type_pattern_matches(Self&! self,
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.NodeId element_pattern
+        sem.NodeId element_pattern,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         types.TypeInfo info = self.state.ctx.store.types.get(actual_type);
         guard info.data is .optional(optional) else { return false; }
-        return self.where_type_pattern_matches(optional.element, generic_owner, type_args, element_pattern);
+        return self.where_type_pattern_matches(optional.element, generic_owner, type_args, element_pattern, bindings);
     }
 
     Bool reference_where_type_pattern_matches(Self&! self,
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.NodeId element_pattern
+        sem.NodeId element_pattern,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         types.TypeInfo info = self.state.ctx.store.types.get(actual_type);
         guard info.data is .handle_type(handle) else { return false; }
         if (handle.kind == .reference) {
-            return self.where_type_pattern_matches(handle.element, generic_owner, type_args, element_pattern);
+            return self.where_type_pattern_matches(handle.element, generic_owner, type_args, element_pattern, bindings);
         }
         if (handle.kind != .slice) {
             return false;
@@ -2712,28 +2750,30 @@ public struct TypeOps: Movable {
             handle.sentinel,
             info.span
         );
-        return self.where_type_pattern_matches(array_id, generic_owner, type_args, element_pattern);
+        return self.where_type_pattern_matches(array_id, generic_owner, type_args, element_pattern, bindings);
     }
 
     Bool slice_value_where_type_pattern_matches(Self&! self,
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.LayeredTypeRef layered
+        sem.LayeredTypeRef layered,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         types.TypeInfo info = self.state.ctx.store.types.get(actual_type);
         guard info.data is .slice_value_type(array_type) else { return false; }
         if (!self.sentinel_pattern_matches(array_type.sentinel, layered)) {
             return false;
         }
-        return self.where_type_pattern_matches(array_type.element, generic_owner, type_args, layered.element);
+        return self.where_type_pattern_matches(array_type.element, generic_owner, type_args, layered.element, bindings);
     }
 
     Bool handle_where_type_pattern_matches(Self&! self,
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.LayeredTypeRef layered
+        sem.LayeredTypeRef layered,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         types.HandleTypeKind kind = self.handle_kind_for_layered_pattern(layered.kind);
         types.TypeInfo info = self.state.ctx.store.types.get(actual_type);
@@ -2744,7 +2784,7 @@ public struct TypeOps: Movable {
         if (!self.sentinel_pattern_matches(handle.sentinel, layered)) {
             return false;
         }
-        return self.where_type_pattern_matches(handle.element, generic_owner, type_args, layered.element);
+        return self.where_type_pattern_matches(handle.element, generic_owner, type_args, layered.element, bindings);
     }
 
     types.HandleTypeKind handle_kind_for_layered_pattern(self, sem.TypeLayerKind kind) {
@@ -2783,7 +2823,8 @@ public struct TypeOps: Movable {
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.ArrayTypeRef pattern
+        sem.ArrayTypeRef pattern,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         types.TypeInfo info = self.state.ctx.store.types.get(actual_type);
         guard info.data is .array_type(array_type) else { return false; }
@@ -2793,17 +2834,18 @@ public struct TypeOps: Movable {
         if (!self.sentinel_pattern_matches_parts(array_type.sentinel, pattern.sentinel_kind, pattern.sentinel_value)) {
             return false;
         }
-        return self.where_type_pattern_matches(array_type.element, generic_owner, type_args, pattern.element);
+        return self.where_type_pattern_matches(array_type.element, generic_owner, type_args, pattern.element, bindings);
     }
 
     Bool tuple_where_type_pattern_matches(Self&! self,
         qid.TypeId actual_type,
         qid.DefId generic_owner,
         list.ArrayList<qid.TypeId>& type_args,
-        sem.TupleTypeRef pattern
+        sem.TupleTypeRef pattern,
+        list.ArrayList<types.GenericArg>&? bindings
     ) {
         if (pattern.items.length == 1) {
-            return self.where_type_pattern_matches(actual_type, generic_owner, type_args, pattern.items[0]);
+            return self.where_type_pattern_matches(actual_type, generic_owner, type_args, pattern.items[0], bindings);
         }
         Int item_count = self.tuple_type_item_count(actual_type);
         if (item_count != pattern.items.length) { return false; }
@@ -2814,13 +2856,27 @@ public struct TypeOps: Movable {
                 item,
                 generic_owner,
                 type_args,
-                pattern.items[index]
+                pattern.items[index],
+                bindings
             )) {
                 return false;
             }
             index = index + 1;
         }
         return true;
+    }
+
+    Bool errorable_where_type_pattern_matches(Self&! self,
+        qid.TypeId actual_type,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        sem.ErrorableTypeRef pattern,
+        list.ArrayList<types.GenericArg>&? bindings
+    ) {
+        guard self.state.ctx.store.types.get(actual_type).data is .error_union(actual) else { return false; }
+        guard pattern.error_type is .some(error) else { return false; }
+        return self.where_type_pattern_matches(actual.value, generic_owner, type_args, pattern.value_type, bindings)
+            && self.where_type_pattern_matches(actual.error, generic_owner, type_args, error, bindings);
     }
 
     public qid.TypeId check_where_type_pattern_ref(Self&! self, sem.NodeId pattern_ref) {
@@ -2852,7 +2908,8 @@ public struct TypeOps: Movable {
                 || self.where_type_pattern_contains_wildcard(layered.element);
         }
         if (pattern.data is .array_type_ref(array_type)) {
-            return self.model_sentinel_is_wildcard(array_type.sentinel_kind)
+            return array_type.count_kind == .inferred
+                || self.model_sentinel_is_wildcard(array_type.sentinel_kind)
                 || self.where_type_pattern_contains_wildcard(array_type.element);
         }
         return false;
@@ -2883,12 +2940,40 @@ public struct TypeOps: Movable {
         qid.DefId def_id = named.def_id;
         Int arg_count = named.args.length;
         self.check_type_arg_arity(pattern_ref, def_id, arg_count);
+        list.ArrayList<qid.TypeId> type_args! = list.ArrayList<qid.TypeId>();
         Int index! = 0;
         while (index < arg_count) {
             sem.NodeId arg = self.named_type_ref_arg_at(pattern_ref, index);
-            self.check_where_type_pattern_ref(arg);
+            self.check_where_generic_arg_pattern(def_id, index, arg, type_args$.mut_ref());
             index = index + 1;
         }
+    }
+
+    Void check_where_generic_arg_pattern(Self&! self,
+        qid.DefId owner, Int index, sem.NodeId arg, list.ArrayList<qid.TypeId>&! type_args
+    ) {
+        if (index < self.generic_param_count(owner)) {
+            qid.DefId parameter = self.generic_param_at(owner, index);
+            if (self.generic_param_is_value_param(parameter)) {
+                if (self.where_type_pattern_is_wildcard(arg)) { return; }
+                qid.TypeId expected = self.const_generic_param_type(owner, parameter, type_args);
+                if ((self.is_invalid_type(expected) || self.state.ctx.store.types.get(expected).needs_substitution)
+                    && self.deferred_const_pattern_ready(arg)) { return; }
+                self.check_const_generic_arg(owner, parameter, arg, type_args);
+                return;
+            }
+        }
+        type_args.add(self.check_where_type_pattern_ref(arg));
+    }
+
+    #doc 类型通配尚未决定 const 参数类型时，只准备常量来源；实际值类型在模式匹配时校验。
+    Bool deferred_const_pattern_ready(Self&! self, sem.NodeId arg) {
+        if (self.state.ctx.store.model.node(arg).data is .literal(_)) { return true; }
+        if (self.const_generic_param_ref(arg) != null) { return true; }
+        guard self.const_generic_value_def(arg) is .some(definition) else { return false; }
+        self.ensure_const_value_for_expected_type(arg);
+        qid.TypeId type = self.type_for_def(definition);
+        return self.known_const_value_for_expected_type(arg, type) != null;
     }
 
     sem.NodeId named_type_ref_arg_at(self, sem.NodeId type_ref, Int index) {
@@ -3158,6 +3243,14 @@ public struct TypeOps: Movable {
     public Void ensure_const_value_for_expected_type(Self&! self, sem.NodeId arg_ref) {
         guard self.const_generic_value_def(arg_ref) is .some(def_id) else { return; }
         self.ensure_const_generic_def_value(def_id);
+        self.observe_const_value(arg_ref, def_id);
+    }
+
+    #doc 普通常量引用与反射复用同一值事实，跨文件转发也记录已求值内容的依赖。
+    public Void observe_const_value(self, sem.NodeId use, qid.DefId definition) {
+        _ module = self.state.ctx.store.defs.get(use.owner_def).module_id$.some();
+        self.state.ctx.query.observe_declaration_type(self.state.ctx.store$.ref(), module,
+            definition, .constant_value, 0, false);
     }
 
     Void ensure_const_generic_def_value(Self&! self, qid.DefId def_id) {
@@ -5281,7 +5374,7 @@ public struct TypeOps: Movable {
         // builtin/local 的类型绑定不一定拥有 declaration model。
         if (!self.state.ctx.store.model.has_def(def_id)) { return; }
         if (!self.state.ctx.store.model.has_function_signature(def_id)) { return; }
-        if (self.state.ctx.store.typeck.signature_checked(def_id)) { return; }
+        if (self.state.ctx.query.type_check_signature.ready(def_id)) { return; }
         TypeOps ops! = TypeOps(self.state$.mut_ref());
         decl_check.DeclCheck checker! = decl_check.DeclCheck(ops);
         checker.ensure_signature_checked(def_id);
@@ -6353,7 +6446,7 @@ public struct TypeOps: Movable {
         if (!self.handle_mutability_assignable(expected, actual)) {
             return false;
         }
-        return self.same_type_ignoring_mutability(expected, actual);
+        return self.same_type_with_contracts(expected, actual);
     }
 
     Bool handle_mutability_assignable(self, qid.TypeId expected, qid.TypeId actual) {
@@ -6406,7 +6499,7 @@ public struct TypeOps: Movable {
         if (actual_handle.kind != .owner_pointer) {
             return false;
         }
-        return self.same_type_ignoring_mutability(expected_element, actual_handle.element);
+        return self.same_type_with_contracts(expected_element, actual_handle.element);
     }
 
     Bool assigns_to_optional(self, qid.TypeId expected, qid.TypeId actual) {
@@ -6415,6 +6508,11 @@ public struct TypeOps: Movable {
             return false;
         }
         return self.is_assignable(optional.element, actual);
+    }
+
+    #doc 值传递要求结构类型和嵌套 callable 契约匹配，mutability 由赋值规则独立检查。
+    public Bool same_type_with_contracts(self, qid.TypeId lhs, qid.TypeId rhs) {
+        return self.state.ctx.store.types.same_type_with_contracts(lhs, rhs, false);
     }
 
     public Bool same_type_ignoring_mutability(self, qid.TypeId lhs, qid.TypeId rhs) {

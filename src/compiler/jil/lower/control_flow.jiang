@@ -1,6 +1,7 @@
-// 条件、模式、循环、switch 和比较控制流 lowering。
-//
-// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+#doc(module)
+    在 Semantic Model 到 JIL 阶段降低条件、循环、switch 和比较控制流。
+    条件短路保留直接成功／失败边，模式绑定沿成功路径进入后续作用域。
+#end
 
 alias context = import "../../context.jiang";
 alias sem = import "../../sema/model.jiang";
@@ -32,16 +33,12 @@ alias pattern = import "./pattern.jiang";
 public extend body_context.BodyLowerer {
     public Void lower_if(Self&! self, sem.NodeId node_id, sem.If if_expr, jil.Place destination) {
         list.ArrayList<jil.LocalId> condition_locals! = list.ArrayList<jil.LocalId>();
-        support.IfConditionLowerResult condition_result = self.lower_if_condition(if_expr.condition);
         jil.BlockId then_block = self.builder.reserve_block(self.lowerer.model_span(if_expr.then_body));
         jil.BlockId else_block = self.builder.reserve_block(self.lowerer.model_span(node_id));
         jil.BlockId join_block = self.builder.reserve_block(self.lowerer.model_span(node_id));
 
-        self.builder.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
-            condition: self.if_condition_operand(condition_result$.ref()),
-            then_target: then_block,
-            else_target: else_block
-        )), self.lowerer.model_span(if_expr.condition));
+        support.IfConditionLowerResult condition_result =
+            self.lower_if_condition(if_expr.condition, then_block, else_block);
 
         Int active_depth = self.active_locals.len();
         self.builder.start_block(then_block);
@@ -76,14 +73,10 @@ public extend body_context.BodyLowerer {
     }
 
     public Void lower_guard(Self&! self, sem.NodeId node_id, sem.Guard guard_stmt) {
-        support.IfConditionLowerResult condition = self.lower_if_condition(guard_stmt.condition);
         jil.BlockId continue_block = self.builder.reserve_block(self.lowerer.model_span(node_id));
         jil.BlockId else_block = self.builder.reserve_block(self.lowerer.model_span(guard_stmt.else_body));
-        self.builder.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
-            condition: self.if_condition_operand(condition$.ref()),
-            then_target: continue_block,
-            else_target: else_block
-        )), self.lowerer.model_span(guard_stmt.condition));
+        support.IfConditionLowerResult condition =
+            self.lower_if_condition(guard_stmt.condition, continue_block, else_block);
 
         self.builder.start_block(else_block);
         self.lower_expr_statement(guard_stmt.else_body);
@@ -98,46 +91,22 @@ public extend body_context.BodyLowerer {
         self.lower_if_condition_bindings(condition$.ref(), condition_locals$.mut_ref());
     }
 
+    #doc 左条件失败直接进入失败边，成功后绑定左侧再测试右侧，避免布尔合流丢失条件存活事实。
     public support.IfConditionLowerResult lower_logic_and_condition(
-        Self&! self,
-        sem.NodeId node_id,
-        sem.Binary binary
+        Self&! self, sem.NodeId node_id, sem.Binary binary,
+        jil.BlockId then_block, jil.BlockId else_block
     ) {
-        token.Span span = self.lowerer.model_span(node_id);
-        jil.LocalId result_local = self.add_temp(self.lowerer.store.types.bool_type(), span);
-        support.IfConditionLowerResult left = self.lower_if_condition(binary.left);
         jil.BlockId rhs_block = self.builder.reserve_block(self.lowerer.model_span(binary.right));
-        jil.BlockId false_block = self.builder.reserve_block(span);
-        jil.BlockId join_block = self.builder.reserve_block(span);
-        self.builder.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
-            condition: self.if_condition_operand(left$.ref()),
-            then_target: rhs_block,
-            else_target: false_block
-        )), self.lowerer.model_span(binary.left));
-
+        support.IfConditionLowerResult left = self.lower_if_condition(binary.left, rhs_block, else_block);
         Int active_depth = self.active_locals.len();
         self.builder.start_block(rhs_block);
         list.ArrayList<jil.LocalId> materialized! = list.ArrayList<jil.LocalId>();
         self.lower_if_condition_bindings(left$.ref(), materialized$.mut_ref());
-        support.IfConditionLowerResult right = self.lower_if_condition(binary.right);
-        self.builder.push_assign(
-            self.place_for_local(result_local),
-            jil.use_rvalue(jil.UseRvalue (value: self.if_condition_operand(right$.ref()))),
-            span
-        );
-        if (!self.builder.terminated) {
-            self.builder.finish_block(self.goto_terminator(join_block), span);
-        }
+        support.IfConditionLowerResult right = self.lower_if_condition(binary.right, then_block, else_block);
         self.append_condition_active_locals(materialized$.mut_ref(), right.active_locals$.ref());
         self.restore_active_locals(active_depth);
-
-        self.builder.start_block(false_block);
-        self.builder.push_assign(self.place_for_local(result_local), self.bool_rvalue(false, span), span);
-        self.builder.finish_block(self.goto_terminator(join_block), span);
-        self.builder.start_block(join_block);
-
         return support.IfConditionLowerResult (
-            condition_local: result_local,
+            condition_local: right.condition_local,
             binding: right.binding,
             active_locals: materialized
         );
@@ -160,12 +129,7 @@ public extend body_context.BodyLowerer {
             true, self.lowerer.model_span(node_id)
         );
         if (loop_expr.condition is .some(condition)) {
-            condition_result = self.lower_if_condition(condition);
-            self.builder.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
-                condition: self.if_condition_operand(condition_result$.ref()),
-                then_target: body_block,
-                else_target: exit_block
-            )), self.lowerer.model_span(condition));
+            condition_result = self.lower_if_condition(condition, body_block, exit_block);
         } else {
             self.builder.finish_block(jil.goto_terminator_kind(jil.GotoTerminator (target: body_block)),
                 self.lowerer.model_span(node_id)
@@ -1107,7 +1071,7 @@ public extend body_context.BodyLowerer {
         Int index! = 0;
         while (index < literal.items.length) {
             jil.Place element_place = self.project_runtime_index(destination, index, span);
-            self.lower_into_place_as_type(literal.items[index], element_place, element_type);
+            self.lower_into_place(literal.items[index], element_place);
             index = index + 1;
         }
     }

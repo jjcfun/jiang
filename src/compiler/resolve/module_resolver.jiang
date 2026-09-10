@@ -11,6 +11,7 @@ alias cache_identity = import "../artifact/cache_identity.jiang";
 alias artifact_path = import "../artifact/path.jiang";
 alias interface_builder = import "../artifact/interface_builder.jiang";
 alias driver_options = import "../driver/options.jiang";
+alias source_fingerprint = import "../artifact/source_fingerprint.jiang";
 alias source_ji = import "../artifact/source_ji.jiang";
 alias incremental_fingerprint = import "../incremental/fingerprint.jiang";
 alias source_graph = import "../incremental/source_graph.jiang";
@@ -70,6 +71,9 @@ public struct ModelTiming: Copyable {
 public struct ModuleResolver: Movable {
     RawFn<comptime_value.ComptimeValue?, context.CompilerContext&!, ModuleResolver&!,
         module_graph.ModuleGraph&!, sem.NodeId, qid.TypeId> evaluate_expression;
+    RawFn<Bool, context.CompilerContext&!, ModuleResolver&!,
+        module_graph.ModuleGraph&!, qid.DefId, artifact.ObservationAspect>?
+        prepare_observed_fact;
     map.WyHashMap<source.SourceId, ast.AstUnit> asts!;
     map.WyHashMap<qid.ModuleId, module_graph_builder.ModuleResolvePassState> module_states!;
     map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId> declaration_defs!;
@@ -92,9 +96,13 @@ public struct ModuleResolver: Movable {
         UInt64? compiler_version_hash = null,
         Bool use_source_artifacts = true,
         driver_options.CompileMode? mode = null,
-        Bool timing_enabled = false
+        Bool timing_enabled = false,
+        RawFn<Bool, context.CompilerContext&!, ModuleResolver&!,
+            module_graph.ModuleGraph&!, qid.DefId, artifact.ObservationAspect>?
+            prepare_observed_fact = null
     ) {
         self.evaluate_expression = evaluate_expression;
+        self.prepare_observed_fact = prepare_observed_fact;
         self.asts = map.WyHashMap<source.SourceId, ast.AstUnit>();
         self.module_states = map.WyHashMap<qid.ModuleId, module_graph_builder.ModuleResolvePassState>();
         self.declaration_defs = map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>();
@@ -250,6 +258,13 @@ public struct ModuleResolver: Movable {
     ) {
         ModuleResolvePhase phase! = ModuleResolvePhase(ctx, self);
         return phase.ensure_declaration_model(graph, def_id);
+    }
+
+    public Bool ensure_module_metadata(Self&! self, context.CompilerContext&! ctx,
+        module_graph.ModuleGraph&! graph, qid.ModuleId module
+    ) {
+        ModuleResolvePhase phase! = ModuleResolvePhase(ctx, self);
+        return phase.ensure_module_metadata(graph, module);
     }
 
     public Bool ensure_declaration_signature(
@@ -510,7 +525,7 @@ struct ModuleResolvePhase: Movable {
         Int end
     ) {
         UInt64 started! = self.timing_start();
-        Bool use_source = self.component_requires_source(schedule, source_modules, begin, end);
+        Bool use_source = self.component_requires_source(schedule, source_modules, query_graph, begin, end);
         self.add_timing_freshness(self.timing_elapsed(started));
         started = self.timing_start();
         if (!self.prepare_source_component(schedule, source_modules, begin, end, use_source)) {
@@ -623,6 +638,7 @@ struct ModuleResolvePhase: Movable {
         Self&! self,
         source_graph.SourceSchedule& schedule,
         map.WyHashMap<cache_identity.StableSourceId, qid.ModuleId>& source_modules,
+        module_graph.ModuleGraph&! query_graph,
         Int begin,
         Int end
     ) {
@@ -655,8 +671,8 @@ struct ModuleResolvePhase: Movable {
                 identity,
                 source_dirty,
                 dependency_candidate,
-                { [ref self, module_id] dependency_candidate =>
-                    return self.module_model_can_restore(module_id, dependency_candidate);
+                { [ref self, ref! query_graph, module_id] dependency_candidate =>
+                    return self.module_model_can_restore(query_graph, module_id, dependency_candidate);
                 }
             );
             if (input == .source) {
@@ -695,13 +711,13 @@ struct ModuleResolvePhase: Movable {
 
     Bool module_model_can_restore(
         Self&! self,
+        module_graph.ModuleGraph&! query_graph,
         qid.ModuleId module_id,
         Bool dependency_candidate
     ) {
         if (self.ctx.store.resolve.module_ref(module_id).comptime_items.len() > 0) { return false; }
-        if (dependency_candidate && !self.module_observations_valid(module_id)) {
-            return false;
-        }
+        // 文档和位置变化不改变语义接口，必须独立校验，不能由 dependency_candidate 门控。
+        if (!self.module_observations_valid(query_graph, module_id, !dependency_candidate)) { return false; }
         return self.ensure_fresh_module_interface(module_id);
     }
 
@@ -721,21 +737,69 @@ struct ModuleResolvePhase: Movable {
         }
     }
 
-    Bool module_observations_valid(Self&! self, qid.ModuleId module_id) {
+    Bool module_observations_valid(Self&! self, module_graph.ModuleGraph&! query_graph,
+        qid.ModuleId module_id, Bool nonsemantic_only
+    ) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
         source.SourceId source_id = module.source_id;
         if (self.ctx.store.artifacts.load_observations(source_id) == null
             && !self.load_module_observations(module_id)) {
             return false;
         }
+        if (!self.ctx.query.prepare_observed_reflection(self.ctx.store$.mut_ref(), source_id)) { return false; }
+        if (!self.prepare_observed_facts(query_graph, source_id, nonsemantic_only)) { return false; }
+        guard source_ji.source_identity_for_module(self.ctx$.mut_ref(), module_id) is .some(identity)
+            else { return false; }
+        qkey.Fingerprint128 reflection_inputs = source_fingerprint.reflection_inputs(
+            self.ctx.store.artifacts$.ref(), source_id);
+        if (!db.object_reflection_inputs_match(self.ctx.query$.ref(), identity, reflection_inputs)) { return false; }
         guard self.ctx.store.artifacts.load_observations(source_id)
             is .some(observations) else {
             return false;
         }
         return self.ctx.query.validate_declaration_observations(
             self.ctx.store$.ref(),
-            observations
+            observations,
+            nonsemantic_only,
+            identity,
+            true
         );
+    }
+
+    #doc 语义观察复用编译层的事实准备；未选定模型的同一 SCC 回退源码，不重入正在选择的模块。
+    Bool prepare_observed_facts(Self&! self, module_graph.ModuleGraph&! graph,
+        source.SourceId source_id, Bool dependencies_unchanged
+    ) {
+        Int count = self.ctx.store.artifacts.load_observations(source_id)$.some().entries.len();
+        Int index! = 0;
+        while (index < count) {
+            _ item = self.ctx.store.artifacts.load_observations(source_id)$.some().entries.get(index);
+            index = index + 1;
+            if (item.aspect != .declaration_type && item.aspect != .metadata) { continue; }
+            if (item.aspect == .declaration_type
+                && (item.name.low == UInt64(Int(db.DeclarationTypeProperty.regions))
+                    || item.name.low == UInt64(Int(db.DeclarationTypeProperty.constraints)))) {
+                continue;
+            }
+            guard self.ctx.store.incremental.current_def_for_stable(item.subject) is .some(definition)
+                else { return false; }
+            _ module = self.ctx.store.defs.get(definition).module_id$.some();
+            if (self.ctx.store.resolve.module_ref(module).source_id == source_id) {
+                if (!dependencies_unchanged) { return false; }
+                continue;
+            }
+            _ state = self.module_state(module);
+            if (state != .resolved && state != .interface_loaded) { return false; }
+            guard self.owner.prepare_observed_fact is .some(prepare) else { return false; }
+            qid.DefId target = if item.aspect == .declaration_type
+                && self.ctx.store.defs.get(definition).kind == .generic_param_def {
+                self.ctx.store.defs.get(definition).owner_def$.some()
+            } else { definition };
+            if (!prepare(self.ctx$.mut_ref(), self.owner$.mut_ref(), graph$.mut_ref(), target, item.aspect)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     Bool load_module_observations(Self&! self, qid.ModuleId module_id) {
@@ -796,6 +860,8 @@ struct ModuleResolvePhase: Movable {
                 // 验证；这里只 materialize 已选中的 interface facts。
                 self.ctx.store.artifacts.record_interface_lookup(.hit);
                 self.ctx.store.resolve.set_module_interface_only(module_id, true);
+                db.retain_declaration_observations(self.ctx.query$.ref(), self.ctx.store.artifacts$.ref(),
+                    self.ctx.store.resolve.module_ref(module_id).source_id);
                 self.set_module_state(module_id, .interface_loaded);
             }
             index = index + 1;
@@ -1030,9 +1096,7 @@ struct ModuleResolvePhase: Movable {
         while (index < end) {
             qid.ModuleId module_id =
                 self.module_for_source_node(schedule.node_at(index), source_modules)$.some();
-            if (self.module_state(module_id) == .interface_loaded
-                && !self.owner.extension_skeletons.has(module_id)
-            ) {
+            if (self.module_state(module_id) == .interface_loaded) {
                 self.load_module_interface_extension_groups(module_id);
             }
             index = index + 1;
@@ -1216,6 +1280,7 @@ struct ModuleResolvePhase: Movable {
         token.Span current_span,
         Int depth
     ) {
+        if (surface_namespace == other_namespace) { return false; }
         if (depth > self.ctx.store.resolve.wildcard_imports.len()) { return false; }
         table.MultiTableCursor cursor! =
             self.ctx.store.resolve.first_namespace_binding(surface_namespace);
@@ -1229,7 +1294,10 @@ struct ModuleResolvePhase: Movable {
                     candidate.domain,
                     0
                 ) is .some(other_binding)) {
-                    if (candidate.def_id.to_index() != other_binding.def_id.to_index()) {
+                    // 同一名字空间中同名函数属于一个重载组，重复路径不能把组内成员判为冲突。
+                    if (candidate.def_id != other_binding.def_id
+                        && candidate.namespace_id != other_binding.namespace_id
+                    ) {
                         self.add_wildcard_import_conflict(
                             module_id,
                             previous_span,
@@ -1485,6 +1553,45 @@ struct ModuleResolvePhase: Movable {
             if (!self.ensure_declaration_model(graph, member)) { return false; }
         }
         return true;
+    }
+
+    #doc 模块标签只降低独立顶层项，复用声明的按需引用解析，不强制降低模块中的函数体。
+    public Bool ensure_module_metadata(Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id) {
+        _ record = self.ctx.store.resolve.module_ref(module_id);
+        qid.DefId definition = record.def_id;
+        source.SourceId source_id = record.source_id;
+        qid.NamespaceId namespace_id = record.namespace_id;
+        if (self.ctx.query.metadata.prepared(definition)) { return true; }
+        guard self.owner.asts.get(source_id) is .some(unit) else { return false; }
+        guard unit.root is .some(root) else { return false; }
+        list.ArrayList<ast.AstId> items! = list.ArrayList<ast.AstId>();
+        self.collect_module_metadata_items(source_id, root, items$.mut_ref());
+        Int index! = 0;
+        while (index < items.len()) {
+            if (!self.resolve_and_lower_declaration(source_id, module_id, namespace_id,
+                items.get(index), definition, false, true, graph)) { return false; }
+            index = index + 1;
+        }
+        self.ctx.query.metadata.prepare(definition);
+        return true;
+    }
+
+    Void collect_module_metadata_items(self, source.SourceId source_id, ast.AstId item,
+        list.ArrayList<ast.AstId>&! items
+    ) {
+        _ unit = self.owner.asts.get(source_id)$.some();
+        _ node = unit.get(item);
+        if (node.data is .meta_attribute(meta)) {
+            if (meta.module_target) { items.add(item); }
+            return;
+        }
+        guard ast.root_data(node.data) is .some(root) else { return; }
+        Int index! = 0;
+        while (index < root.items.length) {
+            _ child = unit.child_at(root.items, index);
+            self.collect_module_metadata_items(source_id, child, items);
+            index = index + 1;
+        }
     }
 
     public Bool ensure_declaration_signature(
@@ -2160,6 +2267,9 @@ struct ModuleResolvePhase: Movable {
         self.bind_core_trait(core_module, "Domain");
         self.bind_core_trait(core_module, "AtomicValue");
         self.bind_core_namespace(core_module, "coroutine");
+        // alias 解析可能立即触发普通 comptime；发布 namespace 时同步登记其内建函数身份。
+        self.record_reflect_module_if_ready();
+        self.record_generate_functions_if_ready();
     }
 
     Void bind_core_declarations_if_ready(Self&! self) {
@@ -2486,12 +2596,310 @@ struct ModuleResolvePhase: Movable {
     }
 
     Void record_core_functions_if_ready(Self&! self) {
+        self.record_reflect_module_if_ready();
+        self.record_generate_functions_if_ready();
         guard self.ctx.store.resolve.core_module is .some(core_module) else { return; }
         qid.SymbolId symbol = self.ctx.store.symbols.intern("coroutine");
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(core_module);
         guard self.ctx.store.resolve.lookup_namespace(module.namespace_id, symbol, .namespace_name, false)
             is .some(binding) else { return; }
         self.record_core_namespace_functions("coroutine", binding);
+    }
+
+    #doc 生成输出能力绑定到 core 的真实函数身份，普通同名声明不会获得宿主能力。
+    Void record_generate_functions_if_ready(Self&! self) {
+        guard self.ctx.store.resolve.core_module is .some(core_module) else { return; }
+        qid.NamespaceId core_namespace = self.ctx.store.resolve.module_ref(core_module).namespace_id;
+        qid.SymbolId symbol = self.ctx.store.symbols.intern("generate");
+        guard self.ctx.store.resolve.lookup_namespace(core_namespace, symbol, .namespace_name, false)
+            is .some(binding) else { return; }
+        guard self.ctx.store.defs.get(binding.def_id).owned_namespace_id is .some(namespace_id) else { return; }
+        self.ctx.store.resolve.core_functions.generate_write = self.core_member_function(namespace_id, "generate_write");
+        self.ctx.store.resolve.core_functions.generate_read = self.core_member_function(namespace_id, "generate_read");
+        self.ctx.store.resolve.core_functions.generate_cache_read =
+            self.core_member_function(namespace_id, "generate_cache_read");
+        self.ctx.store.resolve.core_functions.generate_cache_write =
+            self.core_member_function(namespace_id, "generate_cache_write");
+        self.ctx.store.resolve.core_functions.generate_resource_bytes =
+            self.core_member_function(namespace_id, "generate_resource_bytes");
+        self.bind_core_namespace(core_module, "generate");
+    }
+
+    #doc 从 compiler core 的 namespace 绑定记录标准句柄身份，不接受用户同名类型。
+    Void record_reflect_module_if_ready(Self&! self) {
+        guard self.ctx.store.resolve.core_module is .some(core_module) else { return; }
+        qid.NamespaceId core_namespace = self.ctx.store.resolve.module_ref(core_module).namespace_id;
+        qid.SymbolId reflect_symbol = self.ctx.store.symbols.intern("reflect");
+        guard self.ctx.store.resolve.lookup_namespace(core_namespace, reflect_symbol, .namespace_name, false)
+            is .some(binding) else { return; }
+        guard self.ctx.store.defs.get(binding.def_id).owned_namespace_id is .some(namespace_id) else { return; }
+        qid.SymbolId module_symbol = self.ctx.store.symbols.intern("Module");
+        guard self.ctx.store.resolve.lookup_namespace(namespace_id, module_symbol, .type_name, false)
+            is .some(module_binding) else { return; }
+        self.ctx.store.resolve.core_types.reflect_module_type = module_binding.def_id;
+        self.ctx.store.resolve.core_functions.reflect_location_fingerprint =
+            self.core_member_function(namespace_id, "reflect_location_fingerprint");
+        self.ctx.store.resolve.core_functions.reflect_module_fingerprint =
+            self.core_member_function(namespace_id, "reflect_module_fingerprint");
+        self.ctx.store.resolve.core_functions.reflect_decl_fingerprint =
+            self.core_member_function(namespace_id, "reflect_decl_fingerprint");
+        self.ctx.store.resolve.core_functions.reflect_fingerprint_bytes =
+            self.core_member_function(namespace_id, "reflect_fingerprint_bytes");
+        self.ctx.store.resolve.core_functions.reflect_fingerprint_combine =
+            self.core_member_function(namespace_id, "reflect_fingerprint_combine");
+        self.ctx.store.resolve.core_functions.reflect_decl_generics =
+            self.core_member_function(namespace_id, "reflect_decl_generics");
+        self.ctx.store.resolve.core_functions.reflect_decl_const =
+            self.core_member_function(namespace_id, "reflect_decl_const");
+        self.ctx.store.resolve.core_functions.reflect_decl_type =
+            self.core_member_function(namespace_id, "reflect_decl_type");
+        self.ctx.store.resolve.core_functions.reflect_type_members =
+            self.core_member_function(namespace_id, "reflect_type_members");
+        self.ctx.store.resolve.core_functions.reflect_decl_definition =
+            self.core_member_function(namespace_id, "reflect_decl_definition");
+        self.ctx.store.resolve.core_functions.reflect_type_of =
+            self.core_member_function(namespace_id, "reflect_type_of");
+        self.ctx.store.resolve.core_functions.reflect_type_kind =
+            self.core_member_function(namespace_id, "reflect_type_kind");
+        self.ctx.store.resolve.core_functions.reflect_type_number =
+            self.core_member_function(namespace_id, "reflect_type_number");
+        self.ctx.store.resolve.core_functions.reflect_type_element =
+            self.core_member_function(namespace_id, "reflect_type_element");
+        self.ctx.store.resolve.core_functions.reflect_type_definition =
+            self.core_member_function(namespace_id, "reflect_type_definition");
+        self.ctx.store.resolve.core_functions.reflect_type_parameter =
+            self.core_member_function(namespace_id, "reflect_type_parameter");
+        self.ctx.store.resolve.core_functions.reflect_type_sentinel =
+            self.core_member_function(namespace_id, "reflect_type_sentinel");
+        self.ctx.store.resolve.core_functions.reflect_argument_count =
+            self.core_member_function(namespace_id, "reflect_argument_count");
+        self.ctx.store.resolve.core_functions.reflect_argument_at =
+            self.core_member_function(namespace_id, "reflect_argument_at");
+        self.ctx.store.resolve.core_functions.reflect_constant_type =
+            self.core_member_function(namespace_id, "reflect_constant_type");
+        self.ctx.store.resolve.core_functions.reflect_constant_parameter =
+            self.core_member_function(namespace_id, "reflect_constant_parameter");
+        self.ctx.store.resolve.core_functions.reflect_constant_binding =
+            self.core_member_function(namespace_id, "reflect_constant_binding");
+        self.ctx.store.resolve.core_functions.reflect_constant_read =
+            self.core_member_function(namespace_id, "reflect_constant_read");
+        self.ctx.store.resolve.core_functions.reflect_type_equal =
+            self.core_member_function(namespace_id, "reflect_type_equal");
+        self.ctx.store.resolve.core_functions.reflect_type_mutable =
+            self.core_member_function(namespace_id, "reflect_type_mutable");
+        self.ctx.store.resolve.core_functions.reflect_type_has_parameters =
+            self.core_member_function(namespace_id, "reflect_type_has_parameters");
+        self.ctx.store.resolve.core_functions.reflect_function_result =
+            self.core_member_function(namespace_id, "reflect_function_result");
+        self.ctx.store.resolve.core_functions.reflect_function_receiver =
+            self.core_member_function(namespace_id, "reflect_function_receiver");
+        self.ctx.store.resolve.core_functions.reflect_function_async =
+            self.core_member_function(namespace_id, "reflect_function_async");
+        self.ctx.store.resolve.core_functions.reflect_function_unsafe =
+            self.core_member_function(namespace_id, "reflect_function_unsafe");
+        self.ctx.store.resolve.core_functions.reflect_function_has_body =
+            self.core_member_function(namespace_id, "reflect_function_has_body");
+        self.ctx.store.resolve.core_functions.reflect_function_domain =
+            self.core_member_function(namespace_id, "reflect_function_domain");
+        self.ctx.store.resolve.core_functions.reflect_type_domain =
+            self.core_member_function(namespace_id, "reflect_type_domain");
+        self.ctx.store.resolve.core_functions.reflect_domain_type =
+            self.core_member_function(namespace_id, "reflect_domain_type");
+        self.ctx.store.resolve.core_functions.reflect_domain_binding =
+            self.core_member_function(namespace_id, "reflect_domain_binding");
+        self.ctx.store.resolve.core_functions.reflect_domain_equal =
+            self.core_member_function(namespace_id, "reflect_domain_equal");
+        self.ctx.store.resolve.core_functions.reflect_decl_regions =
+            self.core_member_function(namespace_id, "reflect_decl_regions");
+        self.ctx.store.resolve.core_functions.reflect_type_regions =
+            self.core_member_function(namespace_id, "reflect_type_regions");
+        self.ctx.store.resolve.core_functions.reflect_region_count =
+            self.core_member_function(namespace_id, "reflect_region_count");
+        self.ctx.store.resolve.core_functions.reflect_region_at =
+            self.core_member_function(namespace_id, "reflect_region_at");
+        self.ctx.store.resolve.core_functions.reflect_region_name =
+            self.core_member_function(namespace_id, "reflect_region_name");
+        self.ctx.store.resolve.core_functions.reflect_region_shape =
+            self.core_member_function(namespace_id, "reflect_region_shape");
+        self.ctx.store.resolve.core_functions.reflect_region_default =
+            self.core_member_function(namespace_id, "reflect_region_default");
+        self.ctx.store.resolve.core_functions.reflect_region_sources =
+            self.core_member_function(namespace_id, "reflect_region_sources");
+        self.ctx.store.resolve.core_functions.reflect_region_equal =
+            self.core_member_function(namespace_id, "reflect_region_equal");
+        self.ctx.store.resolve.core_functions.reflect_life_explicit =
+            self.core_member_function(namespace_id, "reflect_life_explicit");
+        self.ctx.store.resolve.core_functions.reflect_function_contract =
+            self.core_member_function(namespace_id, "reflect_function_contract");
+        self.ctx.store.resolve.core_functions.reflect_type_contract =
+            self.core_member_function(namespace_id, "reflect_type_contract");
+        self.ctx.store.resolve.core_functions.reflect_contract_count =
+            self.core_member_function(namespace_id, "reflect_contract_count");
+        self.ctx.store.resolve.core_functions.reflect_contract_at =
+            self.core_member_function(namespace_id, "reflect_contract_at");
+        self.ctx.store.resolve.core_functions.reflect_flow_source =
+            self.core_member_function(namespace_id, "reflect_flow_source");
+        self.ctx.store.resolve.core_functions.reflect_flow_target =
+            self.core_member_function(namespace_id, "reflect_flow_target");
+        self.ctx.store.resolve.core_functions.reflect_borrow_root =
+            self.core_member_function(namespace_id, "reflect_borrow_root");
+        self.ctx.store.resolve.core_functions.reflect_borrow_count =
+            self.core_member_function(namespace_id, "reflect_borrow_count");
+        self.ctx.store.resolve.core_functions.reflect_borrow_at =
+            self.core_member_function(namespace_id, "reflect_borrow_at");
+        self.ctx.store.resolve.core_functions.reflect_nominal_contract =
+            self.core_member_function(namespace_id, "reflect_nominal_contract");
+        self.ctx.store.resolve.core_functions.reflect_region_path_count =
+            self.core_member_function(namespace_id, "reflect_region_path_count");
+        self.ctx.store.resolve.core_functions.reflect_region_path_at =
+            self.core_member_function(namespace_id, "reflect_region_path_at");
+        self.ctx.store.resolve.core_functions.reflect_constraint_count =
+            self.core_member_function(namespace_id, "reflect_constraint_count");
+        self.ctx.store.resolve.core_functions.reflect_constraint_at =
+            self.core_member_function(namespace_id, "reflect_constraint_at");
+        self.ctx.store.resolve.core_functions.reflect_constraint_type =
+            self.core_member_function(namespace_id, "reflect_constraint_type");
+        self.ctx.store.resolve.core_functions.reflect_constraint_parameter =
+            self.core_member_function(namespace_id, "reflect_constraint_parameter");
+        self.ctx.store.resolve.core_functions.reflect_constraint_name =
+            self.core_member_function(namespace_id, "reflect_constraint_name");
+        self.ctx.store.resolve.core_functions.reflect_constraint_value =
+            self.core_member_function(namespace_id, "reflect_constraint_value");
+        self.ctx.store.resolve.core_functions.reflect_pattern_shape =
+            self.core_member_function(namespace_id, "reflect_pattern_shape");
+        self.ctx.store.resolve.core_functions.reflect_pattern_element =
+            self.core_member_function(namespace_id, "reflect_pattern_element");
+        self.ctx.store.resolve.core_functions.reflect_pattern_definition =
+            self.core_member_function(namespace_id, "reflect_pattern_definition");
+        self.ctx.store.resolve.core_functions.reflect_pattern_arg_count =
+            self.core_member_function(namespace_id, "reflect_pattern_arg_count");
+        self.ctx.store.resolve.core_functions.reflect_pattern_arg_at =
+            self.core_member_function(namespace_id, "reflect_pattern_arg_at");
+        self.ctx.store.resolve.core_functions.reflect_pattern_layer =
+            self.core_member_function(namespace_id, "reflect_pattern_layer");
+        self.ctx.store.resolve.core_functions.reflect_pattern_extent =
+            self.core_member_function(namespace_id, "reflect_pattern_extent");
+        self.ctx.store.resolve.core_functions.reflect_literal_value =
+            self.core_member_function(namespace_id, "reflect_literal_value");
+        self.ctx.store.resolve.core_functions.reflect_extension_trait_type =
+            self.core_member_function(namespace_id, "reflect_extension_trait_type");
+        self.ctx.store.resolve.core_functions.reflect_extension_unsafe =
+            self.core_member_function(namespace_id, "reflect_extension_unsafe");
+        self.ctx.store.resolve.core_functions.reflect_extension_target =
+            self.core_member_function(namespace_id, "reflect_extension_target");
+        self.ctx.store.resolve.core_functions.reflect_pattern_error =
+            self.core_member_function(namespace_id, "reflect_pattern_error");
+        self.ctx.store.resolve.core_functions.reflect_life_count =
+            self.core_member_function(namespace_id, "reflect_life_count");
+        self.ctx.store.resolve.core_functions.reflect_life_at =
+            self.core_member_function(namespace_id, "reflect_life_at");
+        self.ctx.store.resolve.core_functions.reflect_life_target =
+            self.core_member_function(namespace_id, "reflect_life_target");
+        self.ctx.store.resolve.core_functions.reflect_life_source =
+            self.core_member_function(namespace_id, "reflect_life_source");
+        self.ctx.store.resolve.core_functions.reflect_lifetime_shape =
+            self.core_member_function(namespace_id, "reflect_lifetime_shape");
+        self.ctx.store.resolve.core_functions.reflect_lifetime_root_kind =
+            self.core_member_function(namespace_id, "reflect_lifetime_root_kind");
+        self.ctx.store.resolve.core_functions.reflect_lifetime_root_name =
+            self.core_member_function(namespace_id, "reflect_lifetime_root_name");
+        self.ctx.store.resolve.core_functions.reflect_lifetime_segment_count =
+            self.core_member_function(namespace_id, "reflect_lifetime_segment_count");
+        self.ctx.store.resolve.core_functions.reflect_lifetime_segment_at =
+            self.core_member_function(namespace_id, "reflect_lifetime_segment_at");
+        self.ctx.store.resolve.core_functions.reflect_parameter_count =
+            self.core_member_function(namespace_id, "reflect_parameter_count");
+        self.ctx.store.resolve.core_functions.reflect_parameter_at =
+            self.core_member_function(namespace_id, "reflect_parameter_at");
+        self.ctx.store.resolve.core_functions.reflect_parameter_name =
+            self.core_member_function(namespace_id, "reflect_parameter_name");
+        self.ctx.store.resolve.core_functions.reflect_parameter_type =
+            self.core_member_function(namespace_id, "reflect_parameter_type");
+        self.ctx.store.resolve.core_functions.reflect_parameter_default =
+            self.core_member_function(namespace_id, "reflect_parameter_default");
+        self.ctx.store.resolve.core_functions.reflect_parameter_equal =
+            self.core_member_function(namespace_id, "reflect_parameter_equal");
+        self.ctx.store.resolve.core_functions.reflect_meta_count =
+            self.core_member_function(namespace_id, "reflect_meta_count");
+        self.ctx.store.resolve.core_functions.reflect_meta_at =
+            self.core_member_function(namespace_id, "reflect_meta_at");
+        self.ctx.store.resolve.core_functions.reflect_documented_count =
+            self.core_member_function(namespace_id, "reflect_documented_count");
+        self.ctx.store.resolve.core_functions.reflect_documented_at =
+            self.core_member_function(namespace_id, "reflect_documented_at");
+        self.ctx.store.resolve.core_functions.reflect_module_documentation =
+            self.core_member_function(namespace_id, "reflect_module_documentation");
+        self.ctx.store.resolve.core_functions.reflect_decl_documentation =
+            self.core_member_function(namespace_id, "reflect_decl_documentation");
+        self.ctx.store.resolve.core_functions.reflect_module_name =
+            self.core_member_function(namespace_id, "reflect_module_name");
+        self.ctx.store.resolve.core_functions.reflect_module_path =
+            self.core_member_function(namespace_id, "reflect_module_path");
+        self.ctx.store.resolve.core_functions.reflect_module_package =
+            self.core_member_function(namespace_id, "reflect_module_package");
+        self.ctx.store.resolve.core_functions.reflect_module_is_virtual =
+            self.core_member_function(namespace_id, "reflect_module_is_virtual");
+        self.ctx.store.resolve.core_functions.reflect_module_location =
+            self.core_member_function(namespace_id, "reflect_module_location");
+        self.ctx.store.resolve.core_functions.reflect_package_name =
+            self.core_member_function(namespace_id, "reflect_package_name");
+        self.ctx.store.resolve.core_functions.reflect_package_equal =
+            self.core_member_function(namespace_id, "reflect_package_equal");
+        self.ctx.store.resolve.core_functions.reflect_recursive_declarations =
+            self.core_member_function(namespace_id, "reflect_recursive_declarations");
+        self.ctx.store.resolve.core_functions.reflect_module_declarations =
+            self.core_member_function(namespace_id, "reflect_module_declarations");
+        self.ctx.store.resolve.core_functions.reflect_decl_members =
+            self.core_member_function(namespace_id, "reflect_decl_members");
+        self.ctx.store.resolve.core_functions.reflect_declaration_count =
+            self.core_member_function(namespace_id, "reflect_declaration_count");
+        self.ctx.store.resolve.core_functions.reflect_declaration_at =
+            self.core_member_function(namespace_id, "reflect_declaration_at");
+        self.ctx.store.resolve.core_functions.reflect_decl_name =
+            self.core_member_function(namespace_id, "reflect_decl_name");
+        self.ctx.store.resolve.core_functions.reflect_decl_module =
+            self.core_member_function(namespace_id, "reflect_decl_module");
+        self.ctx.store.resolve.core_functions.reflect_decl_public =
+            self.core_member_function(namespace_id, "reflect_decl_public");
+        self.ctx.store.resolve.core_functions.reflect_decl_location =
+            self.core_member_function(namespace_id, "reflect_decl_location");
+        self.ctx.store.resolve.core_functions.reflect_decl_equal =
+            self.core_member_function(namespace_id, "reflect_decl_equal");
+        self.ctx.store.resolve.core_functions.reflect_module_equal =
+            self.core_member_function(namespace_id, "reflect_module_equal");
+        self.ctx.store.resolve.core_functions.reflect_module_count =
+            self.core_member_function(namespace_id, "reflect_module_count");
+        self.ctx.store.resolve.core_functions.reflect_module_at =
+            self.core_member_function(namespace_id, "reflect_module_at");
+        self.ctx.store.resolve.core_functions.reflect_export_count =
+            self.core_member_function(namespace_id, "reflect_export_count");
+        self.ctx.store.resolve.core_functions.reflect_export_at =
+            self.core_member_function(namespace_id, "reflect_export_at");
+        self.ctx.store.resolve.core_functions.reflect_export_name =
+            self.core_member_function(namespace_id, "reflect_export_name");
+        self.ctx.store.resolve.core_functions.reflect_export_target =
+            self.core_member_function(namespace_id, "reflect_export_target");
+        self.ctx.store.resolve.core_functions.reflect_export_source =
+            self.core_member_function(namespace_id, "reflect_export_source");
+        self.ctx.store.resolve.core_functions.reflect_export_location =
+            self.core_member_function(namespace_id, "reflect_export_location");
+        self.ctx.store.resolve.core_functions.reflect_import_count =
+            self.core_member_function(namespace_id, "reflect_import_count");
+        self.ctx.store.resolve.core_functions.reflect_import_at =
+            self.core_member_function(namespace_id, "reflect_import_at");
+        self.ctx.store.resolve.core_functions.reflect_import_source =
+            self.core_member_function(namespace_id, "reflect_import_source");
+        self.ctx.store.resolve.core_functions.reflect_import_target =
+            self.core_member_function(namespace_id, "reflect_import_target");
+        self.ctx.store.resolve.core_functions.reflect_import_public =
+            self.core_member_function(namespace_id, "reflect_import_public");
+        self.ctx.store.resolve.core_functions.reflect_import_wildcard =
+            self.core_member_function(namespace_id, "reflect_import_wildcard");
+        self.ctx.store.resolve.core_functions.reflect_import_name =
+            self.core_member_function(namespace_id, "reflect_import_name");
+        self.ctx.store.resolve.core_functions.reflect_import_location =
+            self.core_member_function(namespace_id, "reflect_import_location");
+        self.bind_core_namespace(core_module, "reflect");
     }
 
     Void record_core_namespace_functions(Self&! self, UInt8[]& name, namespace.BindingEntry binding) {
@@ -2824,9 +3232,7 @@ struct ModuleResolvePhase: Movable {
         Int index! = 0;
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
-            if (self.module_state(module_id) == .interface_loaded
-                && !self.owner.extension_skeletons.has(module_id)
-            ) {
+            if (self.module_state(module_id) == .interface_loaded) {
                 self.load_module_interface_extension_groups(module_id);
             }
             index = index + 1;

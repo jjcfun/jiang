@@ -785,6 +785,177 @@ check_deferred_const_instances() {
   expect_exit "$prefix-retry" 68
 }
 
+check_reflection_documentation() {
+  local fixture="$WORK_DIR/reflection-doc"
+  local cache="$WORK_DIR/reflection-doc-cache"
+  local prefix="$WORK_DIR/reflection-doc"
+  cp -R "$ROOT_DIR/test/compiler/fixture/reflection_doc_cache" "$fixture"
+  check_only "$cache" "$prefix-check-cold.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-cold.log" "$prefix-cold" "$fixture/app"
+  expect_exit "$prefix-cold" 1
+  check_only "$cache" "$prefix-check-hot.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-hot.log" "$prefix-hot" "$fixture/app"
+  expect_exit "$prefix-hot" 1
+  require_stat_eq "$prefix-hot.log" artifact_emitted_units 0
+
+  cp "$fixture/library_changed.jiang" "$fixture/library/main.jiang"
+  check_only "$cache" "$prefix-check-changed.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-changed.log" "$prefix-changed" "$fixture/app"
+  expect_exit "$prefix-changed" 4
+  require_stat_ge "$prefix-changed.log" artifact_emitted_units 1
+  compile_executable "$JIANGC" "$cache" "$prefix-changed-hot.log" "$prefix-changed" "$fixture/app"
+  expect_exit "$prefix-changed" 4
+  require_stat_eq "$prefix-changed-hot.log" artifact_no_op_hits 1
+
+  cp "$fixture/library_unread.jiang" "$fixture/library/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-unread.log" "$prefix-unread" "$fixture/app"
+  expect_exit "$prefix-unread" 4
+  require_stat_eq "$prefix-unread.log" artifact_emitted_units 0
+  cp "$fixture/library_removed.jiang" "$fixture/library/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-removed.log" "$prefix-removed" "$fixture/app"
+  expect_exit "$prefix-removed" 0
+  require_stat_ge "$prefix-removed.log" artifact_emitted_units 1
+  cp "$ROOT_DIR/test/compiler/fixture/reflection_doc_cache/library/main.jiang" "$fixture/library/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-restored.log" "$prefix-restored" "$fixture/app"
+  expect_exit "$prefix-restored" 1
+
+  compile_executable "$JIANGC" "$cache" "$prefix-local-cold.log" "$prefix-local" "$fixture/local"
+  expect_exit "$prefix-local" 1
+  compile_executable "$JIANGC" "$cache" "$prefix-local-hot.log" "$prefix-local-hot" "$fixture/local"
+  expect_exit "$prefix-local-hot" 1
+  require_stat_eq "$prefix-local-hot.log" artifact_emitted_units 0
+  cp "$fixture/local_changed.jiang" "$fixture/local/main.jiang"
+  check_only "$cache" "$prefix-local-check.log" "$fixture/local"
+  compile_executable "$JIANGC" "$cache" "$prefix-local-changed.log" "$prefix-local" "$fixture/local"
+  expect_exit "$prefix-local" 4
+  require_stat_ge "$prefix-local-changed.log" artifact_emitted_units 1
+}
+
+write_reflection_location_input() {
+  printf '#doc(module) 位置输入。\npublic Int unused() {%sreturn 1; }\npublic struct Box {\npublic Int field;\n}\n' "$2" >"$1"
+}
+
+write_reflection_location_local() {
+  write_reflection_location_input "$1" "$2"
+  cat >>"$1" <<'EOF'
+Int width<T>() { return reflect.type_of<T>().members().get(0).location().line; }
+const Int line = width<Box>();
+Int main() { return line; }
+EOF
+}
+
+check_reflection_location() {
+  local fixture="$WORK_DIR/reflection-location"
+  local cache="$WORK_DIR/reflection-location-cache"
+  local prefix="$WORK_DIR/reflection-location"
+  cp -R "$ROOT_DIR/test/compiler/fixture/reflection_doc_cache" "$fixture"
+  cat >"$fixture/reader/main.jiang" <<'EOF'
+#doc(module) 跨包读取字段位置。
+public Int width<T>() { return reflect.type_of<T>().members().get(0).location().line; }
+EOF
+  write_reflection_location_input "$fixture/library/main.jiang" '   '
+  check_only "$cache" "$prefix-check-cold.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-cold.log" "$prefix-cold" "$fixture/app"
+  expect_exit "$prefix-cold" 4
+  compile_executable "$JIANGC" "$cache" "$prefix-hot.log" "$prefix-hot" "$fixture/app"
+  expect_exit "$prefix-hot" 4
+  require_stat_eq "$prefix-hot.log" artifact_emitted_units 0
+
+  # 字节 offset 不变，仅将一个空格替换为换行。
+  write_reflection_location_input "$fixture/library/main.jiang" $'\n  '
+  check_only "$cache" "$prefix-check-changed.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-changed.log" "$prefix-changed" "$fixture/app"
+  expect_exit "$prefix-changed" 5
+  require_stat_ge "$prefix-changed.log" artifact_emitted_units 1
+  compile_executable "$JIANGC" "$cache" "$prefix-changed-hot.log" "$prefix-changed" "$fixture/app"
+  expect_exit "$prefix-changed" 5
+  require_stat_eq "$prefix-changed-hot.log" artifact_no_op_hits 1
+
+  # 只改变字段之后的空白；被读取的位置保持不变，不应额外发射 object。
+  printf '\n\n' >>"$fixture/library/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-unread.log" "$prefix-unread" "$fixture/app"
+  expect_exit "$prefix-unread" 5
+  require_stat_eq "$prefix-unread.log" artifact_emitted_units 0
+  write_reflection_location_input "$fixture/library/main.jiang" '   '
+  compile_executable "$JIANGC" "$cache" "$prefix-reverted.log" "$prefix-reverted" "$fixture/app"
+  expect_exit "$prefix-reverted" 4
+
+  write_reflection_location_local "$fixture/local/main.jiang" '   '
+  compile_executable "$JIANGC" "$cache" "$prefix-local-cold.log" "$prefix-local" "$fixture/local"
+  expect_exit "$prefix-local" 4
+  compile_executable "$JIANGC" "$cache" "$prefix-local-hot.log" "$prefix-local-hot" "$fixture/local"
+  expect_exit "$prefix-local-hot" 4
+  require_stat_eq "$prefix-local-hot.log" artifact_emitted_units 0
+  write_reflection_location_local "$fixture/local/main.jiang" $'\n  '
+  check_only "$cache" "$prefix-local-check.log" "$fixture/local"
+  compile_executable "$JIANGC" "$cache" "$prefix-local-changed.log" "$prefix-local" "$fixture/local"
+  expect_exit "$prefix-local" 5
+  require_stat_ge "$prefix-local-changed.log" artifact_emitted_units 1
+}
+
+write_reflection_scalar_input() {
+  printf '#doc(module) 标量反射缓存输入。\npublic struct Box { public Int work(self, Int %s%s) { return %s; } }\n' \
+    "$2" "$3" "$4" >"$1"
+}
+
+check_reflection_scalar() {
+  local fixture="$WORK_DIR/reflection-scalar"
+  local cache="$WORK_DIR/reflection-scalar-cache"
+  local prefix="$WORK_DIR/reflection-scalar"
+  cp -R "$ROOT_DIR/test/compiler/fixture/reflection_doc_cache" "$fixture"
+  cat >"$fixture/reader/main.jiang" <<'EOF'
+#doc(module) 跨包读取函数与参数标量。
+public Int width<T>() {
+    _ decl = reflect.type_of<T>().members().get(0);
+    guard decl is .function(fn) else { return 0; }
+    _ param = fn.signature().parameters.get(0);
+    Int extra = if param.has_default() { 1 } else { 0 };
+    return decl.name().length + param.name().length + extra;
+}
+EOF
+  write_reflection_scalar_input "$fixture/library/main.jiang" value ' = 1' value
+  check_only "$cache" "$prefix-check-cold.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-cold.log" "$prefix-cold" "$fixture/app"
+  expect_exit "$prefix-cold" 10
+  compile_executable "$JIANGC" "$cache" "$prefix-hot.log" "$prefix-hot" "$fixture/app"
+  expect_exit "$prefix-hot" 10
+  require_stat_eq "$prefix-hot.log" artifact_emitted_units 0
+
+  write_reflection_scalar_input "$fixture/library/main.jiang" value ' = 9' 'value + 1'
+  compile_executable "$JIANGC" "$cache" "$prefix-body.log" "$prefix-body" "$fixture/app"
+  expect_exit "$prefix-body" 10
+  write_reflection_scalar_input "$fixture/library/main.jiang" id ' = 9' id
+  check_only "$cache" "$prefix-check-name.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-name.log" "$prefix-name" "$fixture/app"
+  expect_exit "$prefix-name" 7
+  require_stat_ge "$prefix-name.log" artifact_emitted_units 1
+  write_reflection_scalar_input "$fixture/library/main.jiang" id '' id
+  check_only "$cache" "$prefix-check-default.log" "$fixture/app"
+  compile_executable "$JIANGC" "$cache" "$prefix-default.log" "$prefix-default" "$fixture/app"
+  expect_exit "$prefix-default" 6
+  compile_executable "$JIANGC" "$cache" "$prefix-default-hot.log" "$prefix-default-hot" "$fixture/app"
+  expect_exit "$prefix-default-hot" 6
+  require_stat_eq "$prefix-default-hot.log" artifact_emitted_units 0
+  write_reflection_scalar_input "$fixture/library/main.jiang" value ' = 1' value
+  compile_executable "$JIANGC" "$cache" "$prefix-restored.log" "$prefix-restored" "$fixture/app"
+  expect_exit "$prefix-restored" 10
+
+  write_reflection_scalar_input "$fixture/local/main.jiang" value ' = 1' value
+  tail -n +2 "$fixture/reader/main.jiang" >>"$fixture/local/main.jiang"
+  printf '\nconst Int result = width<Box>(); Int main() { return result; }\n' >>"$fixture/local/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$prefix-local.log" "$prefix-local" "$fixture/local"
+  expect_exit "$prefix-local" 10
+  compile_executable "$JIANGC" "$cache" "$prefix-local-hot.log" "$prefix-local-hot" "$fixture/local"
+  expect_exit "$prefix-local-hot" 10
+  require_stat_eq "$prefix-local-hot.log" artifact_emitted_units 0
+  write_reflection_scalar_input "$fixture/local/main.jiang" id '' id
+  tail -n +2 "$fixture/reader/main.jiang" >>"$fixture/local/main.jiang"
+  printf '\nconst Int result = width<Box>(); Int main() { return result; }\n' >>"$fixture/local/main.jiang"
+  check_only "$cache" "$prefix-local-check.log" "$fixture/local"
+  compile_executable "$JIANGC" "$cache" "$prefix-local-changed.log" "$prefix-local-changed" "$fixture/local"
+  expect_exit "$prefix-local-changed" 6
+}
+
 check_member_alias_interface() {
   local cache="$WORK_DIR/member-alias-cache"
   local input="$ROOT_DIR/test/lang/import/run/alias_member_public.jiang"
@@ -1166,6 +1337,9 @@ run_check compiler_build "compiler build identity" check_compiler_build_invalida
 run_check object_contract "object contract and target" check_emit_object_contract_and_target
 run_check const_generic "const generic closure" check_cross_package_const_generic
 run_check deferred_const "deferred const instance restore and invalidation" check_deferred_const_instances
+run_check reflection_documentation "reflection documentation and object invalidation" check_reflection_documentation
+run_check reflection_location "reflection locations and object invalidation" check_reflection_location
+run_check reflection_scalar "reflection declaration scalars and object invalidation" check_reflection_scalar
 run_check shared_generic "shared generic callers" check_shared_generic_callers
 run_check release_units "release whole-package state" check_release_whole_package_state
 run_check global_only "global-only dependency" check_global_only_dependency

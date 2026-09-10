@@ -1,0 +1,448 @@
+#doc(module)
+    持久常量的规范类型记录；声明采用稳定身份，恢复直接复用 TypeStore 的构造及 interning。
+    值 payload 与普通 const 共用编码和恢复，根类型随记录保存；不建立新的语义缓存或指纹算法。
+#end
+alias store_api = import "../store.jiang";
+alias qid = import "../id.jiang";
+alias types = import "../sema/type.jiang";
+alias value = import "../sema/comptime/value.jiang";
+alias constant = import "./constant.jiang";
+alias binary = import "./source_fingerprint.jiang";
+alias list = import "../support/list.jiang";
+alias token = import "../syntax/token.jiang";
+
+enum TypeTag {
+    invalid, never, unit, boolean, namespace_type, character, integer, floating,
+    named, companion, optional, error_union, handle, slice_value, array, tuple,
+    closure_environment, task_state, function, task,
+}
+
+#doc 类型与值同一条记录，不依赖某个 const 声明来恢复类型；失败不返回可发布的字节。
+public list.ArrayList<UInt8>? encode_value(store_api.CompilerStore& store, value.ComptimeValue item) {
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    {
+        binary.SourceSectionWriter writer! = binary.SourceSectionWriter(bytes$.mut_ref());
+        writer.write_bytes("jiang.typed-constant.v1");
+        if (!write_value(store, writer$.mut_ref(), item)) { return null; }
+    }
+    return bytes;
+}
+
+public value.ComptimeValue? decode_value(store_api.CompilerStore&! store, UInt8[]& bytes) {
+    binary.SourceSectionReader reader! = binary.SourceSectionReader(bytes);
+    if (!reader.read_magic("jiang.typed-constant.v1")) { return null; }
+    guard read_value(store, reader$.mut_ref()) is .some(result) else { return null; }
+    if (!reader.finished()) { return null; }
+    return result;
+}
+
+Bool write_value(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, value.ComptimeValue item) {
+    if (!write_type(store, writer, item.type_id)) { return false; }
+    if (item.data is .const_param_value(param)) {
+        writer.write_bool(true);
+        return write_def(store, writer, param);
+    }
+    writer.write_bool(false);
+    _ payload = constant.to_interface(store, item);
+    if (payload.data is .invalid) { return false; }
+    binary.write_comptime_value(store.symbols$.ref(), writer, payload);
+    return true;
+}
+
+value.ComptimeValue? read_value(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard read_type(store, reader) is .some(type_id) else { return null; }
+    guard reader.read_bool() is .some(is_parameter) else { return null; }
+    if (is_parameter) {
+        guard read_def(store, reader) is .some(param) else { return null; }
+        return value.ComptimeValue(type_id: type_id, data: .const_param_value(param));
+    }
+    guard binary.read_const_value(store.symbols$.mut_ref(), reader) is .some(payload) else { return null; }
+    guard constant.from_interface(store, payload) is .some(result) else { return null; }
+    return value.ComptimeValue(type_id: type_id, data: result.data);
+}
+
+Bool write_def(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, qid.DefId definition) {
+    guard store.incremental.stable_id_for_def(definition) is .some(stable) else { return false; }
+    writer.write_uint64(stable.low);
+    writer.write_uint64(stable.high);
+    return true;
+}
+
+qid.DefId? read_def(store_api.CompilerStore& store, binary.SourceSectionReader&! reader) {
+    guard reader.read_stable_id() is .some(stable) else { return null; }
+    return store.incremental.current_def_for_stable(stable);
+}
+
+Bool write_optional_def(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, qid.DefId? definition) {
+    writer.write_bool(definition != null);
+    if (definition is .some(item)) { return write_def(store, writer, item); }
+    return true;
+}
+
+#doc 外层 optional 表示编码有效，内层 optional 表示记录中是否带有声明引用。
+qid.DefId?? read_optional_def(store_api.CompilerStore& store, binary.SourceSectionReader&! reader) {
+    guard reader.read_bool() is .some(present) else { return null; }
+    if (!present) { qid.DefId? absent = null; return absent; }
+    guard read_def(store, reader) is .some(definition) else { return null; }
+    qid.DefId? result = definition;
+    return result;
+}
+
+TypeTag type_tag(types.TypeData data) {
+    return switch data {
+        .invalid => .invalid, .never => .never, .unit => .unit, .bool_type => .boolean,
+        .namespace_type => .namespace_type, .char_type => .character, .int_type(_) => .integer,
+        .float_type(_) => .floating, .named(_) => .named, .trait_companion(_) => .companion,
+        .optional(_) => .optional, .error_union(_) => .error_union, .handle_type(_) => .handle,
+        .slice_value_type(_) => .slice_value, .array_type(_) => .array, .tuple_type(_) => .tuple,
+        .closure_environment_type(_) => .closure_environment, .task_state_type(_) => .task_state,
+        .function_type(_) => .function, .task_type(_) => .task,
+    };
+}
+
+Bool write_type(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, qid.TypeId type_id) {
+    types.TypeInfo info = store.types.get(type_id);
+    writer.write_bool(info.is_mutable);
+    writer.write_int(Int(type_tag(info.data)));
+    return write_type_data(store, writer, info.data);
+}
+
+Bool write_type_data(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, types.TypeData data) {
+    if (data is .invalid) { return false; }
+    if (data is .int_type(item)) {
+        writer.write_int(item.bits);
+        writer.write_bool(item.signed);
+        return true;
+    }
+    if (data is .float_type(item)) { writer.write_int(item.bits); return true; }
+    if (data is .named(item)) {
+        if (!write_def(store, writer, item.def_id)) { return false; }
+        writer.write_bool(item.is_substitutable);
+        return write_args(store, writer, item.args);
+    }
+    if (data is .trait_companion(item)) {
+        writer.write_int(Int(item.kind));
+        return write_def(store, writer, item.trait_def);
+    }
+    if (data is .optional(item)) { return write_type(store, writer, item.element); }
+    if (data is .error_union(item)) {
+        return write_type(store, writer, item.value) && write_type(store, writer, item.error);
+    }
+    if (data is .handle_type(item)) {
+        writer.write_int(Int(item.kind));
+        return write_type(store, writer, item.element) && write_sentinel(store, writer, item.sentinel);
+    }
+    if (data is .slice_value_type(item)) {
+        return write_type(store, writer, item.element) && write_sentinel(store, writer, item.sentinel);
+    }
+    if (data is .array_type(item)) {
+        writer.write_int(item.count);
+        return write_optional_def(store, writer, item.count_param)
+            && write_type(store, writer, item.element) && write_sentinel(store, writer, item.sentinel);
+    }
+    if (data is .tuple_type(item)) { return write_types(store, writer, item.items); }
+    if (data is .closure_environment_type(item)) {
+        return write_def(store, writer, item.lambda_def) && write_args(store, writer, item.args)
+            && write_types(store, writer, item.capture_types);
+    }
+    if (data is .task_state_type(item)) { return write_type(store, writer, item.result); }
+    if (data is .function_type(item)) { return write_function(store, writer, item); }
+    if (data is .task_type(item)) { return write_type(store, writer, item.result); }
+    return true;
+}
+
+Bool write_args(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, types.GenericArg[]& args) {
+    writer.write_int(args.length);
+    Int index! = 0;
+    while (index < args.length) {
+        if (args[index] is .type_arg(item)) {
+            writer.write_bool(true);
+            if (!write_optional_def(store, writer, item.param_def)
+                || !write_type(store, writer, item.value)) { return false; }
+        } else if (args[index] is .const_arg(item)) {
+            writer.write_bool(false);
+            if (!write_optional_def(store, writer, item.param_def)
+                || !write_optional_def(store, writer, item.binding_def)
+                || !write_value(store, writer, item.value)) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool write_types(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, qid.TypeId[]& items) {
+    writer.write_int(items.length);
+    Int index! = 0;
+    while (index < items.length) {
+        if (!write_type(store, writer, items[index])) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool write_sentinel(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, types.Sentinel? sentinel) {
+    writer.write_bool(sentinel != null);
+    if (sentinel is .some(item)) { return write_value(store, writer, item.value); }
+    return true;
+}
+
+Bool write_function(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, types.FunctionType item) {
+    writer.write_bool(item.effects.has_unsafe);
+    writer.write_bool(item.effects.has_async);
+    writer.write_bool(item.effects.domain != null);
+    if (item.effects.domain is .some(domain)) {
+        if (!write_def(store, writer, domain.binding)
+            || !write_type(store, writer, domain.domain_type)) { return false; }
+    }
+    writer.write_int(Int(item.kind));
+    writer.write_int(Int(item.call_ownership));
+    if (!write_types(store, writer, item.params) || !write_type(store, writer, item.result)) { return false; }
+    Int count = store.types.lifetime_contract_flow_count(item.lifetime_contract);
+    writer.write_int(count);
+    Int index! = 0;
+    while (index < count) {
+        _ flow = store.types.lifetime_contract_flow_at(item.lifetime_contract, index);
+        if (!write_path(store, writer, flow.source) || !write_path(store, writer, flow.target)) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool write_path(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer, types.LifetimePath path) {
+    writer.write_int(Int(path.root_kind));
+    writer.write_int(path.root_index);
+    writer.write_int(path.position_index);
+    return write_projection(store, writer, path.projection_path);
+}
+
+Bool write_projection(store_api.CompilerStore& store, binary.SourceSectionWriter&! writer,
+    types.LifetimeProjectionPathId? projection
+) {
+    writer.write_bool(projection != null);
+    guard projection is .some(identity) else { return true; }
+    _ node = store.types.lifetime_projection_path(identity);
+    if (!write_projection(store, writer, node.parent)) { return false; }
+    writer.write_int(Int(node.kind));
+    writer.write_int(node.tuple_index);
+    return write_optional_def(store, writer, node.field_def);
+}
+
+qid.TypeId? read_type(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_bool() is .some(is_mutable) else { return null; }
+    guard reader.read_int() is .some(tag) else { return null; }
+    guard read_type_data(store, reader, tag) is .some(result) else { return null; }
+    if (is_mutable) { return store.types.mutable_type(result, token.Span(0, 0)); }
+    return result;
+}
+
+qid.TypeId? read_type_data(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader, Int tag) {
+    token.Span span = token.Span(0, 0);
+    if (tag == Int(TypeTag.never)) { return store.types.never_type(); }
+    if (tag == Int(TypeTag.unit)) { return store.types.unit_type(); }
+    if (tag == Int(TypeTag.boolean)) { return store.types.bool_type(); }
+    if (tag == Int(TypeTag.namespace_type)) { return store.types.namespace_type(); }
+    if (tag == Int(TypeTag.character)) { return store.types.char_type(); }
+    if (tag == Int(TypeTag.integer)) {
+        guard reader.read_int() is .some(bits) else { return null; }
+        guard reader.read_bool() is .some(signed) else { return null; }
+        if (bits < 0) { return null; }
+        if (signed) {
+            if (bits == 0) { return store.types.int_type(); }
+            if (bits == 8) { return store.types.int8_type(); }
+            if (bits == 16) { return store.types.int16_type(); }
+            if (bits == 32) { return store.types.int32_type(); }
+            if (bits == 64) { return store.types.int64_type(); }
+        } else {
+            if (bits == 0) { return store.types.uint_type(); }
+            if (bits == 8) { return store.types.uint8_type(); }
+            if (bits == 16) { return store.types.uint16_type(); }
+            if (bits == 32) { return store.types.uint32_type(); }
+            if (bits == 64) { return store.types.uint64_type(); }
+        }
+        return store.types.create(.int_type(types.IntType(bits: bits, signed: signed)), span);
+    }
+    if (tag == Int(TypeTag.floating)) {
+        guard reader.read_int() is .some(bits) else { return null; }
+        if (bits < 0) { return null; }
+        if (bits == 16) { return store.types.float16_type(); }
+        if (bits == 32) { return store.types.float_type(); }
+        if (bits == 64) { return store.types.double_type(); }
+        return store.types.create(.float_type(types.FloatType(bits: bits)), span);
+    }
+    if (tag == Int(TypeTag.named)) {
+        guard read_def(store, reader) is .some(definition) else { return null; }
+        guard reader.read_bool() is .some(substitutable) else { return null; }
+        guard read_args(store, reader) is .some(args) else { return null; }
+        if (substitutable) {
+            return store.types.substitutable_named_type_with_ordered_generic_args(definition, args, span);
+        }
+        return store.types.named_type_with_ordered_generic_args(definition, args, span);
+    }
+    if (tag == Int(TypeTag.companion)) {
+        guard reader.read_int() is .some(kind) else { return null; }
+        guard read_def(store, reader) is .some(definition) else { return null; }
+        types.TraitCompanionKind companion = switch kind {
+            0 => .any, 1 => .vtable, 2 => .receiver, else => { return null; },
+        };
+        return store.types.trait_companion_type(definition, companion, span);
+    }
+    if (tag == Int(TypeTag.optional)) {
+        guard read_type(store, reader) is .some(element) else { return null; }
+        return store.types.optional_type(element, span);
+    }
+    if (tag == Int(TypeTag.error_union)) {
+        guard read_type(store, reader) is .some(result) else { return null; }
+        guard read_type(store, reader) is .some(error) else { return null; }
+        return store.types.error_union_type(result, error, span);
+    }
+    if (tag == Int(TypeTag.handle)) { return read_handle(store, reader); }
+    if (tag == Int(TypeTag.slice_value)) {
+        guard read_type(store, reader) is .some(element) else { return null; }
+        guard read_sentinel(store, reader) is .some(sentinel) else { return null; }
+        return store.types.slice_value_type_with_sentinel(element, sentinel, span);
+    }
+    if (tag == Int(TypeTag.array)) { return read_array(store, reader); }
+    if (tag == Int(TypeTag.tuple)) {
+        guard read_types(store, reader) is .some(items) else { return null; }
+        return store.types.tuple_type(items, span);
+    }
+    if (tag == Int(TypeTag.closure_environment)) {
+        guard read_def(store, reader) is .some(definition) else { return null; }
+        guard read_args(store, reader) is .some(args) else { return null; }
+        guard read_types(store, reader) is .some(captures) else { return null; }
+        return store.types.closure_environment_type(definition, args.slice(), captures$.ref(), span);
+    }
+    if (tag == Int(TypeTag.task_state)) {
+        guard read_type(store, reader) is .some(result) else { return null; }
+        return store.types.task_state_type(result, span);
+    }
+    if (tag == Int(TypeTag.function)) { return read_function(store, reader); }
+    if (tag == Int(TypeTag.task)) {
+        guard read_type(store, reader) is .some(result) else { return null; }
+        return store.types.task_type(result, null, span);
+    }
+    return null;
+}
+
+list.ArrayList<types.GenericArg>? read_args(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_int() is .some(count) else { return null; }
+    if (count < 0) { return null; }
+    list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
+    Int index! = 0;
+    while (index < count) {
+        guard reader.read_bool() is .some(is_type) else { return null; }
+        guard read_optional_def(store, reader) is .some(parameter) else { return null; }
+        if (is_type) {
+            guard read_type(store, reader) is .some(type_id) else { return null; }
+            args.add(.type_arg(types.GenericTypeArg(param_def: parameter, value: type_id)));
+        } else {
+            guard read_optional_def(store, reader) is .some(binding) else { return null; }
+            guard read_value(store, reader) is .some(item) else { return null; }
+            args.add(.const_arg(types.GenericConstArg(param_def: parameter, binding_def: binding, value: item)));
+        }
+        index = index + 1;
+    }
+    return args;
+}
+
+list.ArrayList<qid.TypeId>? read_types(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_int() is .some(count) else { return null; }
+    if (count < 0) { return null; }
+    list.ArrayList<qid.TypeId> items! = list.ArrayList<qid.TypeId>();
+    Int index! = 0;
+    while (index < count) {
+        guard read_type(store, reader) is .some(item) else { return null; }
+        items.add(item);
+        index = index + 1;
+    }
+    return items;
+}
+
+types.Sentinel?? read_sentinel(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_bool() is .some(present) else { return null; }
+    if (!present) { types.Sentinel? absent = null; return absent; }
+    guard read_value(store, reader) is .some(item) else { return null; }
+    types.Sentinel? result = types.Sentinel(item);
+    return result;
+}
+
+qid.TypeId? read_handle(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_int() is .some(kind) else { return null; }
+    types.HandleTypeKind handle = switch kind {
+        0 => .reference, 1 => .owner_pointer, 2 => .raw_pointer, 3 => .slice, else => { return null; },
+    };
+    guard read_type(store, reader) is .some(element) else { return null; }
+    guard read_sentinel(store, reader) is .some(sentinel) else { return null; }
+    return store.types.handle_type_with_sentinel(handle, element, sentinel, token.Span(0, 0));
+}
+
+qid.TypeId? read_array(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_int() is .some(count) else { return null; }
+    if (count < 0) { return null; }
+    guard read_optional_def(store, reader) is .some(parameter) else { return null; }
+    guard read_type(store, reader) is .some(element) else { return null; }
+    guard read_sentinel(store, reader) is .some(sentinel) else { return null; }
+    if (parameter is .some(definition)) {
+        if (count != 0) { return null; }
+        return store.types.array_type_with_const_count(element, definition, sentinel, token.Span(0, 0));
+    }
+    return store.types.array_type_with_sentinel(element, count, sentinel, token.Span(0, 0));
+}
+
+qid.TypeId? read_function(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_bool() is .some(has_unsafe) else { return null; }
+    guard reader.read_bool() is .some(has_async) else { return null; }
+    guard reader.read_bool() is .some(has_domain) else { return null; }
+    types.DomainEffect? domain! = null;
+    if (has_domain) {
+        guard read_def(store, reader) is .some(binding) else { return null; }
+        guard read_type(store, reader) is .some(type_id) else { return null; }
+        domain = types.DomainEffect(binding: binding, domain_type: type_id);
+    }
+    guard reader.read_int() is .some(kind_value) else { return null; }
+    types.FunctionKind kind = switch kind_value { 0 => .raw, 1 => .closure, else => { return null; }, };
+    guard reader.read_int() is .some(ownership) else { return null; }
+    if (ownership < 0 || ownership > 1) { return null; }
+    guard read_types(store, reader) is .some(params) else { return null; }
+    guard read_type(store, reader) is .some(result) else { return null; }
+    guard reader.read_int() is .some(count) else { return null; }
+    if (count < 0) { return null; }
+    list.ArrayList<types.LifetimeFlow> flows! = list.ArrayList<types.LifetimeFlow>();
+    Int index! = 0;
+    while (index < count) {
+        guard read_path(store, reader) is .some(source) else { return null; }
+        guard read_path(store, reader) is .some(target) else { return null; }
+        flows.add(types.LifetimeFlow(source: source, target: target));
+        index = index + 1;
+    }
+    return store.types.function_type_with_kind(params, result, token.Span(0, 0),
+        types.EffectSet(has_unsafe, has_async, domain), kind, flows.slice(), ownership == 1);
+}
+
+types.LifetimePath? read_path(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_int() is .some(kind) else { return null; }
+    types.LifetimeRootKind root = switch kind {
+        0 => .result, 1 => .parameter, 2 => .callable_result, 3 => .callable_parameter, else => { return null; },
+    };
+    guard reader.read_int() is .some(root_index) else { return null; }
+    guard reader.read_int() is .some(position_index) else { return null; }
+    guard read_projection(store, reader) is .some(projection) else { return null; }
+    return types.LifetimePath(root_kind: root, root_index: root_index,
+        position_index: position_index, projection_path: projection);
+}
+
+types.LifetimeProjectionPathId?? read_projection(store_api.CompilerStore&! store, binary.SourceSectionReader&! reader) {
+    guard reader.read_bool() is .some(present) else { return null; }
+    if (!present) { types.LifetimeProjectionPathId? absent = null; return absent; }
+    guard read_projection(store, reader) is .some(parent) else { return null; }
+    guard reader.read_int() is .some(kind) else { return null; }
+    types.LifetimeProjectionKind projection = switch kind {
+        0 => .field, 1 => .tuple_index, 2 => .reference_value, else => { return null; },
+    };
+    guard reader.read_int() is .some(tuple_index) else { return null; }
+    guard read_optional_def(store, reader) is .some(field) else { return null; }
+    if ((projection == .field) != (field != null)) { return null; }
+    types.LifetimeProjectionPathId? result =
+        store.types.intern_lifetime_projection(parent, projection, field, tuple_index);
+    return result;
+}

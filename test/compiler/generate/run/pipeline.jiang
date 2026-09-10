@@ -1,0 +1,272 @@
+#doc(module)
+    验证生成配置、跨包私有入口、单次执行与失败不发布；输入只有定义，生成器独立加载。
+#end
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias jil = import "../../../../src/compiler/jil.jiang";
+alias memory_api = import "../../../../src/compiler/jil/eval/memory.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias source = import "../../../../src/compiler/source.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+import std;
+
+public Int run() {
+    UInt8[]& base = "build/test-generate-pipeline";
+    if (fs.exists(base)) { assert(fs.remove_tree(base)); }
+    assert(fs.create_dirs("build/test-generate-pipeline/app"));
+    assert(fs.create_dirs("build/test-generate-pipeline/tool"));
+    assert(fs.write_all("build/test-generate-pipeline/app/package.ini",
+        "[package]\nname=app\nroot=model.jiang\n[dependencies]\ngen=../tool\n[generate.docs]\nmodule=gen\n"));
+    assert(fs.write_all("build/test-generate-pipeline/app/model.jiang", "struct Model { Int value; }"));
+    assert(fs.write_all("build/test-generate-pipeline/tool/package.ini", "[package]\nname=tool\nroot=tool.jiang\n"));
+    assert(fs.write_all("build/test-generate-pipeline/tool/template.txt", "first resource"));
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang",
+        "@entry(generate) Void emit(reflect.Module root) { generate.write(\"resource.txt\", generate.read(\"template.txt\").bytes()); generate.write(\"root.txt\", root.name()); generate.write(\"program.jiang\", \"Int main() { return 0; }\"); }"));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-generate-pipeline/app", "build/test-generate-pipeline/out", "build/test-generate-pipeline/cache");
+    context.CompilerContext cold! = context.CompilerContext();
+    pipeline.compile(cold$.mut_ref(), options$.ref());
+    assert_success(cold$.mut_ref());
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/root.txt")$.some(),
+        "build/test-generate-pipeline/app/model.jiang"));
+    assert(cold.jil.program.mono_item_count() == 0);
+    check_output_aliases();
+    check_empty_output();
+    context.CompilerContext warm! = context.CompilerContext();
+    pipeline.compile(warm$.mut_ref(), options$.ref());
+    assert_success(warm$.mut_ref());
+    assert(warm.store.artifacts.stats.interface_hit > 0);
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/resource.txt")$.some(), "first resource"));
+    assert(fs.write_all("build/test-generate-pipeline/tool/template.txt", "changed resource"));
+    context.CompilerContext resource_change! = context.CompilerContext();
+    pipeline.compile(resource_change$.mut_ref(), options$.ref());
+    assert_success(resource_change$.mut_ref());
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/resource.txt")$.some(), "changed resource"));
+    source.SourceId resource_id = resource_change.store.sources.find(
+        .file("build/test-generate-pipeline/tool/template.txt"))$.some();
+    assert(resource_change.store.resolve.module_for_source(resource_id) == null);
+    memory_api.Memory memory! = memory_api.Memory();
+    guard resource_change.store.types.get(resource_change.store.typeck.def_type(
+        resource_change.store.resolve.core_functions.generate_read$.some())$.some()).data
+        is .function_type(read_signature) else { assert(false); return 1; }
+    Int handle = memory.allocate(read_signature.result)$.some();
+    memory.set_data(handle, .resource(resource_id));
+    assert(memory.export_value(resource_change.store$.mut_ref(), resource_change.query$.mut_ref(), handle) == null);
+
+    options_api.CompileOptions generated = options_api.CompileOptions(.check_only,
+        "build/test-generate-pipeline/out/program.jiang", "", "build/test-generate-pipeline/check-cache");
+    context.CompilerContext generated_ctx! = context.CompilerContext();
+    pipeline.compile(generated_ctx$.mut_ref(), generated$.ref());
+    assert_success(generated_ctx$.mut_ref());
+
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang",
+        "@entry(generate) Void emit(reflect.Module root) { generate.write(\"root.txt\", \"new\"); generate.write(\"root.txt\", \"duplicate\"); }"));
+    context.CompilerContext failed! = context.CompilerContext();
+    pipeline.compile(failed$.mut_ref(), options$.ref());
+    assert(failed.store.diagnostics.has_errors());
+    Bool call_site! = false;
+    source.SourceId generator_id = failed.store.sources.find(
+        .file("build/test-generate-pipeline/tool/tool.jiang"))$.some();
+    Int diagnostic_index! = 0;
+    while (diagnostic_index < failed.store.diagnostics.len()) {
+        Int note! = 0;
+        while (note < failed.store.diagnostics.get(diagnostic_index).related.len()) {
+            if (failed.store.diagnostics.get(diagnostic_index).related.ref_at(note).range.source_id == generator_id) {
+                call_site = true;
+            }
+            note = note + 1;
+        }
+        diagnostic_index = diagnostic_index + 1;
+    }
+    assert(call_site);
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/root.txt")$.some(),
+        "build/test-generate-pipeline/app/model.jiang"));
+
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang",
+        "@entry(generate) unsafe Void emit(reflect.Module root) { generate.write(\"unsafe.txt\", \"ok\"); }"));
+    pipeline.compile(failed$.mut_ref(), options$.ref());
+    assert_success(failed$.mut_ref());
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/unsafe.txt")$.some(), "ok"));
+
+    assert(fs.write_all("build/test-generate-pipeline/app/package.ini",
+        "[package]\nname=app\nroot=model.jiang\n[generate.docs]\nmodule=missing.jiang\n"));
+    options.emit = .check_only;
+    context.CompilerContext check! = context.CompilerContext();
+    pipeline.compile(check$.mut_ref(), options$.ref());
+    assert_success(check$.mut_ref());
+    assert(check.store.sources.find(.file("build/test-generate-pipeline/app/missing.jiang")) == null);
+    options.emit = .generate;
+    options.generate_name = "unknown";
+    context.CompilerContext unknown! = context.CompilerContext();
+    pipeline.compile(unknown$.mut_ref(), options$.ref());
+    assert(unknown.store.diagnostics.has_errors());
+    assert(fs.write_all("build/test-generate-pipeline/app/model.jiang",
+        "const Int value = comptime { generate.read(\"template.txt\"); 0 };"));
+    options.emit = .check_only;
+    context.CompilerContext ordinary! = context.CompilerContext();
+    pipeline.compile(ordinary$.mut_ref(), options$.ref());
+    Bool context_error! = false;
+    Int error_index! = 0;
+    while (error_index < ordinary.store.diagnostics.len()) {
+        if (string.equal(ordinary.store.diagnostics.get(error_index).code.text, "generate_context_required")) {
+            context_error = true;
+        }
+        error_index = error_index + 1;
+    }
+    if (!context_error) {
+        reporter.report_to_stderr(ordinary.store.diagnostics$.ref(), ordinary.store.sources$.mut_ref());
+    }
+    assert(context_error);
+    check_memory_budget();
+    assert(fs.remove_tree(base));
+    return 0;
+}
+
+Void assert_success(context.CompilerContext&! ctx) {
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+extern {
+    Int32 symlink(UInt8* target, UInt8* link_path);
+}
+
+#doc 输出目录或其父目录指向输入时拒绝发布，锁文件指向输入时也不能修改输入。
+Void check_output_aliases() {
+    assert(unsafe { symlink("app", "build/test-generate-pipeline/input-link") } == 0);
+    assert_output_error("build/test-generate-pipeline/input-link", "generate_output_contains_source");
+    assert(unsafe { symlink(".", "build/test-generate-pipeline/parent-link") } == 0);
+    assert_output_error("build/test-generate-pipeline/parent-link/app", "generate_output_contains_source");
+    assert(unsafe { symlink("tool/template.txt", "build/test-generate-pipeline/locked.jiang-lock") } == 0);
+    assert_output_error("build/test-generate-pipeline/locked", "generate_output_failed");
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/tool/template.txt")$.some(), "first resource"));
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/app/model.jiang")$.some(),
+        "struct Model { Int value; }"));
+    assert(!fs.exists("build/test-generate-pipeline/locked"));
+    assert(fs.remove_file("build/test-generate-pipeline/input-link"));
+    assert(fs.remove_file("build/test-generate-pipeline/parent-link"));
+    assert(fs.remove_file("build/test-generate-pipeline/locked.jiang-lock"));
+}
+
+Void assert_output_error(UInt8[]& output, UInt8[]& code) {
+    options_api.CompileOptions options = options_api.CompileOptions(.generate,
+        "build/test-generate-pipeline/app", output, "build/test-generate-pipeline/cache");
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), options$.ref());
+    Bool found! = false;
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, code)) { found = true; }
+        index = index + 1;
+    }
+    assert(found);
+}
+
+#doc 无文档目标时 StringBuilder 保持未分配，空数组与空堆序列同样应生成真实的空文件。
+Void check_empty_output() {
+    assert(fs.create_dirs("build/test-generate-pipeline/empty"));
+    assert(fs.write_all("build/test-generate-pipeline/empty/model.jiang", "struct Empty {}\n"));
+    assert(fs.write_all("build/test-generate-pipeline/empty/package.ini",
+        "[package]\nname=empty\nroot=model.jiang\n"));
+    std.StringBuilder generator! = std.StringBuilder();
+    generator.append("#doc(module) 空文档集合。\nimport std; @entry(generate) Void gen(reflect.Module root) {\n");
+    generator.append("std.StringBuilder text! = std.StringBuilder();\n");
+    generator.append("for item in reflect.with_doc(root) { text.append(\"documented\"); }\n");
+    generator.append("generate.write(\"builder.txt\", text.slice());\n");
+    generator.append("generate.write(\"nested.txt\", text.slice()[..]);\n");
+    generator.append("UInt8[0] fixed = []; generate.write(\"fixed.txt\", fixed[..]);\n");
+    generator.append("UInt8[]^ allocated = new []; generate.write(\"allocated.txt\", allocated$.ref()); }\n");
+    assert(fs.write_all("build/test-generate-pipeline/empty/generator.jiang", generator.slice()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-generate-pipeline/empty", "build/test-generate-pipeline/empty-out",
+        "build/test-generate-pipeline/empty-cache");
+    options.generator = "build/test-generate-pipeline/empty/generator.jiang";
+    context.CompilerContext ctx! = context.CompilerContext();
+    Int round! = 0;
+    while (round < 2) {
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        assert_success(ctx$.mut_ref());
+        assert(fs.read_all("build/test-generate-pipeline/empty-out/builder.txt")$.some().length == 0);
+        assert(fs.read_all("build/test-generate-pipeline/empty-out/nested.txt")$.some().length == 0);
+        assert(fs.read_all("build/test-generate-pipeline/empty-out/fixed.txt")$.some().length == 0);
+        assert(fs.read_all("build/test-generate-pipeline/empty-out/allocated.txt")$.some().length == 0);
+        round = round + 1;
+    }
+}
+
+#doc 重复遍历及签名查询复用空间；真正保留大量堆数据时报告配额错误并保留旧输出。
+Void check_memory_budget() {
+    std.StringBuilder model! = std.StringBuilder();
+    UInt8[]& alphabet = "abcdefghijklmnopqrstuvwxyz";
+    Int index! = 0;
+    while (index < 500) {
+        Int first = index / 26; Int second = index % 26;
+        model.append("public Int function_");
+        model.append(alphabet[first..first + 1]); model.append(alphabet[second..second + 1]);
+        model.append("(Int a, Int b, Int c, Int d) { return a + b + c + d; }\n");
+        index += 1;
+    }
+    assert(fs.write_all("build/test-generate-pipeline/app/model.jiang", model.slice()));
+    std.StringBuilder generator! = std.StringBuilder();
+    generator.append("@entry(generate) Void emit(reflect.Module root) { generate.write(\"new.txt\", \"partial\"); ");
+    generator.append("Int iteration! = 0; Int total! = 0; while (iteration < 10) { ");
+    generator.append("for declaration in root.declarations() { if (declaration is .function(function)) { ");
+    generator.append("total += function.signature().parameters.len(); } } ");
+    generator.append("iteration += 1; } assert(total == 20000); }");
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang", generator.slice()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-generate-pipeline/app/model.jiang", "build/test-generate-pipeline/out",
+        "build/test-generate-pipeline/memory-cache");
+    options.generator = "build/test-generate-pipeline/tool/tool.jiang";
+    context.CompilerContext repeated! = context.CompilerContext();
+    pipeline.compile(repeated$.mut_ref(), options$.ref());
+    if (repeated.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(repeated.store.diagnostics$.ref(), repeated.store.sources$.mut_ref());
+    }
+    assert(!repeated.store.diagnostics.has_errors());
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/new.txt")$.some(), "partial"));
+    std.StringBuilder growing! = std.StringBuilder();
+    growing.append("@entry(generate) Void emit(reflect.Module root) { generate.write(\"new.txt\", \"overwritten\"); ");
+    growing.append("unsafe { Int*! first = Int$.alloc(100000); Int*! second = Int$.alloc(100000); ");
+    growing.append("Int*! third = Int$.alloc(100000); first$.dealloc(); second$.dealloc(); third$.dealloc(); } }");
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang", growing.slice()));
+    context.CompilerContext failed! = context.CompilerContext();
+    pipeline.compile(failed$.mut_ref(), options$.ref());
+    assert(failed.store.diagnostics.has_errors());
+    Bool memory_error! = false;
+    Int diagnostic_index! = 0;
+    while (diagnostic_index < failed.store.diagnostics.len()) {
+        _ diagnostic = failed.store.diagnostics.get(diagnostic_index);
+        diagnostic_index += 1;
+        if (string.equal(diagnostic.code.text, "comptime_memory_limit")) { memory_error = true; }
+        assert(!string.equal(diagnostic.code.text, "comptime_uninitialized_value"));
+    }
+    if (!memory_error) { reporter.report_to_stderr(failed.store.diagnostics$.ref(), failed.store.sources$.mut_ref()); }
+    assert(memory_error);
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/new.txt")$.some(), "partial"));
+    std.StringBuilder resource! = std.StringBuilder();
+    index = 0;
+    while (index < 500000) { resource.append("x"); index += 1; }
+    assert(fs.write_all("build/test-generate-pipeline/tool/large.txt", resource.slice()));
+    std.StringBuilder reading! = std.StringBuilder();
+    reading.append("@entry(generate) Void emit(reflect.Module root) { generate.write(\"new.txt\", \"changed\"); ");
+    reading.append("_ bytes = generate.read(\"large.txt\").bytes(); assert(bytes.length > 0); }");
+    assert(fs.write_all("build/test-generate-pipeline/tool/tool.jiang", reading.slice()));
+    context.CompilerContext resource_failed! = context.CompilerContext();
+    pipeline.compile(resource_failed$.mut_ref(), options$.ref());
+    memory_error = false;
+    diagnostic_index = 0;
+    while (diagnostic_index < resource_failed.store.diagnostics.len()) {
+        _ diagnostic = resource_failed.store.diagnostics.get(diagnostic_index);
+        diagnostic_index += 1;
+        if (string.equal(diagnostic.code.text, "comptime_memory_limit")) { memory_error = true; }
+        assert(!string.equal(diagnostic.code.text, "comptime_uninitialized_value"));
+    }
+    assert(memory_error);
+    assert(string.equal(fs.read_all("build/test-generate-pipeline/out/new.txt")$.some(), "partial"));
+
+}

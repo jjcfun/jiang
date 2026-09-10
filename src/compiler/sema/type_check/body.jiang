@@ -191,7 +191,7 @@ public struct BodyCheck: Movable {
     // 调用者先发布 model；单个查询按需检查 signature，不隐式检查子声明。
     // 最终 sweep 单独遍历声明树，复用相同的 per-DefId 完成状态。
     public Void ensure_body_checked(Self&! self, qid.DefId def_id) {
-        if (!self.type_ops.state.ctx.store.typeck.signature_checked(def_id)) {
+        if (!self.type_ops.state.ctx.query.type_check_signature.ready(def_id)) {
             type_ops_mod.TypeOps ops! = type_ops_mod.TypeOps(self.type_ops.state$.mut_ref());
             decl_check.DeclCheck checker! = decl_check.DeclCheck(ops);
             checker.ensure_signature_checked(def_id);
@@ -3422,6 +3422,9 @@ public struct BodyCheck: Movable {
 
     qid.DefId? namespace_base_def(self, sem.NodeId base_id) {
         sem.Node base = self.type_ops.state.ctx.store.model.node(base_id);
+        if (base.data is .literal(literal)) {
+            if (literal.value is .namespace_value(owner)) { return owner; }
+        }
         if (base.data is .name_ref(name_ref)) {
             if (name_ref is .def_ref(def_id)) {
                 return def_id;
@@ -4343,7 +4346,7 @@ public struct BodyCheck: Movable {
         types.TypeInfo info = self.type_ops.state.ctx.store.types.get(actual);
         guard info.data is .function_type(function_type) else { return; }
         qid.TypeId result_type = self.iterator_method_result_type(iterator_type, function_type.result);
-        if (self.type_ops.same_type_ignoring_mutability(result_type, expected)) { return; }
+        if (self.type_ops.same_type_with_contracts(result_type, expected)) { return; }
         self.type_ops.add_def_error(next_def, "Iterator.next result must be Element?", "iterator_next_result_mismatch");
     }
 
@@ -4456,6 +4459,8 @@ public struct BodyCheck: Movable {
             );
             pattern_index = pattern_index + 1;
         }
+        pattern_mod.PatternCheck checker! = pattern_mod.PatternCheck(self.type_ops$.mut_ref());
+        checker.check_alternative_bindings(switch_case.patterns);
     }
 
     Void check_enum_switch_exhaustive(
@@ -4994,6 +4999,7 @@ public struct BodyCheck: Movable {
             type_ops_mod.TypeOps ops! = type_ops_mod.TypeOps(self.type_ops.state$.mut_ref());
             decl_check.DeclCheck checker! = decl_check.DeclCheck(ops);
             checker.ensure_enum_case_value(def_id);
+            self.type_ops.observe_const_value(node_id, def_id);
             return;
         }
         if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
@@ -5001,14 +5007,52 @@ public struct BodyCheck: Movable {
             || !self.type_ops.state.ctx.store.model.def_is_const(def_id)) {
             return;
         }
-        if (self.type_ops.state.ctx.store.comptime_store.has_const_value(def_id)) { return; }
-        if (database.type_check_body_is_evaluating(self.type_ops.state.ctx.query$.ref(), def_id)) {
-            self.type_ops.add_node_error(node_id, "recursive const initializer", "recursive_const_initializer");
+        if (!self.type_ops.state.ctx.store.comptime_store.has_const_value(def_id)) {
+            if (database.type_check_body_is_evaluating(self.type_ops.state.ctx.query$.ref(), def_id)) {
+                self.type_ops.add_node_error(node_id, "recursive const initializer", "recursive_const_initializer");
+                return;
+            }
+            self.ensure_body_checked(def_id);
+            // builtin const 没有 initializer body；按需引用也必须发布其编译上下文值。
+            if (!self.type_ops.state.ctx.store.typeck.has_errors()) { self.materialize_const_global(def_id); }
+        }
+        if (self.type_ops.state.ctx.store.comptime_store.const_value(def_id) is .some(value)) {
+            self.ensure_constant_payload_checked(node_id, value.data);
+        }
+        self.type_ops.observe_const_value(node_id, def_id);
+    }
+
+    #doc 缓存常量可先于其类型的全量检查被使用；在 JIL 物化前按普通声明查询准备字段和 enum 判别值。
+    Void ensure_constant_payload_checked(Self&! self, sem.NodeId use, comptime_value.ComptimeValueData data) {
+        if (data is .enum_case_value(case_def)) {
+            self.ensure_const_dependency_checked(use, case_def);
             return;
         }
-        self.ensure_body_checked(def_id);
-        // builtin const 没有 initializer body；按需引用也必须发布其编译上下文值。
-        if (!self.type_ops.state.ctx.store.typeck.has_errors()) { self.materialize_const_global(def_id); }
+        if (data is .struct_value(fields)) {
+            Int index! = 0;
+            while (index < self.type_ops.state.ctx.store.comptime_store.field_count(fields)) {
+                _ field = self.type_ops.state.ctx.store.comptime_store.field_at(fields, index);
+                self.type_ops.type_for_def(field.field_def);
+                self.ensure_constant_payload_checked(use, field.value.data);
+                index = index + 1;
+            }
+            return;
+        }
+        comptime_value.ComptimeAggregateId payload;
+        if (data is .array_value(items)) { payload = items; }
+        else if (data is .tuple_value(items)) { payload = items; }
+        else if (data is .optional_value(items)) { payload = items; }
+        else if (data is .error_union_value(_, items)) { payload = items; }
+        else if (data is .enum_value(case_def, items)) {
+            self.ensure_const_dependency_checked(use, case_def);
+            payload = items;
+        } else { return; }
+        Int index! = 0;
+        while (index < self.type_ops.state.ctx.store.comptime_store.item_count(payload)) {
+            _ item = self.type_ops.state.ctx.store.comptime_store.item_at(payload, index);
+            self.ensure_constant_payload_checked(use, item.data);
+            index = index + 1;
+        }
     }
 
     qid.TypeId check_let(Self&! self, sem.NodeId node_id, sem.Let let_stmt) {
@@ -8627,7 +8671,7 @@ public struct BodyCheck: Movable {
         if (target.lifetime_contract_id.index != source.lifetime_contract_id.index) {
             return false;
         }
-        if (!self.type_ops.same_type_ignoring_mutability(target.result, source.result)) { return false; }
+        if (!self.type_ops.same_type_with_contracts(target.result, source.result)) { return false; }
         if (target.param_count != source.param_count) { return false; }
         Int index! = 0;
         while (index < target.param_count) {
@@ -8635,7 +8679,7 @@ public struct BodyCheck: Movable {
                 self.type_ops.state.ctx.store.types.function_type_param_at(target_type, index);
             qid.TypeId source_param =
                 self.type_ops.state.ctx.store.types.function_type_param_at(arg_type, index);
-            if (!self.type_ops.same_type_ignoring_mutability(target_param, source_param)) {
+            if (!self.type_ops.same_type_with_contracts(target_param, source_param)) {
                 return false;
             }
             index = index + 1;
@@ -8953,8 +8997,10 @@ public struct BodyCheck: Movable {
         return false;
     }
 
+    #doc 构造调用在发布实例前准备完整 init 签名，提前常量求值的 JIL 不得引用未检查的函数类型。
     Void record_constructor_instance(Self&! self, qid.TypeId result_type, sem.Call call, qid.DefId init_def) {
         if (self.type_ops.state.ctx.store.types.named_type_def(result_type) == null) { return; }
+        self.type_ops.type_for_def(init_def);
         Int arg_count = self.type_ops.state.ctx.store.types.named_generic_arg_count(result_type);
         list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>(arg_count);
         Int index! = 0;

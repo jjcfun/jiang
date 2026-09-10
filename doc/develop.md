@@ -70,6 +70,11 @@ previous stable
   -> release/<version> stable
 ```
 
+阶段数量不受单个 bootstrap 限制，但新增阶段必须由固定的前一阶段以 strict 模式编译，
+并以自身产物严格编译同一阶段源码；最终仍须完成 release `next -> stable`。
+不得通过关闭类型、借用或 lifetime 检查打通交接；临时工作区产物不能自行串接成 bootstrap 链。
+只有固定前一阶段确实无法编译下一阶段时，才补充必要的 bootstrap 能力。
+
 release 分支保留自己的线性提交历史；bootstrap 分支只提供编译下一阶段所需的过渡编译器。
 各阶段必须使用独立 build 目录，不混用编译产物。
 

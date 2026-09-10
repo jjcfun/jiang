@@ -4,8 +4,10 @@
 #end
 
 alias compiler_store = import "../../store.jiang";
+alias source = import "../../source.jiang";
 alias qid = import "../../id.jiang";
 alias value = import "../../sema/comptime/value.jiang";
+alias sem = import "../../sema/model.jiang";
 alias types = import "../../sema/type.jiang";
 alias database = import "../../db.jiang";
 alias layout = import "../../layout.jiang";
@@ -13,6 +15,8 @@ alias list = import "../../support/list.jiang";
 alias map = import "../../support/map.jiang";
 alias integer = import "./integer.jiang";
 alias jil = import "../model.jiang";
+
+public enum BorrowContext { function, method, nominal, }
 
 public enum CellData: Copyable {
     uninitialized,
@@ -23,6 +27,29 @@ public enum CellData: Copyable {
     element_reference(Int storage, Int first, Int index),
     null_pointer,
     function(jil.MonoItem),
+    reflected_module(qid.ModuleId),
+    reflected_package(qid.PackageId),
+    reflected_recursive_declarations(qid.ModuleId),
+    reflected_definition(qid.DefId definition, qid.TypeId? owner_type),
+    reflected_declarations(qid.DefId? owner, Bool public_only, Bool generic_parameters, qid.TypeId? owner_type),
+    reflected_type(qid.TypeId),
+    reflected_domain(types.DomainEffect),
+    reflected_contract(types.LifetimeContract, Bool receiver),
+    reflected_nominal_contract(qid.DefId),
+    reflected_flow(types.LifetimeFlow, BorrowContext),
+    reflected_borrow_path(types.LifetimePath, BorrowContext),
+    reflected_constraint(qid.DefId owner, Int index, qid.TypeId? owner_type),
+    reflected_pattern(sem.NodeId, qid.TypeId? owner_type),
+    reflected_life_binding(qid.DefId owner, Int index),
+    reflected_lifetime_expression(sem.LifetimeExpressionData),
+    reflected_lifetime_path(sem.LifetimeName),
+    reflected_regions(qid.DefId owner, qid.TypeId? owner_type, Int target),
+    reflected_region(qid.DefId owner, Int index, qid.TypeId? owner_type),
+    reflected_constant(value.ComptimeValue, qid.DefId? binding),
+    reflected_parameter(qid.DefId function, Int index, qid.TypeId? owner_type),
+    reflected_import(qid.ModuleId source, Int index),
+    reflected_export(qid.ModuleId module, Int index),
+    resource(source.SourceId),
 }
 
 public struct Cell: Copyable {
@@ -32,32 +59,207 @@ public struct Cell: Copyable {
     public Bool read_only;
 }
 
+#doc 分配来源仅用于执行器统计，不影响值、地址或语义事实身份。
+public enum AllocationKind { temporary, frame, local, copy, aggregate, heap, reflection, }
+
+#doc 槽位持有值及所属执行作用域；代次只用于地址有效性，不参与语义类型身份。
+struct Slot: Copyable {
+    public Cell cell!;
+    public Int generation;
+    public AllocationKind kind;
+    public Int scope!;
+    public Int previous!;
+    public Int next!;
+}
+
 public struct Memory: Movable {
-    list.ArrayList<Cell> cells!;
+    list.ArrayList<Slot> cells!;
+    list.ArrayList<Int> scopes!;
+    Int free_hint! = 0;
+    Int generation! = 0;
     // true 表示动态元素序列，false 表示单值分配；不复制元素 TypeId。
     map.WyHashMap<Int, Bool> heap_roots!;
     map.WyHashMap<qid.SymbolId, Int> strings!;
+    map.WyHashMap<value.ComptimeValue, Int> constants!;
     public Int limit;
+    public Int[7] allocations!;
+    public Int[7] live_by_kind!;
+    public Int[7] peak_by_kind!;
+    Int frame_bytes! = 0;
+    public Int live_cells! = 0;
+    public Int peak_live_cells! = 0;
+    public Bool allocation_failed!;
 
-    public init(self, Int limit = 1000000) {
-        self.cells = list.ArrayList<Cell>();
+    public init(self, Int limit = 67108864) {
+        assert(limit >= 8 * Int$.size());
+        self.cells = list.ArrayList<Slot>();
+        self.scopes = list.ArrayList<Int>();
+        self.scopes.add(-1);
         self.heap_roots = map.WyHashMap<Int, Bool>();
         self.strings = map.WyHashMap<qid.SymbolId, Int>();
+        self.constants = map.WyHashMap<value.ComptimeValue, Int>();
         self.limit = limit;
+        self.allocations = [0, 0, 0, 0, 0, 0, 0];
+        self.live_by_kind = [0, 0, 0, 0, 0, 0, 0];
+        self.peak_by_kind = [0, 0, 0, 0, 0, 0, 0];
+        self.allocation_failed = false;
     }
 
-    public Cell get(self, Int address) { return self.cells.get(address); }
+    #doc 地址低 32 位是槽位，高 31 位是分配代次；连续字段共享代次，保留 JIL 的字段偏移。
+    public Cell get(self, Int address) {
+        Slot& slot = self.cells.ref_at(address & 4294967295);
+        if (slot.generation == (address >> 32) && slot.scope >= 0) { return slot.cell; }
+        return Cell(type_id: slot.cell.type_id, data: .uninitialized, alive: false, read_only: false);
+    }
+
+    public Int current_scope(self) { return self.scopes.len() - 1; }
+
+    public Int? begin_scope(Self&! self) {
+        if (self.scopes.len() == self.scopes.cap()
+            && self.retained_bytes() + self.scopes.cap() * Int$.size() > self.limit) {
+            self.allocation_failed = true;
+            return null;
+        }
+        self.scopes.add(-1);
+        return self.current_scope();
+    }
+
+    #doc 作用域链只包含当前存活的槽位；循环复用不会累积历史地址或释放记录。
+    public Void end_scope(Self&! self) {
+        Int scope = self.current_scope();
+        assert(scope > 0);
+        while (self.scopes.get(scope) >= 0) {
+            Int index = self.scopes.get(scope);
+            self.set_live((self.cells.ref_at(index).generation << 32) + index, false);
+        }
+        self.scopes.pop();
+    }
+
+    Void unlink(Self&! self, Int index) {
+        Int previous = self.cells.ref_at(index).previous;
+        Int next = self.cells.ref_at(index).next;
+        Int scope = self.cells.ref_at(index).scope;
+        if (previous >= 0) { self.cells.mut_ref_at(previous).next = next; }
+        else { self.scopes.set(scope, next); }
+        if (next >= 0) { self.cells.mut_ref_at(next).previous = previous; }
+    }
+
+    Void link(Self&! self, Int index, Int scope) {
+        Int next = self.scopes.get(scope);
+        self.cells.mut_ref_at(index).scope = scope;
+        self.cells.mut_ref_at(index).previous = -1;
+        self.cells.mut_ref_at(index).next = next;
+        if (next >= 0) { self.cells.mut_ref_at(next).previous = index; }
+        self.scopes.set(scope, index);
+    }
+
+    #doc 转交值的存储树，不转交借用目标；调用返回不能延长被调用者局部变量的生命期。
+    public Void transfer(Self&! self, Int address, Int scope) {
+        Cell cell = self.get(address);
+        assert(cell.alive);
+        Int index = address & 4294967295;
+        if (self.cells.ref_at(index).scope != scope) {
+            self.unlink(index);
+            self.link(index, scope);
+        }
+        if (cell.data is .aggregate(start, count)) {
+            Int field! = 0;
+            while (field < count) { self.transfer(start + field, scope); field += 1; }
+        }
+    }
+
+    #doc 预算按容器保留容量计算，包含地址及作用域元数据；执行步数由执行器独立限制。
+    public Int retained_bytes(self) {
+        return self.cells.cap() * Slot$.size() + self.scopes.cap() * Int$.size() + self.frame_bytes
+            + self.heap_roots.retained_bytes() + self.strings.retained_bytes() + self.constants.retained_bytes();
+    }
+
+    public Bool reserve_frame(Self&! self, Int locals) {
+        Int bytes = locals * Int$.size();
+        if (bytes > self.limit - self.retained_bytes()) { self.allocation_failed = true; return false; }
+        self.frame_bytes += bytes;
+        return true;
+    }
+
+    public Void release_frame(Self&! self, Int locals) { self.frame_bytes -= locals * Int$.size(); }
+
+    Bool has_capacity(Self&! self, Int count) {
+        if (count >= 0 && count <= self.limit / Slot$.size()) { return true; }
+        self.allocation_failed = true;
+        return false;
+    }
 
     public Int? allocate(Self&! self, qid.TypeId type_id) {
-        if (self.cells.len() >= self.limit) { return null; }
-        Int address = self.cells.len();
-        self.cells.add(Cell(type_id: type_id, data: .uninitialized, alive: true, read_only: false));
+        return self.allocate(type_id, .temporary);
+    }
+
+    public Int? allocate(Self&! self, qid.TypeId type_id, AllocationKind kind) {
+        return self.allocate_in(type_id, kind, self.current_scope());
+    }
+
+    public Int? allocate_in(Self&! self, qid.TypeId type_id, AllocationKind kind, Int scope) {
+        return self.allocate_range(type_id, 1, kind, scope);
+    }
+
+    #doc 优先复用连续空槽，只有真实保留空间增长才消耗预算；代次耗尽时拒绝分配，绝不回绕。
+    Int? allocate_range(Self&! self, qid.TypeId type_id, Int count, AllocationKind kind, Int scope) {
+        if (!self.has_capacity(count) || self.generation == 2147483647) {
+            self.allocation_failed = true;
+            return null;
+        }
+        Int start! = self.free_hint;
+        Int index! = start;
+        while (index < self.cells.len() && index - start < count) {
+            if (self.cells.ref_at(index).scope >= 0) { start = index + 1; }
+            index += 1;
+        }
+        Int end = start + count;
+        Int capacity! = self.cells.cap();
+        if (capacity == 0) { capacity = 8; }
+        while (capacity < end) { capacity *= 2; }
+        if (capacity > 4294967295 || self.retained_bytes()
+            + (capacity - self.cells.cap()) * Slot$.size() > self.limit) {
+            self.allocation_failed = true;
+            return null;
+        }
+        self.generation += 1;
+        Int address = (self.generation << 32) + start;
+        index = start;
+        while (index < end) {
+            Slot slot = Slot(
+                cell: Cell(type_id: type_id, data: .uninitialized, alive: true, read_only: false),
+                generation: self.generation, kind: kind, scope: scope, previous: -1, next: -1
+            );
+            if (index < self.cells.len()) { self.cells.set(index, slot); }
+            else { self.cells.add(slot); }
+            self.link(index, scope);
+            index += 1;
+        }
+        if (start == self.free_hint) { self.free_hint = end; }
+        while (self.free_hint < self.cells.len() && self.cells.ref_at(self.free_hint).scope >= 0) {
+            self.free_hint += 1;
+        }
+        self.allocations[Int(kind)] += count;
+        self.live_by_kind[Int(kind)] += count;
+        if (self.live_by_kind[Int(kind)] > self.peak_by_kind[Int(kind)]) {
+            self.peak_by_kind[Int(kind)] = self.live_by_kind[Int(kind)];
+        }
+        self.live_cells += count;
+        if (self.live_cells > self.peak_live_cells) { self.peak_live_cells = self.live_cells; }
         return address;
+    }
+
+    Void set_cell(Self&! self, Int address, Cell cell) {
+        assert(self.get(address).alive);
+        self.cells.mut_ref_at(address & 4294967295).cell = cell;
     }
 
     #doc JIL 显式分配的根不随调用帧退出失效；只有 free 可以释放它及其子字段。
     public Int? allocate_heap(Self&! self, qid.TypeId type_id) {
-        guard self.allocate(type_id) is .some(address) else { return null; }
+        Int extra = self.heap_roots.reserved_bytes(1) - self.heap_roots.retained_bytes();
+        if (self.retained_bytes() + extra > self.limit) { self.allocation_failed = true; return null; }
+        self.heap_roots.reserve(1);
+        guard self.allocate_in(type_id, .heap, 0) is .some(address) else { return null; }
         self.heap_roots.set(address, false);
         return address;
     }
@@ -66,14 +268,16 @@ public struct Memory: Movable {
     public Bool release_heap(Self&! self, Int address) {
         if (!self.heap_roots.has(address) || !self.get(address).alive) { return false; }
         self.set_live(address, false);
+        self.heap_roots.remove(address);
         return true;
     }
 
     #doc 动态分配保留元素类型和实际数量，不为运行时长度制造新的语义数组类型。
     public Int? allocate_heap_sequence(Self&! self, qid.TypeId element, Int count) {
-        if (count < 0 || count >= self.limit - self.cells.len()) { return null; }
+        if (count < 0) { return null; }
+        if (!self.has_capacity(count) || !self.has_capacity(count + 1)) { return null; }
         guard self.allocate_heap(element) is .some(root) else { return null; }
-        if (!self.allocate_array(root, element, count)) { return null; }
+        if (!self.allocate_array(root, element, count)) { self.release_heap(root); return null; }
         self.heap_roots.set(root, true);
         return root;
     }
@@ -138,29 +342,35 @@ public struct Memory: Movable {
 
     public Void set_data(Self&! self, Int address, CellData data) {
         Cell cell = self.get(address);
-        self.cells.set(address, Cell(type_id: cell.type_id, data: data, alive: cell.alive, read_only: cell.read_only));
+        self.set_cell(address, Cell(type_id: cell.type_id, data: data, alive: cell.alive, read_only: cell.read_only));
     }
 
     public Void set_live(Self&! self, Int address, Bool alive) {
+        assert(!alive);
         Cell cell = self.get(address);
-        if (cell.data is .aggregate(start, count)) {
-            Int index! = 0;
-            while (index < count) {
-                self.set_live(start + index, alive);
-                index = index + 1;
-            }
-        }
-        self.cells.set(address, Cell(
-            type_id: cell.type_id, data: .uninitialized, alive: alive, read_only: cell.read_only
-        ));
+        if (!cell.alive) { return; }
+        self.clear_value(address);
+        Int index = address & 4294967295;
+        self.unlink(index);
+        self.cells.mut_ref_at(index).scope = -1;
+        self.cells.mut_ref_at(index).cell = Cell(
+            type_id: cell.type_id, data: .uninitialized, alive: false, read_only: false
+        );
+        if (index < self.free_hint) { self.free_hint = index; }
+        self.live_cells -= 1;
+        self.live_by_kind[Int(self.cells.ref_at(index).kind)] -= 1;
     }
 
-    // move/drop 消耗值但不结束 local 的存储期；旧字段地址必须失效，不能继续读到搬走前的数据。
+    #doc move/drop 消耗值但保留 local 的存储期；释放子字段后旧元素指针立即失效。
     public Void clear_value(Self&! self, Int address) {
         Cell cell = self.get(address);
-        self.set_live(address, false);
-        self.cells.set(address, Cell(
-            type_id: cell.type_id, data: .uninitialized, alive: cell.alive, read_only: cell.read_only
+        if (!cell.alive) { return; }
+        if (cell.data is .aggregate(start, count)) {
+            Int index! = 0;
+            while (index < count) { self.set_live(start + index, false); index += 1; }
+        }
+        self.set_cell(address, Cell(
+            type_id: cell.type_id, data: .uninitialized, alive: true, read_only: cell.read_only
         ));
     }
 
@@ -179,9 +389,34 @@ public struct Memory: Movable {
 
     public Int? clone(Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int source) {
         if (!self.initialized(source)) { return null; }
-        guard self.allocate(self.get(source).type_id) is .some(target) else { return null; }
+        guard self.allocate(self.get(source).type_id, .copy) is .some(target) else { return null; }
         if (!self.copy_into(store, query, target, source)) { return null; }
         return target;
+    }
+
+    #doc 只消费当前语句的临时值；新目标可以接收字段树，已有稳定字段继续原地复制。
+    public Bool consume_into(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, Int target, Int source
+    ) {
+        Cell input = self.get(source);
+        Cell output = self.get(target);
+        if (source == target || self.current_scope() == 0 || !input.alive || !output.alive || output.read_only
+            || self.cells.ref_at(source & 4294967295).scope != self.current_scope()
+            || !store.types.same_type_ignoring_mutability(input.type_id, output.type_id)) {
+            return self.copy_into(store, query, target, source);
+        }
+        if (!(input.data is .aggregate(_, _))) { return self.copy_into(store, query, target, source); }
+        if (!(output.data is .uninitialized) && !self.has_inactive_fields(target)) {
+            return self.copy_into(store, query, target, source);
+        }
+        self.clear_value(target);
+        guard input.data is .aggregate(start, count) else { assert(false); return false; }
+        Int scope = self.cells.ref_at(target & 4294967295).scope;
+        Int index! = 0;
+        while (index < count) { self.transfer(start + index, scope); index += 1; }
+        self.set_data(source, .uninitialized);
+        self.set_data(target, input.data);
+        return true;
     }
 
     public Bool copy_into(
@@ -252,11 +487,12 @@ public struct Memory: Movable {
         if (database.layout_has_errors(query$.ref())) { return false; }
         layout.TypeLayout shape = query.layout.store().layout(layout_id);
         if (shape.kind != .aggregate && shape.kind != .zero_sized) { return false; }
-        if (shape.fields.length > self.limit - self.cells.len()) { return false; }
-        Int start = self.cells.len();
+        guard self.allocate_range(cell.type_id, shape.fields.length, .aggregate,
+            self.cells.ref_at(address & 4294967295).scope) is .some(start) else { return false; }
         Int index! = 0;
         while (index < shape.fields.length) {
-            self.allocate(shape.fields[index].field_type);
+            self.set_cell(start + index, Cell(type_id: shape.fields[index].field_type,
+                data: .uninitialized, alive: true, read_only: false));
             index = index + 1;
         }
         self.set_data(address, .aggregate(start, shape.fields.length));
@@ -267,19 +503,22 @@ public struct Memory: Movable {
     public Bool allocate_static_fields(Self&! self, Int address, jil.StaticField[]& fields) {
         Cell cell = self.get(address);
         if (!cell.alive || !(cell.data is .uninitialized)) { return false; }
-        if (fields.length > self.limit - self.cells.len()) { return false; }
-        Int start = self.cells.len();
+        guard self.allocate_range(cell.type_id, fields.length, .aggregate,
+            self.cells.ref_at(address & 4294967295).scope) is .some(start) else { return false; }
         Int index! = 0;
-        while (index < fields.length) { self.allocate(fields[index].type_id); index = index + 1; }
+        while (index < fields.length) {
+            self.set_cell(start + index, Cell(type_id: fields[index].type_id,
+                data: .uninitialized, alive: true, read_only: false));
+            index += 1;
+        }
         self.set_data(address, .aggregate(start, fields.length));
         return true;
     }
 
     Bool allocate_array(Self&! self, Int address, qid.TypeId element, Int count) {
-        if (count < 0 || count > self.limit - self.cells.len()) { return false; }
-        Int start = self.cells.len();
-        Int index! = 0;
-        while (index < count) { self.allocate(element); index = index + 1; }
+        if (count < 0 || !self.has_capacity(count)) { return false; }
+        guard self.allocate_range(element, count, .aggregate,
+            self.cells.ref_at(address & 4294967295).scope) is .some(start) else { return false; }
         self.set_data(address, .aggregate(start, count));
         return true;
     }
@@ -306,6 +545,20 @@ public struct Memory: Movable {
             index = index + 1;
         }
         return null;
+    }
+
+    #doc 复用同一不可变语义值的只读存储，避免反复反射读取积累永久副本。
+    public Int? import_constant(
+        Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query, value.ComptimeValue value
+    ) {
+        if (self.constants.get(value) is .some(address)) { return address$.get(); }
+        Int extra = self.constants.reserved_bytes(1) - self.constants.retained_bytes();
+        if (self.retained_bytes() + extra > self.limit) { self.allocation_failed = true; return null; }
+        self.constants.reserve(1);
+        guard self.import_value(store, query, value) is .some(address) else { return null; }
+        self.freeze(address);
+        self.constants.set(value, address);
+        return address;
     }
 
     public Int? import_value(
@@ -337,6 +590,14 @@ public struct Memory: Movable {
                 index = index + 1;
             }
             if (!self.ensure_aggregate(store, query, address)) { return null; }
+            // Domain 的编译期配置不携带 executor；与 export_struct 对称恢复隐藏 owner 的空状态。
+            if (store.resolve.core_traits.domain_trait is .some(domain_trait)) {
+                qid.DefId owner = store.types.named_type_def(source.type_id)$.some();
+                if (store.model.def_has_direct_trait(owner, domain_trait)) {
+                    guard self.get(address).data is .aggregate(start, count) else { return null; }
+                    self.set_data(start + count - 1, .null_pointer);
+                }
+            }
             return address;
         }
         if (source.data is .tuple_value(aggregate)) { return self.import_items(store, query, address, aggregate); }
@@ -424,8 +685,11 @@ public struct Memory: Movable {
 
     Int? string_storage(Self&! self, compiler_store.CompilerStore& store, qid.SymbolId symbol) {
         if (self.strings.get(symbol) is .some(root)) { return root$.get(); }
+        Int extra = self.strings.reserved_bytes(1) - self.strings.retained_bytes();
+        if (self.retained_bytes() + extra > self.limit) { self.allocation_failed = true; return null; }
+        self.strings.reserve(1);
         Int length = store.symbols.text_length(symbol);
-        if (length >= self.limit - 1) { return null; }
+        if (!self.has_capacity(length) || !self.has_capacity(length + 2)) { return null; }
         qid.TypeId byte_type = store.types.uint8_type();
         guard self.allocate(byte_type) is .some(root) else { return null; }
         if (!self.allocate_array(root, byte_type, length + 1)) { return null; }
@@ -444,12 +708,14 @@ public struct Memory: Movable {
 
     #doc 冻结当前值的存储树，不沿借用引用冻结其他分配；局部复制仍具有独立的可写存储。
     public Void freeze(Self&! self, Int address) {
+        Int index = address & 4294967295;
+        if (self.cells.ref_at(index).scope != 0) { self.unlink(index); self.link(index, 0); }
         Cell cell = self.get(address);
         if (cell.data is .aggregate(start, count)) {
             Int index! = 0;
             while (index < count) { self.freeze(start + index); index = index + 1; }
         }
-        self.cells.set(address, Cell(type_id: cell.type_id, data: cell.data, alive: cell.alive, read_only: true));
+        self.set_cell(address, Cell(type_id: cell.type_id, data: cell.data, alive: cell.alive, read_only: true));
     }
 
     #doc 字符串构造定长数组时复制字节；数组值不共享字面量的只读权限。
@@ -584,15 +850,34 @@ public struct Memory: Movable {
         return null;
     }
 
+    #doc 生成输出读取仍然存活的字节切片；复制内容，不让切片地址逃逸出本轮逻辑内存。
+    public list.ArrayList<UInt8>? read_byte_slice(
+        Self&! self, compiler_store.CompilerStore&! store, Int address
+    ) {
+        if (!self.initialized(address)) { return null; }
+        guard self.get(address).data is .aggregate(start, count) else { return null; }
+        if (count != 2) { return null; }
+        return self.read_string_bytes(store, start, false);
+    }
+
     #doc 只读字面量的子切片导出为字节符号；普通借用不自动变成静态值。
     value.ComptimeValue? export_string(
         Self&! self, compiler_store.CompilerStore&! store, qid.TypeId type_id, Int start
     ) {
-        guard self.get(start).data is .element_reference(root, first, offset) else { return null; }
-        if (!self.sequence_live(root, first) || !self.get(root).read_only) { return null; }
-        if (!store.types.same_type(self.get(first).type_id, store.types.uint8_type())) { return null; }
+        guard self.read_string_bytes(store, start, true) is .some(bytes) else { return null; }
+        qid.SymbolId symbol = store.symbols.intern(bytes.slice());
+        return value.ComptimeValue(type_id: type_id, data: .string_value(symbol));
+    }
+
+    list.ArrayList<UInt8>? read_string_bytes(
+        Self&! self, compiler_store.CompilerStore&! store, Int start, Bool require_read_only
+    ) {
         guard self.get(start + 1).data is .scalar(length_data) else { return null; }
         guard length_data is .uint_value(bits) else { return null; }
+        if (self.get(start).data is .null_pointer && bits == 0) { return list.ArrayList<UInt8>(); }
+        guard self.get(start).data is .element_reference(root, first, offset) else { return null; }
+        if (!self.sequence_live(root, first) || (require_read_only && !self.get(root).read_only)) { return null; }
+        if (!store.types.same_type(self.sequence_element_type(store, root), store.types.uint8_type())) { return null; }
         guard self.get(root).data is .aggregate(_, available) else { assert(false); return null; }
         if (bits > UInt64(available - offset)) { return null; }
         Int length = Int(bits);
@@ -604,8 +889,7 @@ public struct Memory: Movable {
             bytes.add(UInt8(byte));
             index = index + 1;
         }
-        qid.SymbolId symbol = store.symbols.intern(bytes.slice());
-        return value.ComptimeValue(type_id: type_id, data: .string_value(symbol));
+        return bytes;
     }
 
     value.ComptimeValue? export_struct(

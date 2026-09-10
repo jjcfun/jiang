@@ -1,0 +1,109 @@
+#doc(module)
+    跨包 metadata 通过真实 `.ji` 冷／热编译恢复，保留重复附着、类型、空集合及 helper 依赖。
+#end
+alias context = import "../../../../src/compiler/context.jiang";
+alias options = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias qid = import "../../../../src/compiler/id.jiang";
+alias keys = import "../../../../src/compiler/artifact/object_key_builder.jiang";
+alias qkey = import "../../../../src/compiler/incremental/key.jiang";
+alias env = import "../../../../src/compiler/system/env.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+import std;
+
+public Int run() {
+    guard env.get("JIANG_TEST_TEMP_DIR") is .some(directory) else { return 2; }
+    _ app = path(directory[..], "app");
+    _ dep = path(directory[..], "dep");
+    _ cache = path(directory[..], "cache");
+    assert(fs.create_dirs(app.bytes()));
+    assert(fs.create_dirs(dep.bytes()));
+    assert(fs.write_all(path(app.bytes(), "package.ini").bytes(),
+        "[package]\nname = meta_app\nroot = main.jiang\n\n[dependencies]\ndep = ../dep\n"));
+    assert(fs.write_all(path(dep.bytes(), "package.ini").bytes(), "[package]\nname = meta_dep\nroot = lib.jiang\n"));
+    assert(fs.write_all(path(app.bytes(), "empty.jiang").bytes(), "public struct Empty {}"));
+    std.StringBuilder source_text! = std.StringBuilder();
+    source_text.append("import dep; import empty = \"./empty.jiang\"; @meta(module: dep.Tag(value: dep.make())) ");
+    source_text.append("@meta(dep.Tag(value: dep.make())) @meta(dep.Tag(value: dep.make() + 1)) ");
+    source_text.append("struct Data {} Int main() { 0 }");
+    assert(fs.write_all(path(app.bytes(), "main.jiang").bytes(), source_text.slice()));
+    write_dependency(dep.bytes(), false);
+    options.CompileOptions configuration = options.CompileOptions(.check_only, app.bytes(), "", cache.bytes());
+    context.CompilerContext cold! = context.CompilerContext();
+    compile(cold$.mut_ref(), configuration$.ref());
+    qkey.Fingerprint128 expected = check(cold$.ref(), app.bytes(), 42, false);
+    context.CompilerContext warm! = context.CompilerContext();
+    compile(warm$.mut_ref(), configuration$.ref());
+    assert(check(warm$.ref(), app.bytes(), 42, true) == expected);
+    assert(warm.store.artifacts.stats.interface_hit > 0);
+    write_dependency(dep.bytes(), true);
+    context.CompilerContext changed! = context.CompilerContext();
+    compile(changed$.mut_ref(), configuration$.ref());
+    assert(check(changed$.ref(), app.bytes(), 52, false) != expected);
+    context.CompilerContext changed_warm! = context.CompilerContext();
+    compile(changed_warm$.mut_ref(), configuration$.ref());
+    check(changed_warm$.ref(), app.bytes(), 52, true);
+    return 0;
+}
+
+Void write_dependency(UInt8[]& directory, Bool changed) {
+    UInt8[]& text = if changed {
+        "@meta(module: 5) public struct Tag: Copyable { public Int value; } public Int make() { 52 }"
+    } else {
+        "@meta(module: 5) public struct Tag: Copyable { public Int value; } public Int make() { 42 }"
+    };
+    assert(fs.write_all(path(directory, "lib.jiang").bytes(), text));
+}
+
+Void compile(context.CompilerContext&! ctx, options.CompileOptions& configuration) {
+    pipeline.compile(ctx, configuration);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+qkey.Fingerprint128 check(context.CompilerContext& ctx, UInt8[]& app, Int expected, Bool restored) {
+    _ source = ctx.store.sources.find(.file(path(app, "main.jiang").bytes()))$.some();
+    _ module = ctx.store.resolve.module_for_source(source)$.some();
+    _ record = ctx.store.resolve.module_ref(module);
+    if (restored) { assert(record.interface_only); }
+    assert(ctx.query.metadata.module_ready(module));
+    assert(ctx.query.metadata.count(record.def_id) == 1);
+    _ item = ctx.query.metadata.at(record.def_id, 0);
+    if (restored) { assert(item.origin is .persisted); }
+    assert(item.span.length > 0);
+    _ value = item.value$.some();
+    guard value.data is .struct_value(payload) else { assert(false); return qkey.Fingerprint128(); }
+    assert(ctx.store.comptime_store.field_count(payload) == 1);
+    guard ctx.store.comptime_store.field_at(payload, 0).value.data is .int_value(number)
+        else { assert(false); return qkey.Fingerprint128(); }
+    assert(number == expected);
+    Int count! = 0;
+    Int index! = 0;
+    while (index < ctx.query.metadata.len()) {
+        _ attached = ctx.query.metadata.get(index);
+        index = index + 1;
+        if (ctx.store.defs.get(attached.target).module_id != module || attached.target == record.def_id) { continue; }
+        if (restored) { assert(attached.origin is .persisted); }
+        guard attached.value$.some().data is .struct_value(fields) else { assert(false); continue; }
+        guard ctx.store.comptime_store.field_at(fields, 0).value.data is .int_value(field_value)
+            else { assert(false); continue; }
+        assert(field_value == expected + count);
+        count = count + 1;
+    }
+    assert(count == 2);
+    _ empty_source = ctx.store.sources.find(.file(path(app, "empty.jiang").bytes()))$.some();
+    _ empty_module = ctx.store.resolve.module_for_source(empty_source)$.some();
+    assert(ctx.query.metadata.module_ready(empty_module));
+    assert(ctx.query.metadata.count(ctx.store.resolve.module_ref(empty_module).def_id) == 0);
+    return keys.stable_comptime_value_fingerprint(ctx.store$.ref(), value);
+}
+
+Path path(UInt8[]& base, UInt8[]& name) {
+    PathBuilder builder! = PathBuilder(base);
+    builder.append(name);
+    return builder.finish();
+}

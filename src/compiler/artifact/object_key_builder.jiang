@@ -1,9 +1,10 @@
-// Object cache stable key 构建。
-//
-// 这里负责把 session-local TypeId 转成 StableTypeKey。object_key.jiang 只保留
-// 纯数据结构和 hash 逻辑，避免它反向依赖 CompilerContext。
+#doc(module)
+    将语义类型和值编码为稳定 key，供 object 缓存及反射事实复用；纯编码只读取 CompilerStore。
+    object 编排仍由编译上下文负责，编码不触发查询或语义准备。
+#end
 
 alias context = import "../context.jiang";
+alias store_api = import "../store.jiang";
 alias fingerprint = import "../incremental/fingerprint.jiang";
 alias sem = import "../sema/model.jiang";
 alias layout = import "../layout.jiang";
@@ -39,20 +40,20 @@ public struct SourceObjectFingerprints: Copyable {
 }
 
 public object_key.StableTypeKey stable_type_key_for_type(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     qid.TypeId type_id
 ) {
-    types.TypeInfo info = ctx.store.types.get(type_id);
-    object_key.StableTypeKey key! = stable_type_key_for_data(ctx, info.data);
+    types.TypeInfo info = store.types.get(type_id);
+    object_key.StableTypeKey key! = stable_type_key_for_data(store, info.data);
     key.is_mutable = info.is_mutable;
     return key;
 }
 
 public qkey.Fingerprint128 stable_type_fingerprint_for_type(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     qid.TypeId type_id
 ) {
-    object_key.StableTypeKey key = stable_type_key_for_type(ctx, type_id);
+    object_key.StableTypeKey key = stable_type_key_for_type(store, type_id);
     hash.WyHasher low! = hash.WyHasher();
     low.write(UInt64(6148914691236517205));
     object_key.write_stable_type_key(low$.mut_ref(), key$.ref());
@@ -60,6 +61,72 @@ public qkey.Fingerprint128 stable_type_fingerprint_for_type(
     high.write(UInt64(12297829382473034410));
     object_key.write_stable_type_key(high$.mut_ref(), key$.ref());
     return qkey.Fingerprint128(low.finish(), high.finish());
+}
+
+#doc 反射类型事实包含类型身份之外可读取的嵌套函数契约及 Domain 类型，不改变 StableTypeKey。
+public qkey.Fingerprint128 stable_type_observation_fingerprint(store_api.CompilerStore& store, qid.TypeId type_id) {
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(stable_type_fingerprint_for_type(store, type_id));
+    append_type_observation_details(store, type_id, parts$.mut_ref());
+    return object_key.combine_fingerprints(UInt64(140), parts$.ref());
+}
+
+#doc 调度域观察组合规范绑定身份及已有类型事实；空域也有独立指纹，不求值域常量。
+public qkey.Fingerprint128 stable_domain_observation_fingerprint(
+    store_api.CompilerStore& store, types.DomainEffect? domain
+) {
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    if (domain is .some(value)) {
+        _ binding = store.incremental.stable_id_for_def(value.binding)$.some();
+        parts.add(qkey.Fingerprint128(binding.low, binding.high));
+        parts.add(stable_type_observation_fingerprint(store, value.domain_type));
+    }
+    return object_key.combine_fingerprints(UInt64(141), parts$.ref());
+}
+
+Void append_type_observation_details(store_api.CompilerStore& store, qid.TypeId type_id,
+    list.ArrayList<qkey.Fingerprint128>&! parts
+) {
+    _ data = store.types.get(type_id).data;
+    if (data is .function_type(function)) {
+        parts.add(fingerprint.stable_lifetime_contract_fingerprint(store, function.lifetime_contract, true));
+        parts.add(stable_domain_observation_fingerprint(store, function.effects.domain));
+        for parameter in function.params { append_type_observation_details(store, parameter, parts); }
+        append_type_observation_details(store, function.result, parts);
+        return;
+    }
+    if (data is .named(named)) {
+        append_argument_observation_details(store, named.args, parts);
+        return;
+    }
+    if (data is .optional(optional)) { append_type_observation_details(store, optional.element, parts); return; }
+    if (data is .handle_type(handle)) { append_type_observation_details(store, handle.element, parts); return; }
+    if (data is .slice_value_type(slice)) { append_type_observation_details(store, slice.element, parts); return; }
+    if (data is .array_type(array)) { append_type_observation_details(store, array.element, parts); return; }
+    if (data is .error_union(error)) {
+        append_type_observation_details(store, error.value, parts);
+        append_type_observation_details(store, error.error, parts);
+        return;
+    }
+    if (data is .tuple_type(tuple)) {
+        for element in tuple.items { append_type_observation_details(store, element, parts); }
+        return;
+    }
+    if (data is .task_type(task)) { append_type_observation_details(store, task.result, parts); return; }
+    if (data is .task_state_type(task)) { append_type_observation_details(store, task.result, parts); return; }
+    if (data is .closure_environment_type(environment)) {
+        append_argument_observation_details(store, environment.args, parts);
+        for capture in environment.capture_types { append_type_observation_details(store, capture, parts); }
+    }
+}
+
+Void append_argument_observation_details(store_api.CompilerStore& store, types.GenericArg[]& args,
+    list.ArrayList<qkey.Fingerprint128>&! parts
+) {
+    for argument in args {
+        if (argument is .type_arg(type)) { append_type_observation_details(store, type.value, parts); }
+        if (argument is .const_arg(value)) { append_type_observation_details(store, value.value.type_id, parts); }
+    }
 }
 
 public object_key.StableInstanceKey? stable_instance_key_for_function(
@@ -99,9 +166,9 @@ public object_key.StableInstanceKey? stable_instance_key_for_function(
     Int index! = 0;
     while (index < function.args.length) {
         if (function.args[index] is .type_arg(value)) {
-            key.add_type_arg(stable_type_key_for_type(ctx, value.value));
+            key.add_type_arg(stable_type_key_for_type(ctx.store$.ref(), value.value));
         } else if (function.args[index] is .const_arg(value)) {
-            key.add_comptime_arg(stable_comptime_value_fingerprint(ctx, value.value));
+            key.add_comptime_arg(stable_comptime_value_fingerprint(ctx.store$.ref(), value.value));
         }
         index = index + 1;
     }
@@ -159,10 +226,17 @@ public qkey.Fingerprint128 stable_function_layout_hash(
 ) {
     list.ArrayList<qid.TypeId> required_types =
         type_requirements.collect_function_types(ctx.store$.ref(), function);
+    return stable_type_layout_hash(ctx, required_types.slice());
+}
+
+#doc object 与生成器执行闭包共用具体布局编码，符号类型保持既有跳过规则。
+public qkey.Fingerprint128 stable_type_layout_hash(
+    context.CompilerContext&! ctx, qid.TypeId[]& required_types
+) {
     list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
     Int index! = 0;
-    while (index < required_types.len()) {
-        qid.TypeId type_id = required_types.get(index);
+    while (index < required_types.length) {
+        qid.TypeId type_id = required_types[index];
         if (!type_has_concrete_layout(ctx, type_id)) {
             index = index + 1;
             continue;
@@ -174,16 +248,16 @@ public qkey.Fingerprint128 stable_function_layout_hash(
         parts.add(fingerprint.type_layout_fingerprint(ctx, type_layout));
         index = index + 1;
     }
-    sort_layout_fingerprints(parts$.mut_ref());
+    sort_fingerprints(parts$.mut_ref());
     return object_key.combine_fingerprints(UInt64(104), parts$.ref());
 }
 
-Void sort_layout_fingerprints(list.ArrayList<qkey.Fingerprint128>&! values) {
+Void sort_fingerprints(list.ArrayList<qkey.Fingerprint128>&! values) {
     Int index! = 1;
     while (index < values.len()) {
         Int current! = index;
         while (current > 0
-            && layout_fingerprint_less(values.get(current), values.get(current - 1))) {
+            && fingerprint_less(values.get(current), values.get(current - 1))) {
             qkey.Fingerprint128 previous = values.get(current - 1);
             values.set(current - 1, values.get(current));
             values.set(current, previous);
@@ -193,7 +267,7 @@ Void sort_layout_fingerprints(list.ArrayList<qkey.Fingerprint128>&! values) {
     }
 }
 
-Bool layout_fingerprint_less(qkey.Fingerprint128 lhs, qkey.Fingerprint128 rhs) {
+Bool fingerprint_less(qkey.Fingerprint128 lhs, qkey.Fingerprint128 rhs) {
     if (lhs.high != rhs.high) { return lhs.high < rhs.high; }
     return lhs.low < rhs.low;
 }
@@ -511,7 +585,7 @@ qkey.Fingerprint128 domain_fingerprint(UInt8[]& domain, UInt8[]& text) {
 }
 
 object_key.StableTypeKey stable_type_key_for_data(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.TypeData data
 ) {
     if (data is .invalid) { return object_key.StableTypeKey(.invalid_type); }
@@ -525,63 +599,72 @@ object_key.StableTypeKey stable_type_key_for_data(
     if (data is .float_type(float_type)) {
         return stable_builtin(3000 + float_type.bits);
     }
-    return stable_compound_type_key(ctx, data);
+    return stable_compound_type_key(store, data);
 }
 
 object_key.StableTypeKey stable_compound_type_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.TypeData data
 ) {
-    if (data is .named(named)) { return stable_named_type_key(ctx, named); }
+    if (data is .named(named)) { return stable_named_type_key(store, named); }
     if (data is .optional(optional)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.optional_type);
-        key.add_arg(stable_type_key_for_type(ctx, optional.element));
+        key.add_arg(stable_type_key_for_type(store, optional.element));
         return key;
     }
     if (data is .error_union(error_union)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.error_union_type);
-        key.add_arg(stable_type_key_for_type(ctx, error_union.value));
-        key.add_arg(stable_type_key_for_type(ctx, error_union.error));
+        key.add_arg(stable_type_key_for_type(store, error_union.value));
+        key.add_arg(stable_type_key_for_type(store, error_union.error));
         return key;
     }
-    return stable_aggregate_type_key(ctx, data);
+    return stable_aggregate_type_key(store, data);
 }
 
 object_key.StableTypeKey stable_aggregate_type_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.TypeData data
 ) {
-    if (data is .handle_type(handle)) { return stable_handle_type_key(ctx, handle); }
+    if (data is .handle_type(handle)) { return stable_handle_type_key(store, handle); }
     if (data is .slice_value_type(slice_value)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.slice_value_type);
-        key.sentinel = stable_sentinel(ctx, slice_value.sentinel);
-        key.add_arg(stable_type_key_for_type(ctx, slice_value.element));
+        key.sentinel = stable_sentinel(store, slice_value.sentinel);
+        key.add_arg(stable_type_key_for_type(store, slice_value.element));
         return key;
     }
     if (data is .array_type(array_type)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.array_type);
         key.array_length = array_type.count;
-        key.sentinel = stable_sentinel(ctx, array_type.sentinel);
-        key.add_arg(stable_type_key_for_type(ctx, array_type.element));
+        if (array_type.count_param is .some(parameter)) {
+            guard store.incremental.stable_id_for_def(parameter) is .some(identity) else {
+                return object_key.StableTypeKey(.invalid_type);
+            }
+            key.has_stable_def = true;
+            key.stable_def_low = identity.low;
+            key.stable_def_high = identity.high;
+        }
+        key.sentinel = stable_sentinel(store, array_type.sentinel);
+        key.add_arg(stable_type_key_for_type(store, array_type.element));
         return key;
     }
     if (data is .tuple_type(tuple_type)) {
-        return stable_type_array_key(ctx, .tuple_type, tuple_type.items);
+        return stable_type_array_key(store, .tuple_type, tuple_type.items);
     }
     if (data is .closure_environment_type(environment)) {
-        return stable_closure_environment_key(ctx, environment);
+        return stable_closure_environment_key(store, environment);
     }
     if (data is .task_state_type(state)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.task_state_type);
-        key.add_arg(stable_type_key_for_type(ctx, state.result));
+        key.add_arg(stable_type_key_for_type(store, state.result));
         return key;
     }
     if (data is .function_type(function_type)) {
-        object_key.StableTypeKey key! = stable_type_array_key(ctx, .function_type, function_type.params);
-        key.add_arg(stable_type_key_for_type(ctx, function_type.result));
-        key.builtin_tag = function_effect_tag(function_type.effects);
+        object_key.StableTypeKey key! = stable_type_array_key(store, .function_type, function_type.params);
+        key.add_arg(stable_type_key_for_type(store, function_type.result));
+        key.builtin_tag = function_effect_tag(function_type.effects) + Int(function_type.kind) * 4
+            + Int(function_type.call_ownership) * 8;
         if (function_type.effects.domain is .some(domain)) {
-            guard ctx.store.incremental.stable_id_for_def(domain.binding) is .some(stable_def) else {
+            guard store.incremental.stable_id_for_def(domain.binding) is .some(stable_def) else {
                 return object_key.StableTypeKey(.invalid_type);
             }
             key.has_stable_def = true;
@@ -592,11 +675,11 @@ object_key.StableTypeKey stable_aggregate_type_key(
     }
     if (data is .task_type(task_type)) {
         object_key.StableTypeKey key! = object_key.StableTypeKey(.task_type);
-        key.add_arg(stable_type_key_for_type(ctx, task_type.result));
+        key.add_arg(stable_type_key_for_type(store, task_type.result));
         return key;
     }
     if (data is .trait_companion(companion)) {
-        guard ctx.store.incremental.stable_id_for_def(companion.trait_def) is .some(stable_def) else {
+        guard store.incremental.stable_id_for_def(companion.trait_def) is .some(stable_def) else {
             return object_key.StableTypeKey(.invalid_type);
         }
         object_key.StableTypeKey key! = object_key.StableTypeKey(.trait_companion_type);
@@ -610,10 +693,10 @@ object_key.StableTypeKey stable_aggregate_type_key(
 }
 
 object_key.StableTypeKey stable_closure_environment_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.ClosureEnvironmentType environment
 ) {
-    guard ctx.store.incremental.stable_id_for_def(environment.lambda_def) is .some(stable_def) else {
+    guard store.incremental.stable_id_for_def(environment.lambda_def) is .some(stable_def) else {
         return object_key.StableTypeKey(.invalid_type);
     }
     object_key.StableTypeKey key! = object_key.StableTypeKey(.closure_environment_type);
@@ -624,17 +707,17 @@ object_key.StableTypeKey stable_closure_environment_key(
     while (index < environment.args.length) {
         types.GenericArg arg = environment.args[index];
         if (arg is .type_arg(type_arg)) {
-            key.add_arg(stable_type_key_for_type(ctx, type_arg.value));
+            key.add_arg(stable_type_key_for_type(store, type_arg.value));
         }
         if (arg is .const_arg(const_arg)) {
-            key.add_comptime_arg(stable_comptime_value_fingerprint(ctx, const_arg.value));
+            key.add_comptime_arg(stable_comptime_value_fingerprint(store, const_arg.value));
         }
         index = index + 1;
     }
     key.builtin_tag = key.args.len();
     index = 0;
     while (index < environment.capture_types.length) {
-        key.add_arg(stable_type_key_for_type(ctx, environment.capture_types[index]));
+        key.add_arg(stable_type_key_for_type(store, environment.capture_types[index]));
         index = index + 1;
     }
     return key;
@@ -652,46 +735,46 @@ Int function_effect_tag(types.EffectSet effects) {
 }
 
 object_key.StableTypeKey stable_named_type_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.NamedType named
 ) {
-    guard ctx.store.incremental.stable_id_for_def(named.def_id) is .some(stable_def) else {
+    guard store.incremental.stable_id_for_def(named.def_id) is .some(stable_def) else {
         return object_key.StableTypeKey(.invalid_type);
     }
 
     object_key.StableTypeKey key! = object_key.StableTypeKey.named_type(stable_def.low, stable_def.high);
     Int index! = 0;
     while (index < named.type_args.length) {
-        key.add_arg(stable_type_key_for_type(ctx, named.type_args[index]));
+        key.add_arg(stable_type_key_for_type(store, named.type_args[index]));
         index = index + 1;
     }
     index = 0;
     while (index < named.const_args.length) {
-        key.add_comptime_arg(stable_comptime_value_fingerprint(ctx, named.const_args[index]));
+        key.add_comptime_arg(stable_comptime_value_fingerprint(store, named.const_args[index]));
         index = index + 1;
     }
     return key;
 }
 
 object_key.StableTypeKey stable_handle_type_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     types.HandleType handle
 ) {
     object_key.StableTypeKey key! = object_key.StableTypeKey(stable_handle_kind(handle.kind));
-    key.sentinel = stable_sentinel(ctx, handle.sentinel);
-    key.add_arg(stable_type_key_for_type(ctx, handle.element));
+    key.sentinel = stable_sentinel(store, handle.sentinel);
+    key.add_arg(stable_type_key_for_type(store, handle.element));
     return key;
 }
 
-object_key.StableSentinel? stable_sentinel(context.CompilerContext& ctx, types.Sentinel? sentinel) {
+object_key.StableSentinel? stable_sentinel(store_api.CompilerStore& store, types.Sentinel? sentinel) {
     if (sentinel is .some(value)) {
-        return object_key.StableSentinel(stable_comptime_value_fingerprint(ctx, value.value));
+        return object_key.StableSentinel(stable_comptime_value_fingerprint(store, value.value));
     }
     return null;
 }
 
 public qkey.Fingerprint128 stable_comptime_value_fingerprint(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     comptime_value.ComptimeValue value
 ) {
     // Sentinel 现在可以是 bool/char/enum/struct 等完整 comptime 值，object key
@@ -700,29 +783,102 @@ public qkey.Fingerprint128 stable_comptime_value_fingerprint(
     hash.WyHasher low! = hash.WyHasher();
     low.write(UInt64(1469598103934665603));
     hash.WyHasher&! low_ref = low$.mut_ref();
-    write_stable_comptime_value(ctx, low_ref, value);
+    write_stable_comptime_value(store, low_ref, value);
 
     hash.WyHasher high! = hash.WyHasher();
     high.write(UInt64(1099511628211));
     hash.WyHasher&! high_ref = high$.mut_ref();
-    write_stable_comptime_value(ctx, high_ref, value);
+    write_stable_comptime_value(store, high_ref, value);
     return qkey.Fingerprint128(low.finish(), high.finish());
 }
 
+#doc 常量读取复用值身份编码，并补入字段类型与 enum 数值表示；不改变泛型实参的类型身份。
+public qkey.Fingerprint128 stable_constant_observation_fingerprint(
+    store_api.CompilerStore& store, comptime_value.ComptimeValue value
+) {
+    list.ArrayList<qkey.Fingerprint128> cases! = list.ArrayList<qkey.Fingerprint128>();
+    append_constant_facts(store, value.data, cases$.mut_ref());
+    sort_fingerprints(cases$.mut_ref());
+    cases.add(stable_comptime_value_fingerprint(store, value));
+    return object_key.combine_fingerprints(UInt64(143), cases$.ref());
+}
+
+public qkey.Fingerprint128 enum_case_observation_fingerprint(store_api.CompilerStore& store, qid.DefId definition) {
+    _ identity = store.incremental.stable_id_for_def(definition)$.some();
+    _ tag = store.typeck.enum_case_value(definition)$.some();
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(qkey.Fingerprint128(identity.low, identity.high));
+    parts.add(qkey.Fingerprint128(UInt64(tag), UInt64(0)));
+    return object_key.combine_fingerprints(UInt64(142), parts$.ref());
+}
+
+#doc 字段身份与类型共同组成一个事实，字段之间交换类型也不能被无序集合归一掉。
+qkey.Fingerprint128 constant_field_observation_fingerprint(store_api.CompilerStore& store, qid.DefId field) {
+    _ identity = store.incremental.stable_id_for_def(field)$.some();
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(qkey.Fingerprint128(identity.low, identity.high));
+    parts.add(stable_type_observation_fingerprint(store, store.typeck.def_type(field)$.some()));
+    return object_key.combine_fingerprints(UInt64(144), parts$.ref());
+}
+
+Void append_constant_facts(store_api.CompilerStore& store, comptime_value.ComptimeValueData data,
+    list.ArrayList<qkey.Fingerprint128>&! cases
+) {
+    if (data is .enum_case_value(definition)) {
+        cases.add(enum_case_observation_fingerprint(store, definition));
+        return;
+    }
+    if (data is .struct_value(aggregate)) {
+        Int index! = 0;
+        while (index < store.comptime_store.field_count(aggregate)) {
+            _ field = store.comptime_store.field_at(aggregate, index);
+            cases.add(constant_field_observation_fingerprint(store, field.field_def));
+            append_constant_facts(store, field.value.data, cases);
+            index = index + 1;
+        }
+        return;
+    }
+    _ aggregate = switch data {
+        .tuple_value(value) => value,
+        .array_value(value) => value,
+        .optional_value(value) => value,
+        .error_union_value(_, value) => value,
+        .enum_value(definition, value) => {
+            cases.add(enum_case_observation_fingerprint(store, definition));
+            Int index! = 0;
+            while (index < store.model.def_member_count(definition)) {
+                _ member = store.model.def_member_at(definition, index);
+                if (store.defs.get(member).kind == .field_def) {
+                    cases.add(constant_field_observation_fingerprint(store, member));
+                }
+                index = index + 1;
+            }
+            value
+        },
+        else => { return; },
+    };
+    Int index! = 0;
+    while (index < store.comptime_store.item_count(aggregate)) {
+        append_constant_facts(store, store.comptime_store.item_at(aggregate, index).data, cases);
+        index = index + 1;
+    }
+}
+
 Void write_stable_comptime_value(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeValue value
 ) {
     // 同一个字面值在不同 expected type 下语义不同，例如 0 可是 Int 也可是 UInt8。
-    // 因此稳定 key 必须先写 type key，再写具体 comptime payload。
-    object_key.StableTypeKey type_key = stable_type_key_for_type(ctx, value.type_id);
+    // 因此稳定 key 必须先写根 type key，再写具体 comptime payload。
+    // 聚合成员的类型由根类型和声明签名确定；接口只恢复 payload，不能把是否保留子 TypeId 编入身份。
+    object_key.StableTypeKey type_key = stable_type_key_for_type(store, value.type_id);
     object_key.write_stable_type_key(hasher, type_key$.ref());
-    write_stable_comptime_value_data(ctx, hasher, value.data);
+    write_stable_comptime_value_data(store, hasher, value.data);
 }
 
 Void write_stable_comptime_value_data(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeValueData data
 ) {
@@ -744,11 +900,11 @@ Void write_stable_comptime_value_data(
         hasher.write(UInt64(uint_value));
         return;
     }
-    write_stable_aggregate_comptime_value(ctx, hasher, data);
+    write_stable_aggregate_comptime_value(store, hasher, data);
 }
 
 Void write_stable_aggregate_comptime_value(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeValueData data
 ) {
@@ -764,106 +920,106 @@ Void write_stable_aggregate_comptime_value(
     }
     if (data is .string_value(string_value)) {
         hasher.write(Int(8));
-        UInt8[]& text = ctx.store.symbols.text(string_value);
+        UInt8[]& text = store.symbols.text(string_value);
         hasher.write(Int(text.length));
         hasher.write(text);
         return;
     }
     if (data is .symbol_value(symbol_value)) {
         hasher.write(Int(9));
-        hasher.write(ctx.store.symbols.text(symbol_value));
+        hasher.write(store.symbols.text(symbol_value));
         return;
     }
-    write_stable_named_comptime_value(ctx, hasher, data);
+    write_stable_named_comptime_value(store, hasher, data);
 }
 
 Void write_stable_named_comptime_value(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeValueData data
 ) {
     if (data is .const_param_value(const_param)) {
         hasher.write(Int(10));
-        write_stable_def_id(ctx, hasher, const_param);
+        write_stable_def_id(store, hasher, const_param);
         return;
     }
     if (data is .enum_case_value(case_def)) {
         hasher.write(Int(11));
-        write_stable_def_id(ctx, hasher, case_def);
+        write_stable_def_id(store, hasher, case_def);
         return;
     }
     if (data is .struct_value(aggregate)) {
         hasher.write(Int(12));
-        Int count = ctx.store.comptime_store.field_count(aggregate);
+        Int count = store.comptime_store.field_count(aggregate);
         hasher.write(count);
-        write_stable_comptime_fields(ctx, hasher, aggregate);
+        write_stable_comptime_fields(store, hasher, aggregate);
         return;
     }
     if (data is .tuple_value(aggregate)) {
         hasher.write(Int(13));
-        write_stable_comptime_values(ctx, hasher, aggregate);
+        write_stable_comptime_values(store, hasher, aggregate);
         return;
     }
     if (data is .array_value(aggregate)) {
         hasher.write(Int(14));
-        write_stable_comptime_values(ctx, hasher, aggregate);
+        write_stable_comptime_values(store, hasher, aggregate);
         return;
     }
     if (data is .optional_value(aggregate)) {
         hasher.write(Int(15));
-        write_stable_comptime_values(ctx, hasher, aggregate);
+        write_stable_comptime_values(store, hasher, aggregate);
         return;
     }
     if (data is .enum_value(case_def, aggregate)) {
         hasher.write(Int(16));
-        write_stable_def_id(ctx, hasher, case_def);
-        write_stable_comptime_values(ctx, hasher, aggregate);
+        write_stable_def_id(store, hasher, case_def);
+        write_stable_comptime_values(store, hasher, aggregate);
         return;
     }
     if (data is .error_union_value(is_error, aggregate)) {
         hasher.write(Int(17));
         hasher.write(is_error);
-        write_stable_comptime_values(ctx, hasher, aggregate);
+        write_stable_comptime_values(store, hasher, aggregate);
         return;
     }
     hasher.write(Int(0));
 }
 
 Void write_stable_comptime_fields(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeAggregateId aggregate
 ) {
-    Int count = ctx.store.comptime_store.field_count(aggregate);
+    Int count = store.comptime_store.field_count(aggregate);
     Int index! = 0;
     while (index < count) {
         comptime_value.ComptimeAggregateField field =
-            ctx.store.comptime_store.field_at(aggregate, index);
-        write_stable_def_id(ctx, hasher, field.field_def);
-        write_stable_comptime_value(ctx, hasher, field.value);
+            store.comptime_store.field_at(aggregate, index);
+        write_stable_def_id(store, hasher, field.field_def);
+        write_stable_comptime_value_data(store, hasher, field.value.data);
         index = index + 1;
     }
 }
 
 Void write_stable_comptime_values(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     hash.WyHasher&! hasher,
     comptime_value.ComptimeAggregateId aggregate
 ) {
-    Int count = ctx.store.comptime_store.item_count(aggregate);
+    Int count = store.comptime_store.item_count(aggregate);
     hasher.write(count);
     Int index! = 0;
     while (index < count) {
-        comptime_value.ComptimeValue item = ctx.store.comptime_store.item_at(aggregate, index);
-        write_stable_comptime_value(ctx, hasher, item);
+        comptime_value.ComptimeValue item = store.comptime_store.item_at(aggregate, index);
+        write_stable_comptime_value_data(store, hasher, item.data);
         index = index + 1;
     }
 }
 
-Void write_stable_def_id(context.CompilerContext& ctx, hash.WyHasher&! hasher, qid.DefId def_id) {
+Void write_stable_def_id(store_api.CompilerStore& store, hash.WyHasher&! hasher, qid.DefId def_id) {
     // 跨编译会话优先使用 incremental stable id；没有 stable id 的临时 def 退回本次
     // 会话内 id，保证同一次构建内 object key 仍然可区分。
-    if (ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
+    if (store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
         hasher.write(UInt64(stable_id.low));
         hasher.write(UInt64(stable_id.high));
         return;
@@ -880,14 +1036,14 @@ object_key.StableTypeKeyKind stable_handle_kind(types.HandleTypeKind kind) {
 }
 
 object_key.StableTypeKey stable_type_array_key(
-    context.CompilerContext& ctx,
+    store_api.CompilerStore& store,
     object_key.StableTypeKeyKind kind,
     qid.TypeId[]& items
 ) {
     object_key.StableTypeKey key! = object_key.StableTypeKey(kind);
     Int index! = 0;
     while (index < items.length) {
-        key.add_arg(stable_type_key_for_type(ctx, items[index]));
+        key.add_arg(stable_type_key_for_type(store, items[index]));
         index = index + 1;
     }
     return key;

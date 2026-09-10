@@ -1,0 +1,154 @@
+#doc(module)
+    声明 lifetime 绑定复用签名事实，覆盖普通／生成读取、跨包失效和磁盘恢复。
+#end
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias artifact = import "../../../../src/compiler/artifact/source.jiang";
+alias source_ji = import "../../../../src/compiler/artifact/source_ji.jiang";
+alias fingerprint = import "../../../../src/compiler/artifact/source_fingerprint.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+import std;
+
+artifact.DeclarationObservationSet observations(context.CompilerContext& ctx, UInt8[]& path,
+    artifact.ObservationAspect aspect
+) {
+    _ full = std.path.join("build/test-reflect-binding-observations", path);
+    _ source = ctx.store.sources.find(.file(full.bytes()))$.some();
+    _ entries = ctx.store.artifacts.load_observations(source)$.some();
+    _ origin = ctx.store.artifacts.documentation_source(source)$.some();
+    _ sections = source_ji.read_source_ji_sections(ctx.store.symbols.text(origin.path))$.some();
+    _ saved = fingerprint.decode_declaration_observations_section(sections.declaration_observations.slice())$.some();
+    assert(saved.entries.len() == entries.entries.len());
+    artifact.DeclarationObservationSet result! = artifact.DeclarationObservationSet();
+    Int index! = 0;
+    while (index < entries.entries.len()) {
+        _ item = entries.entries.get(index);
+        _ disk = saved.entries.get(index);
+        assert(disk.subject == item.subject && disk.aspect == item.aspect && disk.name == item.name);
+        assert(disk.dependency_source == item.dependency_source && disk.observed == item.observed);
+        if (item.aspect == aspect) {
+            assert(item.observed == ctx.store.incremental.signature_fingerprint(item.subject));
+            result.add(item);
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+public Int run() {
+    assert(fs.remove_tree("build/test-reflect-binding-observations"));
+    UInt8[]&[4] directories = ["app", "library", "reader", "tool"];
+    for directory in directories {
+        _ path = std.path.join("build/test-reflect-binding-observations", directory);
+        assert(fs.create_dirs(path.bytes()));
+    }
+    write("app/package.ini", "[package]\nname=app\nroot=main.jiang\n[dependencies]\nlibrary=../library\nreader=../reader\n");
+    write("library/package.ini", "[package]\nname=library\nroot=main.jiang\n");
+    write("reader/package.ini", "[package]\nname=reader\nroot=main.jiang\n");
+    write("tool/package.ini", "[package]\nname=tool\nroot=main.jiang\n[dependencies]\nreader=../reader\n");
+    std.StringBuilder reader! = std.StringBuilder();
+    reader.append("public Int read(reflect.Decl decl) { _ bindings = decl.lifetime_bindings();\n");
+    reader.append("if (bindings.len() == 0) { return if bindings.is_explicit() { 1 } else { 0 }; }\n");
+    reader.append("guard bindings.get(0).source().shape() is .path(path) else { return 99; }\n");
+    reader.append("guard path.root() is .named(name) else { return 98; } return name.length; }\n");
+    write("reader/main.jiang", reader.slice());
+    write("app/main.jiang", "alias lib = import library; alias reader = import reader;\nconst Int count = reader.read(reflect.type_of<lib.Operations>().members().get(0)); alias Force = Int[count];\n");
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "build/test-reflect-binding-observations/app", "", "build/test-reflect-binding-observations/cache");
+    context.CompilerContext ctx! = context.CompilerContext();
+    input("left", false);
+    check(ctx$.mut_ref(), options$.ref());
+    _ baseline = observations(ctx$.ref(), "app/main.jiang", .reflected_signature);
+    assert(baseline.entries.len() == 1);
+    assert(observations(ctx$.ref(), "reader/main.jiang", .reflected_signature).entries.empty());
+    constant(ctx$.ref(), 4);
+    check(ctx$.mut_ref(), options$.ref());
+    constant(ctx$.ref(), 4);
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    input("left", true);
+    check(ctx$.mut_ref(), options$.ref());
+    constant(ctx$.ref(), 4);
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    input("right", false);
+    check(ctx$.mut_ref(), options$.ref());
+    constant(ctx$.ref(), 5);
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    generation(ctx$.mut_ref());
+    assert(fs.remove_tree("build/test-reflect-binding-observations"));
+    return 0;
+}
+
+Void input(UInt8[]& origin, Bool body_change) {
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("public struct Operations { @life(return: "); text.append(origin);
+    text.append(") public Int& choose(Int& left, Int& right) { ");
+    if (body_change) { text.append("Int ignored = 1; "); }
+    text.append("return "); text.append(origin); text.append("; } }\n");
+    write("library/main.jiang", text.slice());
+}
+
+Void constant(context.CompilerContext& ctx, Int expected) {
+    _ source = ctx.store.sources.find(.file("build/test-reflect-binding-observations/app/main.jiang"))$.some();
+    _ module = ctx.store.resolve.module_for_source(source)$.some();
+    _ namespace_id = ctx.store.resolve.module_ref(module).namespace_id;
+    _ name = ctx.store.symbols.find("count")$.some();
+    _ binding = ctx.store.resolve.lookup_namespace(namespace_id, name, .value_name, false)$.some();
+    _ value = ctx.store.comptime_store.const_value(binding.def_id)$.some();
+    guard value.data is .int_value(actual) else { assert(false); return; }
+    assert(actual == expected);
+}
+
+Void generation(context.CompilerContext&! ctx) {
+    write("tool/main.jiang", "import std; alias reader = import reader;\n@entry(generate) Void gen(reflect.Module root) { std.StringBuilder text! = std.StringBuilder(); for decl in root.declarations() { text.append(reader.read(decl)); } generate.write(\"bindings.txt\", text.slice()); }\n");
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-reflect-binding-observations/library", "build/test-reflect-binding-observations/output",
+        "build/test-reflect-binding-observations/generate-cache");
+    options.generator = "build/test-reflect-binding-observations/tool";
+    write("library/main.jiang", "@life() Void empty() {}\nVoid omitted() {}\n");
+    check(ctx, options$.ref());
+    output("10");
+    _ baseline = observations(ctx, "tool/main.jiang", .generated_signature);
+    assert(baseline.entries.len() == 2);
+    assert(observations(ctx, "tool/main.jiang", .reflected_signature).entries.empty());
+    assert(observations(ctx, "reader/main.jiang", .generated_signature).entries.empty());
+    check(ctx, options$.ref());
+    output("10");
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    _ source = ctx.store.sources.find(.file("build/test-reflect-binding-observations/tool/main.jiang"))$.some();
+    assert(ctx.store.resolve.module_ref(ctx.store.resolve.module_for_source(source)$.some()).interface_only);
+    write("library/main.jiang", "#doc Changed.\n@life() Void empty() { Int value = 1; }\nVoid omitted() {}\n");
+    check(ctx, options$.ref());
+    output("10");
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    write("library/main.jiang", "Void empty() {}\nVoid omitted() {}\n");
+    check(ctx, options$.ref());
+    output("00");
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    _ removed = observations(ctx, "tool/main.jiang", .generated_signature);
+    check(ctx, options$.ref());
+    output("00");
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), removed$.ref()));
+    context.CompilerContext restored! = context.CompilerContext();
+    check(restored$.mut_ref(), options$.ref());
+    output("00");
+    assert(restored.query.validate_declaration_observations(restored.store$.ref(), removed$.ref()));
+}
+
+Void check(context.CompilerContext&! ctx, options_api.CompileOptions& options) {
+    pipeline.compile(ctx, options);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+}
+Void write(UInt8[]& path, UInt8[]& text) {
+    _ joined = std.path.join("build/test-reflect-binding-observations", path);
+    assert(fs.write_all(joined.bytes(), text));
+}
+Void output(UInt8[]& expected) {
+    _ text = fs.read_all("build/test-reflect-binding-observations/output/bindings.txt")$.some();
+    assert(string.equal(text[..], expected));
+}

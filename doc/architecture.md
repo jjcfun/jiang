@@ -306,13 +306,16 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   [Borrow Check 设计](compiler/borrow-check.md)。
 - `backend` 把 elaborated JIL 和 layout 转成 LLVM IR、object file 或可执行产物；
   详见 [Backend 设计](compiler/backend.md)。
+- `generate` 在输入与生成器完成语义检查后，按需准备生成入口的 JIL 与 borrow/drop 并调用一次；
+  复用编译期执行器，资源读取与事务输出由生成阶段控制。`reflect` 提供定义级只读句柄和视图，
+  不暴露函数 body 或编译器内部模型，句柄仅在当前求值会话有效；详见[反射与生成](compiler/reflection.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
 - `lang` 负责 `type = lang` provider discovery、入口 source path/package 两级 registry 构建、
   wrapper dylib 构建、host dylib 加载和 syntax-stage provider invocation；
   详见 [DSL / Lang Package](compiler/dsl.md)。
 - `artifact` 保存 source/interface/object/package artifact 的 key、fingerprint、path 和物理容器
-  适配；`.ji` 只保存语义 interface，debug object 记录位于 `.jbuild`，路径由 stable source
+  适配；`.ji` 分段保存语义 interface、文档和读取记录等事实，debug object 记录位于 `.jbuild`，路径由 stable source
   identity 与固定 unit kind 推导，不保存 session-local ID。
   release executable 使用 whole-package codegen；
   `package_fingerprint` /
@@ -358,6 +361,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   epoch 清理由 `begin_compilation` 统一承担。
 - source import closure 由 `SourceGraph` 负责，importer 的细粒度失效由 `.ji` declaration
   observations 裁决；object 复用由 object key 和 `.jbuild` 负责，不建立通用 query graph。
+- 反射按事实及集合分别记录读取依赖，包括空结果、文档和来源信息。普通 comptime 读取约束 object 复用，
+  生成阶段读取独立保存；事实所有权、查询范围和失效边界详见[反射与生成](compiler/reflection.md)。
 - 新代码遵循严格借用模式：可变访问显式 `&!`，不允许把共享 store 引用存入
   长期结构；现有宽松代码按迁移路径逐步收紧，不以放松新代码为代价。
 - `QueryEngine` 保持同步，Movable 阶段 owner 不进入 cache。

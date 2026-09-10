@@ -1,0 +1,313 @@
+#doc(module)
+    固定语义模型的直接与递归声明查询，按归属和可见范围缓存 DefId；不复制定义或枚举函数 body。
+#end
+alias qid = import "../id.jiang";
+alias qkey = import "../incremental/key.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias source = import "../source.jiang";
+alias source_locations = import "../source/source_map.jiang";
+alias token = import "../syntax/token.jiang";
+alias def = import "../resolve/def.jiang";
+alias store_api = import "../store.jiang";
+alias list = import "../support/list.jiang";
+alias module_query = import "./module_graph.jiang";
+alias set = import "../support/set.jiang";
+alias collections = import "./collection_cache.jiang";
+alias sem = import "../sema/model.jiang";
+
+#doc 声明的类型与 schema 投影；索引用于显式参数或 region 槽，实例环境在返回句柄时应用。
+public enum DeclarationTypeProperty {
+    declaration, result, parameter, domain, regions, nominal_contract, region_paths, constraints, constant_value,
+    checked_signature,
+}
+
+public DeclarationTypeProperty? declaration_type_property(Int value) {
+    if (value == Int(DeclarationTypeProperty.declaration)) { return DeclarationTypeProperty.declaration; }
+    if (value == Int(DeclarationTypeProperty.result)) { return DeclarationTypeProperty.result; }
+    if (value == Int(DeclarationTypeProperty.parameter)) { return DeclarationTypeProperty.parameter; }
+    if (value == Int(DeclarationTypeProperty.domain)) { return DeclarationTypeProperty.domain; }
+    if (value == Int(DeclarationTypeProperty.constraints)) { return DeclarationTypeProperty.constraints; }
+    if (value == Int(DeclarationTypeProperty.constant_value)) { return DeclarationTypeProperty.constant_value; }
+    if (value == Int(DeclarationTypeProperty.regions)) { return DeclarationTypeProperty.regions; }
+    if (value == Int(DeclarationTypeProperty.nominal_contract)) { return DeclarationTypeProperty.nominal_contract; }
+    if (value == Int(DeclarationTypeProperty.region_paths)) { return DeclarationTypeProperty.region_paths; }
+    if (value == Int(DeclarationTypeProperty.checked_signature)) { return DeclarationTypeProperty.checked_signature; }
+    return null;
+}
+
+public struct DeclarationScope: Copyable, Hashable, Equatable {
+    public qid.DefId owner;
+    public Bool public_only;
+    public Bool generic_parameters = false;
+    public Void hash<H: Hasher>(self, H&! hasher) {
+        self.owner.hash(hasher); hasher.write(self.public_only); hasher.write(self.generic_parameters);
+    }
+    public Bool equal(Self& lhs, Self& rhs) {
+        return lhs.owner == rhs.owner && lhs.public_only == rhs.public_only
+            && lhs.generic_parameters == rhs.generic_parameters;
+    }
+}
+
+public struct DeclarationQuery: Movable {
+    collections.CollectionCache<DeclarationScope, qid.DefId> members!;
+    collections.CollectionCache<qid.ModuleId, qid.DefId> recursive!;
+    public init(self) {
+        self.members = collections.CollectionCache<DeclarationScope, qid.DefId>();
+        self.recursive = collections.CollectionCache<qid.ModuleId, qid.DefId>();
+    }
+    public Void reset(Self&! self) { self.members.reset(); self.recursive.reset(); }
+
+    #doc 位置正文按需加载，与模型中的语义签名分开准备；Lang 来源沿用已有 SourceMap。
+    public Bool prepare_location(self, store_api.CompilerStore&! store, qid.DefId definition) {
+        guard self.location_source(store, definition) is .some(source_id) else { return false; }
+        if (!store.sources.ensure_source(source_id)) { return false; }
+        store.sources.ensure_line_starts(source_id);
+        return true;
+    }
+
+    #doc 模块位置覆盖原始输入，其余声明沿用 SourceMap；返回的来源总是显式 SourceId。
+    public source_locations.SourceLoc? location(self, store_api.CompilerStore& store, qid.DefId definition) {
+        guard self.location_source(store, definition) is .some(source_id) else { return null; }
+        if (store.defs.get(definition).kind == .module_def) {
+            if (!store.sources.has_source(source_id)) { return null; }
+            return source_locations.SourceLoc(source_id, token.Span(0, store.sources.get(source_id).text.length));
+        }
+        return source_locations.SourceLoc(source_id, store.source_map.def_span(definition)$.some().span);
+    }
+
+    source.SourceId? location_source(self, store_api.CompilerStore& store, qid.DefId definition) {
+        guard store.defs.get(definition).module_id is .some(module) else { return null; }
+        if (store.defs.get(definition).kind != .module_def) {
+            guard store.source_map.def_span(definition) is .some(location) else { return null; }
+            if (location.source_id is .some(source_id)) { return source_id; }
+        }
+        return store.resolve.module_ref(module).source_id;
+    }
+
+    #doc 根优先同包模块闭包，每个模块按声明前序展开；保留符号泛型参数，不沿类型引用或 body 递归。
+    public Void prepare_recursive(
+        Self&! self, store_api.CompilerStore& store, module_query.ModuleGraphQuery&! graph, qid.ModuleId root
+    ) {
+        if (self.recursive.has(root)) { return; }
+        list.ArrayList<qid.DefId> result! = list.ArrayList<qid.DefId>();
+        set.HashSet<qid.DefId> visited! = set.HashSet<qid.DefId>();
+        Int modules = graph.module_count(store.resolve$.ref(), root);
+        Int index! = 0;
+        while (index < modules) {
+            qid.ModuleId module = graph.module_at(store.resolve$.ref(), root, index);
+            self.collect_recursive(store, store.resolve.module_ref(module).def_id,
+                result$.mut_ref(), visited$.mut_ref());
+            index = index + 1;
+        }
+        self.recursive.publish(root, result);
+    }
+
+    #doc 递归视图按返回次序记录声明身份与类别；普通 body、文档和未读取的签名分别跟踪。
+    public qkey.Fingerprint128? recursive_fingerprint(self, store_api.CompilerStore& store, qid.ModuleId root) {
+        return self.recursive.fingerprint(root, { [ref store, root] declarations =>
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            _ owner = store.incremental.stable_id_for_def(store.resolve.module_ref(root).def_id)$.some();
+            parts.add(qkey.Fingerprint128(owner.low, owner.high));
+            Int index! = 0;
+            while (index < declarations.len()) {
+                qid.DefId definition = declarations.get(index);
+                _ identity = store.incremental.stable_id_for_def(definition)$.some();
+                parts.add(qkey.Fingerprint128(identity.low, identity.high));
+                parts.add(qkey.Fingerprint128(UInt64(Int(store.defs.get(definition).kind)), UInt64(0)));
+                index = index + 1;
+            }
+            return object_key.combine_fingerprints(UInt64(134), parts$.ref());
+        });
+    }
+
+    public Int recursive_count(self, qid.ModuleId root) { return self.recursive.count(root); }
+    public qid.DefId recursive_at(self, qid.ModuleId root, Int index) { return self.recursive.at(root, index); }
+
+    Void collect_recursive(
+        Self&! self, store_api.CompilerStore& store, qid.DefId owner, list.ArrayList<qid.DefId>&! result,
+        set.HashSet<qid.DefId>&! visited
+    ) {
+        qid.ModuleId module = store.defs.get(owner).module_id$.some();
+        list.ArrayList<qid.DefId> pending! = list.ArrayList<qid.DefId>();
+        pending.add(owner);
+        while (!pending.empty()) {
+            qid.DefId current = pending.pop();
+            if (store.defs.get(current).module_id != module || visited.has(current)) { continue; }
+            visited.add(current);
+            if (!store.model.has_def(current)) { continue; }
+            if (current != owner) { result.add(current); }
+            DeclarationScope scope = DeclarationScope(owner: current, public_only: false);
+            Int members! = self.count(store, scope);
+            while (members > 0) {
+                members = members - 1;
+                pending.add(self.at(store, scope, members));
+            }
+            DeclarationScope generics = DeclarationScope(owner: current, public_only: false, generic_parameters: true);
+            Int parameters! = self.count(store, generics);
+            while (parameters > 0) {
+                parameters = parameters - 1;
+                pending.add(self.at(store, generics, parameters));
+            }
+        }
+    }
+
+    public Int count(Self&! self, store_api.CompilerStore& store, DeclarationScope scope) {
+        self.prepare(store, scope);
+        return self.members.count(scope);
+    }
+    public qid.DefId at(Self&! self, store_api.CompilerStore& store, DeclarationScope scope, Int index) {
+        self.prepare(store, scope);
+        return self.members.at(scope, index);
+    }
+    #doc 恢复前只读取完整声明模型；不能把循环依赖中的 skeleton 缓存为空成员集合。
+    public Bool prepare_observed_members(Self&! self, store_api.CompilerStore& store, DeclarationScope scope) {
+        if (!store.model.has_def(scope.owner)) { return false; }
+        _ state = store.model.declaration_sema_state(scope.owner);
+        if (state != .body_ready && state != .signature_ready) { return false; }
+        self.prepare(store, scope);
+        return true;
+    }
+
+    #doc 有序成员身份及公开类别决定集合；范围标志区分 public 与泛型参数，实参替换不改变成员身份。
+    public qkey.Fingerprint128? members_fingerprint(self, store_api.CompilerStore& store, DeclarationScope scope) {
+        return self.members.fingerprint(scope, { [ref store, scope] members =>
+            guard store.incremental.stable_id_for_def(scope.owner) is .some(owner) else { return null; }
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            parts.add(qkey.Fingerprint128(owner.low, owner.high));
+            parts.add(qkey.Fingerprint128(if scope.public_only { UInt64(1) } else { UInt64(0) },
+                if scope.generic_parameters { UInt64(1) } else { UInt64(0) }));
+            Int index! = 0;
+            while (index < members.len()) {
+                qid.DefId member = members.get(index);
+                guard store.incremental.stable_id_for_def(member) is .some(identity) else { return null; }
+                parts.add(qkey.Fingerprint128(identity.low, identity.high));
+                parts.add(qkey.Fingerprint128(UInt64(Int(store.defs.get(member).kind)), UInt64(0)));
+                index = index + 1;
+            }
+            return object_key.combine_fingerprints(UInt64(136), parts$.ref());
+        });
+    }
+
+    Void prepare(Self&! self, store_api.CompilerStore& store, DeclarationScope scope) {
+        if (self.members.has(scope)) { return; }
+        list.ArrayList<qid.DefId> result! = list.ArrayList<qid.DefId>();
+        def.DefRecord owner = store.defs.get(scope.owner);
+        def.DefKind kind = owner.kind;
+        // 外包私有名义类型只能得到空视图，但保留内部 owner 身份以跟踪可见性改变。
+        if (scope.public_only && owner.visibility != .public_visibility
+            && (kind == .struct_def || kind == .enum_def || kind == .trait_def)) {
+            self.members.publish(scope, result);
+            return;
+        }
+        // callable 的参数有独立签名接口，body 中的声明不能作为直接成员发布。
+        if (scope.generic_parameters) {
+            Int index! = 0;
+            while (index < store.model.def_generic_param_count(scope.owner)) {
+                result.add(store.model.def_generic_param_at(scope.owner, index));
+                index = index + 1;
+            }
+        } else if (kind != .function_def && kind != .init_def && kind != .deinit_def) {
+            self.collect_members(store, scope, result$.mut_ref());
+        }
+        self.members.publish(scope, result);
+    }
+    Void collect_members(
+        self, store_api.CompilerStore& store, DeclarationScope scope, list.ArrayList<qid.DefId>&! result
+    ) {
+        if (store.model.extension_group_for_definition(scope.owner) is .some(group)) {
+            Int index! = 0;
+            while (index < store.model.extension_member_count(group)) {
+                qid.DefId member = store.model.extension_member_at(group, index);
+                index = index + 1;
+                _ item = store.defs.get(member);
+                if (reflection_case_name(item.kind) == null) { continue; }
+                if (!scope.public_only || item.visibility == .public_visibility) { result.add(member); }
+            }
+            return;
+        }
+        Int index! = 0;
+        while (index < store.model.def_member_count(scope.owner)) {
+            qid.DefId member = store.model.def_member_at(scope.owner, index);
+            index = index + 1;
+            def.DefRecord item = store.defs.get(member);
+            if (reflection_case_name(item.kind) == null || store.model.extension_group_for_member(member) != null) {
+                continue;
+            }
+            if (scope.public_only && item.visibility != .public_visibility) { continue; }
+            result.add(member);
+        }
+        if (store.defs.get(scope.owner).kind != .module_def) { return; }
+        qid.ModuleId module = store.defs.get(scope.owner).module_id$.some();
+        index = 0;
+        while (index < store.model.extension_group_len()) {
+            Int group = index;
+            index = index + 1;
+            if (store.model.extension_group_module(group) != module) { continue; }
+            if (scope.public_only && !store.model.extension_group_is_public(group)) { continue; }
+            qid.DefId definition = store.model.extension_group_binding_owner(group);
+            result.add(definition);
+        }
+        self.sort_members(store, result);
+    }
+
+    #doc 稳定归并避免大量 extension 交错时退化为二次插入；来源缺失的合成记录保留相对次序。
+    Void sort_members(self, store_api.CompilerStore& store, list.ArrayList<qid.DefId>&! members) {
+        if (members.len() < 2) { return; }
+        list.ArrayList<qid.DefId> scratch! = list.ArrayList<qid.DefId>(members.len());
+        Int index! = 0;
+        while (index < members.len()) { scratch.add(members.get(index)); index = index + 1; }
+        Int width! = 1;
+        while (width < members.len()) {
+            Int begin! = 0;
+            while (begin < members.len()) {
+                Int middle = if begin + width < members.len() { begin + width } else { members.len() };
+                Int end = if middle + width < members.len() { middle + width } else { members.len() };
+                self.merge_members(store, members, scratch$.mut_ref(), begin, middle, end);
+                begin = end;
+            }
+            width = width * 2;
+        }
+    }
+
+    Void merge_members(self, store_api.CompilerStore& store, list.ArrayList<qid.DefId>&! members,
+        list.ArrayList<qid.DefId>&! scratch, Int begin, Int middle, Int end
+    ) {
+        Int left! = begin;
+        Int right! = middle;
+        Int write! = begin;
+        while (write < end) {
+            if (left < middle && (right >= end || !self.before(store, members.get(right), members.get(left)))) {
+                scratch.set(write, members.get(left)); left = left + 1;
+            } else { scratch.set(write, members.get(right)); right = right + 1; }
+            write = write + 1;
+        }
+        write = begin;
+        while (write < end) { members.set(write, scratch.get(write)); write = write + 1; }
+    }
+    Bool before(self, store_api.CompilerStore& store, qid.DefId lhs, qid.DefId rhs) {
+        if (store.source_map.top_level_order(lhs) is .some(left)) {
+            if (store.source_map.top_level_order(rhs) is .some(right)) { return left < right; }
+            return true;
+        }
+        return false;
+    }
+}
+
+#doc 分类只描述公开的定义类别；编译器生成的 companion、局部变量和包模块不伪装成用户声明。
+@life()
+public UInt8[]&? reflection_case_name(def.DefKind kind) {
+    switch kind {
+        .function_def, .init_def, .deinit_def => { return "function"; },
+        .struct_def => { return "struct_decl"; },
+        .enum_def => { return "enum_decl"; },
+        .trait_def => { return "trait_decl"; },
+        .alias_def, .import_alias_def => { return "alias_decl"; },
+        .global_def => { return "variable"; },
+        .field_def => { return "field"; },
+        .enum_case_def => { return "variant"; },
+        .associated_type_def => { return "associated_type"; },
+        .generic_param_def => { return "generic_parameter"; },
+        .extension_def => { return "extension"; },
+        else => { return null; },
+    }
+}

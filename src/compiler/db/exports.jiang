@@ -1,0 +1,186 @@
+#doc(module)
+    已就绪名字空间的公开导出查询；保存绑定身份与名称，沿公开通配边枚举，不复制声明或执行函数 body。
+#end
+alias qkey = import "../incremental/key.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias cache_identity = import "../artifact/cache_identity.jiang";
+alias qid = import "../id.jiang";
+alias store_api = import "../store.jiang";
+alias namespace = import "../resolve/namespace.jiang";
+alias declaration = import "./declaration.jiang";
+alias collections = import "./collection_cache.jiang";
+alias list = import "../support/list.jiang";
+alias set = import "../support/set.jiang";
+
+#doc 一个公开名字与实际绑定声明；别名目标由现有语义事实解析，来源仍保留在绑定声明上。
+public struct ExportBinding: Copyable, Equatable, Hashable {
+    public qid.SymbolId name;
+    public qid.DefId definition;
+    public qid.DefId target;
+    public Bool equal(Self& lhs, Self& rhs) {
+        return lhs.name == rhs.name && lhs.definition == rhs.definition && lhs.target == rhs.target;
+    }
+    public Void hash<H: Hasher>(self, H&! hasher) {
+        self.name.hash(hasher); self.definition.hash(hasher); self.target.hash(hasher);
+    }
+}
+
+public struct ExportQuery: Movable {
+    collections.CollectionCache<qid.ModuleId, ExportBinding> modules!;
+    public init(self) { self.modules = collections.CollectionCache<qid.ModuleId, ExportBinding>(); }
+    public Void reset(Self&! self) { self.modules.reset(); }
+    public Int count(Self&! self, store_api.CompilerStore& store, qid.ModuleId module) {
+        self.prepare(store, module);
+        return self.modules.count(module);
+    }
+    public ExportBinding at(Self&! self, store_api.CompilerStore& store, qid.ModuleId module, Int index) {
+        self.prepare(store, module);
+        return self.modules.at(module, index);
+    }
+
+    #doc 空公开表面也有指纹；保留有序名称、绑定与目标身份，私有声明和函数正文不进入集合。
+    public qkey.Fingerprint128? fingerprint(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        return self.modules.fingerprint(module, { [ref store, module] bindings =>
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            _ owner = store.incremental.stable_id_for_def(store.resolve.module_ref(module).def_id)$.some();
+            parts.add(qkey.Fingerprint128(owner.low, owner.high));
+            Int index! = 0;
+            while (index < bindings.len()) {
+                ExportBinding binding = bindings.get(index);
+                _ definition = store.incremental.stable_id_for_def(binding.definition)$.some();
+                _ target = store.incremental.stable_id_for_def(binding.target)$.some();
+                parts.add(cache_identity.text_fingerprint("export-name:", store.symbols.text(binding.name)));
+                parts.add(qkey.Fingerprint128(definition.low, definition.high));
+                parts.add(qkey.Fingerprint128(target.low, target.high));
+                parts.add(qkey.Fingerprint128(UInt64(Int(store.defs.get(binding.target).kind)), UInt64(0)));
+                index = index + 1;
+            }
+            return object_key.combine_fingerprints(UInt64(135), parts$.ref());
+        });
+    }
+
+    Void prepare(Self&! self, store_api.CompilerStore& store, qid.ModuleId module) {
+        if (self.modules.has(module)) { return; }
+        qid.NamespaceId root = store.resolve.module_ref(module).namespace_id;
+        list.ArrayList<ExportBinding> result! = list.ArrayList<ExportBinding>();
+        set.HashSet<ExportBinding> seen! = set.HashSet<ExportBinding>();
+        set.HashSet<qid.NamespaceId> visited! = set.HashSet<qid.NamespaceId>();
+        list.ArrayList<qid.NamespaceId> pending! = list.ArrayList<qid.NamespaceId>();
+        pending.add(root);
+        while (!pending.empty()) {
+            qid.NamespaceId current = pending.pop();
+            if (visited.has(current)) { continue; }
+            visited.add(current);
+            self.collect_namespace(store, root, current, result$.mut_ref(), seen$.mut_ref());
+            Int index! = store.resolve.wildcard_imports.len();
+            while (index > 0) {
+                index = index - 1;
+                _ edge = store.resolve.wildcard_imports.get(index);
+                if (edge.namespace_id == current && edge.visibility == .public_visibility) {
+                    pending.add(edge.target_namespace_id);
+                }
+            }
+        }
+        self.modules.publish(module, result);
+    }
+
+    #doc 本地公开绑定优先；通配候选必须来自正常公开查找选中的名字空间，同名重载保留各自定义。
+    Void collect_namespace(self, store_api.CompilerStore& store, qid.NamespaceId root, qid.NamespaceId current,
+        list.ArrayList<ExportBinding>&! result, set.HashSet<ExportBinding>&! seen
+    ) {
+        list.ArrayList<ExportBinding> direct! = list.ArrayList<ExportBinding>();
+        _ cursor! = store.resolve.first_namespace_binding(current);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = store.resolve.namespace_binding_at(cursor);
+            cursor = store.resolve.next_namespace_binding(cursor);
+            if (binding.visibility != .public_visibility) { continue; }
+            if (declaration.reflection_case_name(store.defs.get(binding.def_id).kind) == null) { continue; }
+            guard store.resolve.lookup_public_namespace(root, binding.symbol, binding.domain) is .some(selected)
+                else { continue; }
+            if (selected.namespace_id != current) { continue; }
+            self.collect_binding(store, binding, direct$.mut_ref(), seen);
+        }
+        self.sort_bindings(store, direct$.mut_ref());
+        Int index! = 0;
+        while (index < direct.len()) { result.add(direct.get(index)); index = index + 1; }
+    }
+
+    #doc 函数别名指向重载组；复用该目标的名字绑定表，只保留其中的公开函数。
+    Void collect_binding(self, store_api.CompilerStore& store, namespace.BindingEntry binding,
+        list.ArrayList<ExportBinding>&! result, set.HashSet<ExportBinding>&! seen
+    ) {
+        qid.DefId target! = binding.def_id;
+        while (store.model.has_def(target)) {
+            guard store.model.def_alias_target(target) is .some(next) else { break; }
+            target = next;
+        }
+        _ record = store.defs.get(target);
+        if (target == binding.def_id || record.kind != .function_def) {
+            self.add(binding, target, result, seen);
+            return;
+        }
+        _ cursor! = store.resolve.first_binding_cursor(record.decl_namespace_id, record.name.symbol, record.domain);
+        while (cursor.valid()) {
+            _ candidate = store.resolve.binding_at(cursor);
+            cursor = store.resolve.next_binding_cursor(cursor);
+            if (candidate.visibility != .public_visibility || store.defs.get(candidate.def_id).kind != .function_def) {
+                continue;
+            }
+            self.add(binding, candidate.def_id, result, seen);
+        }
+    }
+    Void add(self, namespace.BindingEntry binding, qid.DefId target,
+        list.ArrayList<ExportBinding>&! result, set.HashSet<ExportBinding>&! seen
+    ) {
+        ExportBinding item = ExportBinding(name: binding.symbol, definition: binding.def_id, target: target);
+        if (seen.has(item)) { return; }
+        seen.add(item);
+        result.add(item);
+    }
+
+    #doc 每个来源名字空间按声明次序稳定排序，公开通配边再按深度优先顺序展开。
+    Void sort_bindings(self, store_api.CompilerStore& store, list.ArrayList<ExportBinding>&! items) {
+        list.ArrayList<ExportBinding> scratch! = list.ArrayList<ExportBinding>(items.len());
+        Int index! = 0;
+        while (index < items.len()) { scratch.add(items.get(index)); index = index + 1; }
+        Int width! = 1;
+        while (width < items.len()) {
+            Int begin! = 0;
+            while (begin < items.len()) {
+                Int middle = if begin + width < items.len() { begin + width } else { items.len() };
+                Int end = if middle + width < items.len() { middle + width } else { items.len() };
+                self.merge(store, items, scratch$.mut_ref(), begin, middle, end);
+                begin = end;
+            }
+            width = width * 2;
+        }
+    }
+    Void merge(self, store_api.CompilerStore& store, list.ArrayList<ExportBinding>&! items,
+        list.ArrayList<ExportBinding>&! scratch, Int begin, Int middle, Int end
+    ) {
+        Int left! = begin;
+        Int right! = middle;
+        Int output! = begin;
+        while (output < end) {
+            if (left < middle && (right >= end || !self.before(store, items.get(right), items.get(left)))) {
+                scratch.set(output, items.get(left)); left = left + 1;
+            } else { scratch.set(output, items.get(right)); right = right + 1; }
+            output = output + 1;
+        }
+        output = begin;
+        while (output < end) { items.set(output, scratch.get(output)); output = output + 1; }
+    }
+    Bool before(self, store_api.CompilerStore& store, ExportBinding lhs, ExportBinding rhs) {
+        if (lhs.definition == rhs.definition) {
+            if (store.source_map.top_level_order(lhs.target) is .some(left)) {
+                if (store.source_map.top_level_order(rhs.target) is .some(right)) { return left < right; }
+            }
+            return false;
+        }
+        if (store.source_map.top_level_order(lhs.definition) is .some(left)) {
+            if (store.source_map.top_level_order(rhs.definition) is .some(right)) { return left < right; }
+            return true;
+        }
+        return false;
+    }
+}

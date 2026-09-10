@@ -1,0 +1,214 @@
+#doc(module)
+    文档查询按模块延迟读取已验证缓存中的独立 section；源码文档仍由 Semantic Model 持有。
+    无文档与文档事实不可用分别处理；不为每个声明复制 Markdown 或引入第二套声明身份。
+#end
+alias qkey = import "../incremental/key.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias object_hash = import "../artifact/object_hash.jiang";
+alias qid = import "../id.jiang";
+alias store_api = import "../store.jiang";
+alias documentation = import "../artifact/documentation.jiang";
+alias ji = import "../artifact/ji_file.jiang";
+alias module_query = import "./module_graph.jiang";
+alias declaration_query = import "./declaration.jiang";
+alias list = import "../support/list.jiang";
+alias map = import "../support/map.jiang";
+alias query_cache = import "./query_cache.jiang";
+import std;
+
+public enum DocumentationTarget: Copyable { module(qid.ModuleId), declaration(qid.DefId), }
+
+#doc 一个已准备的文档视图及其有序身份指纹；Markdown 仍由原事实持有。
+struct DocumentationTargets: Movable {
+    public list.ArrayList<DocumentationTarget> entries;
+    public qkey.Fingerprint128 fingerprint;
+    public init(self, list.ArrayList<DocumentationTarget> entries, qkey.Fingerprint128 fingerprint) {
+        self.entries = entries;
+        self.fingerprint = fingerprint;
+    }
+}
+
+#doc 已准备的文档值只保存字符串身份，正文仍由原事实持有；空文档值与未准备的缓存项不同。
+struct DocumentationValue: Copyable {
+    public qid.SymbolId? markdown;
+    public qkey.Fingerprint128? fingerprint = null;
+}
+
+public struct DocumentationQuery: Movable {
+    Mutex<query_cache.QueryCache<qid.DefId, DocumentationValue>>^ values;
+    map.WyHashMap<qid.ModuleId, documentation.Documentation> modules!;
+    map.WyHashMap<qid.ModuleId, DocumentationTargets> targets!;
+    public init(self) {
+        self.values = new Mutex<query_cache.QueryCache<qid.DefId, DocumentationValue>>(
+            query_cache.QueryCache<qid.DefId, DocumentationValue>()
+        );
+        self.modules = map.WyHashMap<qid.ModuleId, documentation.Documentation>();
+        self.targets = map.WyHashMap<qid.ModuleId, DocumentationTargets>();
+    }
+    public Void reset(Self&! self) {
+        self.modules.clear(); self.targets.clear();
+        self.values.with_lock<Void>({ cache => cache.reset(); });
+    }
+
+    #doc 同包模块按导入顺序展开；每个模块先返回自身，再以声明前序遍历筛选文档，不进入 body。
+    public qid.ModuleId? prepare_targets(
+        Self&! self, store_api.CompilerStore&! store, module_query.ModuleGraphQuery&! graph,
+        declaration_query.DeclarationQuery&! declarations, qid.ModuleId root
+    ) {
+        if (self.targets.has(root)) { return null; }
+        list.ArrayList<DocumentationTarget> result! = list.ArrayList<DocumentationTarget>();
+        declarations.prepare_recursive(store, graph, root);
+        Int declaration_index! = 0;
+        Int declaration_count = declarations.recursive_count(root);
+        Int count = graph.module_count(store.resolve$.ref(), root);
+        Int index! = 0;
+        while (index < count) {
+            qid.ModuleId module = graph.module_at(store.resolve$.ref(), root, index);
+            index = index + 1;
+            if (!self.prepare(store, module)) { return module; }
+            if (self.module(store, module) != null) { result.add(.module(module)); }
+            while (declaration_index < declaration_count) {
+                qid.DefId definition = declarations.recursive_at(root, declaration_index);
+                if (store.defs.get(definition).module_id != module) { break; }
+                if (self.declaration(store, definition) != null) { result.add(.declaration(definition)); }
+                declaration_index = declaration_index + 1;
+            }
+        }
+        qid.DefId owner = store.resolve.module_ref(root).def_id;
+        qkey.Fingerprint128 fingerprint = targets_fingerprint(store, owner, result$.ref());
+        self.targets.set(root, DocumentationTargets(result$.move(), fingerprint));
+        return null;
+    }
+
+    public Int target_count(self, qid.ModuleId root) { return self.targets.get(root)$.some().entries.len(); }
+    public DocumentationTarget target_at(self, qid.ModuleId root, Int index) {
+        return self.targets.get(root)$.some().entries.get(index);
+    }
+
+    #doc 只比较已准备的完整有序集合；空集合也是有效指纹，未准备返回空值。
+    public qkey.Fingerprint128? targets_fingerprint(self, qid.ModuleId root) {
+        guard self.targets.get(root) is .some(view) else { return null; }
+        return view.fingerprint;
+    }
+
+    #doc 返回 false 表示缺少可验证文档来源或 payload 损坏，不能当作没有文档。
+    public Bool prepare(Self&! self, store_api.CompilerStore&! store, qid.ModuleId module) {
+        if (!store.resolve.module_ref(module).interface_only) {
+            return store.model.module_documentation_ready(module);
+        }
+        if (self.modules.has(module)) { return true; }
+        _ source_id = store.resolve.module_ref(module).source_id;
+        guard store.artifacts.documentation_source(source_id) is .some(origin) else { return false; }
+        if (origin.section is .some(section)) {
+            UInt64 started = store.artifacts.section_timing_start();
+            _ bytes = ji.read_ji_section(store.symbols.text(origin.path), section);
+            store.artifacts.record_section_read(.documentation, section.length, started);
+            guard bytes is .some(payload) else { return false; }
+            UInt64 decoded_at = store.artifacts.section_timing_start();
+            _ decoded = documentation.decode(store.symbols$.mut_ref(), payload);
+            store.artifacts.record_section_decode(.documentation, decoded_at);
+            guard decoded$.move() is .some(result) else { return false; }
+            self.modules.set(module, result);
+        } else { self.modules.set(module, documentation.Documentation()); }
+        return true;
+    }
+
+    #doc 文档值和指纹共用缓存项；仅首次读取指纹时编码正文，无文档使用零值。
+    public qkey.Fingerprint128? fingerprint(self, store_api.CompilerStore& store, qid.DefId definition) {
+        if (self.document(store, definition) == null) { return null; }
+        return self.values.with_lock<qkey.Fingerprint128?>({ [ref store, definition] cache =>
+            _ result = cache.peek(definition)$.some();
+            if (result.fingerprint is .some(value)) { return value; }
+            qkey.Fingerprint128 fingerprint = if result.markdown is .some(markdown) {
+                object_hash.hash_bytes(store.symbols.text(markdown))
+            } else { qkey.Fingerprint128() };
+            cache.publish(definition, DocumentationValue(markdown: result.markdown, fingerprint: fingerprint));
+            return fingerprint;
+        });
+    }
+
+    #doc 缺少可验证文档来源时不发布缓存项，不能把未加载解释成没有文档。
+    DocumentationValue? document(self, store_api.CompilerStore& store, qid.DefId definition) {
+        _ module = store.defs.get(definition).module_id$.some();
+        if (store.resolve.module_ref(module).interface_only) {
+            if (!self.modules.has(module)) { return null; }
+        } else if (!store.model.module_documentation_ready(module)) { return null; }
+        return self.values.with_lock<DocumentationValue?>({ [ref self, ref store, definition, module] cache =>
+            if (cache.peek(definition) is .some(result)) { return result; }
+            _ markdown = if store.defs.get(definition).kind == .module_def {
+                self.module_markdown(store, module)
+            } else { self.declaration_markdown(store, definition) };
+            _ result = DocumentationValue(markdown: markdown);
+            cache.publish(definition, result);
+            return result;
+        });
+    }
+
+    public qid.SymbolId? module(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        return self.document(store, store.resolve.module_ref(module).def_id)$.some().markdown;
+    }
+
+    public qid.SymbolId? declaration(self, store_api.CompilerStore& store, qid.DefId definition) {
+        return self.document(store, definition)$.some().markdown;
+    }
+
+    qid.SymbolId? module_markdown(self, store_api.CompilerStore& store, qid.ModuleId module_id) {
+        if (!store.resolve.module_ref(module_id).interface_only) { return store.model.module_doc(module_id); }
+        return self.modules.get(module_id)$.some().module_markdown;
+    }
+
+    qid.SymbolId? declaration_markdown(self, store_api.CompilerStore& store, qid.DefId definition) {
+        qid.ModuleId module_id = store.defs.get(definition).module_id$.some();
+        if (store.defs.get(definition).kind == .extension_def) {
+            return self.extension(store, module_id, definition);
+        }
+        if (!store.resolve.module_ref(module_id).interface_only) {
+            return store.model.declaration_doc(definition);
+        }
+        guard store.incremental.stable_id_for_def(definition) is .some(stable_id) else { return null; }
+        return self.modules.get(module_id)$.some().declaration(stable_id);
+    }
+
+    qid.SymbolId? extension(self, store_api.CompilerStore& store, qid.ModuleId module, qid.DefId definition) {
+        Int index! = 0;
+        Int ordinal! = 0;
+        while (index < store.model.extension_group_len()) {
+            Int group = index;
+            index = index + 1;
+            if (store.model.extension_group_module(group) != module) { continue; }
+            if (store.model.extension_group_binding_owner(group) == definition) {
+                if (!store.resolve.module_ref(module).interface_only) { return store.model.extension_doc(group); }
+                _ docs = self.modules.get(module)$.some();
+                Int i! = 0;
+                while (i < docs.extensions.len()) {
+                    _ item = docs.extensions.get(i);
+                    if (item.ordinal == ordinal) { return item.markdown; }
+                    i = i + 1;
+                }
+                return null;
+            }
+            ordinal = ordinal + 1;
+        }
+        return null;
+    }
+}
+
+#doc 集合键只含 root 与目标的稳定身份和次序；正文内容由单个 documentation 读取独立跟踪。
+qkey.Fingerprint128 targets_fingerprint(
+    store_api.CompilerStore& store, qid.DefId owner, list.ArrayList<DocumentationTarget>& targets
+) {
+    list.ArrayList<qkey.Fingerprint128> identities! = list.ArrayList<qkey.Fingerprint128>(targets.len() + 1);
+    _ root = store.incremental.stable_id_for_def(owner)$.some();
+    identities.add(qkey.Fingerprint128(root.low, root.high));
+    Int index! = 0;
+    while (index < targets.len()) {
+        qid.DefId definition = switch targets.get(index) {
+            .module(module) => store.resolve.module_ref(module).def_id,
+            .declaration(decl) => decl,
+        };
+        _ identity = store.incremental.stable_id_for_def(definition)$.some();
+        identities.add(qkey.Fingerprint128(identity.low, identity.high));
+        index = index + 1;
+    }
+    return object_key.combine_fingerprints(UInt64(130), identities$.ref());
+}

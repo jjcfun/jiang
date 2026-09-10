@@ -566,6 +566,8 @@ unsafe {
 转换为具有具体元素类型的 raw pointer。
 旧的 `T[*]` / `T[*:S]` many pointer 类型已经移除：低层地址统一使用 `T*` / `T*!`，需要
 length 或 sentinel 保证时使用 `T[]&` / `T[:S]&`。
+零长度普通 slice 可以使用 null 数据指针，例如未分配的空 Vector；`pointer[0..0]` 和空 slice
+的零长度子切片均有效，但不能访问元素。带 sentinel 的空 slice 仍需保存末尾哨兵。
 
 除数组、slice、raw pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]`
 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
@@ -621,7 +623,7 @@ struct Wrapper {
 ```
 
 `b: a` 在声明 `b` 的同时表示 `a` outlives `b`。每个 target 在 `@region` 中只出现一次；
-source 也必须由同一 annotation 声明，但可以写在 target 之前或之后。coverage 允许成环，
+source 也必须由同一 attribute 声明，但可以写在 target 之前或之后。coverage 允许成环，
 `@region(a: b, b: a)` 表示两个 region 互相覆盖。每个 region 都必须由字段或 enum payload
 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；named 模式不能与位置模式
 混用，也不能使用 `self` source。
@@ -722,11 +724,9 @@ const Int validation_level = if (build.mode == .debug) { 2 } else { 1 };
 
 构建模式只能由 `jiang --mode debug|release` 选择，程序不能在源码中修改它。
 
-`comptime { ... }` 与 `comptime [eval] { ... }` 等价。`eval` 和 `generate` 是块的选项，
-仍可用作普通标识符；不支持旧的 `[early]` / `[late]` 名称。
-`comptime [eval]` 在语义分析需要结果时执行；`comptime [generate]` 定义由 `jiang generate`
-在输入完整通过语义检查后执行的生成任务。普通 build/check 不执行 generate 文件输出，
-也不会因为 eval 失败而自动改用 generate。
+`comptime { ... }` 在语义分析需要结果时执行，关键字后直接写普通块，不接受方括号。
+`eval` 与 `generate` 都是普通标识符。
+生成任务使用独立入口，不以 comptime 块表示。
 
 const 可以在局部声明，名字只在所在词法作用域有效。初始化结果必须是 comptime value，
 可以由结果推导类型，也可以显式标注类型。comptime block 的求值结果也属于 comptime value；
@@ -911,6 +911,102 @@ Void hello() {
   return;
 }
 ```
+
+#### 生成与模块反射
+
+生成器是带 `@entry(generate)` 的普通函数，参数为输入的 `reflect.Module`，返回 `Void`，可以保持私有：
+
+```jiang
+import std;
+
+@entry(generate)
+Void emit(reflect.Module root) {
+    std.StringBuilder output! = std.StringBuilder();
+    for module in reflect.modules(root) {
+        output.append(module.name());
+        output.append("\n");
+    }
+    generate.write("modules.txt", output.slice());
+}
+```
+
+通过 `jiang generate ./app --generator ./tools/generate.jiang -o ./generated` 选择输入和生成器。
+入口在输入与生成器完成语义检查后调用一次，成功后发布本次输出；普通 build/check 不自动执行生成器。
+入口可以声明 `unsafe`，但不能声明 `async`，unsafe 也不扩大编译期可执行操作的范围。
+`generate.read(path)` 相对生成器入口文件读取资源快照；同一轮读取总量最多 64 MiB，重复路径只计一次，
+已加载源码也计入资源量。`generate.write(path, bytes)` 最多暂存 4096 个文件、合计 64 MiB。
+输出目录由本任务专用，成功时整体替换，未再次生成的旧文件会被删除；执行失败不发布暂存结果。
+
+`reflect.modules(root)` 是同包可达模块的只读视图，包含 root，按源码导入深度优先排列并去重。
+生成器自身额外加载的文件不会自动出现在输入范围中。视图支持 `len()`、`get(index)` 和重复遍历；
+模块句柄可用 `==` 比较身份，只在本轮编译期执行中有效。
+
+用 `module.imports()` 读取直接导入边。每条边的 `source()` 和 `target()` 返回模块句柄，
+`binding()` 区分 `.named(name)`、`.wildcard`、`.unbound`，`visibility()` 返回可见性，
+`location()` 返回原始来源位置。例如：
+
+```jiang
+for edge in root.imports() {
+    output.append(edge.target().name());
+    output.append("\n");
+}
+```
+
+导入边保留重复绑定及跨包目标，不能通过外包节点继续查询其内部导入。
+`Location.source` 是源码名称，`offset`／`length` 是字节范围，`line`／`column` 从 1 开始；列按 UTF-8 字节计数。
+
+直接声明通过 `module.declarations()` 遍历，类型等声明的直接成员通过 `decl.members()` 读取：
+
+```jiang
+for decl in root.declarations() {
+    output.append(decl.name());
+    switch decl {
+        .struct_decl(_) => {
+            for member in decl.members() { output.append(member.name()); }
+        },
+        else => {},
+    }
+}
+```
+
+声明是 `reflect.Decl` payload enum，支持模式匹配与身份比较；同名重载分别返回。
+视图保留源码顺序，不进入函数 body，也不沿引用类型递归；输入包内包含私有定义，外包只开放公开成员。
+
+函数 payload 用 `signature()` 返回结构化签名：`parameters`、`result`、`receiver`、`is_async`、
+`is_unsafe`、`has_body` 和 `domain`。参数仍是可重复遍历的视图，每个参数可读取 `name()`、`type()`
+和 `has_default()`；receiver 不包含在该列表中。
+
+```jiang
+_ signature = function.signature();
+for parameter in signature.parameters { output.append(parameter.name()); }
+if (signature.is_async) { output.append("async"); }
+```
+
+签名中的类型与参数句柄仅在本轮编译期有效；文档、metadata、位置和 lifetime 契约分别查询。
+
+已知类型可用 `reflect.type_of<T>()` 查询和比较：
+
+```jiang
+const Bool same = comptime {
+    reflect.type_of<Int>() == reflect.type_of<Int>()
+};
+```
+
+`decl.generic_parameters()` 返回符号泛型参数，类型参数的 `type()` 是该参数自身的类型身份，
+const 参数的 `type()` 是其值类型。字段及变量也提供 `type()`；类型句柄支持身份比较，不能保存为运行期值。
+
+#### 程序入口
+
+可用 `@entry(main)` 标记 root file 中任意名称的普通函数：
+
+```jiang
+@entry(main)
+Int start() { return 0; }
+```
+
+入口须非泛型、同步、无参数且有函数体，返回整数或 `Void`。每个 root 最多一个显式 main；
+存在标记时优先选中该函数，否则沿用普通 `main`。标记不支持 alias、成员方法或重导出，
+不沿 import 递归选择，也不改变声明可见性。同名重载中可以只标记一个满足契约的函数。
 
 #### 函数参数
 
@@ -2289,7 +2385,7 @@ _ z = Foo<Float>(value: 3.14);
 ```
 
 省略全部泛型实参时必须有明确的 expected type；`_` 是独立 inference hole，编译器联合
-annotation、initializer 实参与 generic constraints 求解。没有 expected type、nominal head 不同、
+attribute、initializer 实参与 generic constraints 求解。没有 expected type、nominal head 不同、
 显式实参冲突或 hole 无法唯一确定时都会报错，不会猜测默认类型。value initializer 与
 `new` owner initializer 使用相同规则。
 
@@ -2917,7 +3013,8 @@ root = lang.jiang
 type = lang
 ```
 
-provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider`。编译器在 host 上
+provider root 用 `@entry(lang)` 标记一个可无参数构造、实现 `std.jiang.syntax.Provider` 的具体类型。
+入口类型可以私有，名称任意。编译器在 host 上
 把 lang package 编译成 dynamic library；lexer 调用 `scan` 决定 block 边界，parser 调用 `parse`
 取得生成结果。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续走普通
 resolve、type check、JIL 和 backend。
@@ -2927,9 +3024,20 @@ resolve、type check、JIL 和 backend。
 结果可交给 `if_expression()`、`comptime_block()` 或 `alias_declaration()`，
 模块加载和编译期求值仍由普通编译流程完成，不在 Provider 构造语法时执行。
 
+独立 Lang 文件通过普通文件 import 加载，也可以直接作为 `generate` 的输入：
+
+```jiang
+alias models = import "models.schema";
+```
+
+Provider 的 `[lang] extensions = schema, sch` 声明扩展名；使用方可用
+`[lang.<依赖别名>] extensions = model` 整组覆盖。未配置时使用依赖别名作为默认扩展名，
+覆盖仅作用于当前包。扩展名不带前导点，`.jiang` 保留原生语法。
+独立文件的 Provider 输入使用 `.none` 分隔符，必须返回声明或声明集合；诊断仍指向原文件。
+
 当前限制：
 
-- 只支持 block invocation：`#alias { ... }`
+- 源码内使用 block invocation：`#alias { ... }`；独立 Lang 文件按包内扩展名映射加载
 - 不支持 `#alias(...)`
 - 一个 lang package 只提供一个默认 provider
 - provider 不能直接生成 Semantic Model/JIL/backend IR
@@ -2938,7 +3046,8 @@ resolve、type check、JIL 和 backend。
 采用 Jiang 默认词法规则时，provider 只需实现 `parse`：
 
 ```jiang
-public struct Lang: std.jiang.syntax.Provider {
+@entry(lang)
+struct SqlProvider: std.jiang.syntax.Provider {
     public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
@@ -3016,3 +3125,20 @@ extern {
 extern public Int puts(UInt8* text);
 public extern Int errno;
 ```
+
+## 类型化 metadata
+
+`@meta(expr)` 将普通 Jiang 值附着到声明，表达式隐式在编译期求值。模块附着使用独立顶层项
+`@meta(module: expr)`；同一目标允许多次附着，按源码顺序保留。
+
+```jiang
+struct Route: Copyable { Int code; }
+@meta(module: Route(code: 1))
+@meta(Route(code: 2))
+Void handle() {}
+```
+
+构造值的普通函数也可用于 expr；其调用必须满足普通编译期求值与物化规则。
+标签及其嵌套内容必须是静态数据，不能保存 namespace、未绑定泛型参数或反射句柄。
+泛型声明可以附着与参数无关的具体标签，具体实例沿用原声明的数据。
+`@where` 等内建 attribute 仍通过各自的语义属性读取，不属于 metadata。

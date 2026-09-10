@@ -1,0 +1,126 @@
+#doc(module)
+    metadata 的持久 section：保存有序附着、源码位置和规范类型／值，恢复后只发布到共同查询事实。
+    不保存 AST、执行器地址或 Provider 对象；完整解码成功前不发布部分结果。
+#end
+alias context = import "../context.jiang";
+alias store_api = import "../store.jiang";
+alias qid = import "../id.jiang";
+alias query = import "../db/metadata.jiang";
+alias codec = import "./type_codec.jiang";
+alias binary = import "./source_fingerprint.jiang";
+alias ji = import "./ji_file.jiang";
+alias object_hash = import "./object_hash.jiang";
+alias list = import "../support/list.jiang";
+alias token = import "../syntax/token.jiang";
+
+public ji.JiSectionPayload? payload(context.CompilerContext& ctx, qid.ModuleId module) {
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    {
+        binary.SourceSectionWriter writer! = binary.SourceSectionWriter(bytes$.mut_ref());
+        writer.write_bytes("jiang.metadata.v1");
+        Int count! = 0;
+        Int index! = 0;
+        while (index < ctx.query.metadata.len()) {
+            _ item = ctx.query.metadata.get(index);
+            if (ctx.store.defs.get(item.target).module_id == module) { count = count + 1; }
+            index = index + 1;
+        }
+        writer.write_int(count);
+        index = 0;
+        qid.DefId root = ctx.store.resolve.module_ref(module).def_id;
+        while (index < ctx.query.metadata.len()) {
+            _ item = ctx.query.metadata.get(index);
+            index = index + 1;
+            if (ctx.store.defs.get(item.target).module_id != module) { continue; }
+            guard item.value is .some(value) else { return null; }
+            guard codec.encode_value(ctx.store$.ref(), value) is .some(encoded) else { return null; }
+            writer.write_bool(item.target == root);
+            if (item.target != root) {
+                guard ctx.store.incremental.stable_id_for_def(item.target) is .some(stable) else { return null; }
+                writer.write_uint64(stable.low);
+                writer.write_uint64(stable.high);
+            }
+            writer.write_int(item.span.start);
+            writer.write_int(item.span.length);
+            writer.write_int(encoded.len());
+            writer.write_bytes(encoded.slice());
+        }
+    }
+    _ fingerprint = object_hash.hash_bytes(bytes.slice());
+    return ji.JiSectionPayload(.metadata, bytes, fingerprint);
+}
+
+#doc 先验证完整记录及所有稳定引用，再发布；重复加载已准备的模块不会重复附着。
+public Bool decode(context.CompilerContext&! ctx, qid.ModuleId module, UInt8[]& bytes) {
+    if (ctx.query.metadata.module_ready(module)) { return true; }
+    binary.SourceSectionReader reader! = binary.SourceSectionReader(bytes);
+    if (!reader.read_magic("jiang.metadata.v1")) { return false; }
+    guard reader.read_int() is .some(count) else { return false; }
+    if (count < 0) { return false; }
+    qid.DefId root = ctx.store.resolve.module_ref(module).def_id;
+    list.ArrayList<query.MetadataAttachment> entries! = list.ArrayList<query.MetadataAttachment>();
+    Int index! = 0;
+    while (index < count) {
+        guard read_attachment(ctx.store$.mut_ref(), reader$.mut_ref(), module, root) is .some(item)
+            else { return false; }
+        // 需求展开可能已经降低此目标；完整源码附着优先于同一接口的持久记录。
+        if (!ctx.query.metadata.prepared(item.target)) { entries.add(item); }
+        index = index + 1;
+    }
+    if (!reader.finished()) { return false; }
+    index = 0;
+    while (index < entries.len()) { ctx.query.metadata.add(entries.get(index)); index = index + 1; }
+    prepare_empty_targets(ctx, module);
+    ctx.query.metadata.mark_module_ready(module);
+    return true;
+}
+
+query.MetadataAttachment? read_attachment(store_api.CompilerStore&! store,
+    binary.SourceSectionReader&! reader, qid.ModuleId module, qid.DefId root
+) {
+    guard reader.read_bool() is .some(is_module) else { return null; }
+    qid.DefId target! = root;
+    if (!is_module) {
+        guard reader.read_stable_id() is .some(stable) else { return null; }
+        guard store.incremental.current_def_for_stable(stable) is .some(definition) else { return null; }
+        if (store.defs.get(definition).module_id != module) { return null; }
+        target = definition;
+    }
+    guard reader.read_int() is .some(start) else { return null; }
+    guard reader.read_int() is .some(length) else { return null; }
+    if (start < 0 || length < 0) { return null; }
+    guard reader.read_bytes_with_length() is .some(encoded) else { return null; }
+    guard codec.decode_value(store, encoded) is .some(value) else { return null; }
+    return query.MetadataAttachment(target: target, origin: .persisted, span: token.Span(start, length), value: value);
+}
+
+#doc 从已加载接口的声明集合登记空结果，不把缺少附着记录误认为事实尚未准备。
+Void prepare_empty_targets(context.CompilerContext&! ctx, qid.ModuleId module) {
+    _ record = ctx.store.resolve.module_ref(module);
+    ctx.query.metadata.prepare(record.def_id);
+    guard ctx.store.artifacts.load_interface(record.source_id) is .some(interface) else { return; }
+    Int index! = 0;
+    while (index < interface.declarations.len()) {
+        _ stable = interface.declarations.get(index).stable_id;
+        if (ctx.store.incremental.current_def_for_stable(stable) is .some(definition)) {
+            ctx.query.metadata.prepare(definition);
+        }
+        index = index + 1;
+    }
+}
+
+#doc 在语义准备阶段恢复，generate 执行器不加载 section 或回调 Sema。
+public Bool prepare(context.CompilerContext&! ctx, qid.ModuleId module) {
+    if (ctx.query.metadata.module_ready(module)) { return true; }
+    _ source = ctx.store.resolve.module_ref(module).source_id;
+    guard ctx.store.artifacts.metadata_source(source) is .some(origin) else { return false; }
+    guard origin.section is .some(section) else { return false; }
+    UInt64 started = ctx.store.artifacts.section_timing_start();
+    _ bytes = ji.read_ji_section(ctx.store.symbols.text(origin.path), section);
+    ctx.store.artifacts.record_section_read(.metadata, section.length, started);
+    guard bytes is .some(contents) else { return false; }
+    UInt64 decoded_at = ctx.store.artifacts.section_timing_start();
+    Bool result = decode(ctx, module, contents);
+    ctx.store.artifacts.record_section_decode(.metadata, decoded_at);
+    return result;
+}

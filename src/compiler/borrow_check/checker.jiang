@@ -1,9 +1,6 @@
-// Borrow check 的函数体检查器。
-//
-// 当前先实现 move/use 的基础语义：JIL operand 读 place 时，根据类型决定
-// 是 implicit copy 还是 move；move 后再次读取同一个 move path、祖先 path
-// 或子 path 都会把 BorrowCheckStore 标成失败。完整 CFG dataflow 后续会
-// 在这里替换线性扫描状态，而不是改 JIL 结构。
+#doc(module)
+    检查 JIL 的借用、移动及生命周期约束；按函数执行数据流，复用共享语义与 layout 查询。
+#end
 
 alias core_traits = import "../core/traits.jiang";
 alias diagnostic = import "../diagnostic.jiang";
@@ -27,6 +24,9 @@ alias map = import "../support/map.jiang";
 alias string = import "../support/string.jiang";
 alias table = import "../support/table.jiang";
 alias system_time = import "../system/time.jiang";
+alias system_env = import "../system/env.jiang";
+alias system_io = import "../system/io.jiang";
+import std;
 alias token = import "../syntax/token.jiang";
 alias loan = import "./loan.jiang";
 alias location = import "./location.jiang";
@@ -46,6 +46,13 @@ public struct BorrowCheckTiming: Copyable {
     public Int slowest_loans! = 0;
     public Int slowest_region_value_loans! = 0;
     public UInt64 slowest_function_ns! = UInt64(0);
+    public UInt64 initial_paths_ns! = UInt64(0);
+    public UInt64 aggregate_paths_ns! = UInt64(0);
+    public UInt64 contract_paths_ns! = UInt64(0);
+    public UInt64 local_paths_ns! = UInt64(0);
+    public UInt64 call_paths_ns! = UInt64(0);
+    public UInt64 freeze_paths_ns! = UInt64(0);
+    public UInt64 path_types_ns! = UInt64(0);
     public UInt64 move_paths_ns! = UInt64(0);
     public UInt64 liveness_facts_ns! = UInt64(0);
     public UInt64 liveness_solve_ns! = UInt64(0);
@@ -70,6 +77,13 @@ public struct BorrowCheckTiming: Copyable {
             self.slowest_region_value_loans = other.slowest_region_value_loans;
             self.slowest_function_ns = other.slowest_function_ns;
         }
+        self.initial_paths_ns = self.initial_paths_ns + other.initial_paths_ns;
+        self.aggregate_paths_ns = self.aggregate_paths_ns + other.aggregate_paths_ns;
+        self.contract_paths_ns = self.contract_paths_ns + other.contract_paths_ns;
+        self.local_paths_ns = self.local_paths_ns + other.local_paths_ns;
+        self.call_paths_ns = self.call_paths_ns + other.call_paths_ns;
+        self.freeze_paths_ns = self.freeze_paths_ns + other.freeze_paths_ns;
+        self.path_types_ns = self.path_types_ns + other.path_types_ns;
         self.move_paths_ns = self.move_paths_ns + other.move_paths_ns;
         self.liveness_facts_ns = self.liveness_facts_ns + other.liveness_facts_ns;
         self.liveness_solve_ns = self.liveness_solve_ns + other.liveness_solve_ns;
@@ -91,6 +105,7 @@ public struct PackageBorrowChecker: Movable {
     @life(d)
     diagnostic.DiagnosticStore&! diagnostics;
     public Bool timing_enabled;
+    Bool memory_stats;
     public BorrowCheckTiming timing!;
     public init(self,
         store_api.CompilerStore& store,
@@ -104,6 +119,7 @@ public struct PackageBorrowChecker: Movable {
         self.results = results;
         self.diagnostics = diagnostics;
         self.timing_enabled = timing_enabled;
+        self.memory_stats = system_env.get("JIANG_BORROW_MEMORY_STATS") != null;
         self.timing = BorrowCheckTiming();
     }
 
@@ -207,6 +223,7 @@ public struct PackageBorrowChecker: Movable {
     }
 
     Void check_function(Self&! self, jil.Function function) {
+        self.print_memory(function, "begin", 0, 0);
         UInt64 started = borrow_timing_start(self.timing_enabled);
         FunctionBorrowChecker checker! = FunctionBorrowChecker(
             self.store,
@@ -219,6 +236,7 @@ public struct PackageBorrowChecker: Movable {
         checker.timing.move_paths_ns = borrow_timing_elapsed(
             self.timing_enabled, started
         );
+        checker.timing.initial_paths_ns = checker.timing.move_paths_ns;
         checker.check();
         checker.timing.functions = 1;
         checker.timing.slowest_def = jil.function_provenance_def(
@@ -231,7 +249,28 @@ public struct PackageBorrowChecker: Movable {
         checker.timing.slowest_region_value_loans = checker.region_value_loan_count;
         checker.timing.slowest_function_ns = checker.timing.dataflow_check_ns;
         self.timing.add(checker.timing);
+        Int live_bytes = (checker.loan_liveness.point_count + checker.loan_liveness.path_count)
+            * checker.loan_liveness.word_count * Int$.size();
+        self.print_memory(function, "end", checker.paths.len(), live_bytes);
     }
+
+    Void print_memory(self, jil.Function function, UInt8[]& phase, Int paths, Int liveness_bytes) {
+        if (!self.memory_stats) { return; }
+        qid.DefId def_id = jil.function_provenance_def(function.origin);
+        std.StringBuilder text! = std.StringBuilder();
+        text.append("borrow_memory="); text.append(phase);
+        text.append(" def="); text.append(def_id.to_index());
+        text.append(" name="); text.append(self.store.symbols.text(self.store.defs.get(def_id).name.symbol));
+        text.append(" blocks="); text.append(function.body.blocks.length);
+        text.append(" paths="); text.append(paths);
+        text.append(" liveness_bytes="); text.append(liveness_bytes);
+        text.append(" layouts="); text.append(self.query.layout.store().layouts.len());
+        text.append(" layout_bytes="); text.append(self.query.layout.store().storage.reserved_bytes());
+        text.append(" types="); text.append(self.store.types.types.len());
+        text.append(" loans="); text.append(self.results.loans.len());
+        text.append("\n"); system_io.stderr().write_all(text.slice());
+    }
+
 }
 
 UInt64 borrow_timing_start(Bool enabled) {
@@ -312,8 +351,12 @@ struct BorrowDataflowState: Movable {
         unsafe {
             self.path_count = path_count;
             self.word_count = (path_count + 63) / 64;
-            self.moved = UInt64$.alloc(self.word_count);
-            self.live_locals = UInt64$.alloc(self.word_count);
+            self.moved = null;
+            self.live_locals = null;
+            if (self.word_count > 0) {
+                self.moved = UInt64$.alloc(self.word_count);
+                self.live_locals = UInt64$.alloc(self.word_count);
+            }
             Int index! = 0;
             while (index < self.word_count) {
                 self.moved[index] = UInt64(0);
@@ -542,12 +585,24 @@ struct FunctionBorrowChecker: Movable {
                 return;
             }
             UInt64 started! = borrow_timing_start(self.timing_enabled);
+            UInt64 phase_started! = borrow_timing_start(self.timing_enabled);
             self.prebuild_aggregate_move_paths();
+            self.timing.aggregate_paths_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
+            phase_started = borrow_timing_start(self.timing_enabled);
             self.prebuild_function_lifetime_contract_paths();
+            self.timing.contract_paths_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
+            phase_started = borrow_timing_start(self.timing_enabled);
             self.prebuild_local_lifetime_paths();
+            self.timing.local_paths_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
+            phase_started = borrow_timing_start(self.timing_enabled);
             self.prebuild_call_lifetime_paths();
+            self.timing.call_paths_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
+            phase_started = borrow_timing_start(self.timing_enabled);
             self.paths.freeze();
+            self.timing.freeze_paths_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
+            phase_started = borrow_timing_start(self.timing_enabled);
             self.build_move_path_types();
+            self.timing.path_types_ns += borrow_timing_elapsed(self.timing_enabled, phase_started);
             self.timing.move_paths_ns = self.timing.move_paths_ns
                 + borrow_timing_elapsed(self.timing_enabled, started);
             self.build_loan_liveness();
@@ -573,11 +628,22 @@ struct FunctionBorrowChecker: Movable {
             self.init_entry_live_locals(in_states[entry_index]$.ref());
             self.enqueue_block(entry_index, reachable, queued, worklist$.mut_ref());
 
-            while (!worklist.empty()) {
-                Int block_index = worklist.pop();
+            list.ArrayList<Int> order = self.acyclic_order();
+            Bool acyclic = !order.empty();
+            Int order_index! = 0;
+            while ((acyclic && order_index < order.len()) || (!acyclic && !worklist.empty())) {
+                Int block_index!;
+                if (acyclic) {
+                    block_index = order.get(order_index);
+                    order_index += 1;
+                    if (!reachable[block_index]) { continue; }
+                } else { block_index = worklist.pop(); }
                 queued[block_index] = false;
                 UInt64 operation_started! = borrow_timing_start(self.timing_enabled);
-                self.dataflow = self.clone_state(in_states[block_index]$.ref());
+                if (acyclic) {
+                    self.dataflow = in_states[block_index];
+                    in_states[block_index] = BorrowDataflowState(0);
+                } else { self.dataflow = self.clone_state(in_states[block_index]$.ref()); }
                 self.timing.dataflow_clone_ns = self.timing.dataflow_clone_ns
                     + borrow_timing_elapsed(self.timing_enabled, operation_started);
                 operation_started = borrow_timing_start(self.timing_enabled);
@@ -602,6 +668,50 @@ struct FunctionBorrowChecker: Movable {
             self.timing.dataflow_ns = self.timing.dataflow_ns
                 + borrow_timing_elapsed(self.timing_enabled, started);
         }
+    }
+
+    #doc 无环 CFG 的输入在全部前驱处理后即为最终值；按拓扑顺序消费并释放，环仍走固定点。
+    list.ArrayList<Int> acyclic_order(self) {
+        Int count = self.body.blocks.length;
+        list.ArrayList<Int> incoming! = list.ArrayList<Int>(count);
+        Int index! = 0;
+        while (index < count) { incoming.add(0); index += 1; }
+        index = 0;
+        while (index < count) {
+            jil.Terminator term = self.body.blocks[index].terminator;
+            Int edge! = 0;
+            while (edge < jil.terminator_successor_count(term)) {
+                Int next = jil.terminator_successor_at(term, edge).to_index();
+                if (self.valid_block_index(next)) {
+                    Int predecessors = incoming.get(next);
+                    incoming.set(next, predecessors + 1);
+                }
+                edge += 1;
+            }
+            index += 1;
+        }
+        list.ArrayList<Int> order! = list.ArrayList<Int>(count);
+        index = 0;
+        while (index < count) {
+            if (incoming.get(index) == 0) { order.add(index); }
+            index += 1;
+        }
+        index = 0;
+        while (index < order.len()) {
+            jil.Terminator term = self.body.blocks[order.get(index)].terminator;
+            Int edge! = 0;
+            while (edge < jil.terminator_successor_count(term)) {
+                Int next = jil.terminator_successor_at(term, edge).to_index();
+                if (!self.valid_block_index(next)) { edge += 1; continue; }
+                Int remaining = incoming.get(next) - 1;
+                incoming.set(next, remaining);
+                if (remaining == 0) { order.add(next); }
+                edge += 1;
+            }
+            index += 1;
+        }
+        if (order.len() != count) { order.clear(); }
+        return order;
     }
 
     Void record_dataflow_size(Self&! self) {
@@ -986,6 +1096,7 @@ struct FunctionBorrowChecker: Movable {
         guard self.store.typeck.def_type(field_def) is .some(template) else {
             return self.store.types.invalid_type();
         }
+        if (!self.store.types.type_needs_substitution(template)) { return template; }
         generic_bindings.GenericBindings caller! = generic_bindings.GenericBindings();
         generic_bindings.GenericBindings bindings! = generic_bindings.bindings_for_instance(
             self.store.defs$.ref(),

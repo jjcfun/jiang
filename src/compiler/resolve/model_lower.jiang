@@ -20,6 +20,8 @@
 
 alias sem = import "../sema/model.jiang";
 alias fingerprint = import "../incremental/fingerprint.jiang";
+alias metadata_query = import "../db/metadata.jiang";
+alias database = import "../db.jiang";
 alias qkey = import "../incremental/key.jiang";
 alias diagnostic = import "../diagnostic.jiang";
 alias qid = import "../id.jiang";
@@ -105,11 +107,36 @@ struct Lower: Movable {
         self.module_doc_allowed = true;
         self.signature_only = signature_only;
         self.target_def = null;
+        self.prepare_module_documentation();
+    }
+
+    #doc 模块文档只依赖顶层语法；首次按需 lowering 前独立扫描一次，避免 const 查询观察到未准备的空值。
+    Void prepare_module_documentation(Self&! self) {
+        if (self.state.ctx.store.model.module_documentation_ready(self.state.module_id)) { return; }
+        self.state.ctx.store.model.set_module_doc(self.state.module_id, null);
+        if (self.state.unit.root is .some(root)) { self.scan_module_documentation(root); }
+    }
+
+    Void scan_module_documentation(Self&! self, ast.AstId item_id) {
+        ast.AstNode item = self.state.unit.get(item_id);
+        if (item.data is .root(root)) {
+            Int index! = 0;
+            while (index < root.items.length) {
+                self.scan_module_documentation(self.state.unit.child_at(root.items, index));
+                index = index + 1;
+            }
+            return;
+        }
+        if (item.data is .block(block) && block.is_comptime) { return; }
+        if (item.data is .doc_attribute(doc)) { self.lower_module_doc(item.span, doc); return; }
+        if (item.data is .meta_attribute(_)) { return; }
+        if (!self.top_level_item_is_import(item)) { self.module_doc_allowed = false; }
     }
 
     // 只遍历能在 Semantic Model 中拥有可执行/类型语法的 declaration。declaration
     // skeleton 已经存在，这一趟只为当前文件填充 body 和 def-local nodes。
     public Void lower(Self&! self) {
+        self.state.ctx.query.metadata.prepare(self.state.ctx.store.resolve.module_ref(self.state.module_id).def_id);
         guard self.state.unit.root is .some(root_id) else { return; }
         ast.AstNode root = self.state.unit.get(root_id);
         guard ast.root_data(root.data) is .some(root_data) else { return; }
@@ -120,6 +147,7 @@ struct Lower: Movable {
             self.lower_top_level_item(self.state.unit.child_at(root_data.items, index));
             index = index + 1;
         }
+        self.state.record_top_level_orders();
     }
 
     public Void lower_one(Self&! self, ast.AstId item_id) {
@@ -153,18 +181,18 @@ struct Lower: Movable {
             return;
         }
         if (item.data is .block(block) && block.is_comptime) { return; }
-        if (item.data is .doc_attribute(doc_attr)) {
-            self.lower_module_doc(item.span, doc_attr);
+        if (item.data is .doc_attribute(_)) { return; }
+        if (item.data is .meta_attribute(meta)) {
+            qid.DefId target = self.state.ctx.store.resolve.module_ref(self.state.module_id).def_id;
+            self.lower_metadata(target, item_id, item.span, meta);
             return;
-        }
-        if (!self.top_level_item_is_import(item)) {
-            self.module_doc_allowed = false;
         }
         if (self.top_level_item_is_ready(item_id)) { return; }
         if (item.data is .top_level_decl(top_level)) {
             ast.AstNode body = self.state.unit.get(top_level.body);
             if (body.data is .extend_decl(extend_decl)) {
                 self.lower_extend(
+                    top_level.body,
                     extend_decl,
                     top_level.annotations,
                     top_level.modifiers.public_flag,
@@ -407,7 +435,7 @@ struct Lower: Movable {
             return;
         }
         if (decl.data is .extend_decl(extend_decl)) {
-            self.lower_extend(extend_decl, annotations, false, false);
+            self.lower_extend(decl_id, extend_decl, annotations, false, false);
             return;
         }
     }
@@ -473,6 +501,7 @@ struct Lower: Movable {
 
     Void lower_extend(
         Self&! self,
+        ast.AstId declaration,
         ast.ExtendData extend_decl,
         ast.AstRange annotations,
         Bool public_flag,
@@ -487,15 +516,14 @@ struct Lower: Movable {
         self.current_owner_def = owner_def;
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
-        Int? existing_extension = self.extension_group_for_members(extend_decl.members);
-        qid.DefId binding_owner!;
+        qid.DefId binding_owner = self.state.declaration_def(declaration)$.some();
+        Int? existing_extension = self.state.ctx.store.model.extension_group_for_definition(binding_owner);
         Int extension_index!;
         if (existing_extension is .some(existing_index)) {
             extension_index = existing_index;
-            binding_owner = self.state.ctx.store.model.extension_group_binding_owner(existing_index);
             self.define_existing_generic_params(binding_owner, extend_decl.generics);
         } else {
-            binding_owner = self.define_extend_generic_params(extend_decl.generics, owner_def);
+            self.define_extend_generic_params(extend_decl.generics, binding_owner);
             extension_index = self.state.ctx.store.model.add_extension_group(
                 self.state.module_id,
                 owner_def,
@@ -521,22 +549,6 @@ struct Lower: Movable {
         }
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
-    }
-
-    Int? extension_group_for_members(Self&! self, ast.AstRange members) {
-        Int index! = 0;
-        while (index < members.length) {
-            ast.AstId member_id = self.state.unit.child_at(members, index);
-            if (self.member_def_for_ast(member_id) is .some(member_def)) {
-                if (self.state.ctx.store.model.extension_group_for_member(member_def)
-                    is .some(extension_index)
-                ) {
-                    return extension_index;
-                }
-            }
-            index = index + 1;
-        }
-        return null;
     }
 
     Void define_existing_generic_params(
@@ -570,6 +582,8 @@ struct Lower: Movable {
         qid.DefId binding_owner,
         qid.DefId owner_def
     ) {
+        sem.NodeId target_ref = self.lower_type_ref(extend_decl.target_type);
+        self.state.ctx.store.model.set_decl_type_ref(binding_owner, target_ref);
         self.lower_extend_generic_constraints(extension_index, extend_decl.generics, binding_owner);
         self.lower_extend_generic_bounds(extension_index, extend_decl.generics, binding_owner);
         self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
@@ -931,11 +945,15 @@ struct Lower: Movable {
     }
 
     Void lower_extension_annotations(Self&! self, Int extension_index, ast.AstRange annotations) {
+        qid.DefId target = self.state.ctx.store.model.extension_group_binding_owner(extension_index);
+        self.state.ctx.query.metadata.prepare(target);
         Int index! = 0;
         while (index < annotations.length) {
             ast.AstId annotation_id = self.state.unit.child_at(annotations, index);
             ast.AstNode annotation = self.state.unit.get(annotation_id);
-            if (annotation.data is .doc_attribute(doc_attr)) {
+            if (annotation.data is .meta_attribute(_)) {
+                self.lower_annotation(target, annotation_id);
+            } else if (annotation.data is .doc_attribute(doc_attr)) {
                 self.lower_extension_doc(extension_index, annotation.span, doc_attr);
             } else if (annotation.data is .alias_attribute(alias_attr)) {
                 self.lower_alias_attribute(alias_attr);
@@ -1876,7 +1894,21 @@ struct Lower: Movable {
         self.env.define(symbol, domain, def_id, span);
     }
 
+    #doc 只降低表达式并登记附着；普通编译期求值稍后发布值，不新增声明或运行期根。
+    Void lower_metadata(Self&! self, qid.DefId target, ast.AstId source,
+        token.Span span, ast.MetaAttributeData metadata
+    ) {
+        if (self.state.ctx.query.metadata.has_source(target, source.to_index())) { return; }
+        qid.DefId? previous = self.current_owner_def;
+        self.current_owner_def = target;
+        sem.NodeId expression = self.lower_expr(metadata.expression);
+        self.current_owner_def = previous;
+        self.state.ctx.query.metadata.add(metadata_query.MetadataAttachment(
+            target: target, origin: .source(source.to_index(), expression), span: span));
+    }
+
     Void lower_annotations(Self&! self, qid.DefId owner_def, ast.AstRange annotations) {
+        self.state.ctx.query.metadata.prepare(owner_def);
         Int index! = 0;
         while (index < annotations.length) {
             self.lower_annotation(owner_def, self.state.unit.child_at(annotations, index));
@@ -1886,6 +1918,22 @@ struct Lower: Movable {
 
     Void lower_annotation(Self&! self, qid.DefId owner_def, ast.AstId annotation_id) {
         ast.AstNode annotation = self.state.unit.get(annotation_id);
+        if (annotation.data is .meta_attribute(meta)) {
+            if (meta.module_target) {
+                self.add_name_resolution_error(annotation.span,
+                    "module metadata requires a standalone top-level item", "meta_module_target_requires_top_level");
+                return;
+            }
+            self.lower_metadata(owner_def, annotation_id, annotation.span, meta);
+            return;
+        }
+        if (annotation.data is .entry_attribute(_)) {
+            if (self.state.ctx.store.model.def_ref(owner_def).decl.entry_kind == null) {
+                self.add_name_resolution_error(annotation.span,
+                    "@entry must annotate a module-level declaration", "entry_requires_module_declaration");
+            }
+            return;
+        }
         if (annotation.data is .doc_attribute(doc_attr)) {
             if (doc_attr.target == .module) {
                 self.add_name_resolution_error(
@@ -2529,6 +2577,8 @@ struct Lower: Movable {
         self.state.ctx.store.model.load_body(impl_assoc, sem.Body(impl_assoc, placeholder));
         sem.NodeId root = self.lower_expr(binding.value);
         self.state.ctx.store.model.set_body_root(impl_assoc, root);
+        // trait 实参生成的关联常量已完成 lowering，没有独立源码声明可供 ensure 再次加载。
+        self.state.ctx.store.model.set_declaration_sema_state(impl_assoc, .body_ready);
         self.current_owner_def = previous_owner;
     }
 
@@ -3613,6 +3663,10 @@ struct Lower: Movable {
         if (self.state.value_path_resolution(path_id) is .some(resolution)) {
             return self.lower_resolved_value_path(path, resolution);
         }
+        // 与 resolve 的值根优先规则一致，局部值沿现有 LocalId 路径 lower，避免 namespace 同名遮蔽。
+        if (path.segments.length > 1
+            && self.resolved_name_def(self.state.unit.child_at(path.segments, 0), .value_name) != null
+        ) { return self.lower_member_path(path); }
         if (path.segments.length > 1 && self.resolved_value_def_for_expr(path_id) == null
             && self.resolved_namespace_def_for_expr(path_id) == null) {
             return self.lower_member_path(path);
@@ -4473,6 +4527,10 @@ struct Lower: Movable {
             if (!self.state.ctx.store.model.has_def(current)) { return current; }
             sem.Def& alias_model = self.state.ctx.store.model.def_ref(current);
             guard alias_model.decl.alias_target is .some(target_def) else { return current; }
+            // 归一到目标符号后模型不再包含这个 alias；显式保留其依赖，避免 alias 改指向后恢复旧类型。
+            qid.DefId owner = if self.current_owner_def is .some(definition) { definition }
+                else { self.state.ctx.store.resolve.module_ref(self.state.module_id).def_id };
+            database.observe_def_signature(self.state.ctx.query$.ref(), self.state.ctx.store$.ref(), owner, current);
             current = target_def;
             depth = depth + 1;
         }

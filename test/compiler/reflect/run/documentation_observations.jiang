@@ -1,0 +1,243 @@
+#doc(module)
+    文档读取按实际求值文件登记独立事实；验证无文档、重复读取、跨包 helper、持久恢复及内容失效。
+#end
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias artifact = import "../../../../src/compiler/artifact/source.jiang";
+alias source_ji = import "../../../../src/compiler/artifact/source_ji.jiang";
+alias source_fingerprint = import "../../../../src/compiler/artifact/source_fingerprint.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+import std;
+
+#doc 仅保留文档依赖作对照，避免签名或函数 body 的其他读取掩盖文档失效规则。
+artifact.DeclarationObservationSet observations(context.CompilerContext& ctx, UInt8[]& source_path,
+    artifact.ObservationAspect? aspect = null
+) {
+    artifact.ObservationAspect selected = if aspect is .some(value) { value } else { .documentation };
+    _ source = ctx.store.sources.find(.file(source_path))$.some();
+    _ entries = ctx.store.artifacts.load_observations(source)$.some();
+    artifact.DeclarationObservationSet result! = artifact.DeclarationObservationSet();
+    Int index! = 0;
+    while (index < entries.entries.len()) {
+        _ item = entries.entries.get(index);
+        if (item.aspect == selected) {
+            if (selected == .documentation) {
+                _ definition = ctx.store.incremental.current_def_for_stable(item.subject)$.some();
+                assert(item.observed == ctx.query.documentation.fingerprint(ctx.store$.ref(), definition)$.some());
+            }
+            result.add(item);
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+#doc 固定声明身份，仅改变指定的文档或普通函数体。
+Void input(UInt8[]& module_doc, UInt8[]& field_doc, UInt8[]& second_doc, UInt8[]& other_doc, Int body) {
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("#doc(module) "); text.append(module_doc); text.append("\nstruct Box {\n#doc ");
+    text.append(field_doc); text.append("\nInt first;\n");
+    if (second_doc.length > 0) { text.append("#doc "); text.append(second_doc); text.append("\n"); }
+    text.append("Int second;\n}\n#doc "); text.append(other_doc);
+    text.append("\nInt unrelated() { return ");
+    text.append(body);
+    text.append("; }\n");
+    assert(fs.write_all("build/test-reflect-doc-observations/app/main.jiang", text.slice()));
+}
+
+#doc 生成入口与被查询输入分属不同包，辅助读取再经过另一个文件。
+public Int run() {
+    assert(fs.remove_tree("build/test-reflect-doc-observations"));
+    assert(fs.create_dirs("build/test-reflect-doc-observations/app"));
+    assert(fs.create_dirs("build/test-reflect-doc-observations/tool"));
+    assert(fs.write_all("build/test-reflect-doc-observations/app/package.ini",
+        "[package]\nname=app\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/tool/package.ini",
+        "[package]\nname=tool\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/tool/helper.jiang",
+        "#doc(module) 辅助读取。\npublic Bool documented(reflect.Decl item) { return item.documentation() != null; }\n"));
+    std.StringBuilder generator! = std.StringBuilder();
+    generator.append("#doc(module) 文档依赖生成器。\nalias helper = import \"./helper.jiang\";\n");
+    generator.append("@entry(generate) Void gen(reflect.Module root) {\n");
+    generator.append("generate.write(\"module.txt\", root.documentation()$.some());\n");
+    generator.append("_ fields = root.declarations().get(0).members();\n");
+    generator.append("if (helper.documented(fields.get(0))) { generate.write(\"first.txt\", \"yes\"); }\n");
+    generator.append("if (helper.documented(fields.get(1))) { generate.write(\"second.txt\", \"yes\"); }\n");
+    generator.append("assert(helper.documented(fields.get(0))); }\n");
+    assert(fs.write_all("build/test-reflect-doc-observations/tool/main.jiang", generator.slice()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-reflect-doc-observations/app", "build/test-reflect-doc-observations/output",
+        "build/test-reflect-doc-observations/cache");
+    options.generator = "build/test-reflect-doc-observations/tool";
+    input("Module.", "A", "", "Unused.", 1);
+    context.CompilerContext cold! = context.CompilerContext();
+    check(cold$.mut_ref(), options$.ref());
+    artifact.DeclarationObservationSet baseline = observations(cold$.ref(),
+        "build/test-reflect-doc-observations/tool/main.jiang");
+    assert(baseline.entries.len() == 3);
+    assert(observations(cold$.ref(), "build/test-reflect-doc-observations/tool/helper.jiang").entries.empty());
+    context.CompilerContext warm! = context.CompilerContext();
+    check(warm$.mut_ref(), options$.ref());
+    assert(observations(warm$.ref(), "build/test-reflect-doc-observations/tool/main.jiang").entries.len() == 3);
+    assert(warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    _ source = warm.store.sources.find(.file("build/test-reflect-doc-observations/app/main.jiang"))$.some();
+    _ module = warm.store.resolve.module_for_source(source)$.some();
+    assert(warm.store.resolve.module_ref(module).interface_only);
+    input("Module.", "A", "", "Different unused doc.", 2);
+    check(warm$.mut_ref(), options$.ref());
+    assert(warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    input("Module.", "Long", "", "Unused.", 1);
+    check(warm$.mut_ref(), options$.ref());
+    assert(!warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    input("Module.", "A", "New.", "Unused.", 1);
+    check(warm$.mut_ref(), options$.ref());
+    assert(!warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    input("Changed module.", "A", "", "Unused.", 1);
+    check(warm$.mut_ref(), options$.ref());
+    assert(!warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    input("Module.", "A", "", "Unused.", 1);
+    check(warm$.mut_ref(), options$.ref());
+    assert(warm.query.validate_declaration_observations(warm.store$.ref(), baseline$.ref()));
+    check_ordinary();
+    check_collection();
+    assert(fs.remove_tree("build/test-reflect-doc-observations"));
+    return 0;
+}
+
+#doc 使用真实 pipeline 验证记录与缓存恢复，不直接调用记录函数构造期望。
+Void check(context.CompilerContext&! ctx, options_api.CompileOptions& options) {
+    pipeline.compile(ctx, options);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+#doc 普通 const 经跨包泛型 helper 读取第三个包的字段文档，依赖应归 const 所在文件。
+Void check_ordinary() {
+    assert(fs.create_dirs("build/test-reflect-doc-observations/ordinary"));
+    assert(fs.create_dirs("build/test-reflect-doc-observations/library"));
+    assert(fs.create_dirs("build/test-reflect-doc-observations/reader"));
+    assert(fs.write_all("build/test-reflect-doc-observations/ordinary/package.ini",
+        "[package]\nname=ordinary\nroot=main.jiang\n[dependencies]\nlibrary=../library\nreader=../reader\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/library/package.ini",
+        "[package]\nname=library\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/reader/package.ini",
+        "[package]\nname=reader\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/library/main.jiang",
+        "#doc(module) 被查询的库。\npublic struct Box {\n#doc A\npublic Int value;\n}\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/reader/main.jiang",
+        "#doc(module) 泛型读取辅助函数。\npublic Bool documented<T>() { return reflect.type_of<T>().members().get(0).documentation() != null; }\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/ordinary/main.jiang",
+        "#doc(module) 普通常量调用者。\nalias lib = import library; alias reader = import reader;\nconst Bool present = reader.documented<lib.Box>();\nconst Int size = if present { 1 } else { 0 }; alias Size = Int[size];\n"));
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "build/test-reflect-doc-observations/ordinary", "", "build/test-reflect-doc-observations/ordinary-cache");
+    context.CompilerContext ctx! = context.CompilerContext();
+    check(ctx$.mut_ref(), options$.ref());
+    artifact.DeclarationObservationSet baseline = observations(ctx$.ref(),
+        "build/test-reflect-doc-observations/ordinary/main.jiang");
+    assert(baseline.entries.len() == 1);
+    assert(observations(ctx$.ref(), "build/test-reflect-doc-observations/reader/main.jiang").entries.empty());
+    check(ctx$.mut_ref(), options$.ref());
+    _ caller_source = ctx.store.sources.find(.file("build/test-reflect-doc-observations/ordinary/main.jiang"))$.some();
+    assert(ctx.query.prepare_observed_reflection(ctx.store$.mut_ref(), caller_source));
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    assert(fs.write_all("build/test-reflect-doc-observations/library/main.jiang",
+        "#doc(module) 被查询的库。\npublic struct Box { public Int value; }\n"));
+    check(ctx$.mut_ref(), options$.ref());
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()));
+    assert(observations(ctx$.ref(), "build/test-reflect-doc-observations/ordinary/main.jiang").entries.len() == 1);
+}
+
+#doc 集合成员与正文分开跟踪；跨文件新增、空结果、顺序和接口恢复均通过真实生成查询验证。
+Void check_collection() {
+    assert(fs.create_dirs("build/test-reflect-doc-observations/collection"));
+    assert(fs.create_dirs("build/test-reflect-doc-observations/collection-tool"));
+    assert(fs.write_all("build/test-reflect-doc-observations/collection/package.ini",
+        "[package]\nname=collection\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/collection-tool/package.ini",
+        "[package]\nname=collection_tool\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-doc-observations/collection-tool/helper.jiang",
+        "#doc(module) 集合读取辅助函数。\npublic Int count(reflect.Module root) { return reflect.with_doc(root).len(); }\n"));
+    std.StringBuilder generator! = std.StringBuilder();
+    generator.append("#doc(module) 只读取集合身份，不读取文档正文。\nalias helper = import \"./helper.jiang\";\n");
+    generator.append("@entry(generate) Void gen(reflect.Module root) {\n");
+    generator.append("_ docs = reflect.with_doc(root); Int count = helper.count(root);\n");
+    generator.append("Int index! = 0; for item in docs { index = index + 1; } assert(index == count);\n");
+    generator.append("generate.write(\"state.txt\", if count == 0 { \"empty\" } else { \"present\" }); }\n");
+    assert(fs.write_all("build/test-reflect-doc-observations/collection-tool/main.jiang", generator.slice()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-reflect-doc-observations/collection", "build/test-reflect-doc-observations/collection-output",
+        "build/test-reflect-doc-observations/collection-cache");
+    options.generator = "build/test-reflect-doc-observations/collection-tool";
+    collection_input("struct Box {}\nstruct Other {}\n", "struct Child {}\n");
+    context.CompilerContext ctx! = context.CompilerContext();
+    check(ctx$.mut_ref(), options$.ref());
+    _ empty = collection_observations(ctx$.ref());
+    assert(empty.entries.len() == 1);
+    assert(observations(ctx$.ref(), "build/test-reflect-doc-observations/collection-tool/helper.jiang",
+        artifact.ObservationAspect.documentation_targets).entries.empty());
+    check(ctx$.mut_ref(), options$.ref());
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), empty$.ref()));
+    _ source = ctx.store.sources.find(.file("build/test-reflect-doc-observations/collection/main.jiang"))$.some();
+    _ module = ctx.store.resolve.module_for_source(source)$.some();
+    assert(ctx.store.resolve.module_ref(module).interface_only);
+    collection_input("struct Box {}\nstruct Other {}\n", "#doc Child.\nstruct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), empty$.ref()));
+    _ present = collection_observations(ctx$.ref());
+    collection_input("struct Box {}\nstruct Other {}\n", "#doc Changed text.\nstruct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), present$.ref()));
+    collection_input("struct Box {}\nstruct Other {}\n", "struct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), empty$.ref()));
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), present$.ref()));
+    collection_input("#doc Box.\nstruct Box {}\n#doc Other.\nstruct Other {}\n", "struct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    _ ordered = collection_observations(ctx$.ref());
+    collection_input("#doc Other.\nstruct Other {}\n#doc Box.\nstruct Box {}\n", "struct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), ordered$.ref()));
+    collection_input("#doc Box.\nstruct Box {}\n#doc Other.\nstruct Other {}\nInt unused() { return 9; }\n",
+        "struct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), ordered$.ref()));
+    collection_input("#doc(module) Added module doc.\n#doc Box.\nstruct Box {}\n#doc Other.\nstruct Other {}\n",
+        "struct Child {}\n");
+    check(ctx$.mut_ref(), options$.ref());
+    assert(!ctx.query.validate_declaration_observations(ctx.store$.ref(), ordered$.ref()));
+}
+
+#doc 保持导入图固定，允许输入完全无文档以验证空查询结果。
+Void collection_input(UInt8[]& root, UInt8[]& child) {
+    std.StringBuilder text! = std.StringBuilder();
+    text.append(root); text.append("alias child = import \"./child.jiang\";\n");
+    assert(fs.write_all("build/test-reflect-doc-observations/collection/main.jiang", text.slice()));
+    assert(fs.write_all("build/test-reflect-doc-observations/collection/child.jiang", child));
+}
+
+#doc 重复 len 与迭代读取应归入口源码并合并为一条集合依赖。
+artifact.DeclarationObservationSet collection_observations(context.CompilerContext& ctx) {
+    _ result = observations(ctx, "build/test-reflect-doc-observations/collection-tool/main.jiang",
+        artifact.ObservationAspect.documentation_targets);
+    assert(result.entries.len() == 1);
+    _ source = ctx.store.sources.find(.file("build/test-reflect-doc-observations/collection-tool/main.jiang"))$.some();
+    _ origin = ctx.store.artifacts.documentation_source(source)$.some();
+    _ sections = source_ji.read_source_ji_sections(ctx.store.symbols.text(origin.path))$.some();
+    assert(sections.has_declaration_observations);
+    _ saved = source_fingerprint.decode_declaration_observations_section(sections.declaration_observations.slice())$.some();
+    Int count! = 0;
+    Int index! = 0;
+    while (index < saved.entries.len()) {
+        _ item = saved.entries.get(index);
+        index = index + 1;
+        if (item.aspect != .documentation_targets) { continue; }
+        assert(item.observed == result.entries.get(0).observed);
+        count = count + 1;
+    }
+    assert(count == 1);
+    return result;
+}

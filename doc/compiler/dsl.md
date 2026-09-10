@@ -20,8 +20,8 @@ User user = #sql {
 sql = ../sql-lang
 ```
 
-目标 package 必须声明 `type = lang`，并从 package root public 导出满足
-`std.jiang.syntax.Provider` 的 `Lang`。当前只支持 block invocation，不支持 `#sql(...)`，一个 lang
+目标 package 必须声明 `type = lang`，并在 package root 用 `@entry(lang)` 标记一个实现
+`std.jiang.syntax.Provider`、可无参数构造的具体类型；类型名称任意，可以保持私有。当前只支持 block invocation，不支持 `#sql(...)`，一个 lang
 package 只提供一个默认 provider。
 
 编译器内建 inline asm provider 支持 `#asm { ... }` 和 `#jiang.asm { ... }`；内建文档
@@ -43,7 +43,8 @@ compiler AST data、node index、child range、arena 和 factory operation 不�
 `Parser<K>` 的 typed method 创建节点，不能读取、遍历或手工组装 compiler AST。
 
 ```jiang
-public struct Lang: std.jiang.syntax.Provider {
+@entry(lang)
+struct SqlProvider: std.jiang.syntax.Provider {
     public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
@@ -63,7 +64,12 @@ delimiter、string、comment 和 EOF，并把连续 token storage 直接交给 `
 
 factory 创建节点时直接写入 compiler-owned `AstUnit`。`parse` 返回的 `Ast` 只标识本次生成结果的根节点；
 compiler 根据 invocation 位置验证其实际语法角色。当前 parser 已接入 expression、statement、
-declaration/member、type、pattern 和 annotation 位置。
+declaration/member、type、pattern 和 attribute 位置。
+
+Provider 可通过 `parser.provider_import(span, name)` 构造指向自身包入口的私有导入声明。
+将声明加入返回的声明集合后，其他 factory 表达式通过该名字引用 Provider 导出的类型和函数；
+编译器按实际 Provider 包定位入口，不要求使用方采用固定依赖别名。导入后的可见性、类型身份和
+依赖关系遵循普通包导入规则。该能力只构造 AST，不在 `parse` 中触发语义检查或 metadata 求值。
 
 ## Source、Token 与诊断
 
@@ -116,23 +122,48 @@ registry：
 dependency alias -> package id -> provider dylib -> Provider.Any
 ```
 
-compiler-private host 支持位于 `src/compiler/lang/`：
+宿主层负责 Provider 的入口适配、按需构建、加载和生命周期管理；语法调用通过统一的 Provider 契约完成。
+Provider 在宿主目标上编译，其缓存与编译器 ABI 绑定；发布形式为源码，不承诺动态库跨编译器版本复用。
+Provider root 可以使用其他 Lang，也可以是独立 Lang 源文件；宿主入口适配保持原模块的可见性和来源。
 
-- `abi.jiang`：wrapper version 和固定入口符号。
-- `wrapper_template.jiang`：生成 host wrapper package。
-- `dylib_builder.jiang`：按需构建 provider dylib。
-- `runtime.jiang`：加载 dylib 并调用 `scan/parse`。
-- `registry.jiang`：dependency alias 与 dylib 生命周期。
-- `block.jiang`：单个 invocation 的 provider、context、input 和 scan state。
+## 独立源文件扩展名
 
-wrapper 只导出 `jiang_lang_provider_create`，返回 `std.jiang.syntax.Provider.Any^`。provider dylib 是
-本机 compiler cache 产物，不承诺跨 compiler ABI 版本复用；provider 源码仍是发布格式。
+Lang package 可以声明独立源文件的扩展名；未声明时使用引入该 Provider 的依赖别名：
+
+```ini
+[lang]
+extensions = schema, sch
+```
+
+使用方可以按直接依赖别名覆盖整组扩展名，覆盖只作用于当前包：
+
+```ini
+[dependencies]
+schema = ../schema_lang
+
+[lang.schema]
+extensions = model, schema
+```
+
+扩展名使用逗号分隔，不带前导点。空项、重复配置和多个 Provider 的有效映射冲突均报错；
+`.jiang` 保留原生解析。扩展名覆盖不改变 `#schema` 使用的依赖别名。
+
+普通文件 import 和生成输入都使用文件所属包的有效映射，例如 `import "models.schema"`。
+整份文件传给同一个 Provider：`Input.delimiter = .none`、`body_start = 0`，`Source` 保留原始文件内容和身份。
+`scan` 必须覆盖完整文件；`parse` 返回单个声明或 `parser.declarations(...)` 组合的声明集合，允许空集合。
+表达式结果不能作为独立文件的模块根。返回的定义继续参与普通语义检查，诊断位置仍对应原文件。
+扫描范围不完整时停止该 invocation；依赖源码请求构建链中尚未准备完成的 Provider 时报告加载循环。
+
+映射配置与 Provider 实现闭包属于解析依赖。普通源码编辑按源码内容失效，Provider 实现变化则同时
+使其生成的语法结果失效；这些依赖复用编译器的 source/package artifact 管理。
 
 ## Artifact Cache
 
 lang provider dylib 与普通 package artifact 共用 package fingerprint 和 target cache key。provider
-manifest、root/source closure、dependency source、compiler version、wrapper version、host target 或
-mode 改变都会使 dylib key 失效。
+manifest、实际 source/import 闭包、compiler build/version、LLVM version、linker 路径、wrapper version、
+host target 或 mode 改变都会使 dylib key 失效。依赖闭包复用普通导入求值和前端检查，包含导入表达式
+与其他 Lang 源文件；未选中的导入分支不加载。Provider 始终按宿主目标准备，其缓存位置不随嵌套
+构建的层数或用户源码的解析缓存目录改变。
 
 cache 命中后若 dylib 无法加载、缺少固定符号或 ABI version 不匹配，应报告明确诊断；不能靠
 静默重建掩盖损坏产物或 wrapper bug。

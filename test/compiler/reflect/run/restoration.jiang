@@ -1,0 +1,175 @@
+#doc(module)
+    从接口字节恢复声明反射，不保留 AST；检查源码顺序、位置以及位置与语义指纹的独立性。
+#end
+alias source_ji = import "../../../../src/compiler/artifact/source_ji.jiang";
+alias source_artifact = import "../../../../src/compiler/artifact/source.jiang";
+alias ji = import "../../../../src/compiler/artifact/ji_file.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias context = import "../../../../src/compiler/context.jiang";
+alias syntax = import "../../../../src/compiler/syntax.jiang";
+alias ast = import "../../../../src/compiler/syntax/ast.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias resolver_api = import "../../../../src/compiler/resolve/module_resolver.jiang";
+alias graph_builder = import "../../../../src/compiler/resolve/module_graph_builder.jiang";
+alias interface_loader = import "../../../../src/compiler/resolve/interface_loader.jiang";
+alias resolve_state = import "../../../../src/compiler/resolve/state.jiang";
+alias module_graph = import "../../../../src/compiler/resolve/module_graph.jiang";
+alias compilation = import "../../../../src/compiler/analysis.jiang";
+alias codec = import "../../../../src/compiler/artifact/source_fingerprint.jiang";
+alias database = import "../../../../src/compiler/db.jiang";
+alias qid = import "../../../../src/compiler/id.jiang";
+alias qkey = import "../../../../src/compiler/incremental/key.jiang";
+alias source = import "../../../../src/compiler/source.jiang";
+alias map = import "../../../../src/compiler/support/map.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+
+import std;
+
+public Int run() {
+    std.StringBuilder input! = std.StringBuilder();
+    input.append("#doc(module) Module.\n#doc Zebra.\npublic struct Zebra { public Int z; public Bool a; }\n");
+    input.append("public enum Apple { z, a, }\n");
+    input.append("@life(return: first)\npublic T pick<T>(T first, T second) { return first; }\n");
+    UInt8[]& text = input.slice();
+    context.CompilerContext original! = context.CompilerContext();
+    source.SourceId source_id = original.store.sources.intern_virtual("reflection_order", text);
+    _ parsed! = syntax.parse_source(original$.mut_ref(), text, source_id);
+    assert(!parsed.has_errors());
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(compilation.evaluate_source_expression);
+    _ graph = resolver.build_module_graph(original$.mut_ref(), parsed.take_unit());
+    assert(resolver.lower_module_graph_to_model(original$.mut_ref(), graph$.ref()));
+    Bool checked = compilation.check_model_package(original$.mut_ref(), graph$.ref());
+    if (!checked) { reporter.report_to_stderr(original.store.diagnostics$.ref(), original.store.sources$.mut_ref()); }
+    assert(checked);
+    resolver.finalize_module_graph_model(original$.mut_ref(), graph$.ref());
+    _ surface = original.store.artifacts.load_interface(source_id)$.some();
+    _ bytes = codec.encode_module_interface_section(original$.ref(), surface);
+
+    context.CompilerContext restored! = context.CompilerContext();
+    source.SourceId loaded_source = restored.store.sources.intern_virtual("reflection_order", text);
+    _ decoded = codec.decode_module_interface_section(restored.store.symbols$.mut_ref(), loaded_source,
+        source.content_hash(text), bytes.bytes.slice())$.some();
+    map.WyHashMap<source.SourceId, ast.AstUnit> asts! = map.WyHashMap<source.SourceId, ast.AstUnit>();
+    map.WyHashMap<qid.ModuleId, graph_builder.ModuleResolvePassState> states! =
+        map.WyHashMap<qid.ModuleId, graph_builder.ModuleResolvePassState>();
+    map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId> defs! =
+        map.WyHashMap<resolve_state.DeclarationDefKey, qid.DefId>();
+    map.WyHashMap<qid.DefId, ast.AstId> items! = map.WyHashMap<qid.DefId, ast.AstId>();
+    map.WyHashMap<qid.DefId, ast.AstId> containers! = map.WyHashMap<qid.DefId, ast.AstId>();
+    graph_builder.ModuleGraphBuilder builder! = graph_builder.ModuleGraphBuilder(restored$.mut_ref(),
+        asts$.mut_ref(), states$.mut_ref(), defs$.mut_ref(), items$.mut_ref(), containers$.mut_ref(),
+        "build/test-cache/reflect-restoration");
+    qid.ModuleId module = builder.ensure_module(loaded_source);
+    interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(restored$.mut_ref(),
+        states$.mut_ref(), defs$.mut_ref());
+    loader.load_module_interface(module, decoded$.ref());
+    assert(asts.get(loaded_source) == null);
+    restored.store.resolve.set_module_interface_only(module, true);
+    _ module_record = restored.store.resolve.module_ref(module);
+    module_graph.ModuleGraph^ loaded_graph! = new module_graph.ModuleGraph(module_record.package_id, module, true);
+    loaded_graph.add_module(module);
+    Bool loaded_checked = compilation.check_model_package(restored$.mut_ref(), loaded_graph$.ref());
+    if (!loaded_checked) {
+        reporter.report_to_stderr(restored.store.diagnostics$.ref(), restored.store.sources$.mut_ref());
+    }
+    assert(loaded_checked);
+    qid.DefId owner = restored.store.resolve.module_ref(module).def_id;
+    _ scope = database.DeclarationScope(owner: owner, public_only: false);
+    assert(restored.query.declarations.count(restored.store$.ref(), scope) == 3);
+    qid.DefId first = restored.query.declarations.at(restored.store$.ref(), scope, 0);
+    qid.DefId second = restored.query.declarations.at(restored.store$.ref(), scope, 1);
+    assert(string.equal(restored.store.symbols.text(restored.store.defs.get(first).name.symbol), "Zebra"));
+    assert(string.equal(restored.store.symbols.text(restored.store.defs.get(second).name.symbol), "Apple"));
+    _ members = database.DeclarationScope(owner: first, public_only: false);
+    assert(restored.query.declarations.count(restored.store$.ref(), members) == 2);
+    qid.DefId field = restored.query.declarations.at(restored.store$.ref(), members, 1);
+    assert(string.equal(restored.store.symbols.text(restored.store.defs.get(field).name.symbol), "a"));
+    qid.DefId callable = restored.query.declarations.at(restored.store$.ref(), scope, 2);
+    _ signature = restored.store.model.def_ref(callable).decl.function_signature$.some();
+    assert(signature.has_body && !signature.has_receiver);
+    assert(string.equal(restored.store.symbols.text(signature.param_symbols[0]), "first"));
+    qid.TypeId callable_type = restored.store.typeck.def_type(callable)$.some();
+    guard restored.store.types.get(callable_type).data is .function_type(function) else { assert(false); return 1; }
+    assert(function.params.length == 2);
+    assert(restored.store.types.same_type(function.params[0], function.result));
+    assert(restored.store.types.same_type(function.params[1], function.result));
+    assert(restored.store.types.get(function.result).needs_substitution);
+    _ generic_scope = database.DeclarationScope(owner: callable, public_only: true, generic_parameters: true);
+    assert(restored.query.declarations.count(restored.store$.ref(), generic_scope) == 1);
+    qid.DefId generic = restored.query.declarations.at(restored.store$.ref(), generic_scope, 0);
+    assert(restored.store.types.same_type(restored.store.types.named_type_for_def(generic)$.some(), function.result));
+    restored.query.declarations.prepare_recursive(
+        restored.store$.ref(), restored.query.module_graph$.mut_ref(), module);
+    assert(restored.query.declarations.recursive_count(module) == 8);
+    assert(restored.query.declarations.recursive_at(module, 0) == first);
+    assert(restored.query.declarations.recursive_at(module, 2) == field);
+    assert(restored.query.declarations.recursive_at(module, 3) == second);
+    assert(restored.query.declarations.recursive_at(module, 6) == callable);
+    assert(restored.query.declarations.recursive_at(module, 7) == generic);
+    Int index! = 0;
+    while (index < decoded.declarations.len()) {
+        _ declaration = decoded.declarations.get(index);
+        qid.DefId old = original.store.incremental.current_def_for_stable(declaration.stable_id)$.some();
+        qid.DefId fresh = restored.store.incremental.current_def_for_stable(declaration.stable_id)$.some();
+        _ before = original.store.source_map.def_span(old)$.some();
+        _ after = restored.store.source_map.def_span(fresh)$.some();
+        assert(after.source_id == loaded_source);
+        assert(after.span.start == before.span.start && after.span.length == before.span.length);
+        index = index + 1;
+    }
+    check_documentation(original$.ref(), source_id, restored$.mut_ref(), loaded_source, module, first, second);
+    return 0;
+}
+
+Void check_documentation(
+    context.CompilerContext& original, source.SourceId source_id, context.CompilerContext&! restored,
+    source.SourceId loaded_source, qid.ModuleId module, qid.DefId documented, qid.DefId empty
+) {
+    // 仅有 interface 字节不意味着文档为空；必须有对应 section 的已验证来源。
+    qid.DefId owner = restored.store.resolve.module_ref(module).def_id;
+    assert(!restored.query.documentation.prepare(restored.store$.mut_ref(), module));
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), owner) == null);
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), empty) == null);
+    _ image = source_ji.build_source_ji_image(original, original.store.artifacts$.ref(), source_id, UInt64(1))$.some();
+    UInt8[]& path = "build/test-reflect-restoration-doc.ji";
+    assert(ji.write_ji_file(path, image$.ref()));
+    _ layout = ji.read_ji_layout(path)$.some();
+    _ section = layout.sections.find(.documentation)$.some();
+    _ source_path = restored.store.symbols.intern(path);
+    restored.store.artifacts.store_documentation_source(loaded_source,
+        source_artifact.SourceSectionSource(path: source_path, section: section));
+    Int reads = restored.store.artifacts.stats.section_reads;
+    assert(restored.query.documentation.prepare(restored.store$.mut_ref(), module));
+    assert(restored.store.artifacts.stats.section_reads == reads + 1);
+    assert(restored.query.documentation.prepare(restored.store$.mut_ref(), module));
+    assert(restored.store.artifacts.stats.section_reads == reads + 1);
+    _ module_doc = restored.query.documentation.module(restored.store$.ref(), module)$.some();
+    _ decl_doc = restored.query.documentation.declaration(restored.store$.ref(), documented)$.some();
+    assert(string.equal(restored.store.symbols.text(module_doc), "Module."));
+    assert(string.equal(restored.store.symbols.text(decl_doc), "Zebra."));
+    assert(restored.query.documentation.declaration(restored.store$.ref(), empty) == null);
+    _ module_fingerprint = restored.query.documentation.fingerprint(restored.store$.ref(), owner)$.some();
+    _ decl_fingerprint = restored.query.documentation.fingerprint(restored.store$.ref(), documented)$.some();
+    assert(module_fingerprint != qkey.Fingerprint128());
+    assert(decl_fingerprint != qkey.Fingerprint128());
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), owner) == module_fingerprint);
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), empty)$.some() == qkey.Fingerprint128());
+    UInt8[]^ corrupted! = fs.read_all_owned(path)$.some();
+    corrupted[section.offset] = corrupted[section.offset] ^ UInt8(1);
+    assert(fs.write_all(path, corrupted[..]));
+    restored.query.documentation.reset();
+    assert(!restored.query.documentation.prepare(restored.store$.mut_ref(), module));
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), owner) == null);
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), documented) == null);
+    // 已验证的无 section 来源才表示没有文档，不发起磁盘读取。
+    restored.store.artifacts.store_documentation_source(loaded_source,
+        source_artifact.SourceSectionSource(path: source_path, section: null));
+    Int before = restored.store.artifacts.stats.section_reads;
+    assert(restored.query.documentation.prepare(restored.store$.mut_ref(), module));
+    assert(restored.query.documentation.module(restored.store$.ref(), module) == null);
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), owner)$.some() == qkey.Fingerprint128());
+    assert(restored.query.documentation.fingerprint(restored.store$.ref(), documented)$.some()
+        == qkey.Fingerprint128());
+    assert(restored.store.artifacts.stats.section_reads == before);
+    assert(fs.remove_file(path));
+}

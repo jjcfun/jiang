@@ -3,6 +3,7 @@
     向 resolver/typecheck 提供求值能力，串联 lowering、borrow/drop 与执行；不解释表达式或实现类型规则。
 #end
 
+alias token = import "./syntax/token.jiang";
 alias context = import "./context.jiang";
 alias qid = import "./id.jiang";
 alias resolver_api = import "./resolve/module_resolver.jiang";
@@ -30,7 +31,13 @@ alias diagnostic_api = import "./diagnostic.jiang";
 alias query_cache = import "./db/query_cache.jiang";
 alias source_map = import "./source/source_map.jiang";
 alias model_template = import "./artifact/model_template.jiang";
+alias source_artifact = import "./artifact/source.jiang";
+alias metadata_artifact = import "./artifact/metadata.jiang";
 alias database = import "./db.jiang";
+alias fingerprint = import "./incremental/fingerprint.jiang";
+alias qkey = import "./incremental/key.jiang";
+alias object_key = import "./artifact/object_key.jiang";
+alias key_builder = import "./artifact/object_key_builder.jiang";
 
 #doc
     源码表达式共用一个求值入口；条件和 alias 由调用方传入期望类型，resolver 不依赖 JIL。
@@ -71,8 +78,196 @@ public Bool ensure_body_checked(
 }
 
 public Bool check_model_package(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
-    return type_check.check_model_package(ctx, graph,
-        { [ref graph] eval_ctx, node, target => evaluate_checked_expression(eval_ctx, graph, node, target) });
+    if (!type_check.check_model_package(ctx, graph,
+        { [ref graph] eval_ctx, node, target => evaluate_checked_expression(eval_ctx, graph, node, target) })) {
+        return false;
+    }
+    return prepare_metadata(ctx, graph);
+}
+
+#doc metadata 与 const 共用类型检查、JIL 和物化；求值完成后才进入独立生成阶段。
+Bool prepare_metadata(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
+    Int module_index! = 0;
+    while (module_index < graph.module_count()) {
+        qid.ModuleId module = graph.module_at(module_index);
+        module_index = module_index + 1;
+        _ record = ctx.store.resolve.module_ref(module);
+        if (record.interface_only && !ctx.query.metadata.prepared(record.def_id)
+            && !metadata_artifact.prepare(ctx, module)) {
+            _ source = ctx.store.resolve.module_ref(module).source_id;
+            diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), source_map.SourceLoc(source, token.Span()),
+                "cached metadata is unavailable", "metadata_cache_unavailable");
+            return false;
+        }
+    }
+    Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId> evaluate =
+        { [ref graph] eval_ctx, expression => evaluate_checked_expression(eval_ctx, graph, expression) };
+    Int index! = 0;
+    while (index < ctx.query.metadata.len()) {
+        if (!evaluate_metadata_attachment(ctx, index, evaluate$.ref())) {
+            return false;
+        }
+        index = index + 1;
+    }
+    module_index = 0;
+    while (module_index < graph.module_count()) {
+        ctx.query.metadata.mark_module_ready(graph.module_at(module_index));
+        module_index = module_index + 1;
+    }
+    return true;
+}
+
+#doc 缓存恢复通过统一编排准备实际观察的语义事实，签名和标签共用现有求值能力边界。
+public Bool prepare_observed_fact(context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, qid.DefId target, source_artifact.ObservationAspect aspect
+) {
+    if (aspect == .metadata) {
+        if (!prepare_metadata_target(ctx, resolver, graph, target)) { return false; }
+        _ module = ctx.store.defs.get(target).module_id$.some();
+        _ source_id = ctx.store.resolve.module_ref(module).source_id;
+        if (!ctx.store.sources.ensure_source(source_id)) { return false; }
+        ctx.store.sources.ensure_line_starts(source_id);
+        return true;
+    }
+    return prepare_type_models(ctx, resolver, graph, target);
+}
+
+#doc 每条附着共用同一求值状态；按需读取和最终 sweep 均在这里发布普通常量值。
+Bool evaluate_metadata_attachment(context.CompilerContext&! ctx, Int index,
+    Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId>& evaluate
+) {
+    _ attachment = ctx.query.metadata.get(index);
+    if (attachment.value != null) { return true; }
+    if (!ctx.query.metadata.begin_evaluation(index)) {
+        _ module = ctx.store.defs.get(attachment.target).module_id$.some();
+        _ source = ctx.store.resolve.module_ref(module).source_id;
+        diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), source_map.SourceLoc(source, attachment.span),
+            "metadata depends on its own unfinished value", "metadata_dependency_cycle");
+        return false;
+    }
+    Int diagnostic_begin = ctx.store.diagnostics.len();
+    guard attachment.origin is .source(_, expression) else {
+        ctx.query.metadata.cancel_evaluation(index);
+        return false;
+    }
+    guard evaluate(ctx$.mut_ref(), expression) is .some(result) else {
+        ctx.query.metadata.cancel_evaluation(index);
+        report_metadata_failure(ctx, attachment.target, attachment.span, diagnostic_begin);
+        return false;
+    }
+    if (!ctx.store.comptime_store.is_data_value(result)) {
+        ctx.query.metadata.cancel_evaluation(index);
+        _ module = ctx.store.defs.get(attachment.target).module_id$.some();
+        _ source = ctx.store.resolve.module_ref(module).source_id;
+        diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), source_map.SourceLoc(source, attachment.span),
+            "metadata requires data without namespace values or unbound parameters",
+            "meta_requires_materializable_data");
+        return false;
+    }
+    ctx.query.metadata.publish(index, result);
+    return true;
+}
+
+#doc 仅准备实际读取的目标；持久化恢复仍由同一 metadata section 发布到同一 QueryEngine。
+Bool prepare_metadata_target(context.CompilerContext&! ctx, qid.DefId target,
+    Fn<value.ComptimeValue?, context.CompilerContext&!, sem.NodeId> evaluate
+) {
+    if (ctx.query.metadata.ready(ctx.store$.ref(), target)) { return true; }
+    _ module = ctx.store.defs.get(target).module_id$.some();
+    _ record = ctx.store.resolve.module_ref(module);
+    if (record.interface_only && !ctx.query.metadata.module_ready(module)) {
+        if (!metadata_artifact.prepare(ctx, module)) { return metadata_unavailable(ctx, target); }
+    }
+    if (!ctx.query.metadata.prepared(target)) {
+        if (ctx.store.defs.get(target).kind == .generic_param_def) { ctx.query.metadata.prepare(target); }
+        else { return metadata_unavailable(ctx, target); }
+    }
+    Int index! = 0;
+    while (index < ctx.query.metadata.count(target)) {
+        Int attachment = ctx.query.metadata.attachment_index(target, index);
+        if (!evaluate_metadata_attachment(ctx, attachment, evaluate$.ref())) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool metadata_unavailable(context.CompilerContext&! ctx, qid.DefId target) {
+    source_map.SourceLoc location! = source_map.SourceLoc(token.Span());
+    if (ctx.store.source_map.def_span(target) is .some(found)) { location = found; }
+    diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), location,
+        "metadata declaration has not been prepared", "comptime_dependency_not_ready");
+    return false;
+}
+
+Bool prepare_metadata_target(context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, qid.DefId target
+) {
+    _ module = ctx.store.defs.get(target).module_id$.some();
+    if (!ctx.query.metadata.prepared(target) && !ctx.store.resolve.module_ref(module).interface_only) {
+        if (ctx.store.defs.get(target).kind == .module_def) {
+            if (!resolver.ensure_module_metadata(ctx, graph, module)) { return metadata_unavailable(ctx, target); }
+        } else if (!resolver.ensure_declaration_signature(ctx, graph, target)) {
+            return metadata_unavailable(ctx, target);
+        }
+    }
+    return prepare_metadata_target(ctx, target,
+        { [ref! resolver, ref! graph] eval_ctx, expression =>
+            evaluate_checked_expression(eval_ctx, resolver, graph, expression) });
+}
+
+#doc 执行器先结束借用再交出依赖；仅普通求值重试，累计预算不因准备新事实而重置。
+value.ComptimeValue? execute_with_metadata(context.CompilerContext&! ctx,
+    Fn<executor.Evaluation?, context.CompilerContext&!, Int> execute,
+    Fn<Bool, context.CompilerContext&!, qid.DefId> prepare
+) {
+    Int steps! = 10000;
+    while (true) {
+        guard execute(ctx$.mut_ref(), steps) is .some(result) else { return null; }
+        if (result is .value(value)) { return value; }
+        guard result is .metadata(target, remaining) else { return null; }
+        steps = remaining;
+        if (!prepare(ctx$.mut_ref(), target)) { return null; }
+    }
+    return null;
+}
+
+value.ComptimeValue? execute_prepared_expression(context.CompilerContext&! ctx,
+    module_graph.ModuleGraph& graph, jil.FunctionId expression, types.GenericArg[]& args
+) {
+    return execute_with_metadata(ctx,
+        { [expression, ref args] eval_ctx, steps =>
+            executor.evaluate_expression_step(eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(),
+                eval_ctx.jil$.ref(), expression, args, steps) },
+        { [ref graph] eval_ctx, target => prepare_metadata_target(eval_ctx, target,
+            { [ref graph] nested_ctx, root => evaluate_checked_expression(nested_ctx, graph, root) }) });
+}
+
+value.ComptimeValue? execute_prepared_expression(context.CompilerContext&! ctx,
+    resolver_api.ModuleResolver&! resolver, module_graph.ModuleGraph&! graph,
+    jil.FunctionId expression, types.GenericArg[]& args
+) {
+    return execute_with_metadata(ctx,
+        { [expression, ref args] eval_ctx, steps =>
+            executor.evaluate_expression_step(eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(),
+                eval_ctx.jil$.ref(), expression, args, steps) },
+        { [ref! resolver, ref! graph] eval_ctx, target => prepare_metadata_target(eval_ctx, resolver, graph, target) });
+}
+
+#doc 保留实际失败位置及调用链，并说明当前求值由 metadata 触发。
+Void report_metadata_failure(context.CompilerContext&! ctx, qid.DefId target, token.Span span, Int begin) {
+    _ module = ctx.store.defs.get(target).module_id$.some();
+    _ source = ctx.store.resolve.module_ref(module).source_id;
+    if (!ctx.store.diagnostics.has_errors()) {
+        diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), source_map.SourceLoc(source, span),
+            "metadata requires a concrete compile-time value", "meta_requires_comptime_value");
+        return;
+    }
+    Int index! = begin;
+    while (index < ctx.store.diagnostics.len()) {
+        ctx.store.diagnostics.items.mut_ref_at(index).add_related(diagnostic_api.DiagnosticRelatedInformation(
+            diagnostic_api.SourceRange(source, span), "while evaluating @meta at compile time"));
+        index = index + 1;
+    }
 }
 
 #doc 按真实函数或全局初始化需求恢复持久模型；签名存在并不等于声明是外部定义。
@@ -153,9 +348,7 @@ public value.ComptimeValue? evaluate_checked_expression(
     if (expression_requires_instance(ctx, expression)) { return null; }
     list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
     if (!prepare_graph_eval(ctx, graph, .generated_function(expression), args.slice(), false)) { return null; }
-    return executor.evaluate_expression(
-        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, args.slice()
-    );
+    return execute_prepared_expression(ctx, graph, expression, args.slice());
 }
 
 #doc 已发现 graph 的递归求值准备入口，与带 resolver 的入口共享实例结果状态和执行器。
@@ -167,15 +360,24 @@ Bool prepare_graph_eval(context.CompilerContext&! ctx, module_graph.ModuleGraph&
                 qid.DefId function_def = eval_ctx.jil.program.function_instance_at(identity).def_id;
                 if (!prepare_eval_source(eval_ctx, graph, function_def)) { return null; }
             }
+            if (reflected_definition(eval_ctx, item) is .some(definition)) {
+                if (!type_check.ensure_declaration_checked(eval_ctx, graph.root_module,
+                    { [ref graph] nested_ctx, node, target =>
+                        evaluate_checked_expression(nested_ctx, graph, node, target) }, definition, true)) {
+                    return null;
+                }
+            }
             prepare_eval_metadata(eval_ctx, graph, item, bindings,
                 { [ref graph] nested_ctx, expression, instance, arguments =>
                     if (!prepare_graph_eval(nested_ctx, graph, .generated_function(expression), arguments)) {
                         return false;
                     }
-                    publish_eval_result(nested_ctx, graph, expression, instance, arguments)
+                    guard execute_prepared_expression(nested_ctx, graph, expression, arguments)
+                        is .some(result) else { return false; }
+                    publish_eval_result(nested_ctx, graph, expression, instance, result)
                 })
         }, require_all_args
-    );
+    ) != null;
 }
 
 #doc 持有 resolver 的调用方允许求值继续发现模型；TypeCheck 仅借用此调用方提供的回调。
@@ -197,12 +399,23 @@ public value.ComptimeValue? evaluate_checked_expression(
     ) is .some(expression) else { return null; }
     if (expression_requires_instance(ctx, expression)) { return null; }
     list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>();
-    if (!prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), args.slice(), false)) {
+    if (prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), args.slice(), false) == null) {
         return null;
     }
-    return executor.evaluate_expression(
-        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, args.slice()
-    );
+    return execute_prepared_expression(ctx, resolver, graph, expression, args.slice());
+}
+
+#doc 反射类型的实参属于当前求值实例；准备仅针对名义定义，不把类型句柄解释成目标内存。
+qid.DefId? reflected_definition(context.CompilerContext& ctx, jil.MonoItem item) {
+    guard ctx.store.resolve.core_functions.reflect_type_of is .some(builtin) else { return null; }
+    guard item is .source_instance(identity) else { return null; }
+    _ instance = ctx.jil.program.function_instance_at(identity);
+    if (instance.def_id != builtin || instance.args.length != 1) { return null; }
+    guard instance.args[0] is .type_arg(argument) else { return null; }
+    guard ctx.store.types.get(argument.value).data is .named(named) else { return null; }
+    def.DefKind kind = ctx.store.defs.get(named.def_id).kind;
+    if (kind != .struct_def && kind != .enum_def && kind != .trait_def) { return null; }
+    return named.def_id;
 }
 
 #doc 内部 const 请求尚无实例实参时只探测依赖，不将合法模板诊断为具体化失败。
@@ -219,10 +432,10 @@ Bool expression_requires_instance(context.CompilerContext& ctx, jil.FunctionId e
 #doc
     每轮先结束递归 Sema/lowering，再借用 JIL 做 borrow/drop；表达式实参贯穿依赖准备与验证。
 #end
-Bool prepare_eval_dependencies(
+qkey.Fingerprint128? prepare_eval_dependencies(
     context.CompilerContext&! ctx, jil.MonoItem root, types.GenericArg[]& root_args,
     Fn<references.References?, context.CompilerContext&!, jil.MonoItem, bindings_api.GenericBindings&> prepare_item,
-    Bool require_all_args = true
+    Bool require_all_args = true, Bool implementation_key = false
 ) {
     bindings_api.GenericBindings expression_bindings! = bindings_api.GenericBindings();
     if (root is .generated_function(id)) {
@@ -234,9 +447,15 @@ Bool prepare_eval_dependencies(
         instance_reader.bind_eval_constants(ctx.store$.ref(), ctx.jil.program$.ref(),
             owner, expression_bindings$.mut_ref());
     }
+    qid.DefId use_owner = switch root {
+        .source_instance(identity) => ctx.jil.program.function_instance_at(identity).def_id,
+        .source_resume_instance(resume) => ctx.jil.program.function_instance_at(resume.identity).def_id,
+        .generated_function(id) => jil.function_provenance_def(ctx.jil.program.function(id).origin),
+    };
     list.ArrayList<jil.MonoItem> pending! = list.ArrayList<jil.MonoItem>();
     set.HashSet<Int> seen! = set.HashSet<Int>();
     set.HashSet<Int> seen_globals! = set.HashSet<Int>();
+    list.ArrayList<jil.GlobalId> globals! = list.ArrayList<jil.GlobalId>();
     append_eval_item(root, pending$.mut_ref(), seen$.mut_ref());
     Int prepared! = 0;
     Int dropped! = 0;
@@ -244,18 +463,25 @@ Bool prepare_eval_dependencies(
         while (prepared < pending.len()) {
             jil.MonoItem item = pending.get(prepared);
             guard prepare_item(ctx$.mut_ref(), item, expression_bindings$.ref()) is .some(dependencies) else {
-                return false;
+                return null;
             }
+            qid.DefId target = switch item {
+                .source_instance(identity) => ctx.jil.program.function_instance_at(identity).def_id,
+                .source_resume_instance(resume) => ctx.jil.program.function_instance_at(resume.identity).def_id,
+                .generated_function(id) => jil.function_provenance_def(ctx.jil.program.function(id).origin),
+            };
+            database.observe_def_body(ctx.query$.ref(), ctx.store$.ref(), use_owner, target);
             append_eval_dependencies(ctx, dependencies, pending$.mut_ref(),
-                seen$.mut_ref(), seen_globals$.mut_ref());
+                seen$.mut_ref(), seen_globals$.mut_ref(), globals$.mut_ref(), implementation_key);
             prepared = prepared + 1;
         }
-        if (!check_eval_borrows(ctx, pending.slice(), dropped)) { return false; }
+        if (!check_eval_borrows(ctx, pending.slice(), dropped)) { return null; }
         while (dropped < prepared) {
             jil.MonoItem item = pending.get(dropped);
             if (!prepare_eval_drops(
-                ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref(), seen_globals$.mut_ref()
-            )) { return false; }
+                ctx, item, expression_bindings$.ref(), pending$.mut_ref(), seen$.mut_ref(),
+                seen_globals$.mut_ref(), globals$.mut_ref(), implementation_key
+            )) { return null; }
             dropped = dropped + 1;
         }
     }
@@ -265,12 +491,15 @@ Bool prepare_eval_dependencies(
         index = index + 1;
         if (item is .generated_function(id) && jil.function_is_eval_expression(ctx.jil.program.function(id).origin)) {
             if (!verifier.verify_expression(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), id,
-                expression_bindings$.ref(), require_all_args)) { return false; }
+                expression_bindings$.ref(), require_all_args)) { return null; }
             continue;
         }
-        if (!verifier.verify_instance(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), item, .drop_output)) { return false; }
+        if (!verifier.verify_instance(ctx.store$.mut_ref(), ctx.jil$.mut_ref(), item, .drop_output)) { return null; }
     }
-    return true;
+    if (implementation_key) {
+        return prepared_implementation_fingerprint(ctx$.mut_ref(), pending.slice(), globals.slice());
+    }
+    return qkey.Fingerprint128();
 }
 
 Bool prepare_eval_source(
@@ -302,7 +531,8 @@ Bool check_eval_borrows(context.CompilerContext&! ctx, jil.MonoItem[]& items, In
 
 Bool prepare_eval_drops(
     context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
-    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals,
+    list.ArrayList<jil.GlobalId>&! globals, Bool implementation_key
 ) {
     list.ArrayList<jil.FunctionId> glues! = list.ArrayList<jil.FunctionId>();
     if (item is .source_instance(identity)) {
@@ -321,7 +551,8 @@ Bool prepare_eval_drops(
                 ctx.store$.ref(), ctx.query.layout$.mut_ref(), ctx.jil.storage$.ref(),
                 ctx.jil.program$.mut_ref(), ctx.jil.drop_elaboration$.mut_ref(), id
             );
-            append_eval_references(ctx, item, expression_bindings, pending, seen, seen_globals);
+            append_eval_references(ctx, item, expression_bindings, pending, seen,
+                seen_globals, globals, implementation_key);
         }
     }
     Int index! = 0;
@@ -341,10 +572,11 @@ Void append_eval_item(jil.MonoItem item, list.ArrayList<jil.MonoItem>&! pending,
 
 Void append_eval_references(
     context.CompilerContext&! ctx, jil.MonoItem item, bindings_api.GenericBindings& expression_bindings,
-    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals,
+    list.ArrayList<jil.GlobalId>&! globals, Bool implementation_key
 ) {
     references.References dependencies = collect_eval_references(ctx, item, expression_bindings);
-    append_eval_dependencies(ctx, dependencies, pending, seen, seen_globals);
+    append_eval_dependencies(ctx, dependencies, pending, seen, seen_globals, globals, implementation_key);
 }
 
 #doc 先准备局部编译期值，再以完整绑定发现调用及元数据依赖；无求值依赖时只遍历一次。
@@ -455,7 +687,9 @@ public Bool prepare_runtime_eval(context.CompilerContext&! ctx, module_graph.Mod
             if (!prepare_eval_values(ctx, item, empty$.ref(), dependencies$.mut_ref(),
                 { [ref graph] eval_ctx, expression, instance, args =>
                     if (!prepare_graph_eval(eval_ctx, graph, .generated_function(expression), args)) { return false; }
-                    publish_eval_result(eval_ctx, graph, expression, instance, args)
+                    guard execute_prepared_expression(eval_ctx, graph, expression, args)
+                        is .some(result) else { return false; }
+                    publish_eval_result(eval_ctx, graph, expression, instance, result)
                 })) { return false; }
             Int index! = 0;
             while (index < dependencies.globals.len()) {
@@ -540,11 +774,9 @@ Bool prepare_runtime_global(context.CompilerContext&! ctx, module_graph.ModuleGr
     return false;
 }
 
-#doc 依赖、borrow/drop 就绪后执行一次，再通过 lowering 发布静态值；不在执行器中递归编排。
+#doc 已完成求值的结果经共同 lowering 发布；执行方保留其 resolver 或已发现 graph 的准备权限。
 Bool publish_eval_result(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph,
-    jil.FunctionId expression, Int instance, types.GenericArg[]& args) {
-    guard executor.evaluate_expression(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(),
-        expression, args) is .some(result) else { return false; }
+    jil.FunctionId expression, Int instance, value.ComptimeValue result) {
     return lower.materialize_eval_result(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output,
         graph, ctx.jil$.mut_ref(), expression, instance, result) != null;
 }
@@ -602,7 +834,8 @@ references.References collect_eval_references(
 
 Void append_eval_dependencies(
     context.CompilerContext&! ctx, references.References dependencies!,
-    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals
+    list.ArrayList<jil.MonoItem>&! pending, set.HashSet<Int>&! seen, set.HashSet<Int>&! seen_globals,
+    list.ArrayList<jil.GlobalId>&! globals, Bool implementation_key
 ) {
     append_eval_function_references(ctx, dependencies$.ref(), pending, seen);
     Int closure_index! = 0;
@@ -635,6 +868,7 @@ Void append_eval_dependencies(
         global_cursor = global_cursor + 1;
         if (seen_globals.has(id.to_index())) { continue; }
         seen_globals.add(id.to_index());
+        if (implementation_key) { globals.add(id); }
         references.References children = references.collect_global_refs(ctx.jil.program.globals.get(id.to_index()));
         append_eval_function_references(ctx, children$.ref(), pending, seen);
         Int index! = 0;
@@ -672,9 +906,11 @@ public value.ComptimeValue? evaluate_function(
     qid.DefId function_def, types.GenericArg[]& generic_args, value.ComptimeValue[]& args
 ) {
     if (!prepare_function(ctx, resolver, graph, function_def, generic_args)) { return null; }
-    return executor.evaluate_function(
-        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), function_def, generic_args, args
-    );
+    return execute_with_metadata(ctx,
+        { [function_def, ref generic_args, ref args] eval_ctx, steps =>
+            executor.evaluate_function_step(eval_ctx.store$.mut_ref(), eval_ctx.query$.mut_ref(),
+                eval_ctx.jil$.ref(), function_def, generic_args, args, steps) },
+        { [ref! resolver, ref! graph] eval_ctx, target => prepare_metadata_target(eval_ctx, resolver, graph, target) });
 }
 
 #doc 表达式只检查本次 root，不借由 owner body check 提前执行或发布整个 const initializer。
@@ -701,10 +937,46 @@ public value.ComptimeValue? evaluate_model_expression(
     guard lower.ensure_expression(
         ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.output, graph, ctx.jil$.mut_ref(), root, result_type
     ) is .some(expression) else { return null; }
-    if (!prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), generic_args)) { return null; }
-    return executor.evaluate_expression(
-        ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), expression, generic_args
-    );
+    if (prepare_resolved_eval(ctx, resolver, graph, .generated_function(expression), generic_args) == null) { return null; }
+    return execute_prepared_expression(ctx, resolver, graph, expression, generic_args);
+}
+
+#doc 生成入口沿普通求值路径准备一次，并直接取该次准备的执行闭包指纹。
+public qkey.Fingerprint128? prepare_function_implementation(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    module_graph.ModuleGraph&! graph, qid.DefId function_def, types.GenericArg[]& generic_args
+) {
+    Int root = ctx.jil.program.function_instance_identity(ctx.jil.storage$.ref(), function_def, generic_args);
+    return prepare_resolved_eval(ctx, resolver, graph, .source_instance(root), generic_args, true, true);
+}
+
+#doc 可达顺序由既有依赖收集器确定；不遍历整包或其他求值任务已经生成的 JIL。
+qkey.Fingerprint128 prepared_implementation_fingerprint(
+    context.CompilerContext&! ctx, jil.MonoItem[]& items, jil.GlobalId[]& globals
+) {
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    list.ArrayList<qid.TypeId> layouts! = list.ArrayList<qid.TypeId>();
+    for item in items {
+        jil.Function function;
+        if (item is .source_instance(identity)) {
+            function = instance_reader.source_instance_function(ctx.store$.ref(), ctx.jil.program$.ref(), identity);
+            _ definition = ctx.jil.program.function_instance_at(identity).def_id;
+            parts.add(ctx.query.checked_signature_fingerprint(ctx.store$.ref(), definition)$.some());
+        } else {
+            guard item is .generated_function(id) else { assert(false); return qkey.Fingerprint128(); }
+            function = ctx.jil.program.function(id);
+        }
+        parts.add(fingerprint.jil_function_fingerprint(ctx$.ref(), ctx.jil$.ref(), function, true));
+        _ required = type_requirements.collect_function_types(ctx.store$.ref(), ctx.jil$.ref(), item);
+        for type in required.slice() { layouts.add(type); }
+    }
+    for global in globals {
+        layouts.add(ctx.jil.program.globals.get(global.to_index()).type_id);
+        parts.add(fingerprint.jil_global_fingerprint(ctx$.ref(), ctx.jil.program$.ref(),
+            ctx.jil.program.globals.get(global.to_index())));
+    }
+    parts.add(key_builder.stable_type_layout_hash(ctx, layouts.slice()));
+    return object_key.combine_fingerprints(UInt64(163), parts$.ref());
 }
 
 public Bool prepare_function(
@@ -713,13 +985,13 @@ public Bool prepare_function(
     qid.DefId function_def, types.GenericArg[]& generic_args
 ) {
     Int root = ctx.jil.program.function_instance_identity(ctx.jil.storage$.ref(), function_def, generic_args);
-    return prepare_resolved_eval(ctx, resolver, graph, .source_instance(root), generic_args);
+    return prepare_resolved_eval(ctx, resolver, graph, .source_instance(root), generic_args) != null;
 }
 
-Bool prepare_resolved_eval(
+qkey.Fingerprint128? prepare_resolved_eval(
     context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
     module_graph.ModuleGraph&! graph, jil.MonoItem root, types.GenericArg[]& root_args,
-    Bool require_all_args = true
+    Bool require_all_args = true, Bool implementation_key = false
 ) {
     return prepare_eval_dependencies(ctx, root, root_args,
         { [ref! resolver, ref! graph] eval_ctx, item, bindings =>
@@ -727,13 +999,18 @@ Bool prepare_resolved_eval(
                 qid.DefId function_def = eval_ctx.jil.program.function_instance_at(identity).def_id;
                 if (!prepare_eval_source(eval_ctx, resolver, graph, function_def)) { return null; }
             }
+            if (reflected_definition(eval_ctx, item) is .some(definition)) {
+                if (!prepare_type_models(eval_ctx, resolver, graph, definition)) { return null; }
+            }
             prepare_eval_metadata(eval_ctx, graph, item, bindings,
                 { [ref! resolver, ref! graph] nested_ctx, expression, instance, arguments =>
-                    if (!prepare_resolved_eval(nested_ctx, resolver, graph,
-                        .generated_function(expression), arguments)) { return false; }
-                    publish_eval_result(nested_ctx, graph, expression, instance, arguments)
+                    if (prepare_resolved_eval(nested_ctx, resolver, graph,
+                        .generated_function(expression), arguments) == null) { return false; }
+                    guard execute_prepared_expression(nested_ctx, resolver, graph, expression, arguments)
+                        is .some(result) else { return false; }
+                    publish_eval_result(nested_ctx, graph, expression, instance, result)
                 })
-        }, require_all_args
+        }, require_all_args, implementation_key
     );
 }
 
@@ -760,7 +1037,7 @@ Bool prepare_eval_source(
     为 typecheck 准备字段、被调用函数签名及其类型；这些声明不能只有名字 skeleton。
     只遍历本次依赖的 Semantic Model 节点，不扫描源文件 AST，也不请求 callee/member body。
 #end
-Bool prepare_type_models(
+public Bool prepare_type_models(
     context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
     module_graph.ModuleGraph&! graph, qid.DefId root
 ) {
@@ -777,14 +1054,18 @@ Bool prepare_type_models(
             && ctx.store.model.declaration_sema_state(current) == .skeleton) {
             if (!resolver.ensure_declaration_signature(ctx, graph, current)) {
                 if (!ctx.store.diagnostics.has_errors()) {
-                    diagnostics.add_global_error(ctx.store.diagnostics$.mut_ref(),
+                    source_map.SourceLoc location! = source_map.SourceLoc(token.Span());
+                    if (ctx.store.source_map.def_span(current) is .some(found)) { location = found; }
+                    diagnostics.add_error_at_loc(ctx.store.diagnostics$.mut_ref(), location,
                         "eval type dependency has no available declaration signature", "comptime_dependency_not_ready");
                 }
                 return false;
             }
         }
-        // const 的定义检查会读取 initializer；signature skeleton 的空 body 不能被当成没有 initializer。
-        if (ctx.store.model.def_decl_kind(current) == .global_decl && ctx.store.model.def_is_const(current)) {
+        // const 和字段默认值属于定义数据；仅有签名时，缺失的 initializer 不能被当成源码没有提供。
+        Bool initializer = ctx.store.defs.get(current).kind == .field_def
+            || (ctx.store.model.def_decl_kind(current) == .global_decl && ctx.store.model.def_is_const(current));
+        if (initializer) {
             if (!resolver.ensure_declaration_model(ctx, graph, current)) { return false; }
         }
         collect_type_model_dependencies(ctx, current, pending$.mut_ref());

@@ -20,11 +20,12 @@ alias cache_identity = import "./cache_identity.jiang";
 alias source_artifact = import "./source.jiang";
 alias source_fingerprint = import "./source_fingerprint.jiang";
 alias documentation = import "./documentation.jiang";
+alias metadata_artifact = import "./metadata.jiang";
 
 public UInt64 artifact_version_hash(UInt8[]& compiler_version) {
     // `.ji` 的版本 hash 同时包含编译器版本和 source artifact schema seed。
     // 只要 section payload 编码发生变化，就 bump seed，让旧缓存自动失效。
-    return source.content_hash(compiler_version) ^ source.content_hash("source-ji-v98");
+    return source.content_hash(compiler_version) ^ source.content_hash("source-ji-v172");
 }
 
 public struct SourceJiSections: Movable {
@@ -38,6 +39,8 @@ public struct SourceJiSections: Movable {
     public list.ArrayList<UInt8> declaration_observations!;
     public Bool has_documentation!;
     public list.ArrayList<UInt8> documentation!;
+    public Bool has_metadata!;
+    public list.ArrayList<UInt8> metadata!;
 
     public init(self) {
         self.has_import_summary = false;
@@ -50,6 +53,8 @@ public struct SourceJiSections: Movable {
         self.declaration_observations = list.ArrayList<UInt8>();
         self.has_documentation = false;
         self.documentation = list.ArrayList<UInt8>();
+        self.has_metadata = false;
+        self.metadata = list.ArrayList<UInt8>();
     }
 }
 
@@ -81,6 +86,8 @@ public ji.JiFileImage? build_source_ji_image(
     }
 
     if (ctx.store.resolve.module_for_source(source_id) is .some(module_id)) {
+        guard metadata_artifact.payload(ctx, module_id) is .some(meta_payload) else { return null; }
+        payloads.add(meta_payload);
         if (documentation.payload(ctx, module_id) is .some(doc_payload)) {
             payloads.add(doc_payload);
             if (source_hash == null) {
@@ -123,10 +130,9 @@ public Bool write_source_ji_file(
     return ji.write_ji_file(path, image$.ref());
 }
 
-// 写入整个 package 的 source interface cache。source artifact 只缓存跨编译
-// 可复用的公开事实，不能写入 session-local Semantic Model/Type/JIL 对象。
+#doc 写入整个 package 的本地源码缓存，保留可跨编译恢复的事实，不写入会话内 Model／Type／JIL 对象。
 public Void write_package_source_artifact_cache(
-    context.CompilerContext& ctx,
+    context.CompilerContext&! ctx,
     module_graph.ModuleGraph& graph,
     UInt8[]& artifact_cache_dir,
     UInt8[]& compiler_version
@@ -144,6 +150,54 @@ public Void write_package_source_artifact_cache(
     }
 }
 
+#doc 生成器接口恢复后仍会产生本轮读取记录；只在记录变化时原子替换该 section，保留其他持久事实。
+public Void write_module_observation_artifact(
+    context.CompilerContext&! ctx, qid.ModuleId module_id, UInt8[]& artifact_cache_dir, UInt8[]& compiler_version
+) {
+    if (!ctx.store.resolve.module_ref(module_id).interface_only) { return; }
+    source.SourceId source_id = ctx.store.resolve.module_ref(module_id).source_id;
+    if (ctx.store.sources.has_overlay(source_id) || !source_snapshot_matches(ctx, module_id)) { return; }
+    guard ctx.store.artifacts.load_observations(source_id) is .some(observations) else { return; }
+    ji.JiSectionPayload replacement = source_fingerprint.declaration_observations_payload(observations);
+    guard source_identity_for_module(ctx, module_id) is .some(identity) else { return; }
+    guard acquire_source_artifact_lock(artifact_cache_dir, identity) is .some(held_lock) else { return; }
+    system_fs.FileLock lock! = held_lock;
+    UInt8[]^ path = artifact_path.stable_source_ji_path(artifact_cache_dir, identity);
+    guard ji.read_ji_layout(path[..]) is .some(layout) else { return; }
+    ji.JiHeader header = layout.header;
+    if (header.compiler_version != artifact_version_hash(compiler_version)
+        || header.stable_source_identity != identity.fingerprint
+        || header.source_hash != ctx.store.sources.content_hash(source_id)) { return; }
+    guard ctx.store.artifacts.load_interface(source_id) is .some(module_interface) else { return; }
+    if (header.package_interface_fingerprint != module_interface.interface_hash) { return; }
+    if (layout.sections.find(.declaration_observations) is .some(previous)
+        && previous.hash == replacement.hash) { return; }
+    list.ArrayList<ji.JiSectionPayload> payloads! = list.ArrayList<ji.JiSectionPayload>();
+    Int index! = 0;
+    while (index < layout.sections.len()) {
+        ji.JiSectionEntry entry = layout.sections.entry_at(index);
+        index = index + 1;
+        if (entry.kind == .declaration_observations) { continue; }
+        guard read_section(ctx.store.artifacts$.mut_ref(), path[..], layout$.ref(), entry.kind)
+            is .some(bytes) else { return; }
+        payloads.add(ji.JiSectionPayload.from_bytes(entry.kind, bytes, entry.hash));
+    }
+    payloads.add(replacement$.move());
+    ji.JiSourceMetadata metadata! = ji.JiSourceMetadata(header.source_hash);
+    metadata.stable_source_identity = header.stable_source_identity;
+    metadata.source_modified_ns = header.source_modified_ns;
+    metadata.source_size = header.source_size;
+    metadata.package_interface_fingerprint = header.package_interface_fingerprint;
+    metadata.public_interface_fingerprint = header.public_interface_fingerprint;
+    ji.JiFileImage image = ji.build_ji_file_image(header.compiler_version, metadata, payloads);
+    if (!ji.write_ji_file(path[..], image$.ref())) { return; }
+    qid.SymbolId symbol = ctx.store.symbols.intern(path[..]);
+    ctx.store.artifacts.store_documentation_source(source_id,
+        source_artifact.SourceSectionSource(path: symbol, section: image.disk_section(.documentation)));
+    ctx.store.artifacts.store_metadata_source(source_id,
+        source_artifact.SourceSectionSource(path: symbol, section: image.disk_section(.metadata)));
+}
+
 public cache_identity.StableSourceId? source_identity_for_module(
     context.CompilerContext& ctx,
     qid.ModuleId module_id
@@ -154,7 +208,7 @@ public cache_identity.StableSourceId? source_identity_for_module(
 // 为单个 module 写入 `.ji` interface。没有 stable source identity 的 module
 // 不具备跨编译身份，不能进入本地 artifact cache。
 Void write_module_source_artifact(
-    context.CompilerContext& ctx,
+    context.CompilerContext&! ctx,
     qid.ModuleId module_id,
     UInt8[]& artifact_cache_dir,
     UInt64 compiler_version
@@ -180,14 +234,15 @@ Void write_module_source_artifact(
         source_identity
     );
     ji.JiSourceMetadata metadata = source_metadata(ctx, module_id, source_identity);
-    write_source_ji_file(
-        ctx,
-        ctx.store.artifacts$.ref(),
-        module.source_id,
-        compiler_version,
-        artifact_file[..],
-        metadata
-    );
+    source.SourceId source_id = module.source_id;
+    guard build_source_ji_image(ctx, ctx.store.artifacts$.ref(), source_id, compiler_version, metadata)
+        is .some(image) else { return; }
+    if (!ji.write_ji_file(artifact_file[..], image$.ref())) { return; }
+    qid.SymbolId path = ctx.store.symbols.intern(artifact_file[..]);
+    ctx.store.artifacts.store_documentation_source(source_id,
+        source_artifact.SourceSectionSource(path: path, section: image.disk_section(.documentation)));
+    ctx.store.artifacts.store_metadata_source(source_id,
+        source_artifact.SourceSectionSource(path: path, section: image.disk_section(.metadata)));
 }
 
 public system_fs.FileLock? acquire_module_artifact_lock(
@@ -452,6 +507,11 @@ Bool load_interface_from_layout(
         return false;
     }
     store.artifacts.store_interface(source_id, loaded);
+    qid.SymbolId source_path = store.symbols.intern(path);
+    store.artifacts.store_documentation_source(source_id,
+        source_artifact.SourceSectionSource(path: source_path, section: layout.sections.find(.documentation)));
+    store.artifacts.store_metadata_source(source_id,
+        source_artifact.SourceSectionSource(path: source_path, section: layout.sections.find(.metadata)));
     return true;
 }
 
@@ -534,6 +594,11 @@ Void record_source_section(SourceJiSections&! sections, ji.JiSectionKind kind, U
     if (kind == .documentation) {
         sections.has_documentation = true;
         sections.documentation = copy_bytes(bytes);
+        return;
+    }
+    if (kind == .metadata) {
+        sections.has_metadata = true;
+        sections.metadata = copy_bytes(bytes);
         return;
     }
 }

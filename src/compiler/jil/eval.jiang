@@ -3,6 +3,10 @@
     执行标量、聚合、引用、locals、CFG 和直接调用；未支持的操作明确失败，不调用旧解释器。
 #end
 
+alias extension_matcher = import "../sema/generic/extension.jiang";
+alias sem = import "../sema/model.jiang";
+alias source = import "../source.jiang";
+alias set = import "../support/set.jiang";
 alias context = import "../context.jiang";
 alias compiler_store = import "../store.jiang";
 alias qid = import "../id.jiang";
@@ -24,6 +28,15 @@ alias frame_api = import "./eval/frame.jiang";
 alias integer = import "./eval/integer.jiang";
 alias floating = import "./eval/floating.jiang";
 alias memory_api = import "./eval/memory.jiang";
+alias system_env = import "../system/env.jiang";
+alias system_io = import "../system/io.jiang";
+alias output_api = import "../generate/output.jiang";
+alias cache_identity = import "../artifact/cache_identity.jiang";
+alias artifact_cache = import "../artifact/cache.jiang";
+alias location_query = import "../db/source_location.jiang";
+alias key_builder = import "../artifact/object_key_builder.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias qkey = import "../incremental/key.jiang";
 import std;
 
 public value.ComptimeValue? evaluate_function(
@@ -48,6 +61,27 @@ public value.ComptimeValue? evaluate_function(
     return executor.evaluate(function_def, generic_args, args);
 }
 
+#doc 只执行已准备的生成入口；模块句柄直接进入本轮逻辑内存，不经过可持久化的常量值。
+public Bool evaluate_generator(context.CompilerContext&! ctx, qid.DefId function_def, qid.ModuleId root) {
+    output_api.Outputs outputs! = output_api.Outputs();
+    return evaluate_generator(ctx, function_def, root, outputs$.mut_ref());
+}
+
+#doc 执行成功才转移暂存产物；执行器本身不发布文件，不向普通编译期求值开放写入能力。
+public Bool evaluate_generator(
+    context.CompilerContext&! ctx, qid.DefId function_def, qid.ModuleId root, output_api.Outputs&! outputs,
+    UInt8[]& cache_root = "", qkey.Fingerprint128? implementation = null
+) {
+    Executor executor! = Executor(ctx.store$.mut_ref(), ctx.query$.mut_ref(), ctx.jil$.ref(), 1000000, 128);
+    executor.cache_root = std.String.from_valid_utf8(cache_root);
+    if (implementation is .some(key)) { executor.implementation_key = key; }
+    Bool success = executor.evaluate_generator(function_def, root);
+    executor.report_memory_stats();
+    if (!success) { return false; }
+    outputs$.set(executor.outputs$.move());
+    return true;
+}
+
 public value.ComptimeValue? evaluate_expression(
     context.CompilerContext&! ctx, jil.Store& program, jil.FunctionId expression,
     types.GenericArg[]& generic_args, Int step_quota = 10000, Int depth_limit = 128
@@ -65,6 +99,45 @@ public value.ComptimeValue? evaluate_expression(
     return executor.evaluate_expression(expression, generic_args);
 }
 
+#doc 普通求值可交出缺失的声明 metadata；编排恢复事实后重试，执行预算跨重试延续。
+public enum Evaluation: Copyable {
+    value(value.ComptimeValue result),
+    metadata(qid.DefId target, Int remaining_steps),
+}
+
+public Evaluation? evaluate_expression_step(
+    compiler_store.CompilerStore&! store, database.QueryEngine&! query, jil.Store& program,
+    jil.FunctionId expression, types.GenericArg[]& generic_args, Int steps
+) {
+    Executor executor! = Executor(store, query, program, steps, 128);
+    executor.request_metadata = true;
+    _ result = executor.evaluate_expression(expression, generic_args);
+    if (executor.pending_metadata is .some(target)) { return Evaluation.metadata(target, executor.steps); }
+    if (result is .some(value)) { return Evaluation.value(value); }
+    return null;
+}
+
+public Evaluation? evaluate_function_step(
+    compiler_store.CompilerStore&! store, database.QueryEngine&! query, jil.Store& program,
+    qid.DefId function, types.GenericArg[]& generic_args, value.ComptimeValue[]& args, Int steps
+) {
+    Executor executor! = Executor(store, query, program, steps, 128);
+    executor.request_metadata = true;
+    _ result = executor.evaluate(function, generic_args, args);
+    if (executor.pending_metadata is .some(target)) { return Evaluation.metadata(target, executor.steps); }
+    if (result is .some(value)) { return Evaluation.value(value); }
+    return null;
+}
+
+alias ModuleProperty = database.ModuleProperty;
+enum ExportProperty { name, target, source, location, }
+enum ImportProperty { source, target, visibility, wildcard, name, location, }
+enum DeclarationProperty { name, module, visibility, location, members, generics, type, const_flag, equal, definition, }
+enum FunctionProperty { contract, domain, result, receiver, async_flag, unsafe_flag, has_body, parameter_count, parameter_at, }
+enum ContractProperty { type, count, at, source, target, root, projection_count, projection_at, }
+enum ParameterProperty { name, type, default_value, equal, }
+enum TypeProperty { equal, mutable_flag, parameters, }
+
 @region(a, b)
 struct Executor: Movable {
     @life(a)
@@ -76,7 +149,19 @@ struct Executor: Movable {
     Int steps!;
     Int depth!;
     Int depth_limit;
+    Int initial_type_count;
     Bool failed!;
+    Bool generating! = false;
+    Bool request_metadata! = false;
+    qid.DefId? pending_metadata! = null;
+    qid.ModuleId? generator_module! = null;
+    qid.ModuleId? reflection_root! = null;
+    set.HashSet<source.SourceId> resources!;
+    Int resource_bytes! = 0;
+    std.String cache_root!;
+    qkey.Fingerprint128 implementation_key! = qkey.Fingerprint128();
+    Int cache_bytes! = 0;
+    output_api.Outputs outputs!;
     memory_api.Memory memory!;
     map.WyHashMap<Int, Int> globals!;
 
@@ -88,14 +173,19 @@ struct Executor: Movable {
         self.steps = steps;
         self.depth = 0;
         self.depth_limit = depth_limit;
+        self.initial_type_count = self.store.types.types.next_id().to_index();
         self.failed = false;
         self.memory = memory_api.Memory();
+        self.outputs = output_api.Outputs();
+        self.cache_root = std.String.from_valid_utf8("");
+        self.resources = set.HashSet<source.SourceId>();
         self.globals = map.WyHashMap<Int, Int>();
     }
 
     value.ComptimeValue? evaluate(
         Self&! self, qid.DefId function_def, types.GenericArg[]& generic_args, value.ComptimeValue[]& args
     ) {
+        self.reflection_root = self.store.defs.get(function_def).module_id;
         list.ArrayList<Int> addresses! = list.ArrayList<Int>(args.length);
         Int index! = 0;
         while (index < args.length) {
@@ -113,11 +203,29 @@ struct Executor: Movable {
         return self.export_result(function_def, result);
     }
 
+    #doc 调用者已验证入口签名，句柄参数的类型取自已检查签名，执行期间不触发 Sema。
+    Bool evaluate_generator(Self&! self, qid.DefId function_def, qid.ModuleId root) {
+        guard self.store.typeck.def_type(function_def) is .some(function_type) else { return false; }
+        guard self.store.types.get(function_type).data is .function_type(signature) else { return false; }
+        if (signature.params.length != 1 || signature.result != self.store.types.unit_type()) { return false; }
+        guard self.memory.allocate(signature.params[0]) is .some(argument) else { return false; }
+        self.memory.set_data(argument, .reflected_module(root));
+        self.generating = true;
+        self.reflection_root = root;
+        self.generator_module = self.store.defs.get(function_def).module_id;
+        self.query.begin_generation(self.store.resolve.module_ref(self.generator_module$.some()).source_id);
+        list.ArrayList<Int> args! = list.ArrayList<Int>();
+        args.add(argument);
+        list.ArrayList<types.GenericArg> generics! = list.ArrayList<types.GenericArg>();
+        return self.call(function_def, generics.slice(), args.slice(), token.Span()) != null;
+    }
+
     value.ComptimeValue? evaluate_expression(
         Self&! self, jil.FunctionId expression, types.GenericArg[]& generic_args
     ) {
         jil.Function function = self.program.program.function(expression);
         qid.DefId owner = jil.function_provenance_def(function.origin);
+        self.reflection_root = self.store.defs.get(owner).module_id;
         if (!self.program_ready()
             || !self.store.borrowck.generated_function_checked(expression.to_index())) {
             self.fail(owner, function.span, "comptime_function_not_ready",
@@ -146,12 +254,432 @@ struct Executor: Movable {
 
     Int? call(
         Self&! self, qid.DefId function_def, types.GenericArg[]& generic_args,
-        Int[]& args, token.Span span
+        Int[]& args, token.Span span, qid.TypeId? expected_result = null
     ) {
         if (!self.ready(function_def, span)) { return null; }
+        if (self.store.resolve.core_functions.reflect_decl_generics is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .generics); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_const is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .const_flag); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_type is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .type); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_members is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_members(function_def, args, span); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_definition is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .definition); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_of is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_known_type(function_def, generic_args, args, span); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_kind is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_structure(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_number is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_structure(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_element is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_structure(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_definition is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_structure(function_def, args, span, 3); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_parameter is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type_structure(function_def, args, span, 4); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_sentinel is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_sentinel(function_def, args); }
+        }
+        if (self.store.resolve.core_functions.reflect_argument_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_arguments(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_argument_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_arguments(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_constant_type is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_constant(function_def, generic_args, args, span, 0, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_constant_parameter is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_constant(function_def, generic_args, args, span, 1, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_constant_binding is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_constant(function_def, generic_args, args, span, 2, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_constant_read is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_constant(function_def, generic_args, args, span, 3, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_type_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type(function_def, args, span, .equal); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_mutable is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type(function_def, args, span, .mutable_flag); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_has_parameters is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_type(function_def, args, span, .parameters); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_result is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .result); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_receiver is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .receiver); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_async is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .async_flag); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_unsafe is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .unsafe_flag); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_domain is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .domain); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_domain is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_domain(function_def, args, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_domain_type is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_domain(function_def, args, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_domain_binding is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_domain(function_def, args, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_domain_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_domain(function_def, args, 3); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_regions is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_regions is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 3); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 4); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_shape is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 5); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_default is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 6); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_sources is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 7); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_regions(function_def, args, span, 8); }
+        }
+        if (self.store.resolve.core_functions.reflect_life_explicit is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_contract is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .contract); }
+        }
+        if (self.store.resolve.core_functions.reflect_type_contract is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .type); }
+        }
+        if (self.store.resolve.core_functions.reflect_contract_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .count); }
+        }
+        if (self.store.resolve.core_functions.reflect_contract_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .at); }
+        }
+        if (self.store.resolve.core_functions.reflect_flow_source is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .source); }
+        }
+        if (self.store.resolve.core_functions.reflect_flow_target is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .target); }
+        }
+        if (self.store.resolve.core_functions.reflect_borrow_root is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .root); }
+        }
+        if (self.store.resolve.core_functions.reflect_borrow_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .projection_count); }
+        }
+        if (self.store.resolve.core_functions.reflect_borrow_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_contract(function_def, args, span, .projection_at); }
+        }
+        if (self.store.resolve.core_functions.reflect_nominal_contract is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_nominal_lifetime(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_path_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_nominal_lifetime(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_region_path_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_nominal_lifetime(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_error is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 13); }
+        }
+        if (self.store.resolve.core_functions.reflect_extension_target is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_extension(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_extension_trait_type is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_extension(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_extension_unsafe is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_extension(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 0); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_type is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_parameter is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 3); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 4); }
+        }
+        if (self.store.resolve.core_functions.reflect_constraint_value is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 5); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_shape is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 6); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_element is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 7); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_definition is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 8); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_arg_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 9); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_arg_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 10); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_layer is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 11); }
+        }
+        if (self.store.resolve.core_functions.reflect_literal_value is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_pattern(function_def, args, span, 14); }
+        }
+        if (self.store.resolve.core_functions.reflect_pattern_extent is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_constraint(function_def, args, span, 12); }
+        }
+        if (self.store.resolve.core_functions.reflect_life_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 1); }
+        }
+        if (self.store.resolve.core_functions.reflect_life_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 2); }
+        }
+        if (self.store.resolve.core_functions.reflect_life_target is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 3); }
+        }
+        if (self.store.resolve.core_functions.reflect_life_source is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 4); }
+        }
+        if (self.store.resolve.core_functions.reflect_lifetime_shape is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 5); }
+        }
+        if (self.store.resolve.core_functions.reflect_lifetime_root_kind is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 6); }
+        }
+        if (self.store.resolve.core_functions.reflect_lifetime_root_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 7); }
+        }
+        if (self.store.resolve.core_functions.reflect_lifetime_segment_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 8); }
+        }
+        if (self.store.resolve.core_functions.reflect_lifetime_segment_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_lifetime(function_def, args, span, 9); }
+        }
+        if (self.store.resolve.core_functions.reflect_function_has_body is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .has_body); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .parameter_count); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_function(function_def, args, span, .parameter_at); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_parameter(function_def, args, span, .name); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_type is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_parameter(function_def, args, span, .type); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_default is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_parameter(function_def, args, span, .default_value); }
+        }
+        if (self.store.resolve.core_functions.reflect_parameter_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_parameter(function_def, args, span, .equal); }
+        }
+        if (self.store.resolve.core_functions.reflect_meta_count is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_metadata(function_def, generic_args, args, span, false, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_meta_at is .some(builtin)) {
+            if (function_def == builtin) {
+                return self.reflect_metadata(function_def, generic_args, args, span, true, expected_result);
+            }
+        }
+        if (self.store.resolve.core_functions.reflect_documented_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_documented(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_documented_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_documented(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_documentation is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_documentation(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_documentation is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_documentation(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_path is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_module_property(function_def, args, span, .path); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_package is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_module_property(function_def, args, span, .package); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_is_virtual is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_module_property(function_def, args, span, .virtual_flag); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_location is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_module_property(function_def, args, span, .location); }
+        }
+        if (self.store.resolve.core_functions.reflect_package_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_package_property(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_package_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_package_property(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_name is .some(module_name)) {
+            if (function_def == module_name) { return self.reflect_module_property(function_def, args, span, .name); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_equal is .some(equal)) {
+            if (function_def == equal) { return self.reflect_module_equal(function_def, args, span); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_count is .some(count)) {
+            if (function_def == count) { return self.reflect_modules(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_at is .some(at)) {
+            if (function_def == at) { return self.reflect_modules(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_count is .some(count)) {
+            if (function_def == count) { return self.reflect_exports(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_at is .some(at)) {
+            if (function_def == at) { return self.reflect_exports(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_export(function_def, args, span, .name); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_target is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_export(function_def, args, span, .target); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_source is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_export(function_def, args, span, .source); }
+        }
+        if (self.store.resolve.core_functions.reflect_export_location is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_export(function_def, args, span, .location); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_count is .some(count)) {
+            if (function_def == count) { return self.reflect_modules(function_def, args, span, false, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_at is .some(at)) {
+            if (function_def == at) { return self.reflect_modules(function_def, args, span, true, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_source is .some(source_fn)) {
+            if (function_def == source_fn) { return self.reflect_import(function_def, args, span, .source); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_target is .some(target)) {
+            if (function_def == target) { return self.reflect_import(function_def, args, span, .target); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_public is .some(visibility)) {
+            if (function_def == visibility) { return self.reflect_import(function_def, args, span, .visibility); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_wildcard is .some(wildcard)) {
+            if (function_def == wildcard) { return self.reflect_import(function_def, args, span, .wildcard); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_name is .some(name)) {
+            if (function_def == name) { return self.reflect_import(function_def, args, span, .name); }
+        }
+        if (self.store.resolve.core_functions.reflect_import_location is .some(location)) {
+            if (function_def == location) { return self.reflect_import(function_def, args, span, .location); }
+        }
+        if (self.store.resolve.core_functions.reflect_recursive_declarations is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration_view(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_declarations is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration_view(function_def, args, span); }
+        }
+        if (self.store.resolve.core_functions.reflect_declaration_count is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declarations(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_declaration_at is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declarations(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_name is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .name); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_module is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .module); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_public is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .visibility); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_location is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .location); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_members is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .members); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_equal is .some(builtin)) {
+            if (function_def == builtin) { return self.reflect_declaration(function_def, args, span, .equal); }
+        }
+        if (self.store.resolve.core_functions.reflect_location_fingerprint is .some(builtin)) {
+            if (function_def == builtin) { return self.location_fingerprint(function_def, args); }
+        }
+        if (self.store.resolve.core_functions.reflect_module_fingerprint is .some(builtin)) {
+            if (function_def == builtin) { return self.definition_fingerprint(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.reflect_decl_fingerprint is .some(builtin)) {
+            if (function_def == builtin) { return self.definition_fingerprint(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.reflect_fingerprint_bytes is .some(builtin)) {
+            if (function_def == builtin) { return self.fingerprint_bytes(function_def, args); }
+        }
+        if (self.store.resolve.core_functions.reflect_fingerprint_combine is .some(builtin)) {
+            if (function_def == builtin) { return self.fingerprint_combine(function_def, args); }
+        }
+        if (self.store.resolve.core_functions.generate_write is .some(write)) {
+            if (function_def == write) { return self.generate_write(function_def, args, span); }
+        }
+        if (self.store.resolve.core_functions.generate_cache_read is .some(builtin)) {
+            if (function_def == builtin) { return self.generate_cache(function_def, args, span, false); }
+        }
+        if (self.store.resolve.core_functions.generate_cache_write is .some(builtin)) {
+            if (function_def == builtin) { return self.generate_cache(function_def, args, span, true); }
+        }
+        if (self.store.resolve.core_functions.generate_read is .some(read)) {
+            if (function_def == read) { return self.generate_read(function_def, args, span); }
+        }
+        if (self.store.resolve.core_functions.generate_resource_bytes is .some(bytes)) {
+            if (function_def == bytes) { return self.generate_resource_bytes(function_def, args, span); }
+        }
         jil.Function function = self.program.program.source_function(function_def);
         if (function.is_external || function.effects.has_async) {
-            self.fail(function_def, span, "comptime_call_not_supported",
+            self.fail(function_def, function.span, "comptime_call_not_supported",
                 "external or async call is not supported in eval");
             return null;
         }
@@ -164,6 +692,2278 @@ struct Executor: Movable {
             self.store$.ref(), self.program.program$.ref(), function_def, concrete$.mut_ref()
         );
         return self.execute(function, concrete, args);
+    }
+
+    #doc 组合查询复用已有声明身份；仅模块级枚举要求生成上下文，已知声明沿用普通编译期准备。
+    Int? definition_fingerprint(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool module) {
+        if (self.reflection_root == null || (module && !self.generating)) {
+            self.fail(function_def, span, "reflection_context_required", "definition scope has no reflection context");
+            return null;
+        }
+        qid.DefId definition!;
+        qid.TypeId? owner_type! = null;
+        if (module) {
+            guard self.memory.get(args[0]).data is .reflected_module(root) else { return null; }
+            definition = self.store.resolve.module_ref(root).def_id;
+        } else {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(owner, type) else { return null; }
+            definition = owner;
+            owner_type = type;
+        }
+        qid.ModuleId source_module = self.store.defs.get(definition).module_id$.some();
+        Bool external = self.store.resolve.module_ref(source_module).package_id
+            != self.store.resolve.module_ref(self.reflection_root$.some()).package_id;
+        _ scope = database.DeclarationScope(owner: definition, public_only: external);
+        if (!self.prepare_definition_facts(function_def, span, scope)) { return null; }
+        qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+            else { self.reflection_root$.some() };
+        guard self.query.definition_content_fingerprint(self.store, scope, use_module, self.generating)
+            is .some(content) else {
+            self.fail(function_def, span, "comptime_dependency_not_ready", "definition content has not been prepared");
+            return null;
+        }
+        if (owner_type is .some(type)) {
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            parts.add(content);
+            parts.add(key_builder.stable_type_observation_fingerprint(self.store, type));
+            return self.fingerprint_value(object_key.combine_fingerprints(UInt64(162), parts$.ref()),
+                self.builtin_result_type(function_def));
+        }
+        return self.fingerprint_value(content, self.builtin_result_type(function_def));
+    }
+
+    #doc 元数据缺失时只交出依赖；文档独立加载，所有类型与签名仍须在执行前准备完成。
+    Bool prepare_definition_facts(Self&! self, qid.DefId function_def, token.Span span,
+        database.DeclarationScope scope
+    ) {
+        list.ArrayList<qid.DefId> pending! = list.ArrayList<qid.DefId>();
+        pending.add(scope.owner);
+        while (!pending.empty()) {
+            qid.DefId current = pending.pop();
+            _ record = self.store.defs.get(current);
+            if (scope.public_only && record.visibility != .public_visibility
+                && (record.kind == .struct_def || record.kind == .enum_def || record.kind == .trait_def)) { continue; }
+            if (record.kind != .extension_def && !self.reflection_signature_ready(function_def, current, span)) {
+                return false;
+            }
+            if (!self.query.metadata.ready(self.store, current) && self.request_metadata && !self.generating) {
+                self.pending_metadata = current;
+                return false;
+            }
+            if (!self.query.documentation.prepare(self.store, record.module_id$.some())) {
+                self.documentation_unavailable(function_def, span, record.module_id$.some());
+                return false;
+            }
+            Int kind! = 0;
+            while (kind < 2) {
+                _ children = database.DeclarationScope(owner: current, public_only: scope.public_only,
+                    generic_parameters: kind == 1);
+                Int index! = 0;
+                while (index < self.query.declarations.count(self.store, children)) {
+                    pending.add(self.query.declarations.at(self.store, children, index));
+                    index = index + 1;
+                }
+                kind = kind + 1;
+            }
+        }
+        return true;
+    }
+
+    Int? location_fingerprint(Self&! self, qid.DefId function_def, Int[]& args) {
+        guard self.memory.read_byte_slice(self.store, args[0]) is .some(name) else { return null; }
+        list.ArrayList<UInt64> numbers! = list.ArrayList<UInt64>(4);
+        Int index! = 1;
+        while (index < args.length) {
+            guard self.memory.export_value(self.store, self.query, args[index]) is .some(number) else { return null; }
+            numbers.add(integer.bits(number)$.some());
+            index = index + 1;
+        }
+        return self.fingerprint_value(location_query.position_fingerprint(name.slice(), numbers.get(0),
+            numbers.get(1), numbers.get(2), numbers.get(3)), self.builtin_result_type(function_def));
+    }
+
+    #doc 指纹只处理当前活字节，复用产物缓存的内容算法；返回普通标量字段，不创建反射句柄。
+    Int? fingerprint_bytes(Self&! self, qid.DefId function_def, Int[]& args) {
+        guard self.memory.read_byte_slice(self.store, args[0]) is .some(bytes) else { return null; }
+        return self.fingerprint_value(cache_identity.text_fingerprint("generate-bytes:", bytes.slice()),
+            self.builtin_result_type(function_def));
+    }
+
+    Int? fingerprint_combine(Self&! self, qid.DefId function_def, Int[]& args) {
+        list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+        Int index! = 0;
+        while (index < args.length) {
+            guard self.read_fingerprint(args[index]) is .some(part) else { return null; }
+            parts.add(part);
+            index = index + 1;
+        }
+        return self.fingerprint_value(object_key.combine_fingerprints(UInt64(160), parts$.ref()),
+            self.builtin_result_type(function_def));
+    }
+
+    qkey.Fingerprint128? read_fingerprint(Self&! self, Int address) {
+        guard self.memory.child(self.store, self.query, address, 0) is .some(low) else { return null; }
+        guard self.memory.child(self.store, self.query, address, 1) is .some(high) else { return null; }
+        guard self.memory.export_value(self.store, self.query, low) is .some(low_value) else { return null; }
+        guard self.memory.export_value(self.store, self.query, high) is .some(high_value) else { return null; }
+        return qkey.Fingerprint128(integer.bits(low_value)$.some(), integer.bits(high_value)$.some());
+    }
+
+    #doc 缓存消费现有上下文目录及准备阶段的实现 key；不自动记录反射读取或发布输出。
+    Int? generate_cache(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool write) {
+        if (!self.generating || self.cache_root.bytes().length == 0 || args.length != (if write { 3 } else { 2 })) {
+            self.fail(function_def, span, "generate_context_required", "cache access requires a generator invocation");
+            return null;
+        }
+        guard self.memory.read_byte_slice(self.store, args[0]) is .some(purpose) else { return null; }
+        guard self.read_fingerprint(args[1]) is .some(input) else { return null; }
+        list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+        parts.add(self.implementation_key);
+        parts.add(cache_identity.text_fingerprint("generate-purpose:", purpose.slice()));
+        parts.add(input);
+        _ key = object_key.combine_fingerprints(UInt64(164), parts$.ref());
+        if (!write) { return self.read_cached_content(function_def, span, key); }
+        guard self.memory.read_byte_slice(self.store, args[2]) is .some(bytes) else { return null; }
+        if (!self.reserve_cache_bytes(function_def, span, bytes.len())) { return null; }
+        Bool stored = artifact_cache.store_content(self.cache_root.bytes(), key, bytes.slice());
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        return self.memory.scalar(value.ComptimeValue(
+            type_id: result_type, data: .bool_value(stored)));
+    }
+
+    #doc 读取有界完整文件；只读快照进入本轮内存，不把缓存文件注册为源码依赖。
+    Int? read_cached_content(Self&! self, qid.DefId function_def, token.Span span, qkey.Fingerprint128 key) {
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard artifact_cache.open_content(self.cache_root.bytes(), key) is .some(file) else {
+            return self.reflection_optional_payload(result, false);
+        }
+        guard file.size() is .some(length) else { return self.reflection_optional_payload(result, false); }
+        if (!self.reserve_cache_bytes(function_def, span, length)) { return null; }
+        _ bytes = try file.read_at_owned(0, length) catch { return self.reflection_optional_payload(result, false); };
+        guard self.reflection_optional_payload(result, true) is .some(payload) else { return null; }
+        _ symbol = self.store.symbols.intern(bytes[..]);
+        qid.TypeId payload_type = self.memory.get(payload).type_id;
+        guard self.memory.import_string(self.store, self.query, payload_type, symbol)
+            is .some(data) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, payload, data)) { return null; }
+        return result;
+    }
+
+    Bool reserve_cache_bytes(Self&! self, qid.DefId function_def, token.Span span, Int length) {
+        if (length > 67108864 - self.cache_bytes) {
+            self.fail(function_def, span, "generate_cache_limit", "cache transfers exceed 64 MiB per invocation");
+            return false;
+        }
+        self.cache_bytes = self.cache_bytes + length;
+        return true;
+    }
+
+    Int? fingerprint_value(Self&! self, qkey.Fingerprint128 fingerprint, qid.TypeId result_type) {
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(low) else { return null; }
+        guard self.memory.child(self.store, self.query, result, 1) is .some(high) else { return null; }
+        self.memory.set_data(low, .scalar(.uint_value(fingerprint.low)));
+        self.memory.set_data(high, .scalar(.uint_value(fingerprint.high)));
+        return result;
+    }
+
+    #doc 资源以 SourceId 记录身份与内容，只读 I/O 不触发 parser、模块发现或 Sema。
+    Int? generate_read(Self&! self, qid.DefId function_def, Int[]& args, token.Span span) {
+        if (!self.generating || args.length != 1) {
+            self.fail(function_def, span, "generate_context_required", "resource reading requires a generator invocation");
+            return null;
+        }
+        guard self.memory.read_byte_slice(self.store, args[0]) is .some(path_bytes) else { return null; }
+        UInt8[]& path = path_bytes.slice();
+        if (path.length == 0) { return self.resource_failed(function_def, span); }
+        Int index! = 0;
+        while (index < path.length) {
+            if (path[index] == UInt8(0)) { return self.resource_failed(function_def, span); }
+            index = index + 1;
+        }
+        qid.ModuleId module_id = self.generator_module$.some();
+        source.SourceId source_id = self.store.resolve.module_ref(module_id).source_id;
+        guard self.store.sources.entry(source_id).key is .file(entry_path) else {
+            return self.resource_failed(function_def, span);
+        }
+        Path joined = std.path.join(std.path.dirname(entry_path), path);
+        Path normalized = std.path.normalize(joined.bytes());
+        source.SourceId? resource! = self.store.sources.find(.file(normalized.bytes()));
+        Bool captured! = false;
+        if (resource is .some(id)) {
+            captured = self.resources.has(id);
+            if (!captured && self.store.resolve.module_for_source(id) != null) {
+                if (!self.store.sources.ensure_source(id)) { return self.resource_failed(function_def, span); }
+                if (!self.reserve_resource_bytes(function_def, span, self.store.sources.get(id).text.length)) {
+                    return null;
+                }
+                captured = true;
+            }
+        }
+        if (!captured) {
+            guard self.store.sources.load_path_text(normalized.bytes()) is .some(bytes) else {
+                return self.resource_failed(function_def, span);
+            }
+            if (!self.reserve_resource_bytes(function_def, span, bytes.length)) { return null; }
+            resource = self.store.sources.intern_path(normalized.bytes(), bytes[..]);
+        }
+        source.SourceId id = resource$.some();
+        self.resources.add(id);
+        qid.TypeId function_type = self.store.typeck.def_type(function_def)$.some();
+        guard self.store.types.get(function_type).data is .function_type(signature) else { return null; }
+        guard self.memory.allocate(signature.result) is .some(result) else { return null; }
+        self.memory.set_data(result, .resource(id));
+        return result;
+    }
+
+    #doc 本轮首次读取的快照均计入配额，包括已有源码；重复读取由 resources 集合去重。
+    Bool reserve_resource_bytes(Self&! self, qid.DefId function_def, token.Span span, Int length) {
+        if (length > 67108864 - self.resource_bytes) {
+            self.fail(function_def, span, "generate_resource_limit", "resources exceed 64 MiB per invocation");
+            return false;
+        }
+        self.resource_bytes = self.resource_bytes + length;
+        return true;
+    }
+
+    Int? resource_failed(Self&! self, qid.DefId function_def, token.Span span) {
+        self.fail(function_def, span, "generate_resource_read_failed", "failed to read resource relative to generator entry");
+        return null;
+    }
+
+    #doc 只读取本次生成记录的快照，返回字节内容而非宿主文件或地址。
+    Int? generate_resource_bytes(Self&! self, qid.DefId function_def, Int[]& args, token.Span span) {
+        if (!self.generating || args.length != 1) { return self.resource_failed(function_def, span); }
+        guard self.memory.get(args[0]).data is .resource(id) else { return self.resource_failed(function_def, span); }
+        if (!self.resources.has(id) || !self.store.sources.ensure_source(id)) {
+            return self.resource_failed(function_def, span);
+        }
+        qid.TypeId function_type = self.store.typeck.def_type(function_def)$.some();
+        guard self.store.types.get(function_type).data is .function_type(signature) else { return null; }
+        qid.SymbolId bytes = self.store.symbols.intern(self.store.sources.get(id).text[..]);
+        return self.memory.import_string(self.store, self.query, signature.result, bytes);
+    }
+
+    #doc 输出只复制本轮有效字节切片；可读的局部缓冲无需成为可持久化的 comptime 引用。
+    Int? generate_write(Self&! self, qid.DefId function_def, Int[]& args, token.Span span) {
+        if (!self.generating || args.length != 2) {
+            self.fail(function_def, span, "generate_context_required", "output requires a generator invocation");
+            return null;
+        }
+        guard self.memory.read_byte_slice(self.store, args[0]) is .some(path) else {
+            self.fail(function_def, span, "generate_invalid_bytes", "output path requires a live byte slice");
+            return null;
+        }
+        guard self.memory.read_byte_slice(self.store, args[1]) is .some(data) else {
+            self.fail(function_def, span, "generate_invalid_bytes", "output data requires a live byte slice");
+            return null;
+        }
+        if (!self.outputs.write(path.slice(), data.slice())) {
+            self.fail(function_def, span, "generate_output_invalid", self.outputs.error.bytes());
+            return null;
+        }
+        return self.memory.import_value(self.store, self.query, value.ComptimeValue(
+            type_id: self.store.types.unit_type(), data: .unit_value));
+    }
+
+    #doc 反射桥接只接受编译器发放的句柄，普通 extern 或用户同名函数不进入该路径。
+    Int? reflect_module_property(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, ModuleProperty property
+    ) {
+        if (self.reflection_root == null || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required",
+                "module reflection requires a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(module_id) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned module handle");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        _ module = self.store.resolve.module_ref(module_id);
+        qid.PackageId package_id = module.package_id;
+        if (property == .location) { return self.reflect_definition_location(module.def_id, result_type); }
+        qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+            else { self.reflection_root$.some() };
+        self.query.observe_module_origin(self.store, use_module, module_id, self.generating);
+        if (property == .package) {
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_package(package_id));
+            return result;
+        }
+        Bool virtual_source = self.query.module_graph.is_virtual(self.store, module_id);
+        if (property == .virtual_flag) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(virtual_source)));
+        }
+        qid.SymbolId name! = self.store.symbols.intern(
+            self.query.module_graph.source_name(self.store.sources$.ref(), module.source_id));
+        if (property == .path && !virtual_source) {
+            UInt8[]^ relative = self.query.module_graph.relative_path(self.store, module_id);
+            name = self.store.symbols.intern(relative[..]);
+        }
+        return self.memory.import_string(self.store, self.query, result_type, name);
+    }
+
+    Int? reflect_package_property(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool equal
+    ) {
+        if (self.reflection_root == null || args.length != (if equal { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "package reflection requires a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_package(package) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned package handle");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (equal) {
+            guard self.memory.get(args[1]).data is .reflected_package(other) else { return null; }
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(package == other)));
+        }
+        qid.SymbolId name = self.store.resolve.package_ref(package).name;
+        return self.memory.import_string(self.store, self.query, result_type, name);
+    }
+
+    #doc 从公共 Target 解出已有声明身份，泛型实例沿用其原声明附着。
+    qid.DefId? metadata_target(self, Int address) {
+        guard self.memory.get(address).data is .aggregate(start, count) else { return null; }
+        Int index! = 1;
+        while (index < count) {
+            if (self.memory.get(start + index).data is .aggregate(payload, 1)) {
+                if (self.memory.get(payload).data is .reflected_module(module)) {
+                    return self.store.resolve.module_ref(module).def_id;
+                }
+                if (self.declaration_handle(payload) is .some(handle)) {
+                    guard self.memory.get(handle).data is .reflected_definition(definition, _) else { return null; }
+                    return definition;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    #doc metadata 消费同一目标的已物化值；普通求值可交出缺失依赖，generate 不回调 Sema 或返回假空集。
+    Int? reflect_metadata(Self&! self, qid.DefId function_def, types.GenericArg[]& generics,
+        Int[]& args, token.Span span, Bool element, qid.TypeId? expected_result
+    ) {
+        if (self.reflection_root == null || generics.length != 1 || args.length != (if element { 3 } else { 2 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "metadata queries require compile-time reflection");
+            return null;
+        }
+        guard generics[0] is .type_arg(expected) else { return null; }
+        if (self.store.types.type_needs_substitution(expected.value)) {
+            self.fail(function_def, span, "reflection_metadata_requires_concrete_type",
+                "metadata matching requires a fully bound type");
+            return null;
+        }
+        guard self.metadata_target(args[0]) is .some(target) else { return null; }
+        guard self.memory.get(args[1]).data is .scalar(.bool_value(recursive)) else { return null; }
+        qid.ModuleId module = self.store.defs.get(target).module_id$.some();
+        if (recursive) {
+            if (!self.generating) {
+                self.fail(function_def, span, "reflection_context_required",
+                    "module metadata traversal requires a generator context");
+                return null;
+            }
+            qid.ModuleId input = self.reflection_root$.some();
+            if (self.store.resolve.module_ref(module).package_id != self.store.resolve.module_ref(input).package_id) {
+                self.fail(function_def, span, "reflection_external_scope", "cannot traverse external package metadata");
+                return null;
+            }
+        }
+        if (!recursive && !self.query.metadata.ready(self.store, target)
+            && self.request_metadata && !self.generating) {
+            self.pending_metadata = target;
+            return null;
+        }
+        _ scope = database.MetadataScope(owner: target, type_id: expected.value, recursive: recursive);
+        if (!self.query.metadata.prepare_matches(self.store, self.query.module_graph$.mut_ref(),
+            self.query.declarations$.mut_ref(), scope)) {
+            self.fail(function_def, span, "comptime_dependency_not_ready", "metadata has not been prepared");
+            return null;
+        }
+        if (!self.observe_metadata_scope(scope)) {
+            self.fail(function_def, span, "comptime_dependency_not_ready", "metadata source is unavailable");
+            return null;
+        }
+        Int count = self.query.metadata.match_count(scope);
+        qid.TypeId result_type = self.concrete_builtin_result(function_def, generics, expected_result);
+        if (!element) { return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count))); }
+        guard self.memory.get(args[2]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "metadata view index is out of bounds");
+            return null;
+        }
+        return self.metadata_entry(self.query.metadata.match_at(scope, index), result_type);
+    }
+
+    #doc 筛选同时读取范围与所有候选目标的事实；新增首个标签不能漏掉空结果依赖。
+    Bool observe_metadata_scope(Self&! self, database.MetadataScope scope) {
+        qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+            else { self.reflection_root$.some() };
+        if (!scope.recursive) {
+            return self.query.observe_metadata(self.store, use_module, scope.owner, self.generating);
+        }
+        qid.ModuleId root = self.store.defs.get(scope.owner).module_id$.some();
+        self.query.observe_module_graph(self.store, use_module, root, false);
+        self.query.observe_generated_declarations(self.store, use_module, root, false);
+        Int index! = 0;
+        while (index < self.query.module_graph.module_count(self.store.resolve$.ref(), root)) {
+            qid.ModuleId module = self.query.module_graph.module_at(self.store.resolve$.ref(), root, index);
+            qid.DefId target = self.store.resolve.module_ref(module).def_id;
+            if (!self.query.observe_metadata(self.store, use_module, target, self.generating)) { return false; }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < self.query.declarations.recursive_count(root)) {
+            qid.DefId target = self.query.declarations.recursive_at(root, index);
+            if (!self.query.observe_metadata(self.store, use_module, target, self.generating)) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    #doc 每次只物化一个返回记录，payload 冻结后作为只读引用提供，来源使用原始输入文件。
+    Int? metadata_entry(Self&! self, database.MetadataAttachment attachment, qid.TypeId type_id) {
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(target_field) else { return null; }
+        qid.ModuleId module = self.store.defs.get(attachment.target).module_id$.some();
+        database.DocumentationTarget target = if self.store.defs.get(attachment.target).kind == .module_def {
+            .module(module)
+        } else { .declaration(attachment.target) };
+        guard self.documentation_target(target, self.memory.get(target_field).type_id) is .some(target_value)
+            else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, target_field, target_value)) { return null; }
+        guard self.memory.child(self.store, self.query, result, 1) is .some(value_field) else { return null; }
+        guard self.memory.import_constant(self.store, self.query, attachment.value$.some()) is .some(data)
+            else { return null; }
+        qid.TypeId reference_type = self.memory.get(value_field).type_id;
+        guard self.memory.reference(reference_type, data) is .some(reference) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, value_field, reference)) { return null; }
+        guard self.memory.child(self.store, self.query, result, 2) is .some(location_field) else { return null; }
+        guard self.reflect_source_location(self.store.resolve.module_ref(module).source_id, attachment.span,
+            self.memory.get(location_field).type_id) is .some(location) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, location_field, location)) { return null; }
+        return result;
+    }
+
+    Int? reflect_documented(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element
+    ) {
+        if (!self.generating || args.length != (if element { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "documentation views require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(root) else { return null; }
+        qid.ModuleId input = self.reflection_root$.some();
+        if (self.store.resolve.module_ref(root).package_id != self.store.resolve.module_ref(input).package_id) {
+            self.fail(function_def, span, "reflection_external_scope",
+                "cannot traverse an external package's documentation");
+            return null;
+        }
+        if (self.query.documentation.prepare_targets(self.store, self.query.module_graph$.mut_ref(),
+            self.query.declarations$.mut_ref(), root)
+            is .some(missing)
+        ) {
+            self.documentation_unavailable(function_def, span, missing);
+            return null;
+        }
+        self.query.observe_documented_targets(self.store, self.generator_module$.some(), root);
+        Int count = self.query.documentation.target_count(root);
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds",
+                "documentation view index is out of bounds");
+            return null;
+        }
+        return self.documentation_target(self.query.documentation.target_at(root, index), result_type);
+    }
+
+    Int? documentation_target(Self&! self, database.DocumentationTarget target, qid.TypeId type_id) {
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        UInt8[]& name = if target is .module(_) { "module" } else { "declaration" };
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(handle) else { return null; }
+        switch target {
+            .module(module) => { self.memory.set_data(handle, .reflected_module(module)); },
+            .declaration(definition) => {
+                qid.TypeId decl_type = self.memory.get(handle).type_id;
+                guard self.declaration_value(definition, decl_type) is .some(decl) else { return null; }
+                if (!self.memory.copy_into(self.store, self.query, handle, decl)) { return null; }
+            },
+        }
+        return result;
+    }
+
+    Void documentation_unavailable(Self&! self, qid.DefId function_def, token.Span span, qid.ModuleId module) {
+        self.fail(function_def, span, "reflection_documentation_unavailable",
+            "documentation section is missing its verified source or cannot be decoded");
+        Int index = self.store.diagnostics.len() - 1;
+        source.SourceId source_id = self.store.resolve.module_ref(module).source_id;
+        self.store.diagnostics.items.mut_ref_at(index).add_related(diagnostic.DiagnosticRelatedInformation(
+            diagnostic.SourceRange(source_id, token.Span(0, 0)), "module whose documentation was requested"));
+    }
+
+    #doc 文档独立于接口延迟恢复；读取失败不能等同于没有文档。
+    Int? reflect_documentation(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool module_query
+    ) {
+        if (self.reflection_root == null || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required",
+                "documentation queries require a compile-time reflection context");
+            return null;
+        }
+        qid.ModuleId module!;
+        qid.DefId? definition! = null;
+        if (module_query) {
+            guard self.memory.get(args[0]).data is .reflected_module(subject) else { return null; }
+            module = subject;
+        } else {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(subject, _) else { return null; }
+            module = self.store.defs.get(subject).module_id$.some();
+            definition = subject;
+        }
+        if (!self.query.documentation.prepare(self.store, module)) {
+            self.documentation_unavailable(function_def, span, module);
+            return null;
+        }
+        qid.SymbolId? markdown = if definition is .some(subject) {
+            self.query.documentation.declaration(self.store, subject)
+        } else { self.query.documentation.module(self.store, module) };
+        qid.DefId subject = if definition is .some(decl) { decl } else { self.store.resolve.module_ref(module).def_id };
+        qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+            else { self.reflection_root$.some() };
+        self.query.observe_documentation(self.store, use_module, subject);
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        Int active = if markdown == null { 0 } else { 1 };
+        if (!self.memory.select_payload(self.store, self.query, result, active)) { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(tag) else { return null; }
+        self.memory.set_data(tag, .scalar(.bool_value(markdown != null)));
+        if (markdown is .some(text)) {
+            guard self.memory.child(self.store, self.query, result, 1) is .some(target) else { return null; }
+            qid.TypeId text_type = self.memory.get(target).type_id;
+            guard self.memory.import_string(self.store, self.query, text_type, text) is .some(value) else {
+                return null;
+            }
+            if (!self.memory.copy_into(self.store, self.query, target, value)) { return null; }
+        }
+        return result;
+    }
+
+    #doc 模块身份比较不读取声明内容；句柄只在本轮逻辑内存内有效。
+    Int? reflect_module_equal(Self&! self, qid.DefId function_def, Int[]& args, token.Span span) {
+        if (self.reflection_root == null || args.length != 2) {
+            self.fail(function_def, span, "reflection_context_required",
+                "module queries require a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(lhs) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned left module handle");
+            return null;
+        }
+        guard self.memory.get(args[1]).data is .reflected_module(rhs) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned right module handle");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        Bool equal = lhs == rhs;
+        return self.memory.scalar(value.ComptimeValue(
+            type_id: result_type, data: .bool_value(equal)));
+    }
+
+    #doc 查询固定输入图，只生成当前元素的句柄；外包模块不能扩展成其内部导入闭包。
+    Int? reflect_modules(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element, Bool imports = false
+    ) {
+        if (!self.generating || args.length != (if element { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required", "module queries require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(root) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned module handle");
+            return null;
+        }
+        qid.ModuleId input = self.reflection_root$.some();
+        if (self.store.resolve.module_ref(root).package_id != self.store.resolve.module_ref(input).package_id) {
+            self.fail(function_def, span, "reflection_external_scope", "cannot traverse an external package's modules");
+            return null;
+        }
+        Int count = if imports { self.query.module_graph.import_count(self.store.resolve$.ref(), root) }
+            else { self.query.module_graph.module_count(self.store.resolve$.ref(), root) };
+        self.query.observe_module_graph(self.store, self.generator_module$.some(), root, imports);
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "module view index is out of bounds");
+            return null;
+        }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        if (imports) { self.memory.set_data(result, .reflected_import(root, index)); }
+        else {
+            qid.ModuleId module = self.query.module_graph.module_at(self.store.resolve$.ref(), root, index);
+            self.memory.set_data(result, .reflected_module(module));
+        }
+        return result;
+    }
+
+    #doc 导出只开放公开表面，允许查询导入所得的外包模块；不授予外包模块闭包遍历能力。
+    Int? reflect_exports(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element) {
+        if (!self.generating || args.length != (if element { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required", "export queries require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(module) else { return null; }
+        Int count = self.query.exports.count(self.store, module);
+        self.query.observe_generated_declarations(self.store, self.generator_module$.some(), module, true);
+        qid.TypeId type_id = self.builtin_result_type(function_def);
+        if (!element) { return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .int_value(count))); }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "export view index is out of bounds");
+            return null;
+        }
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_export(module, index));
+        return result;
+    }
+
+    Int? reflect_export(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, ExportProperty property
+    ) {
+        if (!self.generating || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required", "export queries require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_export(module, index) else { return null; }
+        _ binding = self.query.exports.at(self.store, module, index);
+        qid.TypeId type_id = self.builtin_result_type(function_def);
+        if (property == .name) { return self.memory.import_string(self.store, self.query, type_id, binding.name); }
+        qid.ModuleId origin = self.store.defs.get(binding.definition).module_id$.some();
+        if (property == .location) {
+            return self.reflect_definition_location(binding.definition, type_id);
+        }
+        if (property == .source) {
+            guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_module(origin));
+            return result;
+        }
+        qid.DefId target = binding.target;
+        if (self.store.defs.get(target).kind == .module_def) {
+            return self.documentation_target(.module(self.store.defs.get(target).module_id$.some()), type_id);
+        }
+        return self.documentation_target(.declaration(target), type_id);
+    }
+
+    #doc 导入句柄只引用原始模块及本轮有序索引；查询不复制绑定事实，也不继续展开外包内部。
+    Int? reflect_import(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, ImportProperty property) {
+        if (!self.generating || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required", "import queries require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_import(module, index) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned import handle");
+            return null;
+        }
+        _ item = self.query.module_graph.import_at(self.store.resolve$.ref(), module, index);
+        qid.TypeId type_id = self.builtin_result_type(function_def);
+        if (property == .location) {
+            _ source_id = self.store.resolve.module_ref(module).source_id;
+            if (!self.store.sources.ensure_source(source_id)) { return null; }
+            self.store.sources.ensure_line_starts(source_id);
+            self.query.observe_import_location(self.store, self.generator_module$.some(), module, index);
+            return self.reflect_source_location(source_id, item.span, type_id);
+        }
+        if (property == .name) {
+            qid.SymbolId name = if (item.alias_symbol is .some(name)) { name } else { self.store.symbols.intern("") };
+            return self.memory.import_string(self.store, self.query, type_id, name);
+        }
+        if (property == .source || property == .target) {
+            qid.ModuleId target = if (property == .source) { module } else { item.target_module$.some() };
+            guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_module(target));
+            return result;
+        }
+        Bool flag = if (property == .visibility) { item.visibility == .public_visibility } else { item.flatten };
+        return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .bool_value(flag)));
+    }
+
+    #doc 声明及模块位置由共享查询提供；先准备来源，再记录实际读取值。
+    Int? reflect_definition_location(Self&! self, qid.DefId definition, qid.TypeId type_id) {
+        if (!self.query.declarations.prepare_location(self.store, definition)) { return null; }
+        qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+            else { self.reflection_root$.some() };
+        self.query.observe_location(self.store, use_module, definition);
+        _ location = self.query.declarations.location(self.store, definition)$.some();
+        return self.reflect_source_location(location.source_id$.some(), location.span, type_id);
+    }
+
+    #doc Location 是可物化的普通值；字段按 core 的声明顺序写入逻辑存储，位置沿用原始 SourceId。
+    Int? reflect_source_location(Self&! self, source.SourceId source_id, token.Span span, qid.TypeId type_id) {
+        if (!self.store.sources.ensure_source(source_id)) { return null; }
+        self.store.sources.ensure_line_starts(source_id);
+        _ location = self.query.locations.evaluate(self.store.sources$.ref(), source_id, span)$.some();
+        diagnostic.SourcePosition position = location.position;
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        if (!self.memory.ensure_aggregate(self.store, self.query, result)) { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(name_field) else { return null; }
+        qid.SymbolId name = self.store.symbols.intern(self.store.sources.entry(source_id).name());
+        qid.TypeId name_type = self.memory.get(name_field).type_id;
+        guard self.memory.import_string(self.store, self.query, name_type, name) is .some(text) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, name_field, text)) { return null; }
+        Int[4] numbers = [span.start, span.length, position.line + 1, position.character + 1];
+        Int index! = 0;
+        while (index < 4) {
+            guard self.memory.child(self.store, self.query, result, index + 1) is .some(field) else { return null; }
+            self.memory.set_data(field, .scalar(.int_value(numbers[index])));
+            index = index + 1;
+        }
+        return result;
+    }
+
+    #doc 声明范围只保存 owner 和外包公开边界；成员结果由 QueryEngine 按需保存身份。
+    Int? declaration_view(
+        Self&! self, qid.DefId owner, qid.TypeId type_id, Bool generics = false, qid.TypeId? owner_type = null
+    ) {
+        qid.ModuleId module = self.store.defs.get(owner).module_id$.some();
+        qid.ModuleId root = self.reflection_root$.some();
+        Bool public_only = self.store.resolve.module_ref(module).package_id
+            != self.store.resolve.module_ref(root).package_id;
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_declarations(owner, public_only, generics, owner_type));
+        return result;
+    }
+
+    Int? reflect_declaration_view(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool recursive = false
+    ) {
+        if (!self.generating || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required",
+                "declaration queries require a generator context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_module(module) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned module handle");
+            return null;
+        }
+        if (recursive) {
+            qid.ModuleId input = self.reflection_root$.some();
+            if (self.store.resolve.module_ref(module).package_id != self.store.resolve.module_ref(input).package_id) {
+                self.fail(function_def, span, "reflection_external_scope",
+                "cannot traverse an external package's declarations");
+                return null;
+            }
+            qid.TypeId result_type = self.builtin_result_type(function_def);
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_recursive_declarations(module));
+            return result;
+        }
+        return self.declaration_view(self.store.resolve.module_ref(module).def_id,
+            self.builtin_result_type(function_def));
+    }
+
+    Int? reflect_declarations(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element
+    ) {
+        if (self.reflection_root == null || args.length != (if element { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "declaration queries require a compile-time reflection context");
+            return null;
+        }
+        if (self.memory.get(args[0]).data is .reflected_recursive_declarations(root)) {
+            return self.reflect_recursive_declarations(function_def, root, args, span, element);
+        }
+        guard self.memory.get(args[0]).data is .reflected_declarations(owner, public_only, generics, owner_type) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned declaration view");
+            return null;
+        }
+        Int count! = 0;
+        if (owner is .some(definition)) {
+            _ scope = database.DeclarationScope(owner: definition, public_only: public_only,
+                generic_parameters: generics);
+            count = self.query.declarations.count(self.store, scope);
+            qid.ModuleId use_module = if self.generator_module is .some(generator) { generator }
+                else { self.reflection_root$.some() };
+            self.query.observe_declaration_members(self.store, use_module, scope, self.generating);
+        }
+        qid.TypeId type_id = self.builtin_result_type(function_def);
+        if (!element) { return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .int_value(count))); }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "declaration view index is out of bounds");
+            return null;
+        }
+        _ scope = database.DeclarationScope(owner: owner$.some(), public_only: public_only,
+            generic_parameters: generics);
+        qid.DefId member = self.query.declarations.at(self.store, scope, index);
+        return self.declaration_value(member, type_id, owner_type);
+    }
+
+    Int? reflect_recursive_declarations(
+        Self&! self, qid.DefId function_def, qid.ModuleId root, Int[]& args, token.Span span, Bool element
+    ) {
+        if (!self.generating) {
+            self.fail(function_def, span, "reflection_context_required",
+                "recursive declaration queries require a generator");
+            return null;
+        }
+        self.query.declarations.prepare_recursive(self.store, self.query.module_graph$.mut_ref(), root);
+        Int count = self.query.declarations.recursive_count(root);
+        self.query.observe_generated_declarations(self.store, self.generator_module$.some(), root, false);
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (!element) { return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count))); }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds",
+                "recursive declaration index is out of bounds");
+            return null;
+        }
+        return self.declaration_value(self.query.declarations.recursive_at(root, index), result_type);
+    }
+
+    #doc Decl 使用正常 enum 布局和标签，只有选中的类别 payload 保存本轮不可物化的 DefId。
+    Int? declaration_value(
+        Self&! self, qid.DefId definition, qid.TypeId type_id, qid.TypeId? owner_type = null
+    ) {
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        UInt8[]& name = database.reflection_case_name(self.store.defs.get(definition).kind)$.some();
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(handle) else { return null; }
+        self.memory.set_data(handle, .reflected_definition(definition, owner_type));
+        return result;
+    }
+
+    Int? declaration_handle(self, Int address) {
+        guard self.memory.get(address).data is .aggregate(start, count) else { return null; }
+        Int index! = 1;
+        while (index < count) {
+            if (self.memory.get(start + index).data is .aggregate(payload, 1)) {
+                if (self.memory.get(payload).data is .reflected_definition(_, _)) { return payload; }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    #doc 声明属性读取共用签名查询，依赖归实际求值入口；跨包 helper 不截断输入依赖。
+    Void observe_declaration_signature(self, qid.DefId definition) {
+        qid.ModuleId use_module = if self.generator_module is .some(module) { module }
+            else { self.reflection_root$.some() };
+        self.query.observe_declaration_signature(self.store, use_module, definition, self.generating);
+    }
+
+    Void observe_declaration_type(self, qid.DefId definition,
+        database.DeclarationTypeProperty property, Int index = 0
+    ) {
+        qid.ModuleId use_module = if self.generator_module is .some(module) { module }
+            else { self.reflection_root$.some() };
+        self.query.observe_declaration_type(self.store, use_module, definition, property, index, self.generating);
+    }
+
+    Int? reflect_declaration(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, DeclarationProperty property
+    ) {
+        if (self.reflection_root == null || args.length != (if property == .equal { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "declaration queries require a compile-time reflection context");
+            return null;
+        }
+        guard self.declaration_handle(args[0]) is .some(handle) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned declaration handle");
+            return null;
+        }
+        guard self.memory.get(handle).data is .reflected_definition(definition, owner_type) else { return null; }
+        qid.TypeId type_id = self.builtin_result_type(function_def);
+        if (property == .definition) { return self.declaration_value(definition, type_id); }
+        if (property == .members || property == .generics) {
+            return self.declaration_view(definition, type_id, property == .generics, owner_type);
+        }
+        if (property == .type) {
+            if (!self.reflection_signature_ready(function_def, definition, span)) { return null; }
+            self.observe_declaration_type(definition, .declaration);
+            _ record = self.store.defs.get(definition);
+            // 类型参数的 decl type_ref 表达约束；符号 T 自身的身份来自命名类型绑定。
+            qid.TypeId subject = if (record.kind == .generic_param_def && record.domain == .type_name) {
+                self.store.types.named_type_for_def(definition)$.some()
+            } else if (record.kind == .enum_case_def
+                && self.store.model.def_ref(definition).decl.type_ref == null) {
+                self.store.types.unit_type()
+            } else { self.store.typeck.def_type(definition)$.some() };
+            return self.type_value(self.reflected_member_type(subject, owner_type), type_id);
+        }
+        if (property == .equal) {
+            guard self.declaration_handle(args[1]) is .some(other_handle) else {
+                self.fail(function_def, span, "reflection_invalid_handle",
+                    "expected a compiler-owned right declaration");
+                return null;
+            }
+            guard self.memory.get(other_handle).data is .reflected_definition(other, other_type) else {
+                return null;
+            }
+            Bool equal = definition == other && self.reflection_context_equal(owner_type, other_type);
+            return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .bool_value(equal)));
+        }
+        _ record = self.store.defs.get(definition);
+        if (property == .const_flag) {
+            self.observe_declaration_signature(definition);
+            Bool is_const = if record.kind == .generic_param_def { record.domain == .value_name }
+                else { self.store.model.def_ref(definition).decl.is_const };
+            return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .bool_value(is_const)));
+        }
+        if (property == .name) {
+            self.observe_declaration_signature(definition);
+            qid.SymbolId name = if record.kind == .extension_def { self.store.symbols.intern("") }
+                else { record.name.symbol };
+            return self.memory.import_string(self.store, self.query, type_id, name);
+        }
+        if (property == .visibility) {
+            self.observe_declaration_signature(definition);
+            Bool visible = record.visibility == .public_visibility;
+            return self.memory.scalar(value.ComptimeValue(type_id: type_id, data: .bool_value(visible)));
+        }
+        qid.ModuleId module = record.module_id$.some();
+        if (property == .location) {
+            return self.reflect_definition_location(definition, type_id);
+        }
+        guard self.memory.allocate(type_id, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_module(module));
+        return result;
+    }
+
+    #doc 已知类型的查询不要求生成入口；句柄从泛型实参取得，不能从目标机器整数伪造。
+    Int? reflect_known_type(
+        Self&! self, qid.DefId function_def, types.GenericArg[]& generics, Int[]& args, token.Span span
+    ) {
+        if (generics.length != 1 || args.length != 0) {
+            self.fail(function_def, span, "reflection_invalid_type_argument", "type_of requires one type argument");
+            return null;
+        }
+        guard generics[0] is .type_arg(argument) else { return null; }
+        return self.type_value(argument.value, self.builtin_result_type(function_def));
+    }
+
+    Int? type_value(Self&! self, qid.TypeId subject, qid.TypeId result_type) {
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_type(subject));
+        return result;
+    }
+
+    Int? reflect_type(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, TypeProperty property
+    ) {
+        if (args.length != (if property == .equal { 2 } else { 1 })) { return null; }
+        guard self.memory.get(args[0]).data is .reflected_type(type_id) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned type handle");
+            return null;
+        }
+        Bool flag!;
+        if (property == .equal) {
+            guard self.memory.get(args[1]).data is .reflected_type(other) else {
+                self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned right type");
+                return null;
+            }
+            flag = self.store.types.same_type(type_id, other);
+        } else if (property == .mutable_flag) { flag = self.store.types.get(type_id).is_mutable; }
+        else { flag = self.store.types.get(type_id).needs_substitution; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(flag)));
+    }
+
+    #doc 约束仅引用原声明或 extension 的直接谓词；句柄保存实例环境，不复制谓词表。
+    Int? reflect_constraint(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        Int arity = if property == 1 || property == 2 || property == 5 || property == 10 || property == 12 { 2 }
+            else { 1 };
+        if (self.reflection_root == null || args.length != arity) { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property >= 6) { return self.reflect_pattern(function_def, args, span, property); }
+        if (property < 2) {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(owner, owner_type) else { return null; }
+            self.observe_declaration_type(owner, .constraints);
+            Int count = self.constraint_count(owner);
+            if (property == 0) {
+                return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+            }
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            if (index < 0 || index >= count) {
+                self.fail(function_def, span, "reflection_index_out_of_bounds", "constraint index is out of bounds");
+                return null;
+            }
+            _ predicate = self.constraint_at(owner, index);
+            UInt8[]& name = switch predicate {
+                .const_type(_) => "const_type", .type_bound(_) => "type_bound",
+                .negative_type_bound(_) => "negative_type_bound", .equal(_) => "equal",
+                .not_equal(_) => "not_equal", .projection_equal(_) => "associated_equal",
+            };
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+            guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+            self.memory.set_data(child, .reflected_constraint(owner, index, owner_type));
+            return result;
+        }
+        guard self.memory.get(args[0]).data is .reflected_constraint(owner, index, owner_type) else { return null; }
+        _ predicate = self.constraint_at(owner, index);
+        if (property == 3) {
+            guard predicate is .const_type(constraint) else { return null; }
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_definition(constraint.param_def, null));
+            return result;
+        }
+        if (property == 4) {
+            guard predicate is .projection_equal(equal) else { return null; }
+            return self.memory.import_string(self.store, self.query, result_type, equal.assoc_symbol);
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(role)) else { return null; }
+        sem.NodeId node = self.constraint_node(predicate, role);
+        if (property == 2) {
+            guard self.constraint_node_type(node) is .some(type_id) else {
+                self.fail(function_def, span, "comptime_dependency_not_ready", "constraint type is not ready");
+                return null;
+            }
+            return self.type_value(self.reflected_member_type(type_id, owner_type), result_type);
+        }
+        qid.TypeId? expected! = null;
+        extension_matcher.ExtensionMatcher matcher = extension_matcher.ExtensionMatcher(self.store);
+        if (predicate is .projection_equal(equal)) {
+            guard self.store.model.node(equal.trait_ref).data is .named_type_ref(trait_type) else { return null; }
+            qid.NamespaceId namespace_id = self.store.defs.get(trait_type.def_id).owned_namespace_id$.some();
+            if (self.store.resolve.namespaces.first_binding(namespace_id, equal.assoc_symbol, .value_name)
+                is .some(binding)) { expected = self.store.typeck.def_type(binding.def_id); }
+        } else {
+            sem.NodeId subject = self.constraint_node(predicate, 0);
+            if (matcher.const_generic_param_ref(subject) is .some(parameter)) {
+                expected = self.store.typeck.def_type(parameter);
+            }
+        }
+        return self.constraint_operand(function_def, span, node, owner_type, expected, result_type);
+    }
+
+    Int constraint_count(self, qid.DefId owner) {
+        if (self.store.model.extension_group_for_definition(owner) is .some(group)) {
+            return self.store.model.extension_where_predicate_count(group);
+        }
+        return self.store.model.def_where_predicate_count(owner);
+    }
+
+    sem.WherePredicate constraint_at(self, qid.DefId owner, Int index) {
+        if (self.store.model.extension_group_for_definition(owner) is .some(group)) {
+            return self.store.model.extension_where_predicate_at(group, index);
+        }
+        return self.store.model.def_where_predicate_at(owner, index);
+    }
+
+    sem.NodeId constraint_node(self, sem.WherePredicate predicate, Int role) {
+        return switch predicate {
+            .const_type(value) => value.type_ref,
+            .type_bound(value) => if role == 0 { value.subject } else { value.bound },
+            .negative_type_bound(value) => if role == 0 { value.subject } else { value.bound },
+            .equal(value) => if role == 0 { value.subject } else { value.value },
+            .not_equal(value) => if role == 0 { value.subject } else { value.value },
+            .projection_equal(value) => if role == 0 { value.subject }
+                else if role == 2 { value.trait_ref } else { value.value },
+        };
+    }
+
+    qid.TypeId? constraint_node_type(self, sem.NodeId node) {
+        if (self.store.typeck.node_type(node) is .some(type)) {
+            if (!(self.store.types.get(type).data is .invalid)) { return type; }
+        }
+        guard self.store.model.node(node).data is .named_type_ref(named) else { return null; }
+        if (named.args.length != 0) { return null; }
+        if (self.store.types.builtin_type_for_def(named.def_id) is .some(type)) { return type; }
+        return self.store.types.named_type_for_def(named.def_id);
+    }
+
+    Int? constraint_operand(Self&! self, qid.DefId function_def, token.Span span, sem.NodeId node,
+        qid.TypeId? owner_type, qid.TypeId? expected_type, qid.TypeId result_type
+    ) {
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        if (expected_type is .some(expected) && self.store.types.get(expected).needs_substitution
+            && self.store.model.node(node).data is .literal(_)) {
+            guard self.reflection_enum_payload(result, "literal") is .some(payload) else { return null; }
+            guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+            self.memory.set_data(child, .reflected_pattern(node, owner_type));
+            return result;
+        }
+        if (expected_type is .some(expected) && !(self.store.model.node(node).data is .infer_type_ref)) {
+            qid.DefId? binding! = null;
+            if (self.store.model.node(node).data is .name_ref(.def_ref(definition))) { binding = definition; }
+            if (self.store.model.node(node).data is .named_type_ref(named)) { binding = named.def_id; }
+            qid.TypeId value_type! = expected;
+            if (self.store.types.get(expected).needs_substitution && binding is .some(definition)) {
+                if (self.store.defs.get(definition).kind != .generic_param_def) {
+                    if (self.store.typeck.def_type(definition) is .some(actual)) { value_type = actual; }
+                    else if (self.store.comptime_store.const_value(definition) is .some(stored)) {
+                        value_type = stored.type_id;
+                    }
+                }
+            }
+            extension_matcher.ExtensionMatcher matcher = extension_matcher.ExtensionMatcher(self.store);
+            guard matcher.known_const_value_for_expected_type(node, value_type) is .some(known) else {
+                self.fail(function_def, span, "comptime_dependency_not_ready", "constraint constant is not ready");
+                return null;
+            }
+            value.ComptimeValue constant! = known;
+            if (constant.data is .const_param_value(parameter) && owner_type is .some(owner)) {
+                guard self.store.types.get(owner).data is .named(named) else { return null; }
+                bindings.GenericBindings empty! = bindings.GenericBindings();
+                bindings.GenericBindings substitutions = bindings.bindings_for_instance(self.store.defs$.ref(),
+                    self.store.model$.ref(), self.store.types$.ref(), named.def_id, named.args, empty$.ref());
+                if (substitutions.const_binding(parameter) is .some(concrete)) {
+                    constant = concrete; binding = substitutions.const_binding_def(parameter);
+                }
+            }
+            constant = value.ComptimeValue(
+                type_id: self.reflected_member_type(constant.type_id, owner_type), data: constant.data);
+            guard self.reflection_enum_payload(result, "constant") is .some(payload) else { return null; }
+            guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+            self.memory.set_data(child, .reflected_constant(constant, binding));
+            return result;
+        }
+        qid.TypeId? type = if self.pattern_has_wildcard(node) { null } else { self.constraint_node_type(node) };
+        UInt8[]& name = if type != null { "type" } else { "pattern" };
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        if (type is .some(type_id)) {
+            qid.TypeId concrete = self.reflected_member_type(type_id, owner_type);
+            self.memory.set_data(child, .reflected_type(concrete));
+        } else { self.memory.set_data(child, .reflected_pattern(node, owner_type)); }
+        return result;
+    }
+
+    Bool pattern_has_wildcard(self, sem.NodeId node) {
+        _ data = self.store.model.node(node).data;
+        if (data is .infer_type_ref) { return true; }
+        if (data is .named_type_ref(named)) {
+            for arg in named.args { if (self.pattern_has_wildcard(arg)) { return true; } }
+        }
+        if (data is .layered_type_ref(layer)) {
+            return layer.sentinel_kind == .wildcard || self.pattern_has_wildcard(layer.element);
+        }
+        if (data is .array_type_ref(array)) {
+            return array.count_kind == .inferred || array.sentinel_kind == .wildcard
+                || self.pattern_has_wildcard(array.element);
+        }
+        return false;
+    }
+
+    #doc 扩展目标复用声明类型引用及已有模式句柄；读取不重新检查或实例化扩展。
+    Int? reflect_extension(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        if (self.reflection_root == null || args.length != 1) { return null; }
+        guard self.memory.get(args[0]).data is .reflected_definition(owner, _) else { return null; }
+        guard self.store.model.extension_group_for_definition(owner) is .some(group) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == 2) {
+            Bool flag = self.store.model.extension_group_is_unsafe(group);
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(flag)));
+        }
+        if (property == 1) {
+            sem.NodeId? trait_ref = self.store.model.extension_group_trait_ref(group);
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            guard self.reflection_optional_payload(result, trait_ref != null) is .some(payload) else { return null; }
+            guard trait_ref is .some(node) else { return result; }
+            guard self.constraint_node_type(node) is .some(type) else {
+                self.fail(function_def, span, "comptime_dependency_not_ready", "extension trait is not ready");
+                return null;
+            }
+            self.memory.set_data(payload, .reflected_type(type));
+            return result;
+        }
+        guard self.store.model.def_ref(owner).decl.type_ref is .some(node) else {
+            self.fail(function_def, span, "comptime_dependency_not_ready", "extension target is not ready");
+            return null;
+        }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_pattern(node, null));
+        return result;
+    }
+
+    Int? reflect_pattern(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        guard self.memory.get(args[0]).data is .reflected_pattern(node, owner_type) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        _ data = self.store.model.node(node).data;
+        if (property == 6) { return self.pattern_shape(node, owner_type, result_type); }
+        if (property == 14) {
+            guard data is .literal(literal) else { return null; }
+            return self.literal_pattern_value(literal.value, result_type);
+        }
+        if (property == 7) {
+            sem.NodeId element = switch data {
+                .layered_type_ref(layer) => layer.element, .array_type_ref(array) => array.element,
+                .errorable_type_ref(errorable) => errorable.value_type,
+                .named_type_ref(named) => named.args[0],
+                else => { assert(false); return null; },
+            };
+            return self.constraint_operand(function_def, span, element, owner_type, null, result_type);
+        }
+        if (property == 13) {
+            guard data is .errorable_type_ref(errorable) else { return null; }
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            guard self.reflection_optional_payload(result, errorable.error_type != null)
+                is .some(payload) else { return null; }
+            guard errorable.error_type is .some(error) else { return result; }
+            qid.TypeId payload_type = self.memory.get(payload).type_id;
+            guard self.constraint_operand(function_def, span, error, owner_type, null, payload_type)
+                is .some(value) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, payload, value)) { return null; }
+            return result;
+        }
+        if (property == 11) {
+            guard data is .layered_type_ref(layer) else { return null; }
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(Int(layer.kind))));
+        }
+        if (property == 12) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(role)) else { return null; }
+            return self.pattern_extent(node, role, result_type);
+        }
+        guard data is .named_type_ref(named) else { return null; }
+        if (property == 8) { return self.declaration_value(named.def_id, result_type); }
+        if (property == 9) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(named.args.length)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= named.args.length) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "pattern argument index is out of bounds");
+            return null;
+        }
+        qid.TypeId? expected! = null;
+        if (index < self.store.model.def_generic_param_count(named.def_id)) {
+            qid.DefId parameter = self.store.model.def_generic_param_at(named.def_id, index);
+            if (self.store.defs.get(parameter).domain == .value_name) {
+                expected = self.pattern_const_parameter_type(named, parameter, index, owner_type);
+            }
+        }
+        return self.constraint_operand(function_def, span, named.args[index], owner_type, expected, result_type);
+    }
+
+    qid.TypeId? pattern_const_parameter_type(
+        self, sem.NamedTypeRef named, qid.DefId parameter, Int index, qid.TypeId? owner_type
+    ) {
+        guard self.store.typeck.def_type(parameter) is .some(type) else { return null; }
+        bindings.GenericBindings arguments! = bindings.GenericBindings();
+        Int current! = 0;
+        while (current < index) {
+            qid.DefId prior = self.store.model.def_generic_param_at(named.def_id, current);
+            sem.NodeId arg = named.args[current];
+            current = current + 1;
+            if (self.store.defs.get(prior).domain != .type_name || self.pattern_has_wildcard(arg)) { continue; }
+            if (self.constraint_node_type(arg) is .some(actual)) {
+                arguments.set_type(prior, self.reflected_member_type(actual, owner_type));
+            }
+        }
+        return bindings.substitute_type(self.store.types$.ref(), type, arguments$.ref());
+    }
+
+    Int? pattern_shape(Self&! self, sem.NodeId node, qid.TypeId? owner_type, qid.TypeId result_type) {
+        _ data = self.store.model.node(node).data;
+        qid.TypeId? type = if self.pattern_has_wildcard(node) { null } else { self.constraint_node_type(node) };
+        UInt8[]& name! = "opaque";
+        Bool structural! = false;
+        if (type != null) { name = "exact"; }
+        else if (data is .infer_type_ref) { name = "wildcard"; }
+        else if (data is .named_type_ref(named)) {
+            if (self.pattern_array_constructor(named.def_id)) { name = "array"; structural = true; }
+            else if (self.reflection_type_definition_visible(named.def_id)) { name = "named"; structural = true; }
+        } else if (data is .layered_type_ref(_)) { name = "layer"; structural = true; }
+        else if (data is .array_type_ref(_)) { name = "array"; structural = true; }
+        else if (data is .errorable_type_ref(_)) { name = "error_union"; structural = true; }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (type is .some(type_id)) {
+            guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+            qid.TypeId concrete = self.reflected_member_type(type_id, owner_type);
+            self.memory.set_data(child, .reflected_type(concrete));
+            return result;
+        }
+        if (!structural) {
+            self.memory.set_data(payload, .scalar(.unit_value)); return result;
+        }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        self.memory.set_data(child, .reflected_pattern(node, owner_type));
+        return result;
+    }
+
+    Bool pattern_array_constructor(self, qid.DefId definition) {
+        if (self.store.resolve.core_types.array_type is .some(owner) && owner == definition) { return true; }
+        if (self.store.resolve.core_types.sentinel_array_type is .some(owner) && owner == definition) { return true; }
+        return false;
+    }
+
+    Int? pattern_extent(Self&! self, sem.NodeId node, Int role, qid.TypeId result_type) {
+        _ data = self.store.model.node(node).data;
+        if (data is .named_type_ref(named)) {
+            Int index = if role == 0 { 1 } else { 2 };
+            if (index >= named.args.length) { return self.pattern_extent_value(.none, UInt64(0), result_type); }
+            return self.pattern_node_extent(named.args[index], result_type);
+        }
+        UInt64 raw! = UInt64(0);
+        sem.SentinelKind kind! = .none;
+        if (role == 0) {
+            guard data is .array_type_ref(array) else { return null; }
+            kind = switch array.count_kind { .inferred => .wildcard, .int_lit => .value, .const_name => .const_name, };
+            raw = array.count_value;
+        } else {
+            if (data is .array_type_ref(array)) { kind = array.sentinel_kind; raw = array.sentinel_value; }
+            else if (data is .layered_type_ref(layer)) { kind = layer.sentinel_kind; raw = layer.sentinel_value; }
+        }
+        return self.pattern_extent_value(kind, raw, result_type);
+    }
+
+    #doc 具名长度数组在模型中使用 builtin 泛型构造；反射仍统一为数组及长度／sentinel。
+    Int? pattern_node_extent(Self&! self, sem.NodeId node, qid.TypeId result_type) {
+        _ data = self.store.model.node(node).data;
+        if (data is .infer_type_ref) { return self.pattern_extent_value(.wildcard, UInt64(0), result_type); }
+        qid.DefId? binding! = null;
+        if (data is .named_type_ref(named)) { binding = named.def_id; }
+        if (data is .name_ref(.def_ref(definition))) { binding = definition; }
+        if (binding is .some(definition)) {
+            qid.SymbolId symbol = self.store.defs.get(definition).name.symbol;
+            return self.pattern_extent_value(.const_name, UInt64(symbol.to_index()), result_type);
+        }
+        guard data is .literal(literal) else { return null; }
+        switch literal.value {
+            .int_value(value) => { return self.pattern_extent_value(.value, value.bits, result_type); },
+            .char_value(value) => { return self.pattern_extent_value(.char_value, UInt64(value), result_type); },
+            .bool_value(value) => {
+                return self.pattern_extent_value(.bool_value, if value { UInt64(1) } else { UInt64(0) }, result_type);
+            },
+            else => { return null; },
+        }
+    }
+
+    Int? pattern_extent_value(Self&! self, sem.SentinelKind kind, UInt64 raw, qid.TypeId result_type) {
+        Bool empty_payload = kind == .none || kind == .wildcard;
+        Bool named = kind == .const_name;
+        UInt8[]& name = switch kind {
+            .none => "absent", .wildcard => "wildcard", .value => "integer", .char_value => "character",
+            .bool_value => "boolean", .const_name => "named",
+        };
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (empty_payload) {
+            self.memory.set_data(payload, .scalar(.unit_value)); return result;
+        }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        if (named) {
+            qid.TypeId child_type = self.memory.get(child).type_id;
+            guard self.memory.import_string(self.store, self.query, child_type, qid.SymbolId(Int(raw)))
+                is .some(text) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, child, text)) { return null; }
+        } else if (kind == .bool_value) { self.memory.set_data(child, .scalar(.bool_value(raw != UInt64(0)))); }
+        else { self.memory.set_data(child, .scalar(.uint_value(raw))); }
+        return result;
+    }
+
+    Int? literal_pattern_value(Self&! self, sem.LiteralValue literal, qid.TypeId result_type) {
+        UInt8[]& name = switch literal {
+            .int_value(_) => "integer", .float_value(_) => "floating", .bool_value(_) => "boolean",
+            .char_value(_) => "character", .string_value(_) => "string", .null_value => "null_value",
+            .unit_value => "unit", else => { return null; },
+        };
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (literal is .null_value || literal is .unit_value) {
+            self.memory.set_data(payload, .scalar(.unit_value)); return result;
+        }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        switch literal {
+            .int_value(int_literal) => {
+                self.memory.set_data(child, .scalar(.uint_value(int_literal.bits)));
+                guard self.memory.child(self.store, self.query, payload, 1) is .some(sign) else { return null; }
+                self.memory.set_data(sign, .scalar(.bool_value(int_literal.signed_value)));
+            },
+            .float_value(number) => { self.memory.set_data(child, .scalar(.float_bits(number.value.to_bits()))); },
+            .bool_value(boolean) => { self.memory.set_data(child, .scalar(.bool_value(boolean))); },
+            .char_value(character) => { self.memory.set_data(child, .scalar(.uint_value(UInt64(character)))); },
+            .string_value(symbol) => {
+                qid.TypeId type = self.memory.get(child).type_id;
+                guard self.memory.import_string(self.store, self.query, type, symbol) is .some(text) else { return null; }
+                if (!self.memory.copy_into(self.store, self.query, child, text)) { return null; }
+            },
+            else => { return null; },
+        }
+        return result;
+    }
+
+    #doc 名义关系和 region 路径复用已检查声明 schema；泛型实例沿用原始声明路径。
+    Int? reflect_nominal_lifetime(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        if (self.reflection_root == null || args.length != (if property == 2 { 2 } else { 1 })) { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == 0) {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(owner, _) else { return null; }
+            if (!self.reflection_signature_ready(function_def, owner, span)) { return null; }
+            self.observe_declaration_type(owner, .nominal_contract);
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_nominal_contract(owner));
+            return result;
+        }
+        guard self.memory.get(args[0]).data is .reflected_region(owner, slot, _) else { return null; }
+        if (!self.reflection_signature_ready(function_def, owner, span)) { return null; }
+        self.observe_declaration_type(owner, .region_paths, slot);
+        Int selected! = -1;
+        if (property == 2) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            selected = index;
+        }
+        Int count! = 0;
+        Int binding_index! = 0;
+        while (binding_index < self.store.typeck.nominal_region_binding_count(owner)) {
+            _ binding = self.store.typeck.nominal_region_binding_at(owner, binding_index);
+            binding_index = binding_index + 1;
+            if (binding.slot != slot) { continue; }
+            if (property == 2 && count == selected) {
+                guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+                types.LifetimePath path = types.LifetimePath(
+                    root_kind: .result, root_index: 0, position_index: 0, projection_path: binding.path);
+                self.memory.set_data(result, .reflected_borrow_path(path, .nominal));
+                return result;
+            }
+            count = count + 1;
+        }
+        if (property == 1) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        self.fail(function_def, span, "reflection_index_out_of_bounds", "region path index is out of bounds");
+        return null;
+    }
+
+    Int? nominal_contract_element(Self&! self, qid.DefId function_def, Int[]& args,
+        token.Span span, qid.DefId owner, Bool element
+    ) {
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        Int count = self.store.typeck.nominal_region_flow_count(owner);
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds",
+                "nominal lifetime flow index is out of bounds");
+            return null;
+        }
+        _ relation = self.store.typeck.nominal_region_flow_at(owner, index);
+        types.LifetimeFlow flow = types.LifetimeFlow(
+            source: types.LifetimePath(root_kind: .result, root_index: 0, position_index: 0,
+                projection_path: relation.source),
+            target: types.LifetimePath(root_kind: .result, root_index: 0, position_index: 0,
+                projection_path: relation.target));
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_flow(flow, .nominal));
+        return result;
+    }
+
+    #doc 契约直接读取规范函数类型；不把来源路径反向猜测成用户的 @life 写法。
+    Int? reflect_contract(Self&! self, qid.DefId function_def, Int[]& args,
+        token.Span span, ContractProperty property
+    ) {
+        Int arity = if property == .at || property == .projection_at { 2 } else { 1 };
+        if (self.reflection_root == null || args.length != arity) { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == .type) {
+            guard self.memory.get(args[0]).data is .reflected_type(type_id) else { return null; }
+            guard self.store.types.get(type_id).data is .function_type(function) else { return null; }
+            return self.contract_value(function.lifetime_contract, false, result_type);
+        }
+        if (property == .count || property == .at) {
+            if (self.memory.get(args[0]).data is .reflected_nominal_contract(owner)) {
+                return self.nominal_contract_element(function_def, args, span, owner, property == .at);
+            }
+            guard self.memory.get(args[0]).data is .reflected_contract(contract, receiver) else { return null; }
+            Int count = self.store.types.lifetime_contract_flow_count(contract);
+            if (property == .count) {
+                return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+            }
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            if (index < 0 || index >= count) {
+                self.fail(function_def, span, "reflection_index_out_of_bounds", "lifetime flow index is out of bounds");
+                return null;
+            }
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            types.LifetimeFlow flow = self.store.types.lifetime_contract_flow_at(contract, index);
+            self.memory.set_data(result, .reflected_flow(flow, if receiver { .method } else { .function }));
+            return result;
+        }
+        if (property == .source || property == .target) {
+            guard self.memory.get(args[0]).data is .reflected_flow(flow, context) else { return null; }
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            types.LifetimePath path = if property == .source { flow.source } else { flow.target };
+            self.memory.set_data(result, .reflected_borrow_path(path, context));
+            return result;
+        }
+        guard self.memory.get(args[0]).data is .reflected_borrow_path(path, context) else { return null; }
+        if (property == .root) { return self.borrow_root(path, context, result_type); }
+        return self.borrow_projection(function_def, args, span, path, property == .projection_at);
+    }
+
+    Int? contract_value(Self&! self, types.LifetimeContract contract, Bool receiver, qid.TypeId result_type) {
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_contract(contract, receiver));
+        return result;
+    }
+
+    Int? borrow_root(Self&! self, types.LifetimePath path,
+        memory_api.BorrowContext context, qid.TypeId result_type
+    ) {
+        Bool receiver = context == .method;
+        UInt8[]& name! = switch path.root_kind {
+            .result => "result", .parameter => "parameter", .callable_result => "callable_result",
+            .callable_parameter => "callable_parameter",
+        };
+        if (receiver && path.root_kind == .parameter && path.root_index == 0) { name = "receiver"; }
+        if (context == .nominal) { name = "value"; }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (context == .nominal || path.root_kind == .result
+            || (receiver && path.root_kind == .parameter && path.root_index == 0)) {
+            self.memory.set_data(payload, .scalar(.unit_value));
+            return result;
+        }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(index) else { return null; }
+        self.memory.set_data(index, .scalar(.int_value(path.root_index - (if receiver { 1 } else { 0 }))));
+        if (path.root_kind == .callable_parameter) {
+            guard self.memory.child(self.store, self.query, payload, 1) is .some(position) else { return null; }
+            self.memory.set_data(position, .scalar(.int_value(path.position_index)));
+        }
+        return result;
+    }
+
+    Bool borrow_field_visible(self, qid.DefId field) {
+        qid.DefId? current! = field;
+        while (current is .some(definition)) {
+            if (!self.reflection_type_definition_visible(definition)) { return false; }
+            current = self.store.defs.get(definition).owner_def;
+        }
+        return true;
+    }
+
+    #doc 私有投影截断在首个不透明节点；逆向存储的路径按来源到目标的顺序查询。
+    Int? borrow_projection(Self&! self, qid.DefId function_def, Int[]& args,
+        token.Span span, types.LifetimePath path, Bool element
+    ) {
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        types.LifetimeProjectionPathId? cursor! = path.projection_path;
+        Int total! = 0;
+        while (cursor is .some(id)) { total = total + 1; cursor = self.store.types.lifetime_projection_path(id).parent; }
+        Int visible! = total;
+        Int position! = total;
+        cursor = path.projection_path;
+        while (cursor is .some(id)) {
+            _ node = self.store.types.lifetime_projection_path(id);
+            if (node.kind == .field && !self.borrow_field_visible(node.field_def$.some())) { visible = position; }
+            position = position - 1;
+            cursor = node.parent;
+        }
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(visible)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= visible) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "borrow projection index is out of bounds");
+            return null;
+        }
+        cursor = path.projection_path;
+        Int skip! = total - index - 1;
+        while (skip > 0) { cursor = self.store.types.lifetime_projection_path(cursor$.some()).parent; skip = skip - 1; }
+        _ node = self.store.types.lifetime_projection_path(cursor$.some());
+        UInt8[]& name! = switch node.kind {
+            .field => "field", .tuple_index => "tuple_index", .reference_value => "pointee",
+        };
+        Bool opaque = node.kind == .field && !self.borrow_field_visible(node.field_def$.some());
+        if (opaque) { name = "opaque"; }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (opaque || node.kind == .reference_value) {
+            self.memory.set_data(payload, .scalar(.unit_value));
+            return result;
+        }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        if (node.kind == .tuple_index) {
+            self.memory.set_data(child, .scalar(.int_value(node.tuple_index)));
+            return result;
+        }
+        qid.TypeId child_type = self.memory.get(child).type_id;
+        guard self.declaration_value(node.field_def$.some(), child_type) is .some(field) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, child, field)) { return null; }
+        return result;
+    }
+
+    #doc 读取声明绑定及语义表达式树；没有 target 表示位置绑定，没有 attribute 与显式空契约分开。
+    Int? reflect_lifetime(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        if (self.reflection_root == null || args.length != (if property == 2 || property == 9 { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required", "lifetime bindings require compile-time reflection");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property < 3) {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(owner, _) else { return null; }
+            Int count = self.store.model.def_life_clause_count(owner);
+            qid.ModuleId use_module = if self.generator_module is .some(module) { module }
+                else { self.reflection_root$.some() };
+            self.query.observe_declaration_signature(self.store, use_module, owner, self.generating);
+            if (property == 0) {
+                Bool explicit = self.store.model.def_life_annotation_count(owner) > 0;
+                return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(explicit)));
+            }
+            if (property == 1) {
+                return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+            }
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            if (index < 0 || index >= count) {
+                self.fail(function_def, span, "reflection_index_out_of_bounds", "lifetime binding index is out of bounds");
+                return null;
+            }
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_life_binding(owner, index));
+            return result;
+        }
+        if (property == 3 || property == 4) {
+            guard self.memory.get(args[0]).data is .reflected_life_binding(owner, index) else { return null; }
+            _ binding = self.store.model.def_life_clause_at(owner, index);
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            if (property == 3) {
+                guard self.reflection_optional_payload(result, binding.target != null) is .some(payload) else { return null; }
+                if (binding.target is .some(target)) { self.memory.set_data(payload, .reflected_lifetime_path(target)); }
+                return result;
+            }
+            sem.LifetimeExpressionData expression! = .name(binding.source);
+            if (binding.source_expression is .some(id)) { expression = self.store.model.lifetime_expression(id).data; }
+            self.memory.set_data(result, .reflected_lifetime_expression(expression));
+            return result;
+        }
+        if (property == 5) { return self.lifetime_shape(args[0], result_type); }
+        return self.lifetime_path(function_def, args, span, property);
+    }
+
+    Int? lifetime_shape(Self&! self, Int expression, qid.TypeId result_type) {
+        guard self.memory.get(expression).data is .reflected_lifetime_expression(data) else { return null; }
+        UInt8[]& name = switch data { .empty => "empty", .name(_) => "path", .product(_) => "product", .meet(_) => "meet" };
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        if (data is .empty) { self.memory.set_data(payload, .scalar(.unit_value)); return result; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        if (data is .name(path)) { self.memory.set_data(child, .reflected_lifetime_path(path)); return result; }
+        sem.LifetimeExpressionBinary binary = switch data {
+            .product(value) => value, .meet(value) => value, else => { assert(false); return null; },
+        };
+        guard self.memory.child(self.store, self.query, child, 0) is .some(left) else { return null; }
+        guard self.memory.child(self.store, self.query, child, 1) is .some(right) else { return null; }
+        self.memory.set_data(left, .reflected_lifetime_expression(self.store.model.lifetime_expression(binary.left).data));
+        self.memory.set_data(right, .reflected_lifetime_expression(self.store.model.lifetime_expression(binary.right).data));
+        return result;
+    }
+
+    Int? lifetime_path(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        guard self.memory.get(args[0]).data is .reflected_lifetime_path(path) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == 6) {
+            Int kind = switch path.kind { .named_lifetime => 0, .self_lifetime => 1, .return_lifetime => 2 };
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(kind)));
+        }
+        if (property == 7) {
+            return self.memory.import_string(self.store, self.query, result_type, path.symbol$.some());
+        }
+        Int count! = 0;
+        sem.LifetimePathId? cursor! = path.projection_path;
+        while (cursor is .some(id)) { count = count + 1; cursor = self.store.model.lifetime_path_node(id).parent; }
+        if (property == 8) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "lifetime path index is out of bounds");
+            return null;
+        }
+        cursor = path.projection_path;
+        Int skip! = count - index - 1;
+        while (skip > 0) { cursor = self.store.model.lifetime_path_node(cursor$.some()).parent; skip = skip - 1; }
+        _ projection = self.store.model.lifetime_path_node(cursor$.some()).projection;
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        UInt8[]& name = if projection.kind == .field { "named" } else { "tuple_index" };
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(child) else { return null; }
+        qid.TypeId child_type = self.memory.get(child).type_id;
+        Int? value!;
+        if (projection.kind == .field) {
+            value = self.memory.import_string(self.store, self.query, child_type, projection.symbol$.some());
+        } else {
+            value = self.memory.scalar(value.ComptimeValue(type_id: child_type, data: .int_value(projection.tuple_index)));
+        }
+        guard value is .some(source) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, child, source)) { return null; }
+        return result;
+    }
+
+    #doc region 查询保留模型中的 schema 和直接关系；类型环境只用于泛型 shape 来源替换。
+    Int? reflect_regions(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int property) {
+        if (self.reflection_root == null || args.length != (if property == 3 || property == 8 { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required", "regions require compile-time reflection");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == 0) {
+            guard self.declaration_handle(args[0]) is .some(handle) else { return null; }
+            guard self.memory.get(handle).data is .reflected_definition(owner, owner_type) else { return null; }
+            return self.region_view(owner, owner_type, -1, result_type);
+        }
+        if (property == 1) {
+            guard self.memory.get(args[0]).data is .reflected_type(type) else { return null; }
+            guard self.store.types.named_type_def(type) is .some(owner) else { return null; }
+            return self.region_view(owner, type, -1, result_type);
+        }
+        if (property == 2 || property == 3) {
+            return self.region_element(function_def, args, span, property == 3);
+        }
+        guard self.memory.get(args[0]).data is .reflected_region(owner, index, owner_type) else { return null; }
+        _ region = self.store.model.def_region_param_at(owner, index);
+        if (property == 4) { return self.memory.import_string(self.store, self.query, result_type, region.name); }
+        if (property == 7) { return self.region_view(owner, owner_type, index, result_type); }
+        if (property == 8) {
+            guard self.memory.get(args[1]).data is .reflected_region(other, position, other_type) else { return null; }
+            Bool equal = owner == other && index == position && self.reflection_context_equal(owner_type, other_type);
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(equal)));
+        }
+        qid.SymbolId? source = if property == 5 { region.shape_source } else { region.default_source };
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, source != null) is .some(payload) else { return null; }
+        guard source is .some(name) else { return result; }
+        if (property == 6) {
+            Int source_index = self.region_index(owner, name);
+            self.memory.set_data(payload, .reflected_region(owner, source_index, owner_type));
+            return result;
+        }
+        if (!self.reflection_signature_ready(function_def, owner, span)) { return null; }
+        Int parameter! = 0;
+        while (parameter < self.store.model.def_generic_param_count(owner)) {
+            qid.DefId definition = self.store.model.def_generic_param_at(owner, parameter);
+            parameter = parameter + 1;
+            if (self.store.defs.get(definition).name.symbol != name) { continue; }
+            qid.TypeId symbolic = self.store.types.named_type_for_def(definition)$.some();
+            qid.TypeId concrete = self.reflected_member_type(symbolic, owner_type);
+            self.memory.set_data(payload, .reflected_type(concrete));
+            return result;
+        }
+        assert(false);
+        return null;
+    }
+
+    Int? region_view(Self&! self, qid.DefId owner, qid.TypeId? owner_type, Int target, qid.TypeId result_type) {
+        self.observe_declaration_type(owner, .regions);
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_regions(owner, owner_type, target));
+        return result;
+    }
+
+    Int region_index(self, qid.DefId owner, qid.SymbolId name) {
+        Int index! = 0;
+        while (index < self.store.model.def_region_param_count(owner)) {
+            if (self.store.model.def_region_param_at(owner, index).name == name) { return index; }
+            index = index + 1;
+        }
+        assert(false);
+        return 0;
+    }
+
+    Int? region_element(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element) {
+        guard self.memory.get(args[0]).data is .reflected_regions(owner, owner_type, target) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        Int requested! = -1;
+        if (element) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            requested = index;
+        }
+        Int count! = self.store.model.def_region_param_count(owner);
+        Int selected! = requested;
+        if (target >= 0) {
+            count = 0;
+            qid.SymbolId name = self.store.model.def_region_param_at(owner, target).name;
+            Int index! = 0;
+            while (index < self.store.model.def_region_constraint_count(owner)) {
+                _ constraint = self.store.model.def_region_constraint_at(owner, index);
+                index = index + 1;
+                if (constraint.target != name) { continue; }
+                if (count == requested) { selected = self.region_index(owner, constraint.source); }
+                count = count + 1;
+            }
+        }
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(count)));
+        }
+        if (requested < 0 || requested >= count) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "region view index is out of bounds");
+            return null;
+        }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_region(owner, selected, owner_type));
+        return result;
+    }
+
+    Int? domain_value(Self&! self, types.DomainEffect? domain, qid.TypeId result_type) {
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, domain != null) is .some(payload) else { return null; }
+        if (domain is .some(value)) { self.memory.set_data(payload, .reflected_domain(value)); }
+        return result;
+    }
+
+    #doc 域身份直接读取规范函数类型；不会求值域初始化器或创建运行期 executor。
+    Int? reflect_domain(Self&! self, qid.DefId function_def, Int[]& args, Int property) {
+        if (self.reflection_root == null || args.length != (if property == 3 { 2 } else { 1 })) { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == 0) {
+            guard self.memory.get(args[0]).data is .reflected_type(subject) else { return null; }
+            guard self.store.types.get(subject).data is .function_type(function) else { return null; }
+            return self.domain_value(function.effects.domain, result_type);
+        }
+        guard self.memory.get(args[0]).data is .reflected_domain(domain) else { return null; }
+        if (property == 1) { return self.type_value(domain.domain_type, result_type); }
+        if (property == 3) {
+            guard self.memory.get(args[1]).data is .reflected_domain(other) else { return null; }
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type,
+                data: .bool_value(domain.binding == other.binding)));
+        }
+        Bool visible = self.reflection_type_definition_visible(domain.binding);
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, visible) is .some(payload) else { return null; }
+        if (visible) {
+            qid.TypeId declaration_type = self.memory.get(payload).type_id;
+            guard self.declaration_value(domain.binding, declaration_type) is .some(decl) else { return null; }
+            if (!self.memory.copy_into(self.store, self.query, payload, decl)) { return null; }
+        }
+        return result;
+    }
+
+    Int? reflect_sentinel(Self&! self, qid.DefId function_def, Int[]& args) {
+        if (self.reflection_root == null || args.length != 1) { return null; }
+        guard self.memory.get(args[0]).data is .reflected_type(subject) else { return null; }
+        types.Sentinel? sentinel = switch self.store.types.get(subject).data {
+            .array_type(array) => array.sentinel,
+            .slice_value_type(slice) => slice.sentinel,
+            .handle_type(handle) => handle.sentinel,
+            else => null,
+        };
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, sentinel != null) is .some(payload) else { return null; }
+        if (sentinel is .some(value)) { self.memory.set_data(payload, .reflected_constant(value.value, null)); }
+        return result;
+    }
+
+    #doc 枚举已有名义类型的混合实参；常量句柄只保留稳定存储中的值引用和可选命名绑定。
+    Int? reflect_arguments(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Bool element) {
+        if (self.reflection_root == null || args.length != (if element { 2 } else { 1 })) { return null; }
+        guard self.memory.get(args[0]).data is .reflected_type(subject) else { return null; }
+        guard self.store.types.get(subject).data is .named(named) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (!element) {
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(named.args.length)));
+        }
+        guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+        if (index < 0 || index >= named.args.length) {
+            self.fail(function_def, span, "reflection_index_out_of_bounds", "generic argument index is out of bounds");
+            return null;
+        }
+        _ argument = named.args[index];
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        UInt8[]& name = if argument is .type_arg(_) { "type" } else { "constant" };
+        guard self.reflection_enum_payload(result, name) is .some(payload) else { return null; }
+        guard self.memory.child(self.store, self.query, payload, 0) is .some(handle) else { return null; }
+        switch argument {
+            .type_arg(type) => { self.memory.set_data(handle, .reflected_type(type.value)); },
+            .const_arg(constant) => {
+                self.memory.set_data(handle, .reflected_constant(constant.value, constant.binding_def));
+            },
+        }
+        return result;
+    }
+
+    #doc 返回 enum payload 的逻辑位置；tag 与布局仍由语义定义和目标 layout 决定。
+    Int? reflection_enum_payload(Self&! self, Int result, UInt8[]& case_name) {
+        qid.TypeId type_id = self.memory.get(result).type_id;
+        qid.DefId owner = self.store.types.named_type_def(type_id)$.some();
+        qid.SymbolId name = self.store.symbols.intern(case_name);
+        Int index! = 0;
+        while (index < self.store.model.def_member_count(owner)) {
+            qid.DefId member = self.store.model.def_member_at(owner, index);
+            index = index + 1;
+            if (self.store.defs.get(member).name.symbol != name) { continue; }
+            guard self.memory.field(self.store, self.query, result, member) is .some(payload) else { return null; }
+            guard self.memory.get(result).data is .aggregate(start, _) else { return null; }
+            if (!self.memory.select_payload(self.store, self.query, result, payload - start)) { return null; }
+            Int tag = self.store.typeck.enum_case_value(member)$.some();
+            guard integer.from_bits(self.store, self.query, self.memory.get(start).type_id, UInt64(tag))
+                is .some(value) else { return null; }
+            self.memory.set_data(start, .scalar(value.data));
+            return payload;
+        }
+        return null;
+    }
+
+    Int? reflect_constant(Self&! self, qid.DefId function_def, types.GenericArg[]& generics,
+        Int[]& args, token.Span span, Int property, qid.TypeId? expected_result
+    ) {
+        if (self.reflection_root == null || args.length != 1) { return null; }
+        guard self.memory.get(args[0]).data is .reflected_constant(constant, binding) else { return null; }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (binding is .some(definition)) {
+            if (property == 0) { self.observe_declaration_type(definition, .declaration); }
+            if (property == 3) { self.observe_declaration_type(definition, .constant_value); }
+        }
+        if (property == 0) { return self.type_value(constant.type_id, result_type); }
+        if (property == 3) { return self.read_reflected_constant(function_def, generics, constant, span, expected_result); }
+        qid.DefId? definition! = null;
+        if (property == 1) {
+            if (constant.data is .const_param_value(parameter)) { definition = parameter; }
+        } else if (binding is .some(named)) {
+            if (self.reflection_type_definition_visible(named)) { definition = named; }
+        }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, definition != null) is .some(payload) else { return null; }
+        if (definition is .some(named)) {
+            if (property == 1) { self.memory.set_data(payload, .reflected_definition(named, null)); }
+            else {
+                qid.TypeId declaration_type = self.memory.get(payload).type_id;
+                guard self.declaration_value(named, declaration_type) is .some(decl) else { return null; }
+                if (!self.memory.copy_into(self.store, self.query, payload, decl)) { return null; }
+            }
+        }
+        return result;
+    }
+
+    #doc optional 的空值只初始化 tag；有值时返回已有布局中的 payload 位置。
+    Int? reflection_optional_payload(Self&! self, Int result, Bool present) {
+        if (!self.memory.select_payload(self.store, self.query, result, if present { 1 } else { 0 })) { return null; }
+        guard self.memory.child(self.store, self.query, result, 0) is .some(tag) else { return null; }
+        self.memory.set_data(tag, .scalar(.bool_value(present)));
+        if (!present) { return result; }
+        return self.memory.child(self.store, self.query, result, 1);
+    }
+
+    Int? read_reflected_constant(Self&! self, qid.DefId function_def, types.GenericArg[]& generics,
+        value.ComptimeValue constant, token.Span span, qid.TypeId? expected_result
+    ) {
+        if (generics.length != 1) { return null; }
+        guard generics[0] is .type_arg(expected) else { return null; }
+        qid.TypeId result_type = self.concrete_builtin_result(function_def, generics, expected_result);
+        Bool present = self.store.types.same_type(expected.value, constant.type_id)
+            && !(constant.data is .const_param_value(_));
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        guard self.reflection_optional_payload(result, present) is .some(payload) else { return null; }
+        if (!present) { return result; }
+        guard self.memory.import_constant(self.store, self.query, constant) is .some(data) else {
+            self.fail(function_def, span, "reflection_constant_unavailable", "constant value cannot be read");
+            return null;
+        }
+        qid.TypeId reference_type = self.memory.get(payload).type_id;
+        guard self.memory.reference(reference_type, data) is .some(reference) else { return null; }
+        if (!self.memory.copy_into(self.store, self.query, payload, reference)) { return null; }
+        return result;
+    }
+
+    #doc 类型结构读取既有 canonical Type；不触发 Sema，也不把内部环境和私有定义展开成用户模型。
+    Int? reflect_type_structure(Self&! self, qid.DefId function_def, Int[]& args, token.Span span, Int operation) {
+        if (self.reflection_root == null || args.length == 0) {
+            self.fail(function_def, span, "reflection_context_required", "type shape requires compile-time reflection");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_type(subject) else { return null; }
+        _ data = self.store.types.get(subject).data;
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (operation == 0) {
+            Int kind = self.reflection_type_kind(data);
+            if (kind < 0) {
+                self.fail(function_def, span, "comptime_dependency_not_ready", "type shape is not ready");
+                return null;
+            }
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(kind)));
+        }
+        if (operation == 1) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(property)) else { return null; }
+            Int number = self.reflection_type_number(subject, data, property);
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(number)));
+        }
+        if (operation == 2) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(role)) else { return null; }
+            guard self.memory.get(args[2]).data is .scalar(.int_value(index)) else { return null; }
+            guard self.reflection_type_element(data, role, index) is .some(element) else {
+                self.fail(function_def, span, "reflection_index_out_of_bounds", "type view index is out of bounds");
+                return null;
+            }
+            return self.type_value(element, result_type);
+        }
+        qid.DefId definition!;
+        if (data is .named(named)) { definition = named.def_id; }
+        else if (data is .array_type(array)) { definition = array.count_param$.some(); }
+        else { return null; }
+        if (operation == 3) { return self.declaration_value(definition, result_type); }
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_definition(definition, null));
+        return result;
+    }
+
+    Int reflection_type_kind(self, types.TypeData data) {
+        switch data {
+            .invalid => { return -1; }, .never => { return 1; }, .unit => { return 2; },
+            .bool_type => { return 3; }, .char_type => { return 4; }, .int_type(_) => { return 5; },
+            .float_type(_) => { return 6; },
+            .named(named) => {
+                if (!self.reflection_type_definition_visible(named.def_id)) { return 0; }
+                return if self.store.defs.get(named.def_id).kind == .generic_param_def { 16 } else { 7 };
+            },
+            .optional(_) => { return 8; }, .error_union(_) => { return 9; }, .handle_type(_) => { return 10; },
+            .array_type(_) => { return 11; }, .slice_value_type(_) => { return 12; }, .tuple_type(_) => { return 13; },
+            .function_type(_) => { return 14; }, .task_type(_) => { return 15; }, else => { return 0; },
+        }
+    }
+    Bool reflection_type_definition_visible(self, qid.DefId definition) {
+        _ record = self.store.defs.get(definition);
+        qid.ModuleId root = self.reflection_root$.some();
+        if (self.store.resolve.module_ref(record.module_id$.some()).package_id
+            == self.store.resolve.module_ref(root).package_id) { return true; }
+        if (record.kind == .generic_param_def && record.owner_def is .some(owner)) {
+            return self.reflection_type_definition_visible(owner);
+        }
+        self.observe_declaration_signature(definition);
+        return record.visibility == .public_visibility;
+    }
+    Int reflection_type_number(self, qid.TypeId subject, types.TypeData data, Int property) {
+        switch data {
+            .int_type(info) => {
+                if (property == 0) { return integer.width(self.store, self.query, subject); }
+                return if info.signed { 1 } else { 0 };
+            },
+            .float_type(number) => { return number.bits; },
+            .handle_type(handle) => { return Int(handle.kind); },
+            .array_type(array) => {
+                if (property == 3) { return array.count; }
+                return if array.count_param != null { 1 } else { 0 };
+            },
+            .tuple_type(tuple) => { return tuple.items.length; },
+            .function_type(function) => {
+                if (property == 5) { return function.params.length; }
+                if (property == 6) { return if function.effects.has_async { 1 } else { 0 }; }
+                if (property == 7) { return if function.effects.has_unsafe { 1 } else { 0 }; }
+                if (property == 8) { return Int(function.kind); }
+                return Int(function.call_ownership);
+            },
+            else => { return 0; },
+        }
+    }
+    qid.TypeId? reflection_type_element(self, types.TypeData data, Int role, Int index) {
+        if (index < 0) { return null; }
+        switch data {
+            .optional(optional) => { return if index == 0 { optional.element } else { null }; },
+            .error_union(union) => {
+                if (index == 0) { return union.value; }
+                return if index == 1 { union.error } else { null };
+            },
+            .handle_type(handle) => { return if index == 0 { handle.element } else { null }; },
+            .array_type(array) => { return if index == 0 { array.element } else { null }; },
+            .slice_value_type(slice) => { return if index == 0 { slice.element } else { null }; },
+            .tuple_type(tuple) => { return if index < tuple.items.length { tuple.items[index] } else { null }; },
+            .function_type(function) => {
+                if (role == 1) { return function.result; }
+                return if index < function.params.length { function.params[index] } else { null };
+            },
+            .task_type(task) => { return if index == 0 { task.result } else { null }; },
+            else => { return null; },
+        }
+    }
+
+    #doc 类型查询只消费完成的签名；重入签名属于编译期依赖循环，不能用临时 invalid 类型产生常量。
+    Bool reflection_signature_ready(
+        Self&! self, qid.DefId function_def, qid.DefId definition, token.Span span
+    ) {
+        if (self.query.type_check_signature.ready(definition)) { return true; }
+        if (self.query.type_check_signature.checking(definition)) {
+            self.fail(function_def, span, "comptime_dependency_cycle",
+                "reflection depends on a declaration whose signature is being checked");
+        } else {
+            self.fail(function_def, span, "comptime_dependency_not_ready",
+                "reflection requires the declaration signature to be checked before evaluation");
+        }
+        if (self.store.source_map.def_span(definition) is .some(location)) {
+            qid.ModuleId module = self.store.defs.get(definition).module_id$.some();
+            source.SourceId source_id = if (location.source_id is .some(id)) { id }
+                else { self.store.resolve.module_ref(module).source_id };
+            Int index = self.store.diagnostics.len() - 1;
+            self.store.diagnostics.items.mut_ref_at(index).add_related(diagnostic.DiagnosticRelatedInformation(
+                diagnostic.SourceRange(source_id, location.span), "required declaration signature"));
+        }
+        return false;
+    }
+
+    #doc 实参替换复用语义类型系统；按参数 DefId 绑定，不捕获方法自己声明的同名泛型参数。
+    qid.TypeId reflected_member_type(self, qid.TypeId template_type, qid.TypeId? owner_type) {
+        guard owner_type is .some(owner) else { return template_type; }
+        guard self.store.types.get(owner).data is .named(named) else { return template_type; }
+        return bindings.type_for_instance(self.store.defs$.ref(), self.store.model$.ref(), self.store.types$.ref(),
+            named.def_id, template_type, named.args);
+    }
+
+    Bool reflection_context_equal(self, qid.TypeId? lhs, qid.TypeId? rhs) {
+        if (lhs is .some(left)) {
+            guard rhs is .some(right) else { return false; }
+            return self.store.types.same_type(left, right);
+        }
+        return rhs == null;
+    }
+
+    Int? reflect_type_members(Self&! self, qid.DefId function_def, Int[]& args, token.Span span) {
+        if (self.reflection_root == null || args.length != 1) {
+            self.fail(function_def, span, "reflection_context_required",
+                "type member queries require a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_type(subject) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned type handle");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (self.store.types.get(subject).data is .named(named)) {
+            qid.TypeId? environment = if named.args.length == 0 { null } else { subject };
+            return self.declaration_view(named.def_id, result_type, false, environment);
+        }
+        // 非名义类型没有声明来源，其成员集合恒为空；外包私有名义类型由带身份的查询过滤。
+        guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+        self.memory.set_data(result, .reflected_declarations(null, true, false, null));
+        return result;
+    }
+
+    #doc 读取已检查签名；显式参数索引跳过隐式 receiver，不准备或执行被查询函数的 body。
+    Int? reflect_function(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, FunctionProperty property
+    ) {
+        if (self.reflection_root == null || args.length != (if property == .parameter_at { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "signature queries require a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_definition(definition, owner_type) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned function handle");
+            return null;
+        }
+        _ signature = self.store.model.def_ref(definition).decl.function_signature$.some();
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == .result || property == .domain || property == .contract) {
+            if (!self.reflection_signature_ready(function_def, definition, span)) { return null; }
+            qid.TypeId type_id = self.store.typeck.def_type(definition)$.some();
+            qid.TypeId concrete = self.reflected_member_type(type_id, owner_type);
+            guard self.store.types.get(concrete).data is .function_type(function) else { return null; }
+            if (property == .contract) {
+                qid.ModuleId use_module = if self.generator_module is .some(module) { module }
+                    else { self.reflection_root$.some() };
+                self.query.observe_declaration_signature(self.store, use_module, definition, self.generating);
+                self.observe_declaration_type(definition, .declaration);
+                return self.contract_value(function.lifetime_contract, signature.has_receiver, result_type);
+            }
+            if (property == .domain) {
+                self.observe_declaration_type(definition, .domain);
+                return self.domain_value(function.effects.domain, result_type);
+            }
+            self.observe_declaration_type(definition, .result);
+            return self.type_value(function.result, result_type);
+        }
+        if (property == .receiver) {
+            self.observe_declaration_signature(definition);
+            Int kind! = 0;
+            if (signature.has_receiver) {
+                kind = switch signature.receiver_mode {
+                    .ref_receiver => 1, .mutable_ref_receiver => 2, .move_receiver => 3,
+                };
+            }
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .int_value(kind)));
+        }
+        if (property == .parameter_count) {
+            self.observe_declaration_signature(definition);
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type,
+                data: .int_value(signature.params.length)));
+        }
+        if (property == .parameter_at) {
+            guard self.memory.get(args[1]).data is .scalar(.int_value(index)) else { return null; }
+            if (index < 0 || index >= signature.params.length) {
+                self.fail(function_def, span, "reflection_index_out_of_bounds",
+                    "parameter view index is out of bounds");
+                return null;
+            }
+            self.observe_declaration_signature(definition);
+            guard self.memory.allocate(result_type, .reflection) is .some(result) else { return null; }
+            self.memory.set_data(result, .reflected_parameter(definition, index, owner_type));
+            return result;
+        }
+        self.observe_declaration_signature(definition);
+        Bool flag = if property == .has_body { signature.has_body }
+            else if property == .async_flag { signature.effects.has_async } else { signature.effects.has_unsafe };
+        return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(flag)));
+    }
+
+    Int? reflect_parameter(
+        Self&! self, qid.DefId function_def, Int[]& args, token.Span span, ParameterProperty property
+    ) {
+        if (self.reflection_root == null || args.length != (if property == .equal { 2 } else { 1 })) {
+            self.fail(function_def, span, "reflection_context_required",
+                "parameter queries require a compile-time reflection context");
+            return null;
+        }
+        guard self.memory.get(args[0]).data is .reflected_parameter(definition, index, owner_type) else {
+            self.fail(function_def, span, "reflection_invalid_handle", "expected a compiler-owned parameter handle");
+            return null;
+        }
+        qid.TypeId result_type = self.builtin_result_type(function_def);
+        if (property == .equal) {
+            guard self.memory.get(args[1]).data is .reflected_parameter(other, other_index, other_type) else {
+                return null;
+            }
+            Bool equal = definition == other && index == other_index
+                && self.reflection_context_equal(owner_type, other_type);
+            return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(equal)));
+        }
+        _ signature = self.store.model.def_ref(definition).decl.function_signature$.some();
+        if (property == .name) {
+            self.observe_declaration_signature(definition);
+            return self.memory.import_string(self.store, self.query, result_type, signature.param_symbols[index]);
+        }
+        if (property == .type) {
+            if (!self.reflection_signature_ready(function_def, definition, span)) { return null; }
+            self.observe_declaration_type(definition, .parameter, index);
+            qid.TypeId type_id = self.store.typeck.def_type(definition)$.some();
+            guard self.store.types.get(type_id).data is .function_type(function) else { return null; }
+            Int position = index + (if signature.has_receiver { 1 } else { 0 });
+            return self.type_value(self.reflected_member_type(function.params[position], owner_type), result_type);
+        }
+        self.observe_declaration_signature(definition);
+        Bool has_default! = false;
+        for item in signature.param_defaults { if (item.param_index == index) { has_default = true; } }
+        return self.memory.scalar(value.ComptimeValue(type_id: result_type, data: .bool_value(has_default)));
+    }
+
+    #doc 热路径直接使用 JIL 调用签名中的结果类型；没有调用点的求值入口才进行实例替换。
+    qid.TypeId concrete_builtin_result(self, qid.DefId function_def, types.GenericArg[]& generics,
+        qid.TypeId? expected_result
+    ) {
+        if (expected_result is .some(type_id)) { return type_id; }
+        return bindings.type_for_instance(self.store.defs$.ref(), self.store.model$.ref(), self.store.types$.ref(),
+            function_def, self.builtin_result_type(function_def), generics);
+    }
+
+    qid.TypeId builtin_result_type(self, qid.DefId function_def) {
+        qid.TypeId type_id = self.store.typeck.def_type(function_def)$.some();
+        guard self.store.types.get(type_id).data is .function_type(signature) else { assert(false); return type_id; }
+        return signature.result;
     }
 
     Int? call_generated(Self&! self, jil.FunctionId id, Int[]& args, token.Span span) {
@@ -184,19 +2984,64 @@ struct Executor: Movable {
         return self.execute(function, empty, args);
     }
 
+    #doc 仅显式诊断时输出分配来源，既有编译期结果和缓存身份不依赖统计开关。
+    Void report_memory_stats(self) {
+        if (system_env.get("JIANG_JIL_EVAL_STATS") == null) { return; }
+        UInt8[]&[7] names = ["temporary", "frame", "local", "copy", "aggregate", "heap", "reflection"];
+        std.StringBuilder text! = std.StringBuilder();
+        text.append("jil_eval_cells");
+        Int index! = 0;
+        while (index < 7) {
+            text.append(" "); text.append(names[index]); text.append("=");
+            text.append(self.memory.allocations[index]);
+            text.append(" "); text.append(names[index]); text.append("_live=");
+            text.append(self.memory.live_by_kind[index]);
+            text.append(" "); text.append(names[index]); text.append("_peak=");
+            text.append(self.memory.peak_by_kind[index]); index += 1;
+        }
+        text.append(" live="); text.append(self.memory.live_cells);
+        text.append(" peak_live="); text.append(self.memory.peak_live_cells);
+        text.append(" created_types=");
+        text.append(self.store.types.types.next_id().to_index() - self.initial_type_count);
+        text.append(" retained_bytes="); text.append(self.memory.retained_bytes());
+        text.append(" cell_bytes="); text.append(memory_api.Cell$.size());
+        text.append("\n"); system_io.stderr().write_all(text.slice());
+    }
+
     Int? execute(Self&! self, jil.Function function, bindings.GenericBindings concrete, Int[]& args) {
         if (self.depth >= self.depth_limit) {
             self.fail(jil.function_provenance_def(function.origin), function.span,
                 "comptime_recursion_limit", "JIL evaluation exceeded recursion limit");
             return null;
         }
+        Int local_count = function.body.locals.length;
+        if (!self.memory.reserve_frame(local_count)) {
+            self.fail(jil.function_provenance_def(function.origin), function.span,
+                "comptime_memory_limit", "cannot allocate JIL frame locals");
+            return null;
+        }
         frame_api.Frame frame! = frame_api.Frame(function, concrete);
-        if (!self.allocate_frame(frame$.mut_ref())) { return null; }
-        if (!self.bind_parameters(frame$.mut_ref(), args)) { return null; }
+        guard self.memory.begin_scope() is .some(scope) else {
+            self.frame_error(frame$.ref(), "comptime_memory_limit", "cannot allocate JIL frame metadata");
+            self.memory.release_frame(local_count);
+            return null;
+        }
+        frame.scope = scope;
+        if (!self.allocate_frame(frame$.mut_ref()) || !self.bind_parameters(frame$.mut_ref(), args)) {
+            self.memory.end_scope();
+            self.memory.release_frame(local_count);
+            return null;
+        }
         self.depth = self.depth + 1;
-        Int? result = self.run(frame$.mut_ref());
+        Int? result! = self.run(frame$.mut_ref());
+        if (self.memory.allocation_failed && !self.failed) {
+            self.frame_error(frame$.ref(), "comptime_memory_limit", "JIL eval memory limit exceeded");
+        }
+        if (self.failed) { result = null; }
         self.depth = self.depth - 1;
-        self.release_frame(frame$.ref());
+        if (result is .some(address)) { self.memory.transfer(address, frame.scope - 1); }
+        self.memory.end_scope();
+        self.memory.release_frame(local_count);
         return result;
     }
 
@@ -205,7 +3050,7 @@ struct Executor: Movable {
         Int index! = 0;
         while (index < frame.function.body.locals.length) {
             qid.TypeId type_id = reader.type_id(frame.function.body.locals[index].type_id);
-            guard self.memory.allocate(type_id) is .some(address) else {
+            guard self.memory.allocate(type_id, .frame) is .some(address) else {
                 self.frame_error(frame, "comptime_memory_limit", "JIL eval memory limit exceeded");
                 return false;
             }
@@ -213,14 +3058,6 @@ struct Executor: Movable {
             index = index + 1;
         }
         return true;
-    }
-
-    Void release_frame(Self&! self, frame_api.Frame& frame) {
-        Int index! = 0;
-        while (index < frame.locals.len()) {
-            self.memory.set_live(frame.locals.get(index), false);
-            index = index + 1;
-        }
     }
 
     Bool program_ready(self) {
@@ -237,7 +3074,7 @@ struct Executor: Movable {
                 if (self.store.borrowck.source_function_checked(index)) { return true; }
             }
         }
-        self.fail(def_id, span, "comptime_function_not_ready",
+        self.fail(def_id, self.store.defs.get(def_id).name.span, "comptime_function_not_ready",
             "JIL function must be lowered and borrow checked before eval");
         return false;
     }
@@ -294,8 +3131,14 @@ struct Executor: Movable {
                 }
                 return self.local(frame, frame.function.body.return_local);
             }
-            guard self.successor(frame, block.terminator) is .some(target) else { return null; }
-            next = target;
+            if (self.memory.begin_scope() == null) {
+                self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL temporary metadata");
+                return null;
+            }
+            jil.BlockId? target = self.successor(frame, block.terminator);
+            self.memory.end_scope();
+            guard target is .some(block_id) else { return null; }
+            next = block_id;
         }
         return null;
     }
@@ -307,7 +3150,15 @@ struct Executor: Movable {
             frame.span = statement.span;
             index = index + 1;
             if (!self.tick(frame, statement.span)) { return; }
+            if (self.memory.begin_scope() == null) {
+                self.frame_error(frame, "comptime_memory_limit", "cannot allocate JIL temporary metadata");
+                return;
+            }
             self.statement(frame, statement);
+            self.memory.end_scope();
+            if (self.memory.allocation_failed && !self.failed) {
+                self.frame_error(frame, "comptime_memory_limit", "JIL eval memory limit exceeded");
+            }
         }
     }
 
@@ -317,6 +3168,16 @@ struct Executor: Movable {
             || statement.kind is .forget_stmt(_)) { return; }
         if (statement.kind is .assign_stmt(assign)) {
             qid.TypeId type_id = self.place_type(frame, assign.destination);
+            if (assign.value is .use_value(use) && use.value is .copy_operand(copy)) {
+                guard self.resolve_place(frame, copy.place) is .some(source) else { return; }
+                if (!self.memory.initialized(source)) {
+                    self.frame_error(frame, "comptime_uninitialized_value", "JIL eval read an uninitialized place");
+                    return;
+                }
+                guard self.use_value(frame, source, type_id) is .some(result) else { return; }
+                self.write(frame, assign.destination, result);
+                return;
+            }
             guard self.rvalue(frame, assign.value, type_id) is .some(result) else { return; }
             self.write(frame, assign.destination, result);
             return;
@@ -324,9 +3185,10 @@ struct Executor: Movable {
         if (statement.kind is .storage_live_stmt(live)) {
             Int local = live.local_id.to_index();
             Int previous = frame.locals.get(local);
-            qid.TypeId type_id = self.memory.get(previous).type_id;
+            reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
+            qid.TypeId type_id = reader.type_id(frame.function.body.locals[local].type_id);
             self.memory.set_live(previous, false);
-            guard self.memory.allocate(type_id) is .some(address) else {
+            guard self.memory.allocate_in(type_id, .local, frame.scope) is .some(address) else {
                 self.frame_error(frame, "comptime_memory_limit", "cannot start JIL local storage lifetime");
                 return;
             }
@@ -359,6 +3221,14 @@ struct Executor: Movable {
         if (terminator.kind is .assert_term(assert_term)) {
             guard self.condition(frame, assert_term.condition) is .some(condition) else { return null; }
             if (condition == assert_term.expected) { return assert_term.target; }
+            if (assert_term.message is .some(message)) {
+                guard self.operand(frame, message) is .some(address) else { return null; }
+                guard self.memory.read_byte_slice(self.store, address) is .some(bytes) else { return null; }
+                if (bytes.len() != 0) {
+                    self.fail(self.frame_def(frame), terminator.span, "comptime_assertion_failed", bytes.slice());
+                    return null;
+                }
+            }
             self.fail(self.frame_def(frame), terminator.span,
                 "comptime_assertion_failed", "assertion failed during JIL eval");
             return null;
@@ -458,12 +3328,12 @@ struct Executor: Movable {
         guard self.call_arguments(frame, call, signature) is .some(args) else { return false; }
         Int? result!;
         if (target.target is .source(def_id)) {
-            result = self.call(def_id, target.args.slice(), args.slice(), span);
+            result = self.call(def_id, target.args.slice(), args.slice(), span, signature.result);
         } else {
             guard target.target is .generated(generated) else { assert(false); return false; }
             result = self.call_generated(generated.id, args.slice(), span);
         }
-        guard result is .some(address) else { return false; }
+        guard result is .some(address) else { self.add_call_context(frame, span); return false; }
         return self.write(frame, call.destination, address);
     }
 
@@ -485,12 +3355,12 @@ struct Executor: Movable {
         Int? result!;
         if (item is .source_instance(identity)) {
             jil.InstanceKey instance = self.program.program.function_instance_at(identity);
-            result = self.call(instance.def_id, instance.args, args.slice(), span);
+            result = self.call(instance.def_id, instance.args, args.slice(), span, signature.result);
         } else {
             guard item is .generated_function(id) else { assert(false); return false; }
             result = self.call_generated(id, args.slice(), span);
         }
-        guard result is .some(value) else { return false; }
+        guard result is .some(value) else { self.add_call_context(frame, span); return false; }
         return self.write(frame, call.destination, value);
     }
 
@@ -515,6 +3385,8 @@ struct Executor: Movable {
 
     #doc 复用 JIL 的引用实参约定，在原 place 上借用，不先 move 再引用临时拷贝。
     Int? call_operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand, qid.TypeId parameter) {
+        // out 的引用类型已由调用签名确定，循环执行不向 TypeStore 重复追加等价类型。
+        if (operand is .out_operand(out)) { return self.reference(frame, out.place, parameter); }
         jil.Place? place! = null;
         if (operand is .copy_operand(copy)) { place = copy.place; }
         if (operand is .move_operand(move)) { place = move.place; }
@@ -591,26 +3463,33 @@ struct Executor: Movable {
             }
         }
         if (rvalue is .binary_value(binary)) {
-            guard self.operand(frame, binary.lhs) is .some(lhs) else { return null; }
-            guard self.operand(frame, binary.rhs) is .some(rhs) else { return null; }
+            value.ComptimeValue left;
+            value.ComptimeValue right;
             Bool structural = binary.op == .structural_eq || binary.op == .structural_ne;
-            if (structural) {
-                guard self.structural_equal(frame, lhs, rhs) is .some(equal) else { return null; }
-                return self.scalar_result(frame, value.ComptimeValue(
-                    type_id: result_type, data: .bool_value(equal == (binary.op == .structural_eq))
-                ));
-            }
-            if (binary.op == .eq || binary.op == .ne) {
-                if (self.reference_equal(lhs, rhs) is .some(equal)) {
-                    Bool result! = equal;
-                    if (binary.op == .ne) { result = !result; }
+            if (structural || binary.op == .eq || binary.op == .ne) {
+                guard self.operand(frame, binary.lhs) is .some(lhs) else { return null; }
+                guard self.operand(frame, binary.rhs) is .some(rhs) else { return null; }
+                if (structural) {
+                    guard self.structural_equal(frame, lhs, rhs) is .some(equal) else { return null; }
                     return self.scalar_result(frame, value.ComptimeValue(
-                        type_id: result_type, data: .bool_value(result)
+                        type_id: result_type, data: .bool_value(equal == (binary.op == .structural_eq))
                     ));
                 }
+                if (self.reference_equal(lhs, rhs) is .some(equal)) {
+                    return self.scalar_result(frame, value.ComptimeValue(
+                        type_id: result_type, data: .bool_value(equal == (binary.op == .eq))
+                    ));
+                }
+                guard self.scalar(frame, lhs) is .some(lhs_value) else { return null; }
+                guard self.scalar(frame, rhs) is .some(rhs_value) else { return null; }
+                left = lhs_value;
+                right = rhs_value;
+            } else {
+                guard self.scalar_operand(frame, binary.lhs) is .some(lhs_value) else { return null; }
+                guard self.scalar_operand(frame, binary.rhs) is .some(rhs_value) else { return null; }
+                left = lhs_value;
+                right = rhs_value;
             }
-            guard self.scalar(frame, lhs) is .some(left) else { return null; }
-            guard self.scalar(frame, rhs) is .some(right) else { return null; }
             value.ComptimeValue? result!;
             if (left.data is .float_bits(_)) {
                 result = floating.binary(self.store, binary.op, left, right, result_type);
@@ -802,9 +3681,9 @@ struct Executor: Movable {
         reader_api.InstanceReader reader = reader_api.InstanceReader(self.store$.ref(), frame.bindings$.ref());
         qid.TypeId element = reader.type_id(allocated.element_type);
         Bool sentinel = types.sentinel_has(self.slice_sentinel(result_type));
-        if (count < 0 || count >= self.memory.limit) {
+        if (count < 0 || (sentinel && count == 9223372036854775807)) {
             self.frame_error(frame, "comptime_invalid_allocation",
-                "JIL allocation count is negative or exceeds eval quota");
+                "JIL allocation count is negative or sentinel count overflows");
             return null;
         }
         Int storage_count! = count;
@@ -837,8 +3716,16 @@ struct Executor: Movable {
         guard self.memory.allocate(type_id) is .some(result) else { return null; }
         guard self.memory.child(self.store, self.query, result, 0) is .some(pointer) else { return null; }
         guard self.memory.child(self.store, self.query, result, 1) is .some(length) else { return null; }
-        guard self.memory.get(storage).data is .aggregate(first, _) else { return null; }
-        self.memory.set_data(pointer, .element_reference(storage, first, start));
+        if (self.memory.get(storage).data is .null_pointer) {
+            if (start != 0 || count != 0 || types.sentinel_has(self.slice_sentinel(type_id))) {
+                self.frame_error(frame, "comptime_invalid_slice", "null storage only supports an empty plain slice");
+                return null;
+            }
+            self.memory.set_data(pointer, .null_pointer);
+        } else {
+            guard self.memory.get(storage).data is .aggregate(first, _) else { return null; }
+            self.memory.set_data(pointer, .element_reference(storage, first, start));
+        }
         guard integer.from_bits(self.store, self.query, self.memory.get(length).type_id, UInt64(count))
             is .some(value) else { return null; }
         self.memory.set_data(length, .scalar(value.data));
@@ -854,13 +3741,17 @@ struct Executor: Movable {
         qid.TypeId base_type = self.memory.get(base).type_id;
         if (self.slice_element_type(base_type) != null) {
             guard self.memory.child(self.store, self.query, base, 0) is .some(pointer) else { return null; }
-            guard self.memory.get(pointer).data is .element_reference(root, first, index) else { return null; }
-            if (!self.sequence_live(frame, root, first)) { return null; }
-            storage = root;
-            offset = index;
             guard self.memory.child(self.store, self.query, base, 1) is .some(length) else { return null; }
             guard self.scalar(frame, length) is .some(value) else { return null; }
             count = Int(integer.bits(value)$.some());
+            if (self.memory.get(pointer).data is .null_pointer && count == 0) {
+                storage = pointer;
+            } else {
+                guard self.memory.get(pointer).data is .element_reference(root, first, index) else { return null; }
+                if (!self.sequence_live(frame, root, first)) { return null; }
+                storage = root;
+                offset = index;
+            }
         } else if (self.store.types.get(base_type).data is .array_type(array)) {
             if (!self.memory.ensure_aggregate(self.store, self.query, base)) { return null; }
             count = array.count;
@@ -870,6 +3761,9 @@ struct Executor: Movable {
             offset = index;
             guard self.memory.get(root).data is .aggregate(_, size) else { return null; }
             count = size - index;
+        } else if (self.memory.get(base).data is .null_pointer) {
+            // 空 Vector 的裸指针尚未分配；只能形成 [0..0]，不伪造可解引用的元素存储。
+            count = 0;
         } else {
             self.frame_error(frame, "comptime_invalid_slice", "JIL slice requires array or sequence storage");
             return null;
@@ -1274,7 +4168,7 @@ struct Executor: Movable {
                 else { return false; }
             stored = converted;
         }
-        if (self.memory.copy_into(self.store, self.query, address, stored)) { return true; }
+        if (self.memory.consume_into(self.store, self.query, address, stored)) { return true; }
         std.StringBuilder message! = std.StringBuilder();
         message.append("cannot assign value to JIL eval storage: type ");
         message.append(self.memory.get(result).type_id.to_index());
@@ -1742,7 +4636,29 @@ struct Executor: Movable {
         return true;
     }
 
+    #doc 标量操作数直接按值读取；move 仍消费原 place，类型视图转换复用既有路径。
     value.ComptimeValue? scalar_operand(Self&! self, frame_api.Frame&! frame, jil.Operand operand) {
+        jil.Place? place! = null;
+        if (operand is .copy_operand(copy)) { place = copy.place; }
+        if (operand is .move_operand(move)) { place = move.place; }
+        if (place is .some(source)) {
+            guard self.resolve_place(frame, source) is .some(address) else { return null; }
+            if (!self.memory.initialized(address)) {
+                self.frame_error(frame, "comptime_uninitialized_value", "JIL eval read an uninitialized scalar place");
+                return null;
+            }
+            guard self.scalar(frame, address) is .some(input) else { return null; }
+            if (self.store.types.same_type_ignoring_mutability(input.type_id, self.place_type(frame, source))) {
+                if (operand is .move_operand(_)) {
+                    if (self.memory.get(address).read_only) {
+                        self.frame_error(frame, "comptime_readonly_storage", "cannot move from static JIL storage");
+                        return null;
+                    }
+                    self.memory.clear_value(address);
+                }
+                return input;
+            }
+        }
         guard self.operand(frame, operand) is .some(address) else { return null; }
         return self.scalar(frame, address);
     }
@@ -1786,6 +4702,17 @@ struct Executor: Movable {
 
     qid.DefId frame_def(self, frame_api.Frame& frame) { return jil.function_provenance_def(frame.function.origin); }
 
+    #doc 求值失败沿真实调用帧回溯，保留跨文件／包的调用位置，不重建源码调用图。
+    Void add_call_context(Self&! self, frame_api.Frame& frame, token.Span span) {
+        if (!self.failed) { return; }
+        qid.DefId caller = self.frame_def(frame);
+        guard self.store.defs.get(caller).module_id is .some(module_id) else { return; }
+        source.SourceId source_id = self.store.resolve.module_ref(module_id).source_id;
+        Int index = self.store.diagnostics.len() - 1;
+        self.store.diagnostics.items.mut_ref_at(index).add_related(diagnostic.DiagnosticRelatedInformation(
+            diagnostic.SourceRange(source_id, span), "during compile-time call"));
+    }
+
     Void frame_error(Self&! self, frame_api.Frame& frame, UInt8[]& code, UInt8[]& message) {
         self.fail(self.frame_def(frame), frame.span, code, message);
     }
@@ -1797,8 +4724,14 @@ struct Executor: Movable {
         if (self.store.defs.get(def_id).module_id is .some(module_id)) {
             range = diagnostic.SourceRange(self.store.resolve.module_ref(module_id).source_id, span);
         }
+        UInt8[]& actual_code! = code;
+        UInt8[]& actual_message! = message;
+        if (self.memory.allocation_failed) {
+            actual_code = "comptime_memory_limit";
+            actual_message = "JIL eval memory limit exceeded";
+        }
         self.store.diagnostics.add(diagnostic.Diagnostic(
-            .error, .type_check, diagnostic.DiagnosticCode(code), range, message
+            .error, .type_check, diagnostic.DiagnosticCode(actual_code), range, actual_message
         ));
     }
 }

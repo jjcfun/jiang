@@ -75,7 +75,7 @@ Token 只表示词法事实，不承载语义类型。
 
 ## Lang Package / 自定义语法
 
-Jiang 的 lang invocation 使用 block 形式：
+Jiang 源码中的 lang invocation 使用 block 形式：
 
 ```jiang
 User user = #sql {
@@ -100,18 +100,19 @@ root = lang.jiang
 type = lang
 ```
 
-lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang.syntax.Provider`。
+lang package root 用 `@entry(lang)` 标记一个可无参数构造、满足 `std.jiang.syntax.Provider` 的具体类型。
+入口类型名称任意，可保持私有；标记不能附着 alias／重导出，也不从导入文件继承。
 编译器在 host 上把该 package 编译成 dynamic library，lexer/parser 在 syntax 阶段调用 provider。
 
 语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` provider 自己扫描
 line/block header）：
 
-- 只支持 block invocation：`#alias { ... }`。
+- Jiang 源码内使用 block invocation：`#alias { ... }`；独立 Lang 文件按扩展名选择 Provider。
 - 当前不支持 `#alias(...)`。
 - 当前不支持源码内声明多个 parser 入口。
 - 一个 lang package 只提供一个默认 provider。
 - provider 返回 opaque `Ast` 根句柄。compiler 根据 invocation 位置验证根节点的实际语法角色；当前支持
-  expression、statement、declaration/member、type、pattern 和 annotation 位置。
+  expression、statement、declaration/member、type、pattern 和 attribute 位置。
 - provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
 - DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
 - Provider 的 `import_expression()` 接收包名或文件路径字面量，构造返回 namespace 的表达式；
@@ -119,6 +120,12 @@ line/block header）：
 - Provider 的 `declarations()` 只组合声明，不引入作用域或执行。`comptime_block()` 接收局部语句
   和可选尾表达式，遵循普通 comptime 的词法作用域与求值规则；条件使用普通 `if_expression()` 组合，
   不提供向外发布分支声明的专用 comptime-if 机制。
+
+独立 Lang 文件采用普通文件 import，也可直接作为生成输入。Provider 在 `[lang] extensions` 声明
+扩展名，使用方通过 `[lang.<依赖别名>] extensions` 整组覆盖，未配置时默认使用依赖别名。
+映射只作用于文件所属包，`.jiang` 保留原生语法；无映射或映射冲突均报错，不猜测解析语言。
+文件 invocation 的 `Input.delimiter` 为 `.none`，`body_start` 为 0，扫描范围必须覆盖整个文件，
+结果必须是声明或声明集合。源码身份及位置保持原文件，不生成带有虚构前缀的包装源码。
 
 provider 有两个阶段：
 
@@ -133,12 +140,13 @@ lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`s
 compiler-owned `AstUnit`，最后只返回根节点 `Ast`；不公开 compiler AST data，也不建立 mirror tree。
 编译器内建 provider 包括 inline asm 和
 API 文档：`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
-`#jiang.doc` 生成 declaration annotation，`#doc(module)` 指向 module semantic owner。短名
+`#jiang.doc` 生成声明 attribute，`#doc(module)` 指向 module semantic owner。短名
 允许被用户的 lang dependency alias 覆盖，`#jiang.*` 始终选择 compiler builtin。
 
-API 文档正文保存规范化后的原始 Markdown。公开 module/declaration 文档写入 `.ji` 的
-独立可选 documentation section；该 section 不进入 interface、body、object 或 monomorph
-fingerprint。文档的浏览与输出形式尚未确定，不进入当前语言与 compiler CLI 设计。
+API 文档保存规范化的 Markdown，模块和声明分别拥有自身文档，具体实例沿用原始声明的文档。
+反射支持读取自身文档及枚举同包范围内带文档的目标，不进入函数体或沿类型引用递归，跨包查询遵守公开边界。
+文档不是类型或签名身份的一部分；实际读取文档的编译期计算及生成任务需要依赖其内容。
+未准备的文档不能视为没有文档。页面组织、渲染和二进制分发规则不属于文档附着本身的职责。
 
 这种机制的目标不是把 Jiang 变成文本宏语言，而是让不同领域可以使用更适合的表面语法，例如
 SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态化和 backend 仍由 Jiang 编译器统一处理。
@@ -202,7 +210,7 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable result，只能出现在函数、方法和 callable 类型的返回位。
 - 错误类型 `E` 顶层不能带 `?` 或 `!`。
-- `T@E` 两侧不允许空白，避免与前缀 annotation 和普通表达式混淆。
+- `T@E` 两侧不允许空白，避免与前缀 attribute 和普通表达式混淆。
 
 内建后缀类型语法不经过普通名字解析，compiler-owned constructor 名称也不进入用户可见
 namespace。用户仍可声明同名 nominal type，但不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
@@ -495,9 +503,9 @@ a.length; // 编译错误：a 已经 move
 与重叠共享/可变引用并存，也会阻止通过来源 place 绕过该借用直接访问。引用最后一次
 使用后，来源 place 可以恢复访问。
 
-生命周期来源约束使用 `@life(...)` leading annotation 表达，并统一写成
+生命周期来源约束使用 `@life(...)` leading attribute 表达，并统一写成
 `target: source`。例如 `@life(return: input)` 表示返回值的 lifetime shape 由 `input`
-覆盖。每个 target 在一条 annotation 中必须唯一；同 Shape 的多个候选来源使用
+覆盖。每个 target 在一条 attribute 中必须唯一；同 Shape 的多个候选来源使用
 `left & right` 逐位取得共同最短 region，多-slot source 使用 `(left, right)` 构造
 product shape。
 `@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，
@@ -513,7 +521,7 @@ product shape。
 
 struct / payload enum 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
 region，`target: source` 在声明 target 的同时表示 source 覆盖 target。每个 target 在
-annotation 中只出现一次，source 必须由同一 annotation 的其他 item 声明，但可以位于 target
+attribute 中只出现一次，source 必须由同一 attribute 的其他 item 声明，但可以位于 target
 之前或之后。coverage 可以成环，例如 `a: b, b: a` 表示两个 region 互相覆盖。每个 public
 region 必须由字段或 enum payload 的实际 lifetime slot 直接使用，不支持 phantom region：
 
@@ -598,6 +606,11 @@ Fn 作为函数参数或返回值时使用同一套命名位置规则；根分�
 共用该 contract；
 closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动态派发和 RawFn/Fn adapter
 同样必须把 contract 映射到 JIL 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
+
+lifetime 契约参与约束检查，不参与类型身份；相同参数类型不能仅因 lifetime 契约不同构成重载，
+这一规则同样适用于参数内部的 `Fn` / `RawFn` 契约。类型相同并不自动代表值满足目标契约：
+函数值赋值、参数传递和 trait 实现仍检查契约兼容性。稳定类型 key 不包含 lifetime 契约；
+需要观察契约内容的反射与缓存依赖使用独立的契约指纹。
 
 裸 `Fn<R, Args...>` / `RawFn<R, Args...>` 的默认返回契约为空。它等价于把 `R` 固定在参数
 lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数的 signature
@@ -713,6 +726,8 @@ Task cancellation 不复用 panic。
 顶层 `const` 是编译期常量声明。initializer 经语义检查后按需进入 JIL，完成借用检查和析构展开，
 再由统一的 JIL 执行器求值；普通函数调用、局部存储和析构遵循与运行期相同的语言语义。
 求值结果保存为可复用的不可变值，不携带执行器的临时地址。
+零长度普通切片允许数据指针为 null，并可继续取 `[0..0]` 子切片；它不提供可访问的元素。
+带 sentinel 的空切片仍需有效的哨兵存储；空分配被释放后，旧视图不能继续使用。
 
 `public const` 是模块公开接口的一部分。编译器在 interface artifact 中保存最终实例化后的
 declaration type 和 const payload；跨模块使用时由 importer 还原成 `ComptimeValue`，不重新执行
@@ -848,6 +863,8 @@ public alias Bool;
 调用时在目标原始 namespace 和 name 下枚举 public overload set，再执行普通重载决议。目标模块
 的 private 同名函数不会通过 alias 暴露。如果右侧不能解析为已有 symbol，则按 type alias
 处理，右侧必须是类型语法。
+带 `?`、`&`、`^`、`*`、可变性或 slice 等类型层的目标属于完整类型语法，alias 必须保留这些层，
+不能只重导出其底层类型符号；链式 alias 继续按最终完整类型归一身份。
 
 `public alias` 是 package public surface 的显式 re-export 机制。package 对外只暴露 root file
 的 public namespace；root file 可以通过 `public import` 重新导出模块命名空间，也可以通过
@@ -913,6 +930,188 @@ T add<T>(T left, T right);
 
 `init` / `deinit` 是目标语言的一部分。`init(self, ...)` 定义构造函数，
 `deinit(self)` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
+
+
+### 显式入口
+
+`@entry(kind)` 标记 root file 中的直接声明。每个 root、每个 kind 至多一个入口；
+标记不附着 alias／重导出，也不沿 import 递归选择。函数重载可以只标记其中一个。
+入口身份不改变普通可见性，私有声明仍然私有。
+
+`@entry(main)` 指定程序入口，函数须非泛型、同步、无参数且有函数体，返回整数类型或 `Void`。
+没有显式标记时沿用普通 `main`；存在显式标记时优先采用该声明，不回退到同名函数。
+`@entry(lang)` 指定语法 Provider 类型，其构造和方法由 Provider 契约约束。
+`@entry(generate)` 指定独立生成任务的函数入口，签名为 `Void (reflect.Module)`。
+
+### 类型化 metadata
+
+`@meta(expr)` 为声明附着一个普通 Jiang 值；`@meta(module: expr)` 是独立顶层项，附着到当前源码模块。
+模块附着不需要后续声明，可以重复出现；不能位于成员或函数 body 内，也不能再带前置 attribute。
+`module:` 是目标前缀，`@meta(module)` 中的 `module` 仍按普通表达式名称解析。
+
+expr 隐式执行普通编译期求值，函数不需要专门标记；结果必须能按普通 const 规则物化。
+同一目标的多次附着保留次序，不覆盖、不去重；精确类型身份决定查询匹配，别名归一。
+`@where`、`@entry` 等内建 attribute 的语义属性不混入 metadata 集合。
+
+Lang factory 的 `declaration_meta(span, expr)` 返回附着到后续声明的 attribute；
+`declaration_meta(decl, span, expr)` 向已有声明追加，`module_meta(span, expr)` 返回独立模块项，
+可直接放入 Provider 的声明集合。它们与原生语法产生同一类附着，不在 Provider 进程内执行 metadata 表达式。
+
+### 模块反射
+
+`reflect.Module` 是编译器发放的只读模块句柄，支持身份比较；`name()` 返回源码名称。
+句柄及包含句柄的集合只在本轮编译期执行中有效，不能物化到运行期或持久化缓存中。
+
+`reflect.modules(root)` 返回 `reflect.Modules` 视图，包含 root 及同包实际导入可达的模块。
+顺序为 root 优先、源码导入顺序的深度优先遍历，按模块身份去重；导入环不会导致重复或无限遍历。
+生成器自身额外加载的模块不自动进入该范围，外包目标不向其内部继续展开。
+
+视图提供 `len()`、`get(index)` 和普通 `Sequence` 遍历；每次遍历拥有独立游标。
+越界索引产生编译期诊断。查询复用已完成前端检查的模块图，不触发新的源码加载。
+
+`module.imports()` 返回可重复遍历的 `reflect.Imports` 视图，同样提供 `len()` 和 `get(index)`。
+每条 `Import` 提供 `source()`、`target()`、`binding()`、`visibility()` 和 `location()`：
+
+- `ImportBinding` 区分 `.named(name)`、`.wildcard` 和 `.unbound`，重复绑定保留为独立边。
+- `Visibility` 区分 `.public_visibility` 与 `.private_visibility`。
+- `Location` 是普通来源数据，包含源码名称 `source`、字节 `offset`／`length`，以及从 1 开始的
+  `line` 和 UTF-8 字节 `column`。来源数据可用于输出，句柄本身仍不可物化。
+
+导入按源码顺序返回，只包含实际生效的关系，保留导入环和外包目标；允许读取外包目标的名称，
+查询其内部导入或模块闭包则诊断。
+
+`module.path()` 沿用编译器源码逻辑路径：包内文件返回相对包目录的路径，其他文件返回规范化源路径；
+virtual 输入保留原名称。
+`module.name()` 保留原始来源名称，`source_kind()` 区分 `SourceKind.file` 与 `.virtual`，
+`location()` 返回整份输入的来源范围，空文件长度为 0。自定义 Lang 保留原始 DSL 文件及扩展名。
+`module.package()` 返回 `reflect.Package`，支持 `name()` 和身份比较；同名包不等于同一包。
+包句柄只在本轮有效，模块来源与包名称是可物化的普通数据；这些查询不开放外包的内部遍历权限。
+
+### 公开导出
+
+`reflect.exports(module)` 返回 `reflect.Exports`，提供 len／get／Sequence，只用于 generate。
+每个 `Export` 提供 `name()`、`target()`、`source()` 和 `location()`；目标为 `Target.module` 或
+`Target.declaration`。显式符号别名保留导出名并解析到实际目标，类型表达式别名仍为自身声明。
+函数别名展开目标名字绑定中的全部公开重载，私有重载不进入导出面。
+
+先按声明顺序返回模块自身的公开绑定，再深度优先展开公开通配边；本地公开名字优先，重复路径和环去重。
+通配导出的来源指向实际命名声明，显式别名的来源指向别名声明；导入路径由 `module.imports()` 查询。
+允许查询外包模块的公开导出，仍不能借此枚举其私有定义或内部导入闭包。视图可重复遍历，句柄不可物化。
+
+### 声明反射
+
+`module.declarations()` 与 `decl.members()` 返回直接拥有的声明视图 `reflect.Declarations`，
+支持 `len()`、`get(index)` 与重复遍历，保留源码顺序。自定义 Lang 的同位置声明按最终 AST 输出
+顺序返回，允许普通声明、公开别名与 extension 交错，工厂创建节点的先后不决定输出次序。
+函数 body 中的局部定义不作为成员返回，
+也不沿字段或参数的类型引用递归。输入包内可查询私有定义，外包模块及类型只返回公开声明／成员。
+
+`reflect.declarations(root)` 返回同包可达声明的递归 `Declarations` 视图，仅用于 generate。
+模块顺序与 `reflect.modules(root)` 一致，每个模块内先返回声明自身，再返回泛型参数和直接成员，
+均保留声明顺序；按声明身份去重。模块本身不作为 Decl 返回，函数的普通参数由签名 API 查询，
+不进入函数 body，也不沿类型引用展开。外包模块不能作为递归查询的根。
+
+元素为带类别 payload 的 `reflect.Decl`，例如 `.function(Function)`、`.struct_decl(Struct)`、
+`.enum_decl(Enum)`、`.field(Field)` 和 `.variant(Variant)`；类别句柄均定义在 `reflect` 中。
+共同操作 `name()`、`module()`、`visibility()`、`location()`、`members()` 位于 Decl 上。
+`==` 比较声明身份及成员替换环境，同名重载是不同声明；payload 支持普通模式匹配，不使用强制转换。
+声明及类别句柄仅在本轮有效，包含句柄的值不能物化到运行期或持久化。
+
+每个 extension 独立表示为 `.extension(Extension)`，由其声明模块枚举；无泛型参数的扩展同样有独立身份。
+扩展没有用户命名，`name()` 返回空文本，使用身份和 `location()` 区分；`visibility()` 来自扩展声明本身。
+扩展的 `members()`、`generic_parameters()` 与 `documentation()` 仅描述自身，不与目标类型的定义合并。
+`Extension.target()` 返回 TypePattern，保留声明目标的实参、通配符和类型层，不枚举符合扩展条件的实例。
+`trait_type()` 返回该扩展声明实现的 optional Type，纯成员扩展为空；关联绑定从 constraints 查询。
+`is_unsafe()` 读取扩展声明的 unsafe 标记。
+类型的直接成员排除 extension 方法；跨包只枚举公开扩展及其公开成员，`with_doc` 保留这个归属边界。
+
+`Function.signature()` 返回 `reflect.FunctionSignature`，字段为 `parameters`、`result`、`receiver`、
+`is_async`、`is_unsafe`、`has_body` 和 `domain`。参数保持不含 receiver 的只读视图，支持名称、类型、
+默认值存在性及身份比较；receiver 区分 `.none`、`.borrowed`、`.mutable_borrowed`、`.owned`。
+`has_body` 只表示声明提供实现，与 body 是否被加载或执行无关。调用方可读取一次签名，再访问多个字段。
+签名与 lifetime 契约分别查询；返回结构体后的字段访问不改变查询的依赖粒度。
+
+`decl.generic_parameters()` 按声明顺序返回泛型参数，不枚举单态实例。`GenericParameter.is_const()` 区分
+值参数与类型参数；`type()` 对类型参数返回符号类型本身，对 const 参数返回所声明的值类型。
+`Field.type()`／`Variable.type()` 返回定义的类型，`Variable.is_const()` 读取常量声明属性。
+
+`reflect.Type` 是本轮语义类型的只读句柄；`reflect.type_of<T>()` 将已知类型接入反射，也可用于普通 comptime。
+类型身份比较归一别名，保留泛型参数所属声明、泛型实参及可变性；`is_mutable()` 读取最外层可变性，
+`has_parameters()` 判断类型中是否仍含待替换参数。含类型句柄的结果不能物化为运行期常量。
+
+`Type.shape()` 返回 `TypeShape`：primitive、nominal、parameter、optional、error_union、handle、array、
+slice、tuple、function 和 task 等结构采用 enum payload。整数提供目标位宽及符号性，浮点数提供位宽；
+子类型保持只读 Type 句柄，不复制语义类型树。外包私有名义类型与编译器内部环境返回 opaque。
+
+`NominalType.definition()` 返回原始声明；`ArrayType` 提供 element／length，长度区分 known 与符号
+GenericParameter；`HandleType` 提供 reference／owner／raw／slice 类别及 element。
+ErrorUnionType 提供 value／error，SliceType 提供 element；元组元素和函数参数使用可重复遍历的 Types 视图。
+FunctionType 提供 result、raw／closure、调用 ownership 和 async／unsafe 标记。视图越界产生编译期诊断。
+结构中的纯值可物化，包含类型或声明句柄的结构不可物化。
+
+`Function.signature().domain` 和 `FunctionType.domain()` 返回 optional `reflect.Domain`。域身份由规范 const 绑定决定，
+别名共享身份，相同类型和初始化值的不同绑定仍是不同域。Domain 提供 type、binding 和身份比较；
+外包私有绑定的 binding 返回 null，其类型仍遵循 opaque 规则。查询不求值初始化器或创建 executor，
+域句柄不能物化，未指定域的普通或 async 函数返回 null。符号域保留 const 泛型参数身份，
+具体类型成员中的域按类型实参替换。
+
+`Decl.regions()` 和 `NominalType.regions()` 返回声明顺序的 Regions 只读视图，支持 len／get／Sequence。
+Region 提供 name、shape_source、default_source 和 sources；固定 region 的 shape_source 为空，
+shape-valued region 返回对应的 Type，具体名义类型按泛型实参替换。schema 不因实例的空 shape 删除 region。
+default_source 返回同一 schema 中的默认 region，sources 只列 `target: source` 的直接覆盖来源，
+保留环而不计算传递闭包。region 身份包含所属声明及类型替换环境；region 和视图句柄均不能物化。
+
+`Decl.lifetime_bindings()` 返回显式 `@life` 绑定的 LifetimeBindings 只读视图，支持 len／get／Sequence。
+省略 attribute 与 `@life()` 都返回空集合，使用 is_explicit 区分；查询保留声明形式，不补入推导契约。
+LifetimeBinding 的 target 为空表示位置绑定；source 返回 LifetimeExpression，其 shape 为
+empty／path／product／meet。组合表达式提供 left／right；路径提供 receiver／result／named 根和
+有序投影片段，保留公开 region 名称，不展开为私有字段。绑定、表达式和路径句柄不能物化。
+具体类型成员上的声明绑定仍使用原声明的名称；有效契约与类型替换独立处理。
+
+`Function.lifetime_contract()` 和 `FunctionType.lifetime_contract()` 返回规范 LifetimeContract 关系视图，
+提供 len／get／Sequence。每条 LifetimeFlow 提供 source／target BorrowPath，包含根和有序投影。
+Function 将 receiver 与显式参数索引分开；FunctionType 按自身参数列表编号。callback 参数的调用契约
+通过该参数的 FunctionType 查询。契约包含省略写法的默认规则及规范化关系，不执行被查询函数。
+投影包括字段原始 Decl、元组位置和 pointee；遇到外包不可见字段，以 opaque 截断余下路径。
+契约、关系和路径句柄不能物化；查询当前已检查并完成类型替换的函数类型，不复制契约事实。
+
+`Struct.lifetime_contract()`、`Enum.lifetime_contract()` 和 `NominalType.lifetime_contract()`
+查询已检查名义声明 schema 的字段关系，复用 LifetimeContract／BorrowPath，根为 value。
+`Region.paths()` 返回该 region 绑定的有序 BorrowPaths 视图；路径可经过字段、variant、元组和 pointee，
+沿用相同的可见性截断与不可物化规则。泛型保留声明 schema，不按具体 shape 展开或删除路径，
+字段身份指向原始声明。关系保留 schema 中的直接边，不另算传递闭包，也不递归展开引用类型。
+
+`Decl.constraints()` 返回直接语义约束的 Constraints 视图，包含行内泛型约束和 `@where`，
+按语义展开顺序读取并沿用编译器的去重规则；extension 从自身约束集合读取。
+Constraint 区分 const_type、type_bound、negative_type_bound、equal、not_equal 和 associated_equal，
+分别提供参数／类型、subject／bound、subject／value 或 subject／trait_type／name／value。
+ConstraintValue 区分 Type、Constant、TypePattern 和 LiteralPattern；常量复用只读 Constant 接口，不触发新的求值。
+const 参数类型依赖通配实参时，LiteralPattern.value() 保留未定型字面量的整数位模式及符号标记、浮点、
+Bool、Char、字符串、null 或 unit；实际匹配时再按 const 参数类型校验。已知的前置类型实参用于替换参数类型，
+已定型值返回 Constant；具名常量保留其自身类型。LiteralPattern 句柄不能物化，提取的普通字面量值可以物化。
+类型模式通过 TypePatternShape 保留通配符、完整类型、名义类型实参、类型层、数组和错误联合形状。
+ErrorUnionTypePattern 提供 value 和 optional error，省略的错误类型保持空值。
+PatternExtent 保留长度或 sentinel 的 absent／wildcard、字面量种类或声明中的符号名称。
+查询成员约束时沿用其类型替换环境；模式视图和约束句柄不能物化为运行期常量。
+
+`NominalType.arguments()` 返回 `GenericArguments` 只读视图，按绑定顺序混合返回
+`GenericArgument.type(Type)` 和 `.constant(Constant)`。Constant 提供 type／parameter／binding；
+符号 const 参数保留其声明，命名绑定仅在当前可见范围内返回，计算出的值可以没有命名绑定。
+`read<T>()` 在值已求出且类型精确匹配时返回 `T&?` 的只读借用，否则返回 null；不隐式转换类型。
+借用的数据不可写，读取出的普通值可用于后续计算，Constant 句柄本身不能物化。
+ArrayType／SliceType／HandleType 的 `sentinel()` 返回 optional Constant，保留具体值或符号参数。
+
+
+`Type.members()` 返回该类型直接拥有的成员，并按类型实参替换字段、参数和返回类型。
+方法自己的泛型参数保留符号身份；不合并 extension，也不沿指针或字段类型递归展开。
+无声明成员的类型返回空视图；外包私有类型只保留不透明身份，其成员不可查询。
+具体成员的比较包含语义类型环境，别名归一；`decl.definition()` 去除环境，回到保留符号参数的原始声明。
+名称、位置和归属始终来自原声明。
+
+已知类型的成员、成员签名及其来源可在普通 `comptime`／const 求值中查询；语义准备由既有按需编译流程完成，
+执行器只消费就绪事实。普通求值以所属包为可见范围，外包私有类型保持不透明；
+由成员取得的模块句柄可读取名称或比较身份，不授予枚举全模块声明／imports／模块闭包的权限。
+这些范围查询要求 generate 上下文。反射参与常量或类型依赖循环时沿用编译期依赖诊断。
 
 ## 函数指针和闭包
 
@@ -1324,7 +1523,7 @@ associated type bound、显式 projection、trait-list associated binding 和 wh
 T id<T>(T value);
 ```
 
-约束使用 leading annotation：
+约束使用 leading attribute：
 
 ```jiang
 @where(T: Hashable)
@@ -1463,6 +1662,9 @@ catch binding 只在 catch body 内可见，类型来自被处理 errorable valu
 - try catch expr
 - binary/unary expr
 - call/field/index/slice/postfix expr
+
+同一个 `switch` 分支可以用逗号列出替代模式。各模式必须绑定相同的名字，且对应绑定的类型、
+可变性与借用方式一致；payload 位置可以不同。匹配成功的模式初始化公共 body 的同一组绑定。
 
 `stmt` 和 `expr` 在语法上保持分离。`block` 的语法以 `doc/grammar.md` 为准：
 `block <- "{" stmt* tail_expr? "}"`。`stmt` 不贡献 `block` 的值；`block`
@@ -1633,11 +1835,9 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 
 - `comptime { ... }` 是语言内建编译期 block，表示 block 内 Jiang 代码在编译期执行。
 - `comptime` 使用普通关键字入口，不占用后续 `#sql { ... }`、`#asm { ... }` 这类 custom syntax
-  namespace；`@` 保留给 attribute / annotation。
-- `comptime {}` 等价于 `comptime [eval] {}`；`eval` 和 `generate` 是 kind 选项，不是全局保留关键字。
-  不接受 early/late 别名；显式选项必须包含且仅包含一个已知 kind。
-- eval 在语义分析需要结果时执行；generate 在目标输入完整通过语义检查后，由独立的
-  `jiang generate` 命令执行。普通 build/check 不执行 generate 文件输出，不根据失败自动切换 kind。
+  namespace；`@` 保留给 attribute。
+- `comptime` 唯一形式为 `comptime { ... }`，不接受方括号；`eval` 与 `generate` 都是普通标识符。
+- comptime 在语义分析需要结果时执行；生成任务由独立入口和命令承载。
 - `comptime` block 不生成 runtime code。
 - `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
   parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only

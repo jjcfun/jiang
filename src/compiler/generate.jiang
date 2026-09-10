@@ -1,0 +1,113 @@
+#doc(module)
+    独立生成 backend 的编排入口；共享输入编译会话，准备所选函数后执行一次，再发布暂存产物。
+#end
+
+alias task_api = import "./generate/task.jiang";
+public alias Task = task_api.Task;
+public alias select = task_api.select;
+alias output_api = import "./generate/output.jiang";
+alias context = import "./context.jiang";
+alias options_api = import "./driver/options.jiang";
+alias source_entry = import "./source/entry.jiang";
+alias source = import "./source.jiang";
+alias resolver_api = import "./resolve/module_resolver.jiang";
+alias graph_api = import "./resolve/module_graph.jiang";
+alias qid = import "./id.jiang";
+alias lang = import "./lang.jiang";
+alias syntax = import "./syntax.jiang";
+alias compilation = import "./analysis.jiang";
+alias evaluator = import "./jil/eval.jiang";
+alias types = import "./sema/type.jiang";
+alias list = import "./support/list.jiang";
+alias table = import "./support/table.jiang";
+alias diagnostic_helper = import "./diagnostic/helper.jiang";
+alias cache_identity = import "./artifact/cache_identity.jiang";
+
+#doc 在全量语义 sweep 前加载生成闭包；编译图合并用于检查，反射范围仍由输入 root 的实际导入边决定。
+public qid.ModuleId? prepare(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    graph_api.ModuleGraph&! compilation_graph, Task& task,
+    options_api.CompileOptions& options, UInt8[]& artifact_cache_dir
+) {
+    source_entry.PackageHandle package = source_entry.load_package(ctx, task.generator.bytes());
+    source_entry.Entry loaded! = source_entry.read_root(ctx, package$.ref());
+    if (!loaded.ok) { return null; }
+    lang.PrepareResult providers! = lang.prepare_for_root(ctx, task.generator.bytes(), options, artifact_cache_dir);
+    if (!providers.ok()) { return null; }
+    if (ctx.store.resolve.module_for_source(loaded.source_id) == null) {
+        syntax.SyntaxResult parsed! = syntax.parse_source_with_lang(
+            ctx, loaded.text[..], loaded.source_id, providers.registry_mut_ref());
+        if (parsed.has_errors()) { return null; }
+        resolver.add_ast(parsed.take_unit());
+    }
+    graph_api.ModuleGraph^ graph! = resolver.build_module_graph_for_source(ctx, loaded.source_id);
+    if (!graph.ok) { return null; }
+    Int index! = 0;
+    while (index < graph.module_count()) {
+        qid.ModuleId module_id = graph.module_at(index);
+        compilation_graph.add_module(module_id);
+        table.MultiTableCursor cursor! = graph.first_import(module_id);
+        while (cursor.valid()) {
+            graph_api.ModuleGraphEdge edge = graph.import_edge(cursor);
+            compilation_graph.add_import(module_id, edge.target_module, edge.span, edge.path_symbol);
+            cursor = graph.next_import(cursor);
+        }
+        index = index + 1;
+    }
+    return graph.root_module;
+}
+
+#doc 全量检查完成后，只准备所选函数及其执行依赖，不再启动第二次模块 lowering。
+public Bool run(
+    context.CompilerContext&! ctx, resolver_api.ModuleResolver&! resolver,
+    graph_api.ModuleGraph&! graph, qid.ModuleId generator_root, Task& task, UInt8[]& cache_root
+) {
+    qid.DefId module_def = ctx.store.resolve.module_ref(generator_root).def_id;
+    guard ctx.store.model.entry_definition(module_def, .generate) is .some(function_def) else {
+        fail(ctx, "generator root requires @entry(generate)", "generate_entry_missing");
+        return false;
+    }
+    list.ArrayList<types.GenericArg> generics! = list.ArrayList<types.GenericArg>();
+    guard compilation.prepare_function_implementation(ctx, resolver, graph, function_def, generics.slice())
+        is .some(implementation) else { return false; }
+    output_api.Outputs outputs! = output_api.Outputs();
+    if (!evaluator.evaluate_generator(ctx, function_def, graph.root_module, outputs$.mut_ref(),
+        cache_root, implementation)) {
+        if (!ctx.store.diagnostics.has_errors()) { fail(ctx, "generation execution failed", "generate_execution_failed"); }
+        return false;
+    }
+    if (ctx.query.layout.has_errors() || ctx.store.diagnostics.has_errors()) { return false; }
+    if (!validate_output(ctx, task.output.bytes())) { return false; }
+    if (!outputs.publish(task.output.bytes())) {
+        fail(ctx, outputs.error.bytes(), "generate_output_failed");
+        return false;
+    }
+    return true;
+}
+
+#doc 整个输出目录由任务替换，因此其中不能包含本轮已加载的输入或生成器源码。
+Bool validate_output(context.CompilerContext&! ctx, UInt8[]& output) {
+    guard output_api.physical_path(output) is .some(physical_output) else {
+        fail(ctx, "cannot resolve generation output path", "generate_output_path_invalid");
+        return false;
+    }
+    Int index! = 0;
+    while (index < ctx.store.sources.len()) {
+        if (ctx.store.sources.entry(source.SourceId(index)).key is .file(path)) {
+            guard output_api.physical_path(path) is .some(physical_source) else {
+                fail(ctx, "cannot resolve generation input path", "generate_input_path_invalid");
+                return false;
+            }
+            if (cache_identity.path_is_within(physical_source.bytes(), physical_output.bytes())) {
+                fail(ctx, "generation output directory contains a source input", "generate_output_contains_source");
+                return false;
+            }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Void fail(context.CompilerContext&! ctx, UInt8[]& message, UInt8[]& code) {
+    diagnostic_helper.add_package_error(ctx.store.diagnostics$.mut_ref(), message, code);
+}

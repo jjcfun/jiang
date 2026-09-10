@@ -355,6 +355,8 @@ public struct DeclCheck: Movable {
                     "unbound_extension_parameter"
                 );
             }
+            // extension 的参数也必须发布共同签名完成状态，供后续类型／定义查询复用。
+            self.ensure_signature_checked(param_def);
             index = index + 1;
         }
     }
@@ -582,14 +584,19 @@ public struct DeclCheck: Movable {
         self.check_declaration_signature_tree(binding.def_id);
     }
 
-    Void check_declaration_signature_tree(Self&! self, qid.DefId def_id) {
+    #doc 检查声明树；局部反射只准备定义成员的签名，不沿 callable 进入 body 内声明。
+    public Void check_declaration_signature_tree(
+        Self&! self, qid.DefId def_id, Bool include_body_members = true
+    ) {
         if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
         self.ensure_signature_checked(def_id);
-        Int index! = 0;
-        while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
-            qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
-            self.check_declaration_signature_tree(member_def);
-            index = index + 1;
+        if (include_body_members || !self.type_ops.state.ctx.store.model.has_function_signature(def_id)) {
+            Int index! = 0;
+            while (index < self.type_ops.state.ctx.store.model.def_member_count(def_id)) {
+                qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(def_id, index);
+                self.check_declaration_signature_tree(member_def, include_body_members);
+                index = index + 1;
+            }
         }
         self.ensure_definition_checked(def_id);
     }
@@ -618,7 +625,7 @@ public struct DeclCheck: Movable {
     #end
     public Void ensure_signature_checked(Self&! self, qid.DefId def_id) {
         if (!self.type_ops.state.ctx.store.model.has_def(def_id)) { return; }
-        if (!self.type_ops.state.ctx.store.typeck.begin_signature_check(def_id)) { return; }
+        if (!self.type_ops.state.ctx.query.type_check_signature.begin(def_id)) { return; }
         self.prepare_lifetime_dependencies(def_id);
         self.check_declaration_signature(def_id);
         Int index! = 0;
@@ -627,7 +634,7 @@ public struct DeclCheck: Movable {
             self.ensure_signature_checked(param);
             index = index + 1;
         }
-        self.type_ops.state.ctx.store.typeck.complete_signature_check(def_id);
+        self.type_ops.state.ctx.query.type_check_signature.complete(def_id);
     }
 
     Void check_declaration_signature(Self&! self, qid.DefId def_id) {
@@ -652,6 +659,7 @@ public struct DeclCheck: Movable {
         self.check_payload_enum_declaration(def_id);
         self.check_const_global_declaration(def_id);
         self.bind_declaration_type(def_id);
+        self.check_entry_declaration(def_id);
         self.check_language_main_signature(def_id);
     }
 
@@ -726,10 +734,62 @@ public struct DeclCheck: Movable {
         );
     }
 
-    Void check_language_main_signature(Self&! self, qid.DefId def_id) {
-        if (!self.is_root_language_main(def_id)) {
+    Void check_entry_declaration(Self&! self, qid.DefId def_id) {
+        guard self.type_ops.state.ctx.store.model.def_ref(def_id).decl.entry_kind is .some(kind) else { return; }
+        def.DefKind def_kind = self.type_ops.state.ctx.store.defs.get(def_id).kind;
+        Bool valid_kind = if (kind == .lang) { def_kind == .struct_def || def_kind == .enum_def }
+            else { def_kind == .function_def };
+        if (!valid_kind) {
+            self.type_ops.add_def_error(def_id, "declaration does not match its entry role", "entry_type_mismatch");
             return;
         }
+        if (self.type_ops.state.ctx.store.model.def_generic_param_count(def_id) != 0) {
+            self.type_ops.add_def_error(def_id, "entry declarations must not be generic", "generic_entry_not_supported");
+        }
+        if (kind == .generate && def_kind == .function_def) { self.check_generate_signature(def_id); }
+        if (def_kind == .function_def
+            && !self.type_ops.state.ctx.store.model.function_has_body_definition(def_id)) {
+            self.type_ops.add_def_error(def_id, "entry functions require a body", "entry_requires_body");
+        }
+    }
+
+    #doc generate 接受唯一的标准 Module 值并返回 Void，别名归一后按类型身份比较。
+    Void check_generate_signature(Self&! self, qid.DefId def_id) {
+        if (self.type_ops.state.ctx.store.model.function_signature_effects(def_id).has_async) {
+            self.type_ops.add_def_error(def_id, "generate must be synchronous", "async_generate_not_supported");
+        }
+        Int count = self.type_ops.state.ctx.store.model.function_signature_param_count(def_id);
+        if (count != 1) {
+            self.type_ops.add_def_error(def_id, "generate requires one reflect.Module parameter",
+                "generate_parameter_mismatch");
+        } else {
+            sem.NodeId param = self.type_ops.state.ctx.store.model.function_signature_param_at(def_id, 0);
+            qid.TypeId param_type = self.type_ops.check_type_ref(param);
+            if (!self.is_reflect_module_type(param_type)) {
+                self.type_ops.add_def_error(def_id, "generate parameter must be reflect.Module",
+                    "generate_parameter_mismatch");
+            }
+        }
+        sem.NodeId result = self.type_ops.state.ctx.store.model.function_signature_result(def_id);
+        if (self.type_ops.check_type_ref(result) != self.type_ops.state.ctx.store.types.unit_type()) {
+            self.type_ops.add_def_error(def_id, "generate must return Void", "generate_return_type_mismatch");
+        }
+    }
+
+    Bool is_reflect_module_type(self, qid.TypeId type_id) {
+        guard self.type_ops.state.ctx.store.resolve.core_types.reflect_module_type is .some(module_type)
+            else { return false; }
+        guard self.type_ops.state.ctx.store.types.get(type_id).data is .named(named) else { return false; }
+        return named.def_id == module_type;
+    }
+
+    Void check_language_main_signature(Self&! self, qid.DefId def_id) {
+        if (self.type_ops.state.ctx.store.defs.get(def_id).kind != .function_def) { return; }
+        Bool explicit_main! = false;
+        if (self.type_ops.state.ctx.store.model.def_ref(def_id).decl.entry_kind is .some(kind)) {
+            explicit_main = kind == .main;
+        }
+        if (!explicit_main && !self.is_root_language_main(def_id)) { return; }
         if (self.type_ops.state.ctx.store.model.function_signature_effects(def_id).has_async) {
             self.type_ops.add_def_error(
                 def_id,
@@ -766,6 +826,7 @@ public struct DeclCheck: Movable {
         qid.DefId module_def =
             self.type_ops.state.ctx.store.resolve.module_ref(self.type_ops.state.root_module).def_id;
         if (!self.type_ops.state.ctx.store.model.has_def(module_def)) { return false; }
+        if (self.type_ops.state.ctx.store.model.entry_definition(module_def, .main) != null) { return false; }
         Int index! = 0;
         while (index < self.type_ops.state.ctx.store.model.def_member_count(module_def)) {
             qid.DefId member_def = self.type_ops.state.ctx.store.model.def_member_at(module_def, index);
@@ -7262,7 +7323,7 @@ public struct DeclCheck: Movable {
                 method_bindings$.ref()
             );
             qid.TypeId impl_param = self.type_ops.check_type_ref(impl_param_ref);
-            if (!self.type_ops.same_type_ignoring_mutability(trait_param, impl_param)) {
+            if (!self.type_ops.same_type_with_contracts(trait_param, impl_param)) {
                 return false;
             }
             index = index + 1;
@@ -7284,7 +7345,7 @@ public struct DeclCheck: Movable {
             method_bindings$.ref()
         );
         qid.TypeId impl_result = self.type_ops.check_type_ref(impl_result_ref);
-        if (!self.type_ops.same_type_ignoring_mutability(trait_result, impl_result)) {
+        if (!self.type_ops.same_type_with_contracts(trait_result, impl_result)) {
             return false;
         }
         return self.trait_method_contract_compatible(trait_method, impl_method);

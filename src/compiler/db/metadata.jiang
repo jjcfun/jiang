@@ -1,0 +1,233 @@
+#doc(module)
+    metadata 的唯一事实 owner：保留源附着身份、顺序、表达式及已物化值；不向声明复制标签。
+    求值由编译编排推进，读取不进入 Sema，epoch reset 同时清除值与目标索引。
+#end
+alias qkey = import "../incremental/key.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias value_key = import "../artifact/object_key_builder.jiang";
+alias location_query = import "./source_location.jiang";
+alias query_cache = import "./query_cache.jiang";
+alias store_api = import "../store.jiang";
+alias collections = import "./collection_cache.jiang";
+alias module_query = import "./module_graph.jiang";
+alias declaration_query = import "./declaration.jiang";
+import std;
+
+alias qid = import "../id.jiang";
+alias sem = import "../sema/model.jiang";
+alias value = import "../sema/comptime/value.jiang";
+alias token = import "../syntax/token.jiang";
+alias list = import "../support/list.jiang";
+alias map = import "../support/map.jiang";
+
+public enum MetadataOrigin: Copyable {
+    source(Int identity, sem.NodeId expression),
+    persisted,
+}
+
+public struct MetadataAttachment: Copyable {
+    public qid.DefId target;
+    public MetadataOrigin origin;
+    public token.Span span;
+    public value.ComptimeValue? value = null;
+    public Bool evaluating = false;
+}
+
+#doc 筛选只缓存有序附着索引，值仍由本查询的唯一事实持有。
+public struct MetadataScope: Copyable, Hashable, Equatable {
+    public qid.DefId owner;
+    public qid.TypeId type_id;
+    public Bool recursive;
+    public Void hash<H: Hasher>(self, H&! hasher) {
+        self.owner.hash(hasher); self.type_id.hash(hasher); hasher.write(self.recursive);
+    }
+    public Bool equal(Self& lhs, Self& rhs) {
+        return lhs.owner == rhs.owner && lhs.type_id == rhs.type_id && lhs.recursive == rhs.recursive;
+    }
+}
+
+public struct MetadataQuery: Movable {
+    Mutex<query_cache.QueryCache<qid.DefId, qkey.Fingerprint128>>^ fingerprints;
+    collections.CollectionCache<MetadataScope, Int> matches!;
+    list.ArrayList<MetadataAttachment> attachments!;
+    map.WyHashMap<qid.DefId, list.ArrayList<Int>> targets!;
+    map.WyHashMap<qid.ModuleId, Bool> ready_modules!;
+
+    public init(self) {
+        self.fingerprints = new Mutex<query_cache.QueryCache<qid.DefId, qkey.Fingerprint128>>(
+            query_cache.QueryCache<qid.DefId, qkey.Fingerprint128>());
+        self.matches = collections.CollectionCache<MetadataScope, Int>();
+        self.attachments = list.ArrayList<MetadataAttachment>();
+        self.targets = map.WyHashMap<qid.DefId, list.ArrayList<Int>>();
+        self.ready_modules = map.WyHashMap<qid.ModuleId, Bool>();
+    }
+
+    public Void reset(Self&! self) {
+        self.fingerprints.with_lock<Void>({ cache => cache.reset(); });
+        self.matches.reset();
+        self.ready_modules.clear();
+        self.targets.clear();
+        self.attachments.clear();
+    }
+
+    #doc 建立已发现目标的空集合；未发现的目标不能解释成没有 metadata。
+    public Void prepare(Self&! self, qid.DefId target) {
+        if (!self.targets.has(target)) { self.targets.set(target, list.ArrayList<Int>()); }
+    }
+
+    public Bool module_ready(self, qid.ModuleId module) { return self.ready_modules.has(module); }
+    public Void mark_module_ready(Self&! self, qid.ModuleId module) { self.ready_modules.set(module, true); }
+
+    public Bool prepared(self, qid.DefId target) { return self.targets.has(target); }
+    public Int len(self) { return self.attachments.len(); }
+    public MetadataAttachment get(self, Int index) { return self.attachments.get(index); }
+    public Int count(self, qid.DefId target) {
+        guard self.targets.get(target) is .some(items) else { return 0; }
+        return items.len();
+    }
+    public Int attachment_index(self, qid.DefId target, Int index) {
+        return self.targets.get(target)$.some().get(index);
+    }
+
+    #doc 单个目标的全部附着已发现且值已发布即可读取；不要求其他声明或整个模块完成。
+    public Bool ready(self, store_api.CompilerStore& store, qid.DefId target) {
+        if (!self.prepared(target)) { return self.module_ready(store.defs.get(target).module_id$.some()); }
+        Int index! = 0;
+        while (index < self.count(target)) {
+            if (self.at(target, index).value == null) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    #doc 求值中的标记仅用于检测附着依赖环，成功值仍由同一条附着记录持有。
+    public Bool begin_evaluation(Self&! self, Int index) {
+        _ item = self.attachments.get(index);
+        if (item.evaluating) { return false; }
+        self.attachments.set(index, MetadataAttachment(target: item.target, origin: item.origin,
+            span: item.span, value: item.value, evaluating: true));
+        return true;
+    }
+
+    public Void cancel_evaluation(Self&! self, Int index) {
+        _ item = self.attachments.get(index);
+        self.attachments.set(index, MetadataAttachment(target: item.target, origin: item.origin,
+            span: item.span, value: item.value));
+    }
+
+    public MetadataAttachment at(self, qid.DefId target, Int index) {
+        return self.attachments.get(self.targets.get(target)$.some().get(index));
+    }
+
+    #doc AstId 只在本次源模块内去重；相同 span 的不同 Lang 附着仍保持独立。
+    public Bool has_source(self, qid.DefId target, Int source_identity) {
+        guard self.targets.get(target) is .some(items) else { return false; }
+        Int index! = 0;
+        while (index < items.len()) {
+            if (self.attachments.get(items.get(index)).origin is .source(identity, _)) {
+                if (identity == source_identity) { return true; }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public Void add(Self&! self, MetadataAttachment attachment) {
+        self.matches.reset();
+        self.invalidate_fingerprint(attachment.target);
+        self.prepare(attachment.target);
+        self.targets.get_mut(attachment.target)$.some().add(self.attachments.len());
+        self.attachments.add(attachment);
+    }
+
+    #doc 仅完整物化后的普通值能发布；聚合内容沿用共同 ComptimeStore 的不可变值 arena。
+    public Void publish(Self&! self, Int index, value.ComptimeValue result) {
+        self.matches.reset();
+        MetadataAttachment source = self.attachments.get(index);
+        self.invalidate_fingerprint(source.target);
+        self.attachments.set(index, MetadataAttachment(target: source.target,
+            origin: source.origin, span: source.span, value: result));
+    }
+
+    #doc 固定输入范围按模块、声明前序、附着顺序筛选；未就绪不发布空集合。
+    public Bool prepare_matches(Self&! self, store_api.CompilerStore&! store,
+        module_query.ModuleGraphQuery&! graph, declaration_query.DeclarationQuery&! declarations, MetadataScope scope
+    ) {
+        if (self.matches.has(scope)) { return true; }
+        list.ArrayList<Int> result! = list.ArrayList<Int>();
+        if (!scope.recursive) {
+            if (!self.append_matches(store, scope.owner, scope.type_id, result$.mut_ref())) { return false; }
+        } else {
+            qid.ModuleId root = store.defs.get(scope.owner).module_id$.some();
+            declarations.prepare_recursive(store, graph, root);
+            Int declaration_index! = 0;
+            Int module_index! = 0;
+            while (module_index < graph.module_count(store.resolve$.ref(), root)) {
+                qid.ModuleId module = graph.module_at(store.resolve$.ref(), root, module_index);
+                if (!self.append_matches(store, store.resolve.module_ref(module).def_id, scope.type_id,
+                    result$.mut_ref())) { return false; }
+                while (declaration_index < declarations.recursive_count(root)) {
+                    qid.DefId definition = declarations.recursive_at(root, declaration_index);
+                    if (store.defs.get(definition).module_id != module) { break; }
+                    if (!self.append_matches(store, definition, scope.type_id, result$.mut_ref())) { return false; }
+                    declaration_index = declaration_index + 1;
+                }
+                module_index = module_index + 1;
+            }
+        }
+        self.matches.publish(scope, result$.move());
+        return true;
+    }
+
+    Bool append_matches(self, store_api.CompilerStore& store, qid.DefId target, qid.TypeId type_id,
+        list.ArrayList<Int>&! result
+    ) {
+        if (!self.ready(store, target)) { return false; }
+        guard self.targets.get(target) is .some(indices) else { return true; }
+        Int index! = 0;
+        while (index < indices.len()) {
+            Int attachment = indices.get(index);
+            guard self.get(attachment).value is .some(value) else { return false; }
+            if (store.types.same_type(type_id, value.type_id)) { result.add(attachment); }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public Int match_count(self, MetadataScope scope) { return self.matches.count(scope); }
+    public MetadataAttachment match_at(self, MetadataScope scope, Int index) {
+        return self.get(self.matches.at(scope, index));
+    }
+
+
+    Void invalidate_fingerprint(self, qid.DefId target) {
+        self.fingerprints.with_lock<Void>({ [target] cache => cache.remove(target); });
+    }
+
+    #doc metadata 的共同事实指纹：完整有序值和附着位置；空集合有效，未完成求值不缓存。
+    public qkey.Fingerprint128? fingerprint(self, store_api.CompilerStore& store,
+        location_query.SourceLocationQuery& locations, qid.DefId target
+    ) {
+        qid.ModuleId module = store.defs.get(target).module_id$.some();
+        if (!self.ready(store, target)) { return null; }
+        return self.fingerprints.with_lock<qkey.Fingerprint128?>({ [ref self, ref store, ref locations, target, module]
+            cache =>
+            if (cache.peek(target) is .some(result)) { return result; }
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            Int index! = 0;
+            while (index < self.count(target)) {
+                _ attachment = self.at(target, index);
+                guard attachment.value is .some(value) else { return null; }
+                parts.add(value_key.stable_constant_observation_fingerprint(store, value));
+                guard locations.evaluate(store.sources$.ref(), store.resolve.module_ref(module).source_id,
+                    attachment.span) is .some(location) else { return null; }
+                parts.add(location.fingerprint);
+                index = index + 1;
+            }
+            qkey.Fingerprint128 result = object_key.combine_fingerprints(UInt64(145), parts$.ref());
+            cache.publish(target, result);
+            return result;
+        });
+    }
+
+}

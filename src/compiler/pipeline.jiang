@@ -7,6 +7,7 @@
 #end
 
 alias context = import "./context.jiang";
+alias qid = import "./id.jiang";
 alias database = import "./db.jiang";
 alias diagnostic = import "./diagnostic.jiang";
 alias diagnostic_helper = import "./diagnostic/helper.jiang";
@@ -19,6 +20,7 @@ alias object_key_builder = import "./artifact/object_key_builder.jiang";
 alias backend = import "./backend.jiang";
 alias borrow_check = import "./borrow_check.jiang";
 alias driver_options = import "./driver/options.jiang";
+alias generation = import "./generate.jiang";
 alias lang = import "./lang.jiang";
 alias jil_pipeline = import "./jil/pipeline.jiang";
 alias jil_lower = import "./jil/lower.jiang";
@@ -68,6 +70,15 @@ Void compile_loaded_package_after_begin(
     source_entry.PackageHandle& package,
     driver_options.CompileOptions& options
 ) {
+    if (options.emit == .generate) {
+        guard generation.select(ctx, package, options) is .some(task) else { return; }
+        source_entry.PackageHandle input = source_entry.load_package(ctx, task.input.bytes());
+        source_entry.Entry entry! = source_entry.read_root(ctx, input$.ref());
+        if (!entry.ok) { return; }
+        compile_package_with_emit(ctx, entry.source_id, input.root_path.bytes(), entry.text[..], options, task$.ref());
+        publish_layout_diagnostics(ctx);
+        return;
+    }
     source_entry.Entry entry! = source_entry.read_root(ctx, package);
     if (!entry.ok) {
         return;
@@ -94,11 +105,13 @@ Void compile_package_with_emit(
     source.SourceId source_id,
     UInt8[]& root_path,
     UInt8[]& source_text,
-    driver_options.CompileOptions& options
+    driver_options.CompileOptions& options,
+    generation.Task&? generate_task = null
 ) {
     if (!backend.validate_output_request(ctx, options)) {
         return;
     }
+    ctx.configure_lang_build(options);
     ctx.store.artifacts.enable_timing(options.jil_stats);
     UInt64 stage_started! = system_time.monotonic_time_ns();
     UInt64 compiler_version_hash = source_artifact_version_hash(options.compiler_version);
@@ -110,8 +123,9 @@ Void compile_package_with_emit(
         object_key_builder.target_fingerprint(target_cache_key.bytes()),
         object_key_builder.toolchain_fingerprint(toolchain_version.bytes()),
         object_key_builder.backend_profile_fingerprint(options.mode),
-        import_context.fingerprint_for_source_path(root_path)
+        import_context.fingerprint_for_source_path(ctx, root_path)
     );
+    if (ctx.store.diagnostics.has_errors()) { return; }
     UInt8[]^ context_root = artifact_path.context_cache_root(
         options.artifact_cache_dir,
         context_key
@@ -201,17 +215,19 @@ Void compile_package_with_emit(
     if (syntax_result.has_errors()) {
         return;
     }
+    if (ctx.lang_provider_build && !lang.wrapper.append_factory(ctx, syntax_result.unit$.mut_ref())) { return; }
     stage_started = print_jil_stage_if_enabled(options, "parse_done", stage_started);
     // release 仍需完整 package body；debug 只有在 `.jbuild` 覆盖对应
     // source/monomorph object 时才允许 clean source 保持 interface-only。
     Bool debug_incremental = options.emit == .executable && options.mode == .debug;
-    Bool use_source_artifacts = options.emit == .check_only || debug_incremental;
+    Bool use_source_artifacts = options.emit == .check_only || options.emit == .generate || debug_incremental;
     resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_source_expression,
         artifact_cache_dir.bytes(),
         compiler_version_hash,
         use_source_artifacts,
         options.mode,
-        options.jil_stats
+        options.jil_stats,
+        compilation.prepare_observed_fact
     );
     module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx, syntax_result.take_unit());
     if (!resolver.prepare_root_entry_environment(ctx, graph$.mut_ref())) {
@@ -224,6 +240,12 @@ Void compile_package_with_emit(
     if (!graph.ok) {
         return;
     }
+    qid.ModuleId? generator_root! = null;
+    if (generate_task is .some(task)) {
+        generator_root = generation.prepare(ctx, resolver$.mut_ref(), graph$.mut_ref(), task,
+            options, artifact_cache_dir.bytes());
+        if (generator_root == null) { return; }
+    }
     if (debug_incremental) {
         database.require_debug_source_products(
             ctx.query$.ref(),
@@ -234,15 +256,6 @@ Void compile_package_with_emit(
         );
     }
     stage_started = print_jil_stage_if_enabled(options, "graph_done", stage_started);
-    lang.PrepareResult graph_lang_registry! = lang.prepare_for_package(
-        ctx,
-        graph.package_id,
-        options,
-        artifact_cache_dir.bytes()
-    );
-    if (!graph_lang_registry.ok()) {
-        return;
-    }
     if (!resolver.lower_module_graph_to_model(ctx, graph$.ref())) {
         return;
     }
@@ -265,6 +278,18 @@ Void compile_package_with_emit(
         resolver.finalize_module_graph_model(ctx, graph$.ref());
     }
     stage_started = print_jil_stage_if_enabled(options, "front_end_done", stage_started);
+    if (generate_task is .some(task)) {
+        if (!generation.run(ctx, resolver$.mut_ref(), graph$.mut_ref(), generator_root$.some(), task,
+            artifact_cache_dir.bytes())) {
+            return;
+        }
+        database.publish_declaration_observations(ctx.query$.ref(), ctx.store.artifacts$.mut_ref());
+        source_ji.write_package_source_artifact_cache(ctx, graph$.ref(), artifact_cache_dir.bytes(), options.compiler_version);
+        source_ji.write_module_observation_artifact(ctx, generator_root$.some(), artifact_cache_dir.bytes(),
+            options.compiler_version);
+        if (options.artifact_stats) { print_artifact_stats(ctx); }
+        return;
+    }
     jil_lower.begin_runtime_package(ctx, graph$.ref());
     if (ctx.jil.program.has_errors() || !compilation.prepare_runtime_eval(ctx, graph$.ref())) { return; }
     jil_lower.finish_runtime_package(ctx, graph$.ref());
@@ -291,6 +316,10 @@ Void compile_package_with_emit(
         stage_started = print_jil_stage("drop_done", stage_started);
         print_jil_stats(ctx$.ref(), graph$.ref(), ctx.jil$.ref());
     }
+    // 前端读取事实进入本轮 object key；backend 失败时仍不发布磁盘 source artifact。
+    if (use_source_artifacts) {
+        database.publish_declaration_observations(ctx.query$.ref(), ctx.store.artifacts$.mut_ref());
+    }
     Bool backend_failed = backend.emit_package(
         ctx,
         ctx.jil$.ref(),
@@ -306,10 +335,6 @@ Void compile_package_with_emit(
         return;
     }
     if (use_source_artifacts) {
-        database.publish_declaration_observations(
-            ctx.query$.ref(),
-            ctx.store.artifacts$.mut_ref()
-        );
         source_ji.write_package_source_artifact_cache(
             ctx,
             graph$.ref(),
@@ -325,7 +350,7 @@ Void compile_package_with_emit(
 }
 
 system_target.BuildOutputKind build_output_kind(driver_options.EmitKind emit) {
-    if (emit == .check_only) { return .check_only; }
+    if (emit == .check_only || emit == .generate) { return .check_only; }
     if (emit == .llvm_ir) { return .llvm_ir; }
     if (emit == .object_file) { return .object_file; }
     if (emit == .dynamic_library) { return .dynamic_library; }

@@ -1,0 +1,195 @@
+#doc(module) 定义组合复用共同查询；验证冷热一致、body 排除、内容更新、引用边界和源码顺序。
+alias database = import "../../../../src/compiler/db.jiang";
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+import std;
+
+public Int run() {
+    assert(fs.remove_tree("build/test-definition-fingerprints"));
+    assert(fs.create_dirs("build/test-definition-fingerprints/app"));
+    assert(fs.create_dirs("build/test-definition-fingerprints/tool"));
+    write("app/package.ini", "[package]\nname=input\nroot=main.jiang\n");
+    write("tool/package.ini", "[package]\nname=tool\nroot=generator.jiang\n");
+    write("tool/generator.jiang", fs.read_all("test/compiler/fixture/fingerprint_definitions/generator.jiang")$.some());
+    write("app/dep.jiang", "public struct Payload { Int field; }\n");
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-definition-fingerprints/app", "build/test-definition-fingerprints/output",
+        "build/test-definition-fingerprints/cache");
+    options.generator = "build/test-definition-fingerprints/tool";
+    input();
+    std.String baseline = generate(options$.ref(), false);
+    assert(baseline == generate(options$.ref(), true));
+    input(body: "Int local = n * 2; return local;");
+    assert(baseline == generate(options$.ref(), false));
+    input(doc: "Changed");
+    assert(!same_root(baseline.bytes(), generate(options$.ref(), false).bytes()));
+    input(meta: 2);
+    assert(!same_root(baseline.bytes(), generate(options$.ref(), false).bytes()));
+    input(count: 5);
+    assert(!same_root(baseline.bytes(), generate(options$.ref(), false).bytes()));
+    input(reorder: true);
+    assert(!same_root(baseline.bytes(), generate(options$.ref(), false).bytes()));
+    input(extra: true);
+    std.String expanded = generate(options$.ref(), false);
+    assert(!same_root(baseline.bytes(), expanded.bytes()));
+    assert(expanded == generate(options$.ref(), true));
+    input();
+    assert(baseline == generate(options$.ref(), false));
+    assert(baseline == generate(options$.ref(), true));
+    input(import_name: "renamed");
+    std.String renamed = generate(options$.ref(), false);
+    assert(!same_root(baseline.bytes(), renamed.bytes()));
+    assert(renamed == generate(options$.ref(), true));
+    input();
+    assert(baseline == generate(options$.ref(), false));
+    write("app/dep.jiang", "public struct Payload { Int field; Bool extra; }\n");
+    assert(baseline == generate(options$.ref(), false));
+    assert(baseline == generate(options$.ref(), true));
+    ordinary();
+    external_visibility();
+    assert(fs.remove_tree("build/test-definition-fingerprints"));
+    return 0;
+}
+
+Void input(UInt8[]& body = "return n + 1;", UInt8[]& doc = "Example", Int meta = 1,
+    Int count = 3, Bool reorder = false, Bool extra = false, UInt8[]& import_name = "lib"
+) {
+    std.StringBuilder code! = std.StringBuilder();
+    code.append("#doc(module) Input\nalias "); code.append_valid_utf8(import_name);
+    code.append(" = import \"./dep.jiang\";\n@meta("); code.append(meta);
+    code.append(") #doc "); code.append_valid_utf8(doc);
+    code.append("\nstruct Box<T> { T value; "); code.append_valid_utf8(import_name);
+    code.append(".Payload* pointer; }\n");
+    code.append("enum Choice { a, b(Int) } trait Trait { associated Item; } alias Number = Int;\n");
+    code.append("@meta(4) extend <T> Box<T> { Int extra() { return 0; } }\n");
+    if (reorder) { code.append("struct Other {}\n"); }
+    code.append("Int function(Int n) { "); code.append_valid_utf8(body); code.append(" }\n");
+    if (!reorder) { code.append("struct Other {}\n"); }
+    code.append("const Int count = helper(); Int helper() { return "); code.append(count); code.append("; }\n");
+    if (extra) { code.append("struct Added { Bool value; }\n"); }
+    write("app/main.jiang", code.slice());
+}
+
+std.String generate(options_api.CompileOptions& options, Bool warm) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), options);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+    if (warm) {
+        _ source = ctx.store.sources.find(.file("build/test-definition-fingerprints/app/main.jiang"))$.some();
+        assert(ctx.store.resolve.module_ref(ctx.store.resolve.module_for_source(source)$.some()).interface_only);
+    }
+    _ source = ctx.store.sources.find(.file("build/test-definition-fingerprints/app/main.jiang"))$.some();
+    _ root = ctx.store.resolve.module_ref(ctx.store.resolve.module_for_source(source)$.some()).def_id;
+    _ scope = database.DeclarationScope(owner: root, public_only: false);
+    std.StringBuilder locations! = std.StringBuilder();
+    _ origin = ctx.query.declaration_location_fingerprint(ctx.store$.ref(), root)$.some();
+    locations.append(origin.low); locations.append(" "); locations.append(origin.high); locations.append("\n");
+    Int index! = 0;
+    while (index < ctx.query.declarations.count(ctx.store$.ref(), scope)) {
+        _ member = ctx.query.declarations.at(ctx.store$.ref(), scope, index);
+        _ location = ctx.query.declaration_location_fingerprint(ctx.store$.ref(), member)$.some();
+        locations.append(location.low); locations.append(" "); locations.append(location.high); locations.append("\n");
+        index = index + 1;
+    }
+    assert(string.equal(locations.slice(),
+        fs.read_all("build/test-definition-fingerprints/output/locations")$.some()));
+    return std.String.from_valid_utf8(fs.read_all("build/test-definition-fingerprints/output/fingerprints")$.some());
+}
+
+#doc 已知声明在普通 comptime 中可读完整内容，metadata 的缺失仍由已有按需路径准备。
+Void ordinary() {
+    write("app/main.jiang", fs.read_all("test/compiler/fixture/fingerprint_definitions/ordinary.jiang")$.some());
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "build/test-definition-fingerprints/app", "", "build/test-definition-fingerprints/cache");
+    Int pass! = 0;
+    while (pass < 2) {
+        context.CompilerContext ctx! = context.CompilerContext();
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        if (ctx.store.diagnostics.has_errors()) {
+            reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+        }
+        assert(!ctx.store.diagnostics.has_errors());
+        _ source = ctx.store.sources.find(.file("build/test-definition-fingerprints/app/main.jiang"))$.some();
+        _ module = ctx.store.resolve.module_for_source(source)$.some();
+        _ namespace = ctx.store.resolve.module_ref(module).namespace_id;
+        _ constant = ctx.store.resolve.first_binding(namespace, ctx.store.symbols.intern("value"), .value_name)$.some();
+        _ value = ctx.store.comptime_store.const_value(constant.def_id)$.some();
+        guard value.data is .struct_value(aggregate) else { assert(false); return; }
+        assert(ctx.store.comptime_store.field_count(aggregate) == 2);
+        guard ctx.store.comptime_store.field_at(aggregate, 0).value.data is .uint_value(low)
+            else { assert(false); return; }
+        guard ctx.store.comptime_store.field_at(aggregate, 1).value.data is .uint_value(high)
+            else { assert(false); return; }
+        _ record = ctx.store.resolve.first_binding(namespace, ctx.store.symbols.intern("Record"), .type_name)$.some();
+        _ scope = database.DeclarationScope(owner: record.def_id, public_only: false);
+        _ expected = ctx.query.definition_content_fingerprint(ctx.store$.mut_ref(), scope, module, false)$.some();
+        assert(low == expected.low && high == expected.high);
+
+        pass = pass + 1;
+    }
+}
+
+#doc 外包模块只计算可见定义；私有声明增删和函数实现不改变生成器读取的公开事实。
+Void external_visibility() {
+    assert(fs.create_dirs("build/test-definition-fingerprints/external"));
+    write("external/package.ini", "[package]\nname=external\nroot=main.jiang\n");
+    write("app/package.ini", "[package]\nname=input\nroot=main.jiang\n[dependencies]\nexternal=../external\n");
+    write("app/main.jiang", "alias external = import external;\n");
+    std.StringBuilder generator! = std.StringBuilder();
+    generator.append("import std; @entry(generate) Void emit(reflect.Module root) { ");
+    generator.append("_ module = root.imports().get(0).target(); assert(module.declarations().len() == 1); ");
+    generator.append("_ key = module.fingerprint(); std.StringBuilder text! = std.StringBuilder(); ");
+    generator.append("text.append(key.low); text.append(\" \"); text.append(key.high); ");
+    generator.append("generate.write(\"external\", text.slice()); }");
+    write("tool/generator.jiang", generator.slice());
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-definition-fingerprints/app", "build/test-definition-fingerprints/output",
+        "build/test-definition-fingerprints/cache");
+    options.generator = "build/test-definition-fingerprints/tool";
+    write("external/main.jiang", "public struct Visible { public Int value; }\nstruct Hidden {}\n");
+    _ baseline = external_fingerprint(options$.ref());
+    assert(baseline == external_fingerprint(options$.ref()));
+    write("external/main.jiang",
+        "public struct Visible { public Int value; }\nstruct Hidden {}\nInt helper() { return 1; }\n");
+    assert(baseline == external_fingerprint(options$.ref()));
+    write("external/main.jiang",
+        "public struct Visible { public Int value; }\nstruct Hidden {}\nInt helper() { return 2; }\n");
+    assert(baseline == external_fingerprint(options$.ref()));
+    write("external/main.jiang", "public struct Visible { public Bool value; }\nstruct Hidden {}\n");
+    _ changed = external_fingerprint(options$.ref());
+    assert(baseline != changed);
+    assert(changed == external_fingerprint(options$.ref()));
+}
+
+#doc 经公开反射接口读取外包内容指纹，同时让每轮编译独立恢复共同事实。
+std.String external_fingerprint(options_api.CompileOptions& options) {
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), options);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+    return std.String.from_valid_utf8(fs.read_all("build/test-definition-fingerprints/output/external")$.some());
+}
+
+Void write(UInt8[]& path, UInt8[]& bytes) {
+    assert(fs.write_all(std.path.join("build/test-definition-fingerprints", path).bytes(), bytes));
+}
+
+#doc 单独比较模块 key，避免仅因声明输出顺序不同而误判模块组合已经覆盖该变化。
+Bool same_root(UInt8[]& lhs, UInt8[]& rhs) {
+    Int index! = 0;
+    while (index < lhs.length && index < rhs.length) {
+        if (lhs[index] != rhs[index]) { return false; }
+        if (lhs[index] == UInt8(10)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}

@@ -1,7 +1,6 @@
-// package.ini 解析。
-//
-// 第一版识别 [package] 的 name/root/version/type，以及 [dependencies] 中的本地依赖。
-// 其他未识别字段会被忽略，方便文档继续提前描述后续字段。
+#doc(module)
+    解析包身份、本地依赖和具名生成任务；生成配置严格校验，不加载未选择任务的源码。
+#end
 
 alias list = import "../support/list.jiang";
 alias fs = import "../system/fs.jiang";
@@ -18,6 +17,41 @@ public struct PackageDependency: Copyable {
     public UInt8[]& path;
 }
 
+enum Section: Copyable {
+    unknown,
+    package_fields,
+    dependencies,
+    generate(Int index),
+    lang(Int index),
+}
+
+@region(a)
+public struct GenerateTask: Copyable {
+    @life(a)
+    public UInt8[]& name;
+    @life(a)
+    public UInt8[]& module!;
+    @life(a)
+    public UInt8[]& root!;
+
+    public init(self, UInt8[]& name) {
+        self.name = name;
+        self.module = "";
+        self.root = "";
+    }
+}
+
+#doc name 为空时表示 Provider 自身声明，其余为 host 对直接依赖别名的整组覆盖。
+@region(a)
+public struct LangExtensions: Copyable {
+    @life(a)
+    public UInt8[]& name;
+    @life(a)
+    public UInt8[]& extensions!;
+
+    public init(self, UInt8[]& name) { self.name = name; self.extensions = ""; }
+}
+
 @region(a)
 public struct PackageManifest: Movable {
     @life(a)
@@ -30,6 +64,10 @@ public struct PackageManifest: Movable {
     public UInt8[]& package_type!;
     @life(a)
     public list.ArrayList<PackageDependency> dependencies!;
+    @life(a)
+    public list.ArrayList<GenerateTask> generate_tasks!;
+    @life(a)
+    public list.ArrayList<LangExtensions> lang_extensions!;
     public Bool ok!;
     @life(a)
     public UInt8[]& error!;
@@ -40,8 +78,21 @@ public struct PackageManifest: Movable {
         self.version = "";
         self.package_type = "lib";
         self.dependencies = list.ArrayList<PackageDependency>();
+        self.generate_tasks = list.ArrayList<GenerateTask>();
+        self.lang_extensions = list.ArrayList<LangExtensions>();
         self.ok = true;
         self.error = "";
+    }
+
+    #doc 空名查询 Provider 声明；别名查询 host 覆盖，空结果表示未配置。
+    public UInt8[]& extensions_for(self, UInt8[]& name) {
+        Int index! = 0;
+        while (index < self.lang_extensions.len()) {
+            LangExtensions mapping = self.lang_extensions.get(index);
+            if (string.equal(mapping.name, name)) { return mapping.extensions; }
+            index = index + 1;
+        }
+        return "";
     }
 
     public UInt8[]& dependency_path(self, UInt8[]& name) {
@@ -61,7 +112,7 @@ public struct PackageManifest: Movable {
 public PackageManifest parse(UInt8[]& package_dir, UInt8[]& text) {
     PackageManifest manifest! = PackageManifest(package_dir);
 
-    Int section! = 0;
+    Section section! = .unknown;
     Int line_start! = 0;
     while (line_start <= text.length) {
         Int line_end! = line_start;
@@ -85,16 +136,37 @@ public PackageManifest parse(UInt8[]& package_dir, UInt8[]& text) {
             continue;
         }
         if (is_section_header(line)) {
-            section = section_kind(line[1..line.length - 1]);
+            section = parse_section(manifest$.mut_ref(), line[1..line.length - 1]);
+            if (!manifest.ok) { return manifest; }
             continue;
         }
 
+        if (line.length >= 9 && string.equal(line[0..9], "[generate")) {
+            manifest.ok = false;
+            manifest.error = "invalid generate section header";
+            return manifest;
+        }
+        if (line.length >= 5 && string.equal(line[0..5], "[lang")) {
+            manifest.ok = false;
+            manifest.error = "invalid lang section header";
+            return manifest;
+        }
         parse_line(manifest$.mut_ref(), section, line);
         if (!manifest.ok) {
             return manifest;
         }
     }
 
+    Int task_index! = 0;
+    while (task_index < manifest.generate_tasks.len()) {
+        if (manifest.generate_tasks.get(task_index).module.length == 0) {
+            manifest.ok = false;
+            manifest.error = "generate task requires module";
+            return manifest;
+        }
+        task_index = task_index + 1;
+    }
+    if (!validate_lang_extensions(manifest$.mut_ref())) { return manifest; }
     if (!ident.is_ident_name(manifest.name)) {
         manifest.ok = false;
         manifest.error = "package name must follow identifier rules";
@@ -159,35 +231,85 @@ public Path root_file_path(UInt8[]& package_dir, PackageManifest& manifest) {
     return std.path.normalize(joined.bytes());
 }
 
-Int section_kind(UInt8[]& name) {
-    if (string.equal(name, "package")) {
-        return 1;
+Section parse_section(PackageManifest&! manifest, UInt8[]& name) {
+    if (string.equal(name, "lang")) { return parse_lang_section(manifest, ""); }
+    if (name.length >= 5 && string.equal(name[0..5], "lang.")) {
+        UInt8[]& alias_name = name[5..name.length];
+        if (!ident.is_ident_name(alias_name)) {
+            manifest.ok = false;
+            manifest.error = "lang override requires a dependency alias";
+            return .unknown;
+        }
+        return parse_lang_section(manifest, alias_name);
     }
-    if (string.equal(name, "dependencies")) {
-        return 2;
+    if (string.equal(name, "package")) { return .package_fields; }
+    if (string.equal(name, "dependencies")) { return .dependencies; }
+    if (string.equal(name, "generate")) {
+        manifest.ok = false;
+        manifest.error = "generate section requires a task name";
+        return .unknown;
     }
-    return 0;
+    if (name.length < 9 || !string.equal(name[0..9], "generate.")) { return .unknown; }
+    UInt8[]& task_name = name[9..name.length];
+    if (!ident.is_ident_name(task_name)) {
+        manifest.ok = false;
+        manifest.error = "generate task name must follow identifier rules";
+        return .unknown;
+    }
+    Int index! = 0;
+    while (index < manifest.generate_tasks.len()) {
+        if (string.equal(manifest.generate_tasks.get(index).name, task_name)) {
+            manifest.ok = false;
+            manifest.error = "duplicate generate task";
+            return .unknown;
+        }
+        index = index + 1;
+    }
+    manifest.generate_tasks.add(GenerateTask(task_name));
+    return .generate(index);
 }
 
-Void parse_line(PackageManifest&! manifest, Int section, UInt8[]& line) {
-    if (is_section_header(line)) {
-        return;
-    }
-
+Void parse_line(PackageManifest&! manifest, Section section, UInt8[]& line) {
     Int eq_index = find_equal(line);
     if (eq_index < 0) {
+        if (section is .lang(_)) {
+            manifest.ok = false;
+            manifest.error = "lang entry requires key = value";
+        }
+        if (section is .generate(_)) {
+            manifest.ok = false;
+            manifest.error = "generate entry requires key = value";
+        }
         return;
     }
-
     UInt8[]& key = trim(line[0..eq_index]);
     UInt8[]& value = trim(unquote(trim(line[eq_index + 1..line.length])));
-    if (section == 1) {
-        parse_package_entry(manifest, key, value);
+    if (section is .package_fields) { parse_package_entry(manifest, key, value); return; }
+    if (section is .dependencies) { parse_dependency_entry(manifest, key, value); return; }
+    if (section is .generate(index)) { parse_generate_entry(manifest, index, key, value); }
+    if (section is .lang(index)) { parse_lang_entry(manifest, index, key, value); }
+}
+
+Void parse_generate_entry(PackageManifest&! manifest, Int index, UInt8[]& key, UInt8[]& value) {
+    if (!string.equal(key, "module") && !string.equal(key, "root")) {
+        manifest.ok = false;
+        manifest.error = "unknown generate task field";
         return;
     }
-    if (section == 2) {
-        parse_dependency_entry(manifest, key, value);
+    if (!path_text_valid(value)) {
+        manifest.ok = false;
+        manifest.error = "generate task path is invalid";
+        return;
     }
+    GenerateTask task! = manifest.generate_tasks.get(index);
+    Bool duplicate = if (string.equal(key, "module")) { task.module.length != 0 } else { task.root.length != 0 };
+    if (duplicate) {
+        manifest.ok = false;
+        manifest.error = "duplicate generate task field";
+        return;
+    }
+    if (string.equal(key, "module")) { task.module = value; } else { task.root = value; }
+    manifest.generate_tasks.set(index, task);
 }
 
 Void parse_package_entry(PackageManifest&! manifest, UInt8[]& key, UInt8[]& value) {
@@ -362,4 +484,95 @@ UInt8[]& basename(UInt8[]& path) {
         index = index + 1;
     }
     return path[start..end];
+}
+
+#doc 扩展名列表只保留原始 manifest 的借用，供校验与 Provider 注册共用分隔规则。
+@life()
+public list.ArrayList<UInt8[]&> split_extensions(UInt8[]& text) {
+    list.ArrayList<UInt8[]&> parts! = list.ArrayList<UInt8[]&>();
+    Int start! = 0;
+    Int index! = 0;
+    while (index <= text.length) {
+        if (index == text.length || text[index] == UInt8(44)) {
+            parts.add(trim(text[start..index]));
+            start = index + 1;
+        }
+        index = index + 1;
+    }
+    return parts;
+}
+
+Section parse_lang_section(PackageManifest&! manifest, UInt8[]& name) {
+    Int index! = 0;
+    while (index < manifest.lang_extensions.len()) {
+        if (string.equal(manifest.lang_extensions.get(index).name, name)) {
+            manifest.ok = false;
+            manifest.error = "duplicate lang section";
+            return .unknown;
+        }
+        index = index + 1;
+    }
+    manifest.lang_extensions.add(LangExtensions(name));
+    return .lang(index);
+}
+
+Void parse_lang_entry(PackageManifest&! manifest, Int index, UInt8[]& key, UInt8[]& value) {
+    if (!string.equal(key, "extensions")) {
+        manifest.ok = false;
+        manifest.error = "unknown lang field";
+        return;
+    }
+    if (manifest.lang_extensions.get(index).extensions.length != 0) {
+        manifest.ok = false;
+        manifest.error = "duplicate lang extensions field";
+        return;
+    }
+    if (!extensions_valid(value)) {
+        manifest.ok = false;
+        manifest.error = "invalid or duplicate lang extension; jiang is reserved";
+        return;
+    }
+    LangExtensions mapping! = manifest.lang_extensions.get(index);
+    mapping.extensions = value;
+    manifest.lang_extensions.set(index, mapping);
+}
+
+Bool extensions_valid(UInt8[]& value) {
+    list.ArrayList<UInt8[]&> parts = split_extensions(value);
+    Int index! = 0;
+    while (index < parts.len()) {
+        UInt8[]& part = parts.get(index);
+        if (!ident.is_ident_name(part) || string.equal(part, "jiang")) { return false; }
+        Int previous! = 0;
+        while (previous < index) {
+            if (string.equal(parts.get(previous), part)) { return false; }
+            previous = previous + 1;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool validate_lang_extensions(PackageManifest&! manifest) {
+    Int index! = 0;
+    while (index < manifest.lang_extensions.len()) {
+        LangExtensions mapping = manifest.lang_extensions.get(index);
+        if (mapping.extensions.length == 0) {
+            manifest.ok = false;
+            manifest.error = "lang section requires extensions";
+            return false;
+        }
+        if (mapping.name.length == 0 && !string.equal(manifest.package_type, "lang")) {
+            manifest.ok = false;
+            manifest.error = "provider extensions require package type lang";
+            return false;
+        }
+        if (mapping.name.length != 0 && manifest.dependency_path(mapping.name).length == 0) {
+            manifest.ok = false;
+            manifest.error = "lang override requires a declared dependency";
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
 }

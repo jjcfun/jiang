@@ -1,0 +1,154 @@
+#doc(module)
+    普通常量求值按实际目标读取 metadata；验证先于整包检查的准备及跨会话恢复。
+#end
+alias artifact = import "../../../../src/compiler/artifact/source.jiang";
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+import std;
+
+public Int run() {
+    assert(fs.remove_tree("build/test-reflect-metadata-comptime"));
+    assert(fs.create_dirs("build/test-reflect-metadata-comptime"));
+    assert(fs.write_all("build/test-reflect-metadata-comptime/package.ini",
+        "[package]\nname=metadata_comptime\nroot=main.jiang\n"));
+    check("@meta(42) struct Record {}", "return item.definition().meta<Int>().get(0).value$.get();", 42);
+    check("struct Record {}", "return if item.definition().has_meta<Int>() { 1 } else { 0 };", 0);
+    check("struct Generic<T> { T field; } alias Record = Generic<Int>;",
+        "return item.definition().generic_parameters().get(0).meta<Int>().len();", 0);
+    check("struct Record { @meta(7) Int field; }",
+        "return reflect.type_of<Record>().members().get(0).meta<Int>().get(0).value$.get();", 7);
+    check("@meta(module: 11) struct Record {}",
+        "return item.definition().module().meta<Int>().get(0).value$.get();", 11);
+    check("@meta(reflect.type_of<Record>().members().len()) struct Record { Int x; Bool y; }",
+        "return item.definition().meta<Int>().get(0).value$.get();", 2);
+    std.StringBuilder dependency! = std.StringBuilder();
+    dependency.append("@meta(other()) struct Record {} @meta(13) struct Other {} Int other() { ");
+    dependency.append("guard reflect.type_of<Other>().shape() is .nominal(other) else { return 0; } ");
+    dependency.append("return other.definition().meta<Int>().get(0).value$.get(); }");
+    check(dependency.slice(), "return item.definition().meta<Int>().get(0).value$.get();", 13);
+    std.StringBuilder nested! = std.StringBuilder();
+    nested.append("@meta(module: 17) struct Record {} Int nested<T>() { const Int value = tags<T>(); value } ");
+    nested.append("Int tags<T>() { guard reflect.type_of<T>().shape() is .nominal(item) else { return 0; } ");
+    nested.append("return item.definition().module().meta<Int>().get(0).value$.get(); }");
+    check(nested.slice(), "return nested<Record>();", 17);
+    failure("@meta(read()) struct Record {}", "return item.definition().meta<Int>().get(0).value$.get();",
+        "metadata_dependency_cycle");
+    failure("struct Record {}", "return reflect.with_meta<Int>(item.definition().module()).len();",
+        "reflection_context_required");
+    cross_package();
+    return 0;
+}
+
+Void input(UInt8[]& declarations, UInt8[]& body) {
+    std.StringBuilder source! = std.StringBuilder();
+    source.append("const Int answer = read(); alias Force = Int[answer];\n");
+    source.append(declarations); source.append("\n");
+    source.append("Int read() { guard reflect.type_of<Record>().shape() is .nominal(item) else { return -1; }\n");
+    source.append(body); source.append(" }\n");
+    assert(fs.write_all("build/test-reflect-metadata-comptime/main.jiang", source.slice()));
+}
+
+Void check(UInt8[]& declarations, UInt8[]& body, Int expected) {
+    input(declarations, body);
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "build/test-reflect-metadata-comptime", "", "build/test-reflect-metadata-comptime/cache");
+    Int pass! = 0;
+    while (pass < 2) {
+        context.CompilerContext ctx! = context.CompilerContext();
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        if (ctx.store.diagnostics.has_errors()) {
+            reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+        }
+        assert(!ctx.store.diagnostics.has_errors());
+        _ source = ctx.store.sources.find(.file("build/test-reflect-metadata-comptime/main.jiang"))$.some();
+        _ module = ctx.store.resolve.module_ref(ctx.store.resolve.module_for_source(source)$.some());
+        _ symbol = ctx.store.symbols.intern("answer");
+        _ binding = ctx.store.resolve.first_binding(module.namespace_id, symbol, .value_name)$.some();
+        _ value = ctx.store.comptime_store.const_value(binding.def_id)$.some();
+        guard value.data is .int_value(number) else { assert(false); return; }
+        assert(number == expected);
+        pass = pass + 1;
+    }
+}
+
+Void failure(UInt8[]& declarations, UInt8[]& body, UInt8[]& code) {
+    input(declarations, body);
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "build/test-reflect-metadata-comptime", "", "build/test-reflect-metadata-comptime/cache");
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), options$.ref());
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        if (string.equal(ctx.store.diagnostics.get(index).code.text, code)) { return; }
+        index = index + 1;
+    }
+    reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    assert(false);
+}
+
+#doc 相同调用方源码从磁盘复用常量；修改被执行的标签 helper 后沿共同 metadata 事实失效。
+Void cross_package() {
+    UInt8[]& base = "build/test-reflect-metadata-comptime/cross";
+    _ app = std.path.join(base, "app");
+    _ library = std.path.join(base, "library");
+    assert(fs.create_dirs(app.bytes()) && fs.create_dirs(library.bytes()));
+    assert(fs.write_all(std.path.join(app.bytes(), "package.ini").bytes(),
+        "[package]\nname=app\nroot=main.jiang\n[dependencies]\nlibrary=../library\n"));
+    assert(fs.write_all(std.path.join(library.bytes(), "package.ini").bytes(),
+        "[package]\nname=library\nroot=main.jiang\n"));
+    std.StringBuilder source! = std.StringBuilder();
+    source.append("alias lib = import library; const Int answer = read(); alias Force = Int[answer];\n");
+    source.append("Int read() { guard reflect.type_of<lib.Record>().shape() is .nominal(item) else { return -1; }\n");
+    source.append("return item.definition().meta<Int>().get(0).value$.get(); }\n");
+    _ input_path = std.path.join(app.bytes(), "main.jiang");
+    assert(fs.write_all(input_path.bytes(), source.slice()));
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        app.bytes(), "", "build/test-reflect-metadata-comptime/cross/cache");
+    artifact.DeclarationObservationSet baseline! = artifact.DeclarationObservationSet();
+    Int iteration! = 0;
+    while (iteration < 4) {
+        Int expected = if iteration < 2 { 41 } else { 42 };
+        if (iteration == 0 || iteration == 2) {
+            std.StringBuilder input! = std.StringBuilder();
+            input.append("@meta(value()) public struct Record {} public Int value() { return ");
+            input.append(expected); input.append("; }\n");
+            assert(fs.write_all(std.path.join(library.bytes(), "main.jiang").bytes(), input.slice()));
+        }
+        context.CompilerContext ctx! = context.CompilerContext();
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        if (ctx.store.diagnostics.has_errors()) {
+            reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+        }
+        assert(!ctx.store.diagnostics.has_errors());
+        _ source_id = ctx.store.sources.find(.file(input_path.bytes()))$.some();
+        _ module = ctx.store.resolve.module_ref(ctx.store.resolve.module_for_source(source_id)$.some());
+        _ binding = ctx.store.resolve.first_binding(module.namespace_id, ctx.store.symbols.intern("answer"),
+            .value_name)$.some();
+        _ value = ctx.store.comptime_store.const_value(binding.def_id)$.some();
+        guard value.data is .int_value(number) else { assert(false); return; }
+        assert(number == expected);
+        if (iteration == 1 || iteration == 3) { assert(module.interface_only); }
+        if (iteration == 0) {
+            _ observations = ctx.store.artifacts.load_observations(source_id)$.some();
+            Int index! = 0;
+            while (index < observations.entries.len()) {
+                _ item = observations.entries.get(index);
+                if (item.aspect == .metadata) {
+                    _ target = ctx.store.incremental.current_def_for_stable(item.subject)$.some();
+                    assert(ctx.query.metadata.fingerprint(ctx.store$.ref(), ctx.query.locations$.ref(),
+                        target)$.some() == item.observed);
+                    baseline.add(item);
+                }
+                index = index + 1;
+            }
+            assert(baseline.entries.len() == 1);
+        } else {
+            assert(ctx.query.validate_declaration_observations(ctx.store$.ref(), baseline$.ref()) == (iteration == 1));
+        }
+        iteration = iteration + 1;
+    }
+}

@@ -1,20 +1,22 @@
-// Package-level fingerprint for artifacts whose cache boundary is a package.
-//
-// This is shared by ordinary target packages and `type = lang` provider
-// packages. The artifact kind decides what gets built; the invalidation rule is
-// the same: package manifest, package source closure, dependency package
-// closure, compiler/toolchain profile, and target profile form the cache key.
+#doc(module)
+    包产物指纹读取实际加载的模块闭包；导入表达式与 Lang 源文件复用普通解析和按需求值流程。
+#end
 
 alias context = import "../context.jiang";
+alias analysis = import "../analysis.jiang";
 alias qid = import "../id.jiang";
 alias resolve_store = import "../resolve/store.jiang";
+alias resolver_api = import "../resolve/module_resolver.jiang";
+alias module_graph = import "../resolve/module_graph.jiang";
 alias package_manifest = import "../source/package_manifest.jiang";
-alias source_model = import "../source.jiang";
+alias source_entry = import "../source/entry.jiang";
 alias syntax = import "../syntax.jiang";
-alias ast = import "../syntax/ast.jiang";
-alias hash = import "../support/hash.jiang";
-alias list = import "../support/list.jiang";
+alias lang_entry = import "../lang/entry.jiang";
 alias string = import "../support/string.jiang";
+alias lang = import "../lang.jiang";
+alias source_ji = import "./source_ji.jiang";
+alias hash = import "../support/hash.jiang";
+alias set = import "../support/set.jiang";
 alias fs = import "../system/fs.jiang";
 import std;
 
@@ -23,291 +25,111 @@ public UInt64 from_manifest(
     UInt8[]& package_dir,
     package_manifest.PackageManifest& manifest
 ) {
+    Path root = package_manifest.root_file_path(package_dir, manifest);
+    _ key = ctx.store.symbols.intern(root.bytes());
+    if (ctx.build_lang_dylibs && ctx.lang_fingerprints.get(key) is .some(cached)) { return cached$.get(); }
+    context.CompilerContext inputs! = context.CompilerContext();
+    inputs.inherit_lang_build(ctx, root.bytes());
+    UInt64 result = prepare_source_closure(
+        inputs$.mut_ref(), root.bytes(), string.equal(manifest.package_type, "lang"));
+    if (inputs.store.diagnostics.has_errors()) {
+        lang.wrapper.add_build_diagnostics(ctx, inputs$.mut_ref());
+        return UInt64(0);
+    }
+    ctx.store.sources.import_file_inputs(inputs.store.sources$.ref());
+    if (ctx.build_lang_dylibs) { ctx.lang_fingerprints.set(key, result); }
+    return result;
+}
+
+UInt64 prepare_source_closure(context.CompilerContext&! ctx, UInt8[]& root_path, Bool provider) {
+    source_entry.PackageHandle package = source_entry.load_package(ctx, root_path);
+    source_entry.Entry entry! = source_entry.read_root(ctx, package$.ref());
+    if (!entry.ok) { return UInt64(0); }
+    UInt64 version = source_ji.artifact_version_hash(ctx.lang_compiler_version.bytes());
+    lang.registry_builder.BuildResult providers! = lang.registry_builder.build_for_source_path(
+        ctx, root_path, ctx.lang_cache_dir.bytes(), version, ctx.lang_mode);
+    if (!providers.ok || !lang.dylib_builder.ensure_configured(ctx, providers.registry$.ref())) { return UInt64(0); }
+    syntax.SyntaxResult parsed! = syntax.parse_source_with_lang(ctx, entry.text[..], entry.source_id,
+        providers.registry$.mut_ref());
+    if (parsed.has_errors()) { return UInt64(0); }
+    if (provider && lang_entry.find(ctx, parsed.unit$.ref()) == null) { return UInt64(0); }
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(analysis.evaluate_source_expression,
+        ctx.lang_cache_dir.bytes(), version, false, ctx.lang_mode);
+    module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx, parsed.take_unit());
+    if (!resolver.prepare_root_entry_environment(ctx, graph$.mut_ref())) { return UInt64(0); }
+    if (!resolver.ensure_root_entry_model(ctx, graph$.mut_ref())) { return UInt64(0); }
+    resolver.seal_module_graph(ctx, graph$.mut_ref());
+    if (!graph.ok) { return UInt64(0); }
+    if (!resolver.lower_module_graph_to_model(ctx, graph$.ref())) { return UInt64(0); }
+    if (!analysis.check_model_package(ctx, graph$.ref())) { return UInt64(0); }
     hash.WyHasher hasher! = hash.WyHasher();
-    list.ArrayList<std.String> visited_packages! = list.ArrayList<std.String>();
-    Path normalized = std.path.normalize(package_dir);
-    hash.WyHasher&! hasher_ref = hasher$.mut_ref();
-    hash_manifest_package_closure(ctx, hasher_ref, normalized.bytes(), manifest, visited_packages$.mut_ref());
+    set.HashSet<qid.PackageId> visited! = set.HashSet<qid.PackageId>();
+    Int index! = 0;
+    while (index < ctx.store.resolve.packages.len()) {
+        hash_package(ctx, hasher$.mut_ref(), qid.PackageId(index), visited$.mut_ref());
+        index = index + 1;
+    }
+    // Provider 的动态库身份包含其自己的实现闭包；不再次解析未被普通 import 加载的 Provider。
+    index = 0;
+    while (index < ctx.store.resolve.packages.len()) {
+        resolve_store.PackageRecord& record = ctx.store.resolve.package_ref(qid.PackageId(index));
+        if (record.lang_info_ref() is .some(info)) {
+            hasher.write(ctx.store.symbols.text(record.dir_path));
+            hasher.write(ctx.store.symbols.text(info.dylib_path));
+        }
+        index = index + 1;
+    }
     return hasher.finish();
 }
 
 public UInt64 from_package(context.CompilerContext&! ctx, qid.PackageId package_id) {
     hash.WyHasher hasher! = hash.WyHasher();
-    list.ArrayList<Int> visited_packages! = list.ArrayList<Int>();
-    hash.WyHasher&! hasher_ref = hasher$.mut_ref();
-    hash_package_record_closure(ctx, hasher_ref, package_id, visited_packages$.mut_ref());
+    set.HashSet<qid.PackageId> visited! = set.HashSet<qid.PackageId>();
+    hash_package(ctx, hasher$.mut_ref(), package_id, visited$.mut_ref());
     return hasher.finish();
 }
 
-Void hash_manifest_package_closure(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest,
-    list.ArrayList<std.String>&! visited_packages
-) {
-    if (visited_text(visited_packages, package_dir)) {
-        return;
-    }
-    visited_packages.add(std.String.from_valid_utf8(package_dir));
-    hash_package_manifest(hasher, package_dir);
-    Path root_path = package_manifest.root_file_path(package_dir, manifest);
-    hash_manifest_source_closure(ctx, hasher, package_dir, root_path.bytes());
-    hash_manifest_dependencies(ctx, hasher, package_dir, manifest, visited_packages);
-}
-
-Void hash_package_record_closure(
+Void hash_package(
     context.CompilerContext&! ctx,
     hash.WyHasher&! hasher,
     qid.PackageId package_id,
-    list.ArrayList<Int>&! visited_packages
+    set.HashSet<qid.PackageId>&! visited
 ) {
-    if (visited_package_id(visited_packages, package_id)) {
-        return;
-    }
-    visited_packages.add(package_id.to_index());
-    resolve_store.PackageRecord& package_record = ctx.store.resolve.package_ref(package_id);
+    if (visited.has(package_id)) { return; }
+    visited.add(package_id);
+    resolve_store.PackageRecord& record = ctx.store.resolve.package_ref(package_id);
     hasher.write("package");
-    hasher.write(Int(package_record.kind));
-    hasher.write(ctx.store.symbols.text(package_record.dir_path));
-    hasher.write(ctx.store.symbols.text(package_record.root_path));
-    hash_package_record_modules(ctx, hasher, package_id);
-    hash_package_record_dependencies(ctx, hasher, package_id, visited_packages);
-}
-
-Void hash_package_record_modules(
-    context.CompilerContext& ctx,
-    hash.WyHasher&! hasher,
-    qid.PackageId package_id
-) {
-    resolve_store.PackageRecord& package_record = ctx.store.resolve.package_ref(package_id);
+    hasher.write(Int(record.kind));
+    hasher.write(ctx.store.symbols.text(record.dir_path));
+    hasher.write(ctx.store.symbols.text(record.root_path));
+    hash_manifest(hasher, ctx.store.symbols.text(record.dir_path));
     Int index! = 0;
-    while (index < package_record.modules.len()) {
-        resolve_store.ModuleRecord& module = ctx.store.resolve.module_ref(package_record.modules.get(index));
-        source_model.SourceInfo& source_record = ctx.store.sources.entry(module.source_id);
-        hasher.write("module");
-        hash_source_key(hasher, source_record);
+    while (index < record.modules.len()) {
+        _ module = ctx.store.resolve.module_ref(record.modules.get(index));
+        ctx.store.sources.entry(module.source_id).key.hash(hasher);
         hasher.write(ctx.store.sources.content_hash(module.source_id));
         index = index + 1;
     }
-}
-
-Void hash_source_key(
-    hash.WyHasher&! hasher,
-    source_model.SourceInfo& source_record
-) {
-    source_record.key.hash(hasher);
-}
-
-Void hash_package_record_dependencies(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    qid.PackageId package_id,
-    list.ArrayList<Int>&! visited_packages
-) {
-    Int dependency_count = ctx.store.resolve.package_ref(package_id).dependencies.len();
-    Int index! = 0;
-    while (index < dependency_count) {
-        resolve_store.PackageDependencyRecord dependency =
-            ctx.store.resolve.package_ref(package_id).dependencies.get(index);
-        hasher.write("dependency");
+    index = 0;
+    while (index < record.dependencies.len()) {
+        _ dependency = record.dependencies.get(index);
         hasher.write(ctx.store.symbols.text(dependency.alias_symbol));
-        if (ctx.store.resolve.package_for_dir(dependency.path_symbol) is .some(package_id)) {
-            hash_package_record_closure(ctx, hasher, package_id, visited_packages);
+        if (ctx.store.resolve.package_for_dir(dependency.path_symbol) is .some(dependency_id)) {
+            hash_package(ctx, hasher, dependency_id, visited);
         } else {
-            std.String dependency_dir =
-                std.String.from_valid_utf8(ctx.store.symbols.text(dependency.path_symbol));
-            hash_dependency_manifest(ctx, hasher, dependency_dir.bytes());
+            hash_manifest(hasher, ctx.store.symbols.text(dependency.path_symbol));
         }
         index = index + 1;
     }
 }
 
-Void hash_dependency_manifest(context.CompilerContext&! ctx, hash.WyHasher&! hasher, UInt8[]& dependency_dir) {
-    package_manifest.PackageManifest dependency_manifest = package_manifest.read(dependency_dir);
-    if (!dependency_manifest.ok) {
-        hasher.write(UInt64(0));
-        return;
-    }
-    list.ArrayList<std.String> visited_packages! = list.ArrayList<std.String>();
-    hash_manifest_package_closure(
-        ctx,
-        hasher,
-        dependency_dir,
-        dependency_manifest$.ref(),
-        visited_packages$.mut_ref()
-    );
-}
-
-Void hash_package_manifest(hash.WyHasher&! hasher, UInt8[]& package_dir) {
-    Path manifest_path = package_manifest.manifest_path(package_dir);
-    UInt8[]& manifest_path_text = manifest_path.bytes();
+Void hash_manifest(hash.WyHasher&! hasher, UInt8[]& package_dir) {
+    Path path = package_manifest.manifest_path(package_dir);
     hasher.write("manifest");
-    hasher.write(manifest_path_text);
-    guard fs.read_all(manifest_path_text) is .some(text) else {
+    hasher.write(path.bytes());
+    if (fs.read_all_owned(path.bytes()) is .some(text)) {
+        hasher.write(text[..]);
+    } else {
         hasher.write(UInt64(0));
-        return;
     }
-    hasher.write(UInt64(source_model.content_hash(text)));
-}
-
-Void hash_manifest_dependencies(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest,
-    list.ArrayList<std.String>&! visited_packages
-) {
-    Int index! = 0;
-    while (index < manifest.dependencies.len()) {
-        package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
-        Path joined = std.path.join(package_dir, dependency.path);
-        Path dependency_dir = std.path.normalize(joined.bytes());
-        hasher.write("dependency");
-        hasher.write(dependency.name);
-        hash_manifest_dependency(ctx, hasher, dependency_dir.bytes(), visited_packages);
-        index = index + 1;
-    }
-}
-
-Void hash_manifest_dependency(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& dependency_dir,
-    list.ArrayList<std.String>&! visited_packages
-) {
-    package_manifest.PackageManifest dependency_manifest = package_manifest.read(dependency_dir);
-    if (!dependency_manifest.ok) {
-        hasher.write(UInt64(0));
-        return;
-    }
-    hash_manifest_package_closure(ctx, hasher, dependency_dir, dependency_manifest$.ref(), visited_packages);
-}
-
-Void hash_manifest_source_closure(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    UInt8[]& root_path
-) {
-    list.ArrayList<std.String> visited_sources! = list.ArrayList<std.String>();
-    hash_source_closure(ctx, hasher, package_dir, root_path, visited_sources$.mut_ref());
-}
-
-Void hash_source_closure(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    UInt8[]& source_path,
-    list.ArrayList<std.String>&! visited_sources
-) {
-    Path normalized_path = std.path.normalize(source_path);
-    if (visited_text(visited_sources, normalized_path.bytes())) {
-        return;
-    }
-    visited_sources.add(std.String.from_valid_utf8(normalized_path.bytes()));
-    hash_source_file(ctx, hasher, package_dir, normalized_path.bytes(), visited_sources);
-}
-
-Void hash_source_file(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    UInt8[]& source_path,
-    list.ArrayList<std.String>&! visited_sources
-) {
-    hasher.write("source");
-    hasher.write(source_path);
-    guard ctx.store.sources.load_path_text(source_path) is .some(loaded) else {
-        hasher.write(UInt64(0));
-        return;
-    }
-
-    UInt8[]^ text! = loaded;
-    hasher.write(UInt64(source_model.content_hash(text[..])));
-    source_model.SourceId source_id = ctx.store.sources.intern_path(source_path, text[..]);
-    ctx.store.artifacts.record_source_parse();
-    syntax.SyntaxResult parsed! = syntax.parse_source(ctx, text[..], source_id);
-    if (parsed.has_errors()) {
-        return;
-    }
-    ast.AstUnit unit! = parsed.take_unit();
-    hash_file_imports(ctx, hasher, package_dir, source_path, unit$.ref(), visited_sources);
-}
-
-Void hash_file_imports(
-    context.CompilerContext&! ctx,
-    hash.WyHasher&! hasher,
-    UInt8[]& package_dir,
-    UInt8[]& source_path,
-    ast.AstUnit& unit,
-    list.ArrayList<std.String>&! visited_sources
-) {
-    guard unit.root is .some(root_id) else { return; }
-    ast.AstNode root = unit.get(root_id);
-    guard ast.root_data(root.data) is .some(root_data) else { return; }
-
-    Int index! = 0;
-    while (index < root_data.items.length) {
-        ast.AstId item_id = unit.child_at(root_data.items, index);
-        if (file_import_path(ctx, unit, item_id) is .some(import_path)) {
-            Path resolved = resolved_import_path(source_path, import_path);
-            hash_source_closure(ctx, hasher, package_dir, resolved.bytes(), visited_sources);
-        }
-        index = index + 1;
-    }
-}
-
-Path resolved_import_path(UInt8[]& source_path, UInt8[]& import_path) {
-    if (std.path.is_absolute(import_path)) {
-        return std.path.normalize(import_path);
-    }
-    UInt8[]& dirname = std.path.dirname(source_path);
-    Path joined = std.path.join(dirname, import_path);
-    return std.path.normalize(joined.bytes());
-}
-
-@life(return: ctx)
-UInt8[]&? file_import_path(context.CompilerContext&! ctx, ast.AstUnit& unit, ast.AstId item_id) {
-    ast.AstNode item = unit.get(item_id);
-    guard item.data is .top_level_decl(top_level) else { return null; }
-    ast.AstNode body = unit.get(top_level.body);
-    guard body.data is .import_decl(import_decl) else { return null; }
-    if (import_decl.kind != .string_path) {
-        return null;
-    }
-    return string_literal_text(ctx, unit, import_decl.path);
-}
-
-@life(return: ctx)
-UInt8[]&? string_literal_text(context.CompilerContext&! ctx, ast.AstUnit& unit, ast.AstId literal_id) {
-    ast.AstNode node = unit.get(literal_id);
-    guard node.data is .literal(literal) else { return null; }
-    if (literal.kind != .string_lit) {
-        return null;
-    }
-    guard literal.symbol_id is .some(symbol) else { return null; }
-    return ctx.store.symbols.text(symbol);
-}
-
-Bool visited_text(list.ArrayList<std.String>& values, UInt8[]& text) {
-    Int index! = 0;
-    while (index < values.len()) {
-        if (string.equal(values.ref_at(index).bytes(), text)) {
-            return true;
-        }
-        index = index + 1;
-    }
-    return false;
-}
-
-Bool visited_package_id(list.ArrayList<Int>& values, qid.PackageId package_id) {
-    Int index! = 0;
-    while (index < values.len()) {
-        if (values.get(index) == package_id.to_index()) {
-            return true;
-        }
-        index = index + 1;
-    }
-    return false;
 }

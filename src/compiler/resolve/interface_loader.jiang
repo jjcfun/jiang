@@ -6,6 +6,7 @@
 #end
 
 alias context = import "../context.jiang";
+alias entry = import "../entry.jiang";
 alias artifact = import "../artifact/source.jiang";
 alias model_template = import "../artifact/model_template.jiang";
 alias interface_builder = import "../artifact/interface_builder.jiang";
@@ -25,6 +26,7 @@ alias string = import "../support/string.jiang";
 alias namespace = import "./namespace.jiang";
 alias resolve_state = import "./state.jiang";
 alias store = import "./store.jiang";
+alias constant = import "../artifact/constant.jiang";
 alias comptime_value = import "../sema/comptime/value.jiang";
 import std;
 
@@ -121,6 +123,18 @@ public struct InterfaceLoader: Movable {
         self.load_extension_groups(module_id, module_interface);
         self.load_public_aliases(module_id, module_interface, false);
         qid.DefId module_def = self.ctx.store.resolve.module_ref(module_id).def_id;
+        if (!module_interface.metadata_expected) {
+            self.ctx.query.metadata.prepare(module_def);
+            index = 0;
+            while (index < module_interface.declarations.len()) {
+                _ stable = module_interface.declarations.get(index).stable_id;
+                if (self.ctx.store.incremental.current_def_for_stable(stable) is .some(definition)) {
+                    self.ctx.query.metadata.prepare(definition);
+                }
+                index = index + 1;
+            }
+            self.ctx.query.metadata.mark_module_ready(module_id);
+        }
         self.ctx.store.model.set_declaration_sema_state(module_def, .body_ready);
     }
 
@@ -255,6 +269,17 @@ public struct InterfaceLoader: Movable {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
         qid.DefId module_def = module.def_id;
         qid.NamespaceId module_namespace = module.namespace_id;
+        if (declaration.kind == .alias_def) {
+            qid.NamespaceId namespace_id = self.decl_namespace(module_def, module_namespace, semantic_owner);
+            if (self.source_alias_skeleton(module_id, namespace_id, declaration.name) is .some(candidate)) {
+                self.ctx.store.defs.set_domain(candidate, declaration.domain);
+                self.ctx.store.resolve.bind_name(namespace_id, declaration.name, declaration.domain,
+                    candidate, declaration.visibility, declaration.span);
+                self.record_interface_stable_key(module_def, module_interface, declaration, candidate);
+                self.record_declaration_fingerprints(declaration);
+                return candidate;
+            }
+        }
         if (declaration.kind == .function_def
             || declaration.kind == .init_def
             || declaration.kind == .deinit_def
@@ -337,7 +362,10 @@ public struct InterfaceLoader: Movable {
                 declaration.kind
             );
         }
-        self.ctx.store.source_map.set_def_span(def_id, module_interface.source_id, token.Span());
+        self.ctx.store.source_map.set_def_span(def_id, module_interface.source_id, declaration.span);
+        if (declaration.top_level_order is .some(order)) {
+            self.ctx.store.source_map.set_top_level_order(def_id, order);
+        }
         self.bind_type_identity(def_id, declaration.kind, declaration.domain);
         self.record_interface_stable_key(module_def, module_interface, declaration, def_id);
         self.record_declaration_fingerprints(
@@ -376,12 +404,14 @@ public struct InterfaceLoader: Movable {
             self.ctx.store.model.mark_error();
             return;
         }
+        // 源码按需解析可能只准备了部分扩展；按声明身份逐条补齐，不能用整包 skeleton 标记跳过恢复。
+        if (self.ctx.store.model.extension_group_for_definition(binding_owner) != null) { return; }
         Int extension_index = self.ctx.store.model.add_extension_group(
             module_id,
             target_owner,
             binding_owner,
             group.public_flag,
-            false
+            group.unsafe_conformance
         );
         self.load_extension_trait_ref(extension_index, binding_owner, group);
         self.load_extension_where_predicates(
@@ -543,8 +573,20 @@ public struct InterfaceLoader: Movable {
             self.ctx.store.model.mark_error();
             return;
         }
+        if (declaration.top_level_order is .some(order)) {
+            self.ctx.store.source_map.set_top_level_order(def_id, order);
+        }
         sem.DeclarationSemaState progress =
             self.ctx.store.model.declaration_sema_state(def_id);
+        if (declaration.alias_target is .some(target_stable)) {
+            guard self.current_def_for_interface_stable(target_stable) is .some(target) else {
+                self.ctx.store.model.mark_error();
+                return;
+            }
+            self.ctx.store.model.set_alias_target(def_id, target);
+            _ target_namespace = self.ctx.store.defs.get(target).owned_namespace_id;
+            self.ctx.store.defs.set_owned_namespace(def_id, target_namespace);
+        }
         if (progress == .body_ready) { return; }
         self.load_field_default(def_id, module_interface, declaration);
         self.load_const_value(def_id, module_interface, declaration);
@@ -586,6 +628,7 @@ public struct InterfaceLoader: Movable {
         self.ctx.store.model.set_decl_extern_kind(def_id, extern_kind);
         self.ctx.store.model.set_decl_is_external(def_id, declaration.is_external);
         self.ctx.store.model.set_inline_mode(def_id, inline_mode);
+        self.ctx.store.model.set_entry_kind(def_id, entry.from_persistent_tag(declaration.entry_tag));
         if (declaration.naked) {
             self.ctx.store.model.set_naked(def_id);
         }
@@ -626,111 +669,24 @@ public struct InterfaceLoader: Movable {
         self.ctx.store.model.set_field_default(def_id, value);
     }
 
+    #doc 已求值判别值恢复到既有 TypeCheckStore，普通值仍由 ComptimeStore 持有。
     Void load_const_value(Self&! self,
         qid.DefId def_id,
         artifact.ModuleInterface& module_interface,
         artifact.InterfaceDeclSummary declaration
     ) {
         if (module_interface.const_value(declaration.stable_id) is .some(value)) {
-            comptime_value.ComptimeValue const_value = self.comptime_value_from_interface(value);
+            if (self.ctx.store.defs.get(def_id).kind == .enum_case_def) {
+                guard value.data is .int_value(tag) else { self.ctx.store.model.mark_error(); return; }
+                self.ctx.store.typeck.set_enum_case_value(def_id, tag);
+                return;
+            }
+            guard constant.from_interface(self.ctx.store$.mut_ref(), value) is .some(const_value) else {
+                self.ctx.store.model.mark_error();
+                return;
+            }
             self.ctx.store.comptime_store.set_const_value(def_id, const_value);
         }
-    }
-
-    comptime_value.ComptimeValue comptime_value_from_interface(Self&! self, artifact.InterfaceConstValue value) {
-        qid.TypeId type_id = self.ctx.store.types.invalid_type();
-        if (value.data is .null_pointer) { return comptime_value.ComptimeValue(type_id: type_id, data: .null_pointer); }
-        if (value.data is .unit_value) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .unit_value());
-        }
-        if (value.data is .bool_value(bool_value)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .bool_value(bool_value));
-        }
-        if (value.data is .int_value(int_value)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .int_value(int_value));
-        }
-        if (value.data is .uint_value(uint_value)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .uint_value(uint_value));
-        }
-        if (value.data is .char_value(char_value)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .char_value(char_value));
-        }
-        if (value.data is .float_bits(float_bits)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .float_bits(float_bits));
-        }
-        if (value.data is .string_value(string_value)) {
-            return comptime_value.ComptimeValue(
-                type_id: type_id,
-                data: .string_value(string_value)
-            );
-        }
-        if (value.data is .symbol_value(symbol_value)) {
-            return comptime_value.ComptimeValue(type_id: type_id, data: .symbol_value(symbol_value));
-        }
-        if (value.data is .enum_case_value(stable_id)) {
-            guard self.current_def_for_interface_stable(stable_id) is .some(case_def) else {
-                return comptime_value.ComptimeValue(type_id: type_id, data: .invalid());
-            }
-            return comptime_value.ComptimeValue(type_id: type_id, data: .enum_case_value(case_def));
-        }
-        if (value.data is .struct_value(fields)) {
-            list.ArrayList<comptime_value.ComptimeAggregateField> values! =
-                list.ArrayList<comptime_value.ComptimeAggregateField>(fields.length);
-            Int index! = 0;
-            while (index < fields.length) {
-                qid.DefId field_def! = qid.DefId.from_index(-1);
-                if (self.current_def_for_interface_stable(fields[index].field_stable_id)
-                    is .some(current_field_def)
-                ) {
-                    field_def = current_field_def;
-                }
-                values.add(comptime_value.ComptimeAggregateField(
-                    field_def: field_def,
-                    value: self.comptime_value_from_interface(fields[index].value)
-                ));
-                index = index + 1;
-            }
-            return self.ctx.store.comptime_store.struct_value(type_id, values.slice());
-        }
-        if (value.data is .tuple_value(items)) {
-            list.ArrayList<comptime_value.ComptimeValue> values! =
-                self.comptime_values_from_interface(items);
-            return self.ctx.store.comptime_store.tuple_value(type_id, values.slice());
-        }
-        if (value.data is .array_value(items)) {
-            list.ArrayList<comptime_value.ComptimeValue> values! =
-                self.comptime_values_from_interface(items);
-            return self.ctx.store.comptime_store.array_value(type_id, values.slice());
-        }
-        if (value.data is .optional_value(items)) {
-            list.ArrayList<comptime_value.ComptimeValue> values! = self.comptime_values_from_interface(items);
-            return self.ctx.store.comptime_store.optional_value(type_id, values.slice());
-        }
-        if (value.data is .enum_value(case_stable_id, items)) {
-            guard self.current_def_for_interface_stable(case_stable_id) is .some(case_def)
-                else { return comptime_value.ComptimeValue(type_id: type_id, data: .invalid()); }
-            comptime_value.ComptimeValue payload = self.comptime_value_from_interface(items[0]);
-            return self.ctx.store.comptime_store.enum_value(type_id, case_def, payload);
-        }
-        if (value.data is .error_union_value(is_error, items)) {
-            comptime_value.ComptimeValue payload = self.comptime_value_from_interface(items[0]);
-            return self.ctx.store.comptime_store.error_union_value(type_id, is_error, payload);
-        }
-        return comptime_value.ComptimeValue(type_id: type_id, data: .invalid());
-    }
-
-    list.ArrayList<comptime_value.ComptimeValue> comptime_values_from_interface(
-        Self&! self,
-        artifact.InterfaceConstValue[]& items
-    ) {
-        list.ArrayList<comptime_value.ComptimeValue> values! =
-            list.ArrayList<comptime_value.ComptimeValue>(items.length);
-        Int index! = 0;
-        while (index < items.length) {
-            values.add(self.comptime_value_from_interface(items[index]));
-            index = index + 1;
-        }
-        return values;
     }
 
 
@@ -795,6 +751,7 @@ public struct InterfaceLoader: Movable {
             self.ctx.store.model.set_alias_target(alias_def, target_def);
             self.ctx.store.defs.set_owned_namespace(alias_def, target_record.owned_namespace_id);
             self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
+            self.restore_alias_location(module_id, alias_def, alias_export);
             return;
         }
         if (self.source_alias_skeleton(module_id, namespace_id, alias_export.alias_symbol)
@@ -813,10 +770,24 @@ public struct InterfaceLoader: Movable {
             );
             self.ctx.store.model.set_alias_target(alias_def, target_def);
             self.ctx.store.model.set_declaration_sema_state(alias_def, .body_ready);
+            self.restore_alias_location(module_id, alias_def, alias_export);
             return;
         }
-        self.create_interface_alias(module_id, owner_def, namespace_id,
+        qid.DefId alias_def = self.create_interface_alias(module_id, owner_def, namespace_id,
             alias_export.alias_symbol, target_def, target_record, domain);
+        self.restore_alias_location(module_id, alias_def, alias_export);
+    }
+
+    Void restore_alias_location(Self&! self, qid.ModuleId module, qid.DefId definition,
+        artifact.AliasExportSummary summary
+    ) {
+        if (summary.top_level_order is .some(order)) {
+            self.ctx.store.source_map.set_top_level_order(definition, order);
+        }
+        if (summary.top_level_order != null || summary.span.length > 0) {
+            self.ctx.store.source_map.set_def_span(definition,
+                self.ctx.store.resolve.module_ref(module).source_id, summary.span);
+        }
     }
 
     qid.DefId? source_alias_skeleton(

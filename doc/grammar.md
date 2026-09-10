@@ -51,17 +51,15 @@ literal     <- int_lit
 file        <- top_level_item* eof
 
 top_level_item
-            <- module_doc
+            <- module_meta
+             / module_doc
              / compile_block
              / intrinsic_block
              / extern_block
              / top_level_decl
 
 compile_block
-            <- "comptime" comptime_kind? compile_item_block
-
-comptime_kind
-            <- "[" ("eval" / "generate") ","? "]"
+            <- "comptime" compile_item_block
 
 compile_item_block
             <- "{" compile_item* "}"
@@ -96,7 +94,9 @@ top_level_decl
 member_decl <- leading_annotation* member_modifier* member_decl_body
 
 leading_annotation
-            <- doc_annotation
+            <- meta_attribute
+             / doc_annotation
+             / "@" "entry" "(" ("main" / "lang" / "generate") ")"
              / "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
              / "@" "alias" "(" alias_attribute_bindings ")"
@@ -105,6 +105,11 @@ doc_annotation
             <- ("#doc" / "#jiang.doc") doc_body
 
 module_doc  <- ("#doc" / "#jiang.doc") "(" "module" ")" doc_body
+
+meta_attribute
+            <- "@" "meta" "(" expr ")"
+
+module_meta <- "@" "meta" "(" "module" ":" expr ")"
 
 alias_attribute_bindings
             <- alias_attribute_binding ("," alias_attribute_binding)* ","?
@@ -240,10 +245,9 @@ binding_name
 等规则本身不重复写 `"public"`。
 `const_global_decl` 同样经由 `top_level_decl` 接受 modifier，因此 `public const Type name = expr;`
 是合法顶层声明。
-`comptime` block 是顶层 item，不经由 `decl_modifier`。省略 kind 等价于 `[eval]`；
-`eval`、`generate` 仅在选项位置有特殊含义，不是保留关键字。未知 kind、多个 kind 和空选项均诊断。
-`[eval]` 表示语义分析期间所需的求值；`[generate]` 表示输入完整通过语义检查后的生成任务，
-两者不能隐式互换。
+`comptime` block 是顶层 item，不经由 `decl_modifier`，也可用于普通语句或表达式位置。
+唯一形式为 `comptime { ... }`，在语义分析需要时求值；关键字后必须紧接块，不接受方括号。
+`eval` 与 `generate` 都是普通标识符。
 alias 必须直接处于 namespace 中，右侧隐式编译期求值。import_expr 返回 namespace；
 独立 import_decl 使用默认或显式名字绑定模块，并额外要求直接处于 module namespace。
 局部 block 中的独立 import 声明由统一声明位置检查诊断，不能穿透 block 发布名字。
@@ -314,7 +318,7 @@ trait_bound_arg
 约束类型不一致时报 `conflicting_const_constraint`。
 
 generic argument 位置的 `_` 同时作为 initializer type inference hole。它只绑定当前位置；
-同一 annotation 中的显式 argument 不会被覆盖。省略 generic nominal constructor 的全部
+同一 attribute 中的显式 argument 不会被覆盖。省略 generic nominal constructor 的全部
 arguments 时，必须由 expected type 提供同一 nominal definition 的完整参数。
 
 ## 类型
@@ -336,7 +340,7 @@ type_primary
 type_args   <- "<" named_type_arg ("," named_type_arg)* ","? ">"
 
 named_type_arg
-            <- type name?
+            <- (literal / type) name?
 
 type_postfix
             <- "?"
@@ -515,7 +519,7 @@ enum_member <- member_modifier* (nominal_decl / method_decl)
 enum 值通过目标整数类型构造表达式转换，例如 `Int(Mode.read)`。无 payload 整数 enum
 保留 `Type.init?(integer)`，并在整数不匹配任何 case 时返回 `.none`。
 `case(T)` 声明匿名 payload，`case(T name, U other)` 声明带契约名的复合 payload。
-variant annotation 可以使用 `@life` 把 payload 槽绑定到 nominal region。
+variant attribute 可以使用 `@life` 把 payload 槽绑定到 nominal region。
 variant 必须写在成员之前；存在 method 或嵌套 nominal 成员时，用 `;` 分隔 variant 与成员。
 `union` 不再是 nominal declaration keyword；tagged sum 统一使用 payload enum。
 
@@ -813,7 +817,7 @@ lang_invocation
 block_expr  <- block
 
 comptime_expr
-            <- "comptime" ("[" "eval" ","? "]")? block
+            <- "comptime" block
 
 effect_block_expr
             <- effect_keywords block

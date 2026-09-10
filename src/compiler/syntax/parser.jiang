@@ -1,9 +1,9 @@
-// Parser skeleton from token stream to flat AST.
-//
-// Parser 只记录语法事实。keyword 仍然先作为 identifier token，
-// 再通过 keyword store 识别。
+#doc(module)
+    将 token 与 Provider 结果组合为 AST；独立 Lang 文件要求声明根，语义与类型检查留给后续阶段。
+#end
 
 alias ast = import "./ast.jiang";
+alias entry = import "../entry.jiang";
 alias syntax_builder = import "./builder.jiang";
 alias lexer = import "./lexer.jiang";
 alias syntax_diagnostics = import "./diagnostics.jiang";
@@ -43,16 +43,48 @@ public ParseResult parse_tokens(
     list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>& tokens,
     lang_block.LangBlockStore&! blocks,
     UInt8[]& source_text,
-    source.SourceId source_id
+    source.SourceId source_id,
+    Bool lang_source = false
 ) {
     ast.AstUnit unit! = ast.AstUnit(source_id);
     {
         Parser parser! = Parser(
             store, tokens.slice(), blocks, unit$.mut_ref(), source_text, source_id
         );
-        parser.parse();
+        if (lang_source) { parser.parse_lang_file(); } else { parser.parse(); }
     }
     return ParseResult(unit);
+}
+
+#doc 在已有模块后追加原生 token 对应的顶层声明，保留原 AstId 与源码位置。
+public Void append_tokens(
+    store_api.CompilerStore&! store,
+    list.ArrayList<std.jiang.Token<std.jiang.TokenKind>>& tokens,
+    ast.AstUnit&! unit,
+    UInt8[]& source_text
+) {
+    ast.RootData original = ast.root_data(unit.get(unit.root$.some()).data)$.some();
+    lang_block.LangBlockStore blocks! = lang_block.LangBlockStore();
+    {
+        Parser parser! = Parser(store, tokens.slice(), blocks$.mut_ref(), unit, source_text, unit.source_id);
+        parser.parse();
+    }
+    ast.RootData appended = ast.root_data(unit.get(unit.root$.some()).data)$.some();
+    Int start = unit.children.len();
+    Int index! = 0;
+    while (index < original.items.length) {
+        ast.AstId child = unit.child_at(original.items, index);
+        unit.children.add(child);
+        index = index + 1;
+    }
+    index = 0;
+    while (index < appended.items.length) {
+        ast.AstId child = unit.child_at(appended.items, index);
+        unit.children.add(child);
+        index = index + 1;
+    }
+    unit.root = unit.add_node(std.jiang.syntax.Span(0, source_text.length),
+        .root(ast.RootData(items: ast.AstRange(start, unit.children.len() - start))));
 }
 
 public Int factory_parse_fragment(
@@ -184,6 +216,17 @@ public struct Parser: Movable {
         self.parse_file();
     }
 
+    #doc 独立 Lang 文件必须返回声明或声明集合，直接成为原 SourceId 的模块根。
+    public Void parse_lang_file(Self&! self) {
+        if (self.at_end()) { self.parse_file(); return; }
+        ast.AstId root = self.parse_lang_block_expr(.declarations);
+        if (self.unit.get(root).data is .root(_)) { self.unit.root = root; return; }
+        Int start = self.temp.len();
+        self.temp.add(root);
+        ast.AstRange items = self.take_children(start);
+        self.unit.root = self.node(self.range_span(items), .root(ast.RootData(items: items)));
+    }
+
     public Int position(self) {
         return self.current;
     }
@@ -218,13 +261,13 @@ public struct Parser: Movable {
             Int annotation_start = self.temp.len();
             ast.AstId root = self.parse_lang_block_expr(.any);
             if (!self.node_is_annotation(root)) { return root; }
-            if (self.node_is_module_doc(root)) { return root; }
+            if (self.node_is_module_doc(root) || self.node_is_module_meta(root)) { return root; }
             self.temp.add(root);
-            self.parse_annotations();
+            self.parse_annotations(true);
             return self.parse_top_level_decl_after_annotations(start, annotation_start);
         }
         if (self.check_compile_block_start()) {
-            return self.parse_compile_block();
+            return self.parse_comptime_expr();
         }
         if (self.check_extern_block_start()) {
             return self.parse_extern_block();
@@ -296,48 +339,6 @@ public struct Parser: Movable {
         return self.check_keyword(.kw_comptime);
     }
 
-    ast.AstId parse_compile_block(Self&! self) {
-        std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_comptime);
-        ast.ComptimeKind kind = self.parse_comptime_kind();
-        self.expect(.left_brace);
-        ast.AstId body = self.finish_block_with_effects(start, ast.EffectSet(), kind == .eval);
-        if (kind == .eval) { return body; }
-        return self.node(self.unit.get(body).span, .compile_block(ast.CompileBlockData(kind: kind, body: body)));
-    }
-
-    ast.ComptimeKind parse_comptime_kind(Self&! self) {
-        if (!self.match(.left_bracket)) { return .eval; }
-        ast.ComptimeKind kind! = .eval;
-        Int count! = 0;
-        while (!self.at_end() && !self.check(.right_bracket) && !self.check(.left_brace)) {
-            std.jiang.Token<std.jiang.TokenKind> option = self.peek();
-            if (count > 0) {
-                self.add_parse_error_message(
-                    option.span, "duplicate_comptime_kind", "comptime accepts exactly one kind"
-                );
-            }
-            if (self.check_symbol_text("eval")) {
-                if (count == 0) { kind = .eval; }
-            } else if (self.check_symbol_text("generate")) {
-                if (count == 0) { kind = .generate; }
-            } else {
-                self.add_parse_error_message(
-                    option.span, "unknown_comptime_kind", "expected comptime kind: eval or generate"
-                );
-            }
-            self.advance();
-            count = count + 1;
-            if (!self.match(.comma)) { break; }
-        }
-        if (count == 0) {
-            self.add_parse_error_message(
-                self.peek().span, "expected_comptime_kind", "expected comptime kind: eval or generate"
-            );
-        }
-        self.expect(.right_bracket);
-        return kind;
-    }
-
     ast.AstId? parse_extern_function_decl(Self&! self) {
         return self.parse_named_function_decl(true);
     }
@@ -393,7 +394,7 @@ public struct Parser: Movable {
     ast.AstId? parse_top_level_decl(Self&! self) {
         std.jiang.Token<std.jiang.TokenKind> start = self.peek();
         Int annotation_start = self.temp.len();
-        self.parse_annotations();
+        self.parse_annotations(true);
         return self.parse_top_level_decl_after_annotations(start, annotation_start);
     }
 
@@ -402,6 +403,16 @@ public struct Parser: Movable {
         std.jiang.Token<std.jiang.TokenKind> start,
         Int annotation_start
     ) {
+        if (self.temp.len() > annotation_start) {
+            ast.AstId last = self.temp.get(self.temp.len() - 1);
+            if (self.node_is_module_meta(last)) {
+                if (self.temp.len() != annotation_start + 1) {
+                    self.error_at_span("meta_module_cannot_have_attributes", self.unit.get(last).span);
+                }
+                self.temp.truncate(annotation_start);
+                return last;
+            }
+        }
         ast.DeclModifiers modifiers = self.parse_decl_modifiers();
         if (self.parse_top_level_decl_body() is .some(body)) {
             ast.AstRange annotations = self.take_children(annotation_start);
@@ -460,7 +471,7 @@ public struct Parser: Movable {
         return self.parse_function_decl();
     }
 
-    Void parse_annotations(Self&! self) {
+    Void parse_annotations(Self&! self, Bool top_level = false) {
         while (true) {
             if (self.check(.raw_block)) {
                 ast.AstId annotation = self.parse_lang_block_expr(.any);
@@ -514,6 +525,20 @@ public struct Parser: Movable {
                 self.temp.add(attribute);
                 continue;
             }
+            if (self.check_symbol_text("meta")) {
+                ast.AstId attribute = self.parse_meta_attribute();
+                if (self.node_is_module_meta(attribute) && !top_level) {
+                    self.error_at_span("meta_module_target_requires_top_level", self.unit.get(attribute).span);
+                }
+                self.temp.add(attribute);
+                if (self.node_is_module_meta(attribute)) { return; }
+                continue;
+            }
+            if (self.check_symbol_text("entry")) {
+                ast.AstId attribute = self.parse_entry_attribute();
+                self.temp.add(attribute);
+                continue;
+            }
             self.reset(mark);
             return;
         }
@@ -528,10 +553,55 @@ public struct Parser: Movable {
         return doc.target == .module;
     }
 
+    Bool node_is_module_meta(self, ast.AstId node_id) {
+        guard self.unit.get(node_id).data is .meta_attribute(meta) else { return false; }
+        return meta.module_target;
+    }
+
     Void reject_module_doc(Self&! self, ast.AstId node_id) {
+        if (self.node_is_module_meta(node_id)) {
+            self.error_at_span("meta_module_target_requires_top_level", self.unit.get(node_id).span);
+        }
         if (self.node_is_module_doc(node_id)) {
             self.error_at_span("doc_module_target_requires_top_level", self.unit.get(node_id).span);
         }
+    }
+
+    #doc module: 仅作为显式附着目标前缀；名为 module 的普通表达式仍正常解析。
+    ast.AstId parse_meta_attribute(Self&! self) {
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
+        self.expect(.left_paren);
+        Bool module_target! = false;
+        if (self.check_symbol_text("module")) {
+            ParserMark mark = self.mark();
+            self.advance();
+            if (self.match(.colon)) { module_target = true; } else { self.reset(mark); }
+        }
+        ast.AstId expression = self.parse_expr();
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
+        return self.node(self.span_from(start.span, end.span),
+            .meta_attribute(ast.MetaAttributeData(expression: expression, module_target: module_target)));
+    }
+
+    ast.AstId parse_entry_attribute(Self&! self) {
+        std.jiang.Token<std.jiang.TokenKind> start = self.advance();
+        self.expect(.left_paren);
+        entry.Kind kind! = .main;
+        if (self.check_symbol_text("main")) {
+            self.advance();
+        } else if (self.check_symbol_text("lang")) {
+            self.advance();
+            kind = .lang;
+        } else if (self.check_symbol_text("generate")) {
+            self.advance();
+            kind = .generate;
+        } else {
+            self.add_parse_error_message(self.peek().span, "unknown_entry_kind",
+                "expected entry role: main, lang or generate");
+            if (!self.at_end() && !self.check(.right_paren)) { self.advance(); }
+        }
+        std.jiang.Token<std.jiang.TokenKind> end = self.expect(.right_paren);
+        return self.node(self.span_from(start.span, end.span), .entry_attribute(ast.EntryAttributeData(kind: kind)));
     }
 
     ast.AstId parse_inline_attribute(Self&! self) {
@@ -1766,7 +1836,7 @@ public struct Parser: Movable {
         if (self.check(.int_lit) || self.check(.float_lit) || self.check(.char_lit) || self.check(.string_lit)) {
             return true;
         }
-        if (self.check_keyword(.kw_true) || self.check_keyword(.kw_false)) {
+        if (self.check_keyword(.kw_true) || self.check_keyword(.kw_false) || self.check_keyword(.kw_null)) {
             return true;
         }
         return false;
@@ -2074,20 +2144,31 @@ public struct Parser: Movable {
     }
 
     Bool starts_simple_type_member_value(self) {
-        return self.current_token_starts_type_name() && token_is(self.peek_next(), .dot);
+        if (!self.current_token_starts_type_name() || !token_is(self.peek_next(), .dot)) { return false; }
+        Int offset! = 1;
+        while (token_is(self.peek_offset(offset), .dot) && token_is(self.peek_offset(offset + 1), .ident)) {
+            offset = offset + 2;
+        }
+        // 路径后的泛型参数属于完整类型，不能先将 pkg.Type 截成成员常量。
+        return !token_is(self.peek_offset(offset), .lt);
     }
 
     ast.AstId parse_simple_type_member_value(Self&! self) {
+        Int start = self.temp.len();
         ast.AstId type_name = self.parse_name();
-        ast.AstRange segments = self.unit.add_child(type_name);
+        self.temp.add(type_name);
+        ast.AstId member_name! = type_name;
+        while (self.match(.dot)) {
+            member_name = self.parse_member_name();
+            if (self.check(.dot)) { self.temp.add(member_name); }
+        }
+        ast.AstRange segments = self.take_children(start);
         ast.AstId path = self.node_from_range(type_name, segments, .path(ast.PathData (segments: segments)));
         ast.AstId type_ref = self.node_from_child(path, .named_type(ast.NamedTypeData (
             path: path,
             args: self.empty_range(),
             contract_names: self.empty_range()
         )));
-        self.expect(.dot);
-        ast.AstId member_name = self.parse_member_name();
         return self.field_expr_node(type_ref, member_name, false);
     }
 
@@ -2601,7 +2682,7 @@ public struct Parser: Movable {
         if (self.check(.char_lit)) { return true; }
         if (self.check(.string_lit)) { return true; }
         if (self.check_keyword(.kw_true)) { return true; }
-        return self.check_keyword(.kw_false);
+        return self.check_keyword(.kw_false) || self.check_keyword(.kw_null);
     }
 
     ast.AstId parse_block(Self&! self) {
@@ -2611,11 +2692,6 @@ public struct Parser: Movable {
     #doc 显式求值保留普通 block 的词法作用域，只标记其执行时机。
     ast.AstId parse_comptime_expr(Self&! self) {
         std.jiang.Token<std.jiang.TokenKind> start = self.expect_keyword(.kw_comptime);
-        ast.ComptimeKind kind = self.parse_comptime_kind();
-        if (kind != .eval) {
-            self.add_parse_error_message(start.span, "comptime_expression_kind",
-                "comptime expression requires eval kind");
-        }
         self.expect(.left_brace);
         return self.finish_block_with_effects(start, ast.EffectSet(), true);
     }

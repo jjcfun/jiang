@@ -1,0 +1,135 @@
+#doc(module) 字节／资源指纹复用缓存算法，验证普通 const、冷／热恢复及显式资源变化。
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+alias cache_identity = import "../../../../src/compiler/artifact/cache_identity.jiang";
+alias object_key = import "../../../../src/compiler/artifact/object_key.jiang";
+alias qkey = import "../../../../src/compiler/incremental/key.jiang";
+alias list = import "../../../../src/compiler/support/list.jiang";
+alias process = import "../../../../src/compiler/system/process.jiang";
+import std;
+
+public Int run() {
+    assert(fs.remove_tree("build/test-reflect-fingerprint-bytes"));
+    assert(fs.create_dirs("build/test-reflect-fingerprint-bytes"));
+    assert(fs.write_all("build/test-reflect-fingerprint-bytes/package.ini",
+        "[package]\nname=fingerprint_bytes\nroot=main.jiang\n"));
+    assert(fs.write_all("build/test-reflect-fingerprint-bytes/main.jiang",
+        fs.read_all("test/compiler/fixture/fingerprint_bytes/main.jiang")$.some()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-reflect-fingerprint-bytes", "build/test-reflect-fingerprint-bytes-output",
+        "build/test-reflect-fingerprint-bytes/cache");
+    options.generator = "build/test-reflect-fingerprint-bytes";
+    check(options$.ref(), "a\0b", false, false, false);
+    check(options$.ref(), "a\0b", true, true, true);
+    Path cached = cached_resource();
+    assert(fs.remove_tree("build/test-reflect-fingerprint-bytes-output"));
+    check(options$.ref(), "a\0b", true, true, true);
+    assert(fs.remove_file(cached.bytes()));
+    check(options$.ref(), "a\0b", true, false, true);
+    assert(fs.remove_file(cached.bytes()));
+    assert(fs.create_dir(cached.bytes()));
+    check(options$.ref(), "a\0b", true, false, true, false);
+    assert(fs.dir_exists(cached.bytes()));
+    assert(fs.remove_tree(cached.bytes()));
+    check(options$.ref(), "a\0b", true, false, true);
+    rewrite_unrelated(1);
+    check(options$.ref(), "a\0b", false, true, true);
+    rewrite_unrelated(2);
+    check(options$.ref(), "a\0b", false, true, true);
+    check(options$.ref(), "changed", true, false, true);
+    check(options$.ref(), "", true, false, true);
+    check(options$.ref(), "a\0b", true, true, true);
+    options.target_triple = "wasm32-wasi";
+    check(options$.ref(), "a\0b", false, false, false);
+    check(options$.ref(), "a\0b", true, true, true);
+    assert(fs.remove_file("build/test-reflect-fingerprint-bytes/data"));
+    run_materialized();
+    assert(fs.remove_tree("build/test-reflect-fingerprint-bytes"));
+    assert(fs.remove_tree("build/test-reflect-fingerprint-bytes-output"));
+    return 0;
+}
+
+Void check(options_api.CompileOptions& options, UInt8[]& resource, Bool warm, Bool hit, Bool constant_hit,
+    Bool stored = true
+) {
+    assert(fs.write_all("build/test-reflect-fingerprint-bytes/data", resource));
+    context.CompilerContext ctx! = context.CompilerContext();
+    assert(options_api.build_context(options, ctx$.mut_ref()).ok);
+    pipeline.compile(ctx$.mut_ref(), options);
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+    assert(string.equal(fs.read_all("build/test-reflect-fingerprint-bytes-output/cache-stored")$.some(),
+        if stored { "yes" } else { "no" }));
+    assert(string.equal(fs.read_all("build/test-reflect-fingerprint-bytes-output/cache-hit")$.some(),
+        if hit { "yes" } else { "no" }));
+    assert(string.equal(fs.read_all("build/test-reflect-fingerprint-bytes-output/constant-hit")$.some(),
+        if constant_hit { "yes" } else { "no" }));
+    assert(string.equal(fs.read_all("build/test-reflect-fingerprint-bytes-output/cached-data")$.some(), resource));
+    if (warm) {
+        _ source = ctx.store.sources.find(.file("build/test-reflect-fingerprint-bytes/main.jiang"))$.some();
+        _ module = ctx.store.resolve.module_for_source(source)$.some();
+        assert(ctx.store.resolve.module_ref(module).interface_only);
+    }
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(cache_identity.text_fingerprint("generate-bytes:", "a\0b"));
+    parts.add(cache_identity.text_fingerprint("generate-bytes:", "中文"));
+    _ combined = object_key.combine_fingerprints(UInt64(160), parts$.ref());
+    _ captured = cache_identity.text_fingerprint("generate-bytes:", resource);
+    std.StringBuilder expected! = std.StringBuilder();
+    expected.append(combined.low); expected.append(" "); expected.append(combined.high); expected.append("\n");
+    expected.append(captured.low); expected.append(" "); expected.append(captured.high); expected.append("\n");
+    assert(string.equal(fs.read_all("build/test-reflect-fingerprint-bytes-output/fingerprint.txt")$.some(),
+        expected.slice()));
+}
+
+#doc 同包无关函数增改不能污染生成器实现闭包；不用新建独立 case 文件。
+Void rewrite_unrelated(Int value) {
+    std.StringBuilder code! = std.StringBuilder();
+    code.append(fs.read_all("test/compiler/fixture/fingerprint_bytes/main.jiang")$.some());
+    code.append("\nInt unrelated() { return "); code.append(value); code.append("; }\n");
+    assert(fs.write_all("build/test-reflect-fingerprint-bytes/main.jiang", code.slice()));
+}
+
+#doc 从真实产物定位测试数据，避免测试自己重算一套完整 key。
+Path cached_resource() {
+    _ contexts! = try fs.list_dir_checked("build/test-reflect-fingerprint-bytes/cache")
+        catch { assert(false); return Path(""); };
+    while (!contexts.empty()) {
+        UInt8[]^ directory = contexts.pop();
+        Path content = std.path.join(directory[..], "content");
+        if (!fs.dir_exists(content.bytes())) { continue; }
+        _ files! = try fs.list_dir_checked(content.bytes()) catch { assert(false); return Path(""); };
+        while (!files.empty()) {
+            UInt8[]^ file = files.pop();
+            guard fs.read_all(file[..]) is .some(bytes) else { continue; }
+            if (string.equal(bytes, "a\0b")) { return Path(file[..]); }
+        }
+    }
+    assert(false, "missing resource cache file");
+    return Path("");
+}
+
+#doc 指纹作为普通常量进入本机产物；缺失生成资源不影响普通 build，也不会自动执行生成入口。
+Void run_materialized() {
+    options_api.CompileOptions options = options_api.CompileOptions(.executable,
+        "build/test-reflect-fingerprint-bytes", "build/test-reflect-fingerprint-bytes/program",
+        "build/test-reflect-fingerprint-bytes/cache");
+    Int pass! = 0;
+    while (pass < 2) {
+        context.CompilerContext ctx! = context.CompilerContext();
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        if (ctx.store.diagnostics.has_errors()) {
+            reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+        }
+        assert(!ctx.store.diagnostics.has_errors());
+        list.ArrayList<UInt8[]&> args! = list.ArrayList<UInt8[]&>();
+        assert(process.run("build/test-reflect-fingerprint-bytes/program", args$.ref()).ok());
+        pass = pass + 1;
+    }
+}

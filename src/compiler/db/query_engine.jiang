@@ -1,6 +1,6 @@
-// QueryEngine：求值层的运行时形态（Database 概念的运行时）。
-//
-// 每个查询一格 typed cache；递归状态由对应 typed query 自己管理。
+#doc(module)
+    共同语义查询的运行时 owner；事实按各自 key 缓存，编译与生成仅分别记录消费依赖。
+#end
 
 alias qid = import "../id.jiang";
 alias layout = import "../layout.jiang";
@@ -16,14 +16,25 @@ alias layout_query = import "./layout_query.jiang";
 alias query_cache = import "./query_cache.jiang";
 alias module_interface_query = import "./module_interface.jiang";
 alias module_model_query = import "./module_model.jiang";
+alias module_graph_query = import "./module_graph.jiang";
+alias metadata_query = import "./metadata.jiang";
+alias documentation_query = import "./documentation.jiang";
+alias source_location_query = import "./source_location.jiang";
+alias export_query = import "./exports.jiang";
+alias declaration_query = import "./declaration.jiang";
 alias object_unit_query = import "./object_unit.jiang";
 alias build_target_query = import "./build_target.jiang";
 alias build_manifest = import "../artifact/build_manifest.jiang";
 alias import_summary_query = import "./source_import_summary.jiang";
 alias stable_fingerprint = import "./stable_fingerprint.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias key_builder = import "../artifact/object_key_builder.jiang";
+alias comptime_value = import "../sema/comptime/value.jiang";
 alias body_queries = import "./type_check_body.jiang";
 alias node_queries = import "./type_check_node.jiang";
 alias def_queries = import "./type_check_def.jiang";
+alias signature_queries = import "./type_check_signature.jiang";
+alias semantic_fingerprint = import "../incremental/fingerprint.jiang";
 alias trait_queries = import "./trait_dependency.jiang";
 alias lifetime_shape_queries = import "./type_lifetime_shape.jiang";
 alias trait_satisfaction_queries = import "./trait_satisfaction.jiang";
@@ -46,14 +57,22 @@ public struct QueryEngine: Movable {
     public layout_query.LayoutQuery layout!;
     module_interface_query.ModuleInterfaceQuery module_interface!;
     module_model_query.ModuleModelQuery module_model!;
+    public module_graph_query.ModuleGraphQuery module_graph!;
+    public declaration_query.DeclarationQuery declarations!;
+    public export_query.ExportQuery exports!;
+    public documentation_query.DocumentationQuery documentation!;
+    public metadata_query.MetadataQuery metadata!;
+    public source_location_query.SourceLocationQuery locations;
     object_unit_query.ObjectUnitQuery object_unit!;
     build_target_query.BuildTargetQuery build_target!;
     import_summary_query.SourceImportSummaryQuery source_import_summary!;
     stable_fingerprint.StableFingerprintQuery def_signatures!;
     stable_fingerprint.StableFingerprintQuery def_bodies!;
+    stable_fingerprint.StableFingerprintQuery constant_values!;
     body_queries.TypeCheckBodyQuery type_check_body!;
     node_queries.TypeCheckNodeQuery type_check_node!;
     def_queries.TypeCheckDefQuery type_check_def!;
+    public signature_queries.TypeCheckSignatureQuery type_check_signature!;
     trait_queries.TraitDependencyQuery trait_dependency!;
     public lifetime_shape_queries.TypeLifetimeShapeQuery lifetime_shape!;
     trait_satisfaction_queries.TraitSatisfactionQuery trait_satisfaction!;
@@ -68,14 +87,22 @@ public struct QueryEngine: Movable {
         self.layout = layout_query.LayoutQuery();
         self.module_interface = module_interface_query.ModuleInterfaceQuery();
         self.module_model = module_model_query.ModuleModelQuery();
+        self.module_graph = module_graph_query.ModuleGraphQuery();
+        self.declarations = declaration_query.DeclarationQuery();
+        self.exports = export_query.ExportQuery();
+        self.documentation = documentation_query.DocumentationQuery();
+        self.metadata = metadata_query.MetadataQuery();
+        self.locations = source_location_query.SourceLocationQuery();
         self.object_unit = object_unit_query.ObjectUnitQuery();
         self.build_target = build_target_query.BuildTargetQuery();
         self.source_import_summary = import_summary_query.SourceImportSummaryQuery();
         self.def_signatures = stable_fingerprint.StableFingerprintQuery();
         self.def_bodies = stable_fingerprint.StableFingerprintQuery();
+        self.constant_values = stable_fingerprint.StableFingerprintQuery();
         self.type_check_body = body_queries.TypeCheckBodyQuery();
         self.type_check_node = node_queries.TypeCheckNodeQuery();
         self.type_check_def = def_queries.TypeCheckDefQuery();
+        self.type_check_signature = signature_queries.TypeCheckSignatureQuery();
         self.trait_dependency = trait_queries.TraitDependencyQuery();
         self.lifetime_shape = lifetime_shape_queries.TypeLifetimeShapeQuery();
         self.trait_satisfaction = trait_satisfaction_queries.TraitSatisfactionQuery();
@@ -94,6 +121,12 @@ public struct QueryEngine: Movable {
         self.layout.reset();
         self.module_interface.reset();
         self.module_model.reset();
+        self.module_graph.reset();
+        self.declarations.reset();
+        self.exports.reset();
+        self.documentation.reset();
+        self.metadata.reset();
+        self.locations.reset();
         self.object_unit.reset();
         self.build_target.reset();
         self.source_import_summary.reset();
@@ -105,6 +138,136 @@ public struct QueryEngine: Movable {
         self.trait_vtable.reset();
         self.jil_store_identities.reset();
         self.declaration_observations.reset();
+    }
+
+    #doc 普通常量使用、反射及恢复校验共用值事实缓存；不就绪不发布，值仍由 ComptimeStore 唯一持有。
+    public qkey.Fingerprint128? constant_value_fingerprint(self,
+        store_api.CompilerStore& store, qid.DefId definition
+    ) {
+        guard store.incremental.stable_id_for_def(definition) is .some(identity) else { return null; }
+        if (store.defs.get(definition).kind == .enum_case_def) {
+            if (store.typeck.enum_case_value(definition) == null) { return null; }
+            return self.constant_values.evaluate(identity, { [ref store, definition] =>
+                key_builder.enum_case_observation_fingerprint(store, definition)
+            });
+        }
+        guard store.comptime_store.const_value(definition) is .some(value) else { return null; }
+        qid.TypeId? type! = store.typeck.def_type(definition);
+        if (type == null && !(store.types.get(value.type_id).data is .invalid)) { type = value.type_id; }
+        guard type is .some(type_id) else { return null; }
+        if (store.types.get(type_id).data is .invalid) { return null; }
+        return self.constant_values.evaluate(identity, { [ref store, type_id, value] =>
+            key_builder.stable_constant_observation_fingerprint(store,
+                comptime_value.ComptimeValue(type_id: type_id, data: value.data))
+        });
+    }
+
+    #doc 类型结果与普通类型查询共用缓存项；已有 Store 事实可直接填充查询，不重新进入 Sema。
+    public qkey.Fingerprint128? checked_type_fingerprint(self, store_api.CompilerStore& store, qid.DefId definition) {
+        qid.TypeId? subject! = store.typeck.def_type(definition);
+        if (subject == null) { subject = store.types.named_type_for_def(definition); }
+        if (subject == null) {
+            if (store.comptime_store.const_value(definition) is .some(value)) { subject = value.type_id; }
+        }
+        guard subject is .some(type_id) else { return null; }
+        if (store.types.get(type_id).data is .invalid) { return null; }
+        _ checked = self.type_check_def.evaluate(definition, { [type_id] _ => type_id });
+        assert(checked == type_id);
+        return self.type_check_def.fingerprint(definition, { [ref store] type =>
+            key_builder.stable_type_observation_fingerprint(store, type)
+        });
+    }
+
+    #doc 完整检查结果与 Sema 共用完成记录；组合已有签名、类型及有效 schema，读取不触发检查。
+    public qkey.Fingerprint128? checked_signature_fingerprint(self, store_api.CompilerStore& store,
+        qid.DefId definition
+    ) {
+        if (!self.type_check_signature.ready(definition)) { return null; }
+        _ stable_id = store.incremental.stable_id_for_def(definition)$.some();
+        _ signature = self.def_signature(stable_id, { [ref store, stable_id] =>
+            return store.incremental.signature_fingerprint(stable_id);
+        });
+        _ type = self.checked_type_fingerprint(store, definition);
+        return self.type_check_signature.fingerprint(definition, { [ref store, definition, signature, type] =>
+            return semantic_fingerprint.checked_declaration_signature_fingerprint(store, definition, signature, type);
+        });
+    }
+
+    #doc 常量、类型和完整签名分别读取共同语义查询的指纹，不按反射属性计算。
+    qkey.Fingerprint128? declaration_type_fingerprint(self, store_api.CompilerStore& store,
+        qid.DefId subject, declaration_query.DeclarationTypeProperty property, Int index
+    ) {
+        if (property == .constant_value) { return self.constant_value_fingerprint(store, subject); }
+        if (property == .declaration) { return self.checked_type_fingerprint(store, subject); }
+        if (property == .checked_signature) { return self.checked_signature_fingerprint(store, subject); }
+        return null;
+    }
+
+    #doc 定义内容只组合共同事实；沿拥有关系纳入成员和泛型，不沿引用类型、import 或函数 body 展开。
+    public qkey.Fingerprint128? definition_content_fingerprint(Self&! self, store_api.CompilerStore&! store,
+        declaration_query.DeclarationScope scope, qid.ModuleId use_module, Bool generating
+    ) {
+        qid.DefId owner = scope.owner;
+        guard store.incremental.stable_id_for_def(owner) is .some(identity) else { return null; }
+        _ record = store.defs.get(owner);
+        list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+        parts.add(qkey.Fingerprint128(identity.low, identity.high));
+        parts.add(qkey.Fingerprint128(if scope.public_only { UInt64(1) } else { UInt64(0) }, UInt64(0)));
+        // 外包私有名义类型只暴露身份；不读取其成员或附着数据。
+        if (scope.public_only && record.visibility != .public_visibility
+            && (record.kind == .struct_def || record.kind == .enum_def || record.kind == .trait_def)) {
+            return object_key.combine_fingerprints(UInt64(161), parts$.ref());
+        }
+        // 模块没有独立签名；成员范围由共同声明查询限定，不能混入含私有成员计数的模型签名。
+        if (record.kind == .extension_def) {
+            parts.add(self.def_signature(identity, { [ref store, identity] =>
+                store.incremental.signature_fingerprint(identity) }));
+            self.observe_declaration_signature(store, use_module, owner, generating);
+        } else if (record.kind != .module_def) {
+            guard self.checked_signature_fingerprint(store, owner) is .some(signature) else { return null; }
+            parts.add(signature);
+            self.observe_declaration_type(store, use_module, owner, .checked_signature, 0, generating);
+        }
+        guard self.documentation.fingerprint(store, owner) is .some(documentation) else { return null; }
+        parts.add(documentation);
+        self.observe_documentation(store, use_module, owner);
+        if (!self.observe_metadata(store, use_module, owner, generating)) { return null; }
+        parts.add(self.metadata.fingerprint(store, self.locations$.ref(), owner)$.some());
+        if (self.constant_value_fingerprint(store, owner) is .some(value)) {
+            parts.add(qkey.Fingerprint128(UInt64(1), UInt64(0)));
+            parts.add(value);
+            self.observe_declaration_type(store, use_module, owner, .constant_value, 0, generating);
+        } else { parts.add(qkey.Fingerprint128()); }
+        if (!self.append_definition_members(store, scope, use_module, generating, parts$.mut_ref())) { return null; }
+        _ generics = declaration_query.DeclarationScope(owner: owner, public_only: scope.public_only,
+            generic_parameters: true);
+        if (!self.append_definition_members(store, generics, use_module, generating, parts$.mut_ref())) { return null; }
+        if (record.kind == .module_def && !scope.public_only) {
+            qid.ModuleId module = record.module_id$.some();
+            self.module_graph.import_count(store.resolve$.ref(), module);
+            self.observe_module_graph(store, use_module, module, true);
+            parts.add(self.module_graph.imports_fingerprint(store, module)$.some());
+        }
+        return object_key.combine_fingerprints(UInt64(161), parts$.ref());
+    }
+
+    Bool append_definition_members(Self&! self, store_api.CompilerStore&! store,
+        declaration_query.DeclarationScope scope, qid.ModuleId use_module, Bool generating,
+        list.ArrayList<qkey.Fingerprint128>&! parts
+    ) {
+        Int count = self.declarations.count(store, scope);
+        self.observe_declaration_members(store, use_module, scope, generating);
+        parts.add(self.declarations.members_fingerprint(store, scope)$.some());
+        Int index! = 0;
+        while (index < count) {
+            qid.DefId member = self.declarations.at(store, scope, index);
+            _ child = declaration_query.DeclarationScope(owner: member, public_only: scope.public_only);
+            guard self.definition_content_fingerprint(store, child, use_module, generating) is .some(value)
+                else { return false; }
+            parts.add(value);
+            index = index + 1;
+        }
+        return true;
     }
 
     public Int def_signature_l2_restores(self) {
@@ -125,10 +288,12 @@ public struct QueryEngine: Movable {
         self.type_check_body.reset();
         self.type_check_node.reset();
         self.type_check_def.reset();
+        self.type_check_signature.reset();
         self.trait_dependency.reset();
         self.lifetime_shape$.mut_ref().reset();
         self.trait_satisfaction.reset();
         self.const_definition.reset();
+        self.constant_values.reset();
     }
 
     public qkey.Fingerprint128 def_signature(
@@ -163,14 +328,279 @@ public struct QueryEngine: Movable {
         self.def_bodies.invalidate(stable_id);
     }
 
+    #doc 反射依赖归实际求值调用方；只记录已准备的单个文档事实，包括无文档结果。
+    public Void observe_documentation(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.DefId subject
+    ) {
+        qid.ModuleId target_module = store.defs.get(subject).module_id$.some();
+        guard store.incremental.stable_id_for_def(subject) is .some(stable_id) else { return; }
+        guard source_identity.for_module(store, target_module) is .some(dependency_source) else { return; }
+        guard self.documentation.fingerprint(store, subject) is .some(observed) else { return; }
+        self.declaration_observations.record(store.resolve.module_ref(use_module).source_id,
+            source_artifact.DeclarationObservation(dependency_source, stable_id, .documentation,
+                qkey.Fingerprint128(), observed));
+    }
+
+    #doc 编译与生成记录相同 metadata 事实，包括空结果；用途只决定是否参与源码恢复。
+    public Bool observe_metadata(self, store_api.CompilerStore&! store, qid.ModuleId use_module,
+        qid.DefId subject, Bool generating
+    ) {
+        qid.ModuleId module = store.defs.get(subject).module_id$.some();
+        _ source_id = store.resolve.module_ref(module).source_id;
+        if (!store.sources.ensure_source(source_id)) { return false; }
+        store.sources.ensure_line_starts(source_id);
+        guard self.metadata.fingerprint(store, self.locations$.ref(), subject) is .some(observed) else { return false; }
+        guard store.incremental.stable_id_for_def(subject) is .some(stable_id) else { return true; }
+        guard source_identity.for_module(store, module) is .some(dependency) else { return true; }
+        source_artifact.ObservationAspect aspect = if generating { .generated_metadata } else { .metadata };
+        self.declaration_observations.record(store.resolve.module_ref(use_module).source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, qkey.Fingerprint128(), observed));
+        return true;
+    }
+
+    #doc 声明只提供原始范围，实际位置及指纹与导入等来源读取共享缓存。
+    public qkey.Fingerprint128? declaration_location_fingerprint(self, store_api.CompilerStore& store,
+        qid.DefId definition
+    ) {
+        guard self.declarations.location(store, definition) is .some(location) else { return null; }
+        guard self.locations.evaluate(store.sources$.ref(), location.source_id$.some(), location.span)
+            is .some(result) else { return null; }
+        return result.fingerprint;
+    }
+
+    #doc 来源位置的读取归实际求值调用方；签名相同时，独立位置变化仍须使依赖结果失效。
+    public Void observe_location(self, store_api.CompilerStore& store, qid.ModuleId use_module, qid.DefId subject) {
+        qid.ModuleId module = store.defs.get(subject).module_id$.some();
+        guard store.incremental.stable_id_for_def(subject) is .some(stable_id) else { return; }
+        guard source_identity.for_module(store, module) is .some(dependency_source) else { return; }
+        guard self.declaration_location_fingerprint(store, subject) is .some(observed) else { return; }
+        self.declaration_observations.record(store.resolve.module_ref(use_module).source_id,
+            source_artifact.DeclarationObservation(dependency_source, stable_id, .location,
+                qkey.Fingerprint128(), observed));
+    }
+
+    #doc 每轮入口只调用一次，在任何生成查询发生前清理继承的专用记录。
+    public Void begin_generation(self, source.SourceId source_id) {
+        self.declaration_observations.begin_generation(source_id);
+    }
+
+    #doc 固定输入的图集合每轮只计算一次指纹；空集合也登记在入口来源上。
+    public Void observe_module_graph(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.ModuleId root, Bool imports
+    ) {
+        _ stable_id = store.incremental.stable_id_for_def(store.resolve.module_ref(root).def_id)$.some();
+        _ dependency = source_identity.for_module(store, root)$.some();
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if imports { .imports } else { .module_closure };
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect,
+            qkey.Fingerprint128(), qkey.Fingerprint128());
+        if (self.declaration_observations.contains(source_id, key)) { return; }
+        _ observed = if imports { self.module_graph.imports_fingerprint(store, root)$.some() }
+            else { self.module_graph.modules_fingerprint(store, root)$.some() };
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, qkey.Fingerprint128(), observed));
+    }
+
+    #doc 生成阶段声明集合保留空结果，每轮每个根只计算一次；具体 getter 另行记录所读事实。
+    public Void observe_generated_declarations(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.ModuleId root, Bool exports
+    ) {
+        _ stable_id = store.incremental.stable_id_for_def(store.resolve.module_ref(root).def_id)$.some();
+        _ dependency = source_identity.for_module(store, root)$.some();
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if exports { .exports } else { .recursive_declarations };
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect,
+            qkey.Fingerprint128(), qkey.Fingerprint128());
+        if (self.declaration_observations.contains(source_id, key)) { return; }
+        _ observed = if exports { self.exports.fingerprint(store, root)$.some() }
+            else { self.declarations.recursive_fingerprint(store, root)$.some() };
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, qkey.Fingerprint128(), observed));
+    }
+
+    #doc 普通 const 成员读取影响编译结果；生成读取独立记录，避免迫使生成器自身回退源码。
+    public Void observe_declaration_members(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, declaration_query.DeclarationScope scope, Bool generating
+    ) {
+        guard store.incremental.stable_id_for_def(scope.owner) is .some(stable_id) else { return; }
+        qid.ModuleId module = store.defs.get(scope.owner).module_id$.some();
+        guard source_identity.for_module(store, module) is .some(dependency) else { return; }
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if generating { .generated_members } else { .declaration_members };
+        _ name = qkey.Fingerprint128(if scope.public_only { UInt64(1) } else { UInt64(0) },
+            if scope.generic_parameters { UInt64(1) } else { UInt64(0) });
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, qkey.Fingerprint128());
+        if (generating && self.declaration_observations.contains(source_id, key)) { return; }
+        guard self.declarations.members_fingerprint(store, scope) is .some(observed) else { return; }
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, observed));
+    }
+
+    #doc 反射属性读取与普通编译命中同一声明签名缓存；用途只区分依赖归属，不按 getter 创建事实。
+    public Void observe_declaration_signature(self, store_api.CompilerStore& store, qid.ModuleId use_module,
+        qid.DefId subject, Bool generating
+    ) {
+        guard store.incremental.stable_id_for_def(subject) is .some(stable_id) else { return; }
+        _ module = store.defs.get(subject).module_id$.some();
+        guard source_identity.for_module(store, module) is .some(dependency) else { return; }
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if generating { .generated_signature } else { .reflected_signature };
+        _ name = qkey.Fingerprint128();
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, qkey.Fingerprint128());
+        if (generating && self.declaration_observations.contains(source_id, key)) { return; }
+        _ observed = self.def_signature(stable_id, { [ref store, stable_id] =>
+            store.incremental.signature_fingerprint(stable_id)
+        });
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, observed));
+    }
+
+    #doc 属性投影归一到共同事实；参数／返回值共享类型，名义类型关系／路径共享完整签名。
+    public Void observe_declaration_type(self, store_api.CompilerStore& store, qid.ModuleId use_module,
+        qid.DefId subject, declaration_query.DeclarationTypeProperty property, Int index, Bool generating
+    ) {
+        if (property == .regions || property == .constraints) {
+            self.observe_declaration_signature(store, use_module, subject, generating);
+            return;
+        }
+        if (property == .nominal_contract || property == .region_paths) {
+            self.observe_declaration_type(store, use_module, subject, .checked_signature, 0, generating);
+            return;
+        }
+        if (property == .result || property == .parameter || property == .domain) {
+            self.observe_declaration_type(store, use_module, subject, .declaration, 0, generating);
+            return;
+        }
+        guard store.incremental.stable_id_for_def(subject) is .some(stable_id) else { return; }
+        _ module = store.defs.get(subject).module_id$.some();
+        guard source_identity.for_module(store, module) is .some(dependency) else { return; }
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if generating { .generated_declaration_type }
+            else { .declaration_type };
+        _ name = qkey.Fingerprint128(UInt64(Int(property)), UInt64(index));
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, qkey.Fingerprint128());
+        if (generating && self.declaration_observations.contains(source_id, key)) { return; }
+        guard self.declaration_type_fingerprint(store, subject, property, index) is .some(observed)
+            else { return; }
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, observed));
+    }
+
+    #doc 来源读取共享整个模块来源事实；消费者只决定依赖归属，不再按 getter 拆分缓存项。
+    public Void observe_module_origin(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.ModuleId module, Bool generating
+    ) {
+        guard store.incremental.stable_id_for_def(store.resolve.module_ref(module).def_id) is .some(stable_id)
+            else { return; }
+        guard source_identity.for_module(store, module) is .some(dependency) else { return; }
+        _ source_id = store.resolve.module_ref(use_module).source_id;
+        source_artifact.ObservationAspect aspect = if generating { .generated_module_origin } else { .module_origin };
+        _ name = qkey.Fingerprint128();
+        _ key = source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, qkey.Fingerprint128());
+        if (generating && self.declaration_observations.contains(source_id, key)) { return; }
+        guard self.module_graph.origin_fingerprint(store, module) is .some(observed) else { return; }
+        self.declaration_observations.record(source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, aspect, name, observed));
+    }
+
+    #doc 导入位置没有独立声明身份，使用来源模块与有序边索引定位当前事实。
+    public Void observe_import_location(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.ModuleId module, Int index
+    ) {
+        _ stable_id = store.incremental.stable_id_for_def(store.resolve.module_ref(module).def_id)$.some();
+        _ dependency = source_identity.for_module(store, module)$.some();
+        guard self.import_location_fingerprint(store, module, index) is .some(observed) else { return; }
+        self.declaration_observations.record(store.resolve.module_ref(use_module).source_id,
+            source_artifact.DeclarationObservation(dependency, stable_id, .import_location,
+                qkey.Fingerprint128(UInt64(index), UInt64(0)), observed));
+    }
+
+    qkey.Fingerprint128? import_location_fingerprint(self, store_api.CompilerStore& store,
+        qid.ModuleId module, Int index
+    ) {
+        guard self.module_graph.prepared_import(store.resolve$.ref(), module, index) is .some(item)
+            else { return null; }
+        guard self.locations.evaluate(store.sources$.ref(),
+            store.resolve.module_ref(module).source_id, item.span) is .some(result) else { return null; }
+        return result.fingerprint;
+    }
+
+    #doc with_doc 只在生成阶段可调用；集合为空也记录，不将正文内容混入成员身份指纹。
+    public Void observe_documented_targets(self, store_api.CompilerStore& store,
+        qid.ModuleId use_module, qid.ModuleId root
+    ) {
+        qid.DefId subject = store.resolve.module_ref(root).def_id;
+        _ stable_id = store.incremental.stable_id_for_def(subject)$.some();
+        _ dependency_source = source_identity.for_module(store, root)$.some();
+        _ observed = self.documentation.targets_fingerprint(root)$.some();
+        self.declaration_observations.record(store.resolve.module_ref(use_module).source_id,
+            source_artifact.DeclarationObservation(dependency_source, stable_id, .documentation_targets,
+                qkey.Fingerprint128(), observed));
+    }
+
+    #doc 恢复调用方前按需准备文档与位置的来源；每次复制单条记录，避免跨可变 Store 保留借用。
+    public Bool prepare_observed_reflection(Self&! self, store_api.CompilerStore&! store,
+        source.SourceId source_id
+    ) {
+        guard store.artifacts.load_observations(source_id) is .some(entries) else { return false; }
+        Int count = entries.entries.len();
+        Int index! = 0;
+        while (index < count) {
+            source_artifact.DeclarationObservation item =
+                store.artifacts.load_observations(source_id)$.some().entries.get(index);
+            index = index + 1;
+            if (item.aspect != .documentation && item.aspect != .location && item.aspect != .declaration_members) {
+                continue;
+            }
+            guard store.incremental.current_def_for_stable(item.subject) is .some(current) else { return false; }
+            guard store.defs.get(current).module_id is .some(module) else { return false; }
+            if (store.resolve.module_ref(module).source_id == source_id) { continue; }
+            if (item.aspect == .declaration_members) {
+                _ scope = declaration_query.DeclarationScope(owner: current,
+                    public_only: item.name.low != UInt64(0), generic_parameters: item.name.high != UInt64(0));
+                if (!self.declarations.prepare_observed_members(store, scope)) { return false; }
+            } else if (item.aspect == .documentation) {
+                if (!self.documentation.prepare(store, module)) { return false; }
+            } else if (!self.declarations.prepare_location(store, current)) { return false; }
+        }
+        return true;
+    }
+
     public Bool validate_declaration_observations(
         self,
         store_api.CompilerStore& store,
-        source_artifact.DeclarationObservationSet& observations
+        source_artifact.DeclarationObservationSet& observations,
+        Bool nonsemantic_only = false,
+        cache_identity.StableSourceId? unchanged_source = null,
+        Bool compilation_only = false
     ) {
-        if (observations.entries.len() == 0) { return false; }
+        if (observations.entries.len() == 0) { return nonsemantic_only; }
         Int index! = 0;
         while (index < observations.entries.len()) {
+            source_artifact.DeclarationObservation item = observations.entries.get(index);
+            // 集合只影响 generate 的执行结果，不参与生成器源码自身的语义恢复。
+            if (compilation_only && item.aspect.generation_only()) {
+                index = index + 1;
+                continue;
+            }
+            // 仅恢复已证明源码未改动的当前模块时跳过自身来源事实；跨文件读取仍逐项校验。
+            if ((item.aspect == .documentation || item.aspect == .metadata || item.aspect == .location
+                || item.aspect == .declaration_members
+                || item.aspect == .reflected_signature
+                || item.aspect == .declaration_type)
+                && unchanged_source == item.dependency_source) {
+                index = index + 1;
+                continue;
+            }
+            // 接口未变化不能证明执行过的函数 body 未变化，显式 body 依赖始终比较。
+            if (nonsemantic_only && item.aspect != .body && item.aspect != .documentation && item.aspect != .metadata
+                && !item.aspect.generation_only()
+                && item.aspect != .location && item.aspect != .declaration_members && item.aspect != .module_origin
+                && item.aspect != .reflected_signature
+                && item.aspect != .declaration_type) {
+                index = index + 1;
+                continue;
+            }
             if (!self.validate_declaration_observation(
                 store,
                 observations.entries.get(index)
@@ -194,7 +624,7 @@ public struct QueryEngine: Movable {
         guard store.defs.get(current_def).module_id is .some(module_id) else { return false; }
         guard source_identity.for_module(store, module_id) is .some(identity) else { return false; }
         if (identity != item.dependency_source) { return false; }
-        if (item.aspect == .signature) {
+        if (item.aspect == .signature || item.aspect == .reflected_signature || item.aspect == .generated_signature) {
             return self.def_signature(item.subject, { [ref store, item] =>
                 store.incremental.signature_fingerprint(item.subject)
             }) == item.observed;
@@ -204,8 +634,56 @@ public struct QueryEngine: Movable {
                 store.incremental.body_fingerprint(item.subject)
             }) == item.observed;
         }
+        if (item.aspect == .metadata || item.aspect == .generated_metadata) {
+            guard self.metadata.fingerprint(store, self.locations$.ref(), current_def) is .some(current)
+                else { return false; }
+            return current == item.observed;
+        }
+        if (item.aspect == .documentation) {
+            guard self.documentation.fingerprint(store, current_def) is .some(current) else { return false; }
+            return current == item.observed;
+        }
+        if (item.aspect == .location) {
+            guard self.declaration_location_fingerprint(store, current_def) is .some(current)
+                else { return false; }
+            return current == item.observed;
+        }
+        if (item.aspect == .documentation_targets) {
+            guard self.documentation.targets_fingerprint(module_id) is .some(current) else { return false; }
+            return current == item.observed;
+        }
+        if (item.aspect == .module_closure) {
+            return self.module_graph.modules_fingerprint(store, module_id) == item.observed;
+        }
+        if (item.aspect == .imports) {
+            return self.module_graph.imports_fingerprint(store, module_id) == item.observed;
+        }
+        if (item.aspect == .import_location) {
+            return self.import_location_fingerprint(store, module_id, Int(item.name.low)) == item.observed;
+        }
+        if (item.aspect == .recursive_declarations) {
+            return self.declarations.recursive_fingerprint(store, module_id) == item.observed;
+        }
+        if (item.aspect == .exports) {
+            return self.exports.fingerprint(store, module_id) == item.observed;
+        }
+        if (item.aspect == .declaration_members || item.aspect == .generated_members) {
+            _ scope = declaration_query.DeclarationScope(owner: current_def,
+                public_only: item.name.low != UInt64(0), generic_parameters: item.name.high != UInt64(0));
+            return self.declarations.members_fingerprint(store, scope) == item.observed;
+        }
+        if (item.aspect == .module_origin || item.aspect == .generated_module_origin) {
+            if (item.name != qkey.Fingerprint128()) { return false; }
+            return self.module_graph.origin_fingerprint(store, module_id) == item.observed;
+        }
         if (item.aspect == .namespace_name) {
             return observation.validate_namespace_name(store, item, current_def);
+        }
+        if (item.aspect == .declaration_type || item.aspect == .generated_declaration_type) {
+            guard declaration_query.declaration_type_property(Int(item.name.low)) is .some(property)
+                else { return false; }
+            return self.declaration_type_fingerprint(store, current_def, property, Int(item.name.high))
+                == item.observed;
         }
         if (item.aspect == .namespace) {
             return observation.validate_namespace(store, item, current_def);
@@ -554,11 +1032,30 @@ public Bool begin_public_extension_search(
     );
 }
 
+#doc 已选定从 interface 恢复的模块沿用经验证的读取记录；后续按需读取仍可更新同一 key。
+public Void retain_declaration_observations(
+    QueryEngine& query, source_artifact.SourceArtifactCache& cache, source.SourceId source_id
+) {
+    guard cache.load_observations(source_id) is .some(observations) else { return; }
+    Int index! = 0;
+    while (index < observations.entries.len()) {
+        query.declaration_observations.record(source_id, observations.entries.get(index));
+        index = index + 1;
+    }
+}
+
 public Void publish_declaration_observations(
     QueryEngine& query,
     source_artifact.SourceArtifactCache&! cache
 ) {
     query.declaration_observations.publish(cache);
+}
+
+#doc 模块恢复前核对上次 object 使用的反射事实，避免 check 更新接口后沿用旧 object。
+public Bool object_reflection_inputs_match(
+    QueryEngine& query, cache_identity.StableSourceId source, qkey.Fingerprint128 current
+) {
+    return query.object_unit.reflection_inputs_match(source, current);
 }
 
 public Void require_debug_source_products(

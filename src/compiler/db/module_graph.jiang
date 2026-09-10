@@ -1,0 +1,225 @@
+#doc(module)
+    已完成前端检查的模块图查询；只缓存导入排序索引与同包闭包身份，事实仍由 ResolveStore 持有。
+    输入图在生成期间固定，缓存随 QueryEngine 的编译会话重置，不跨会话保存 ModuleId。
+#end
+
+alias source_store = import "../source/store.jiang";
+alias source = import "../source.jiang";
+alias object_hash = import "../artifact/object_hash.jiang";
+alias qkey = import "../incremental/key.jiang";
+alias object_key = import "../artifact/object_key.jiang";
+alias cache_identity = import "../artifact/cache_identity.jiang";
+alias store_api = import "../store.jiang";
+alias qid = import "../id.jiang";
+alias resolve = import "../resolve/store.jiang";
+alias list = import "../support/list.jiang";
+alias collections = import "./collection_cache.jiang";
+alias set = import "../support/set.jiang";
+alias stable_fingerprint = import "./stable_fingerprint.jiang";
+
+#doc 模块值查询的选择器；位置沿用单独的位置观察，其余值不要求读取源码正文。
+public enum ModuleProperty { name, path, package, virtual_flag, location, }
+
+public struct ModuleGraphQuery: Movable {
+    stable_fingerprint.StableFingerprintQuery origins;
+    collections.CollectionCache<qid.ModuleId, Int> imports!;
+    collections.CollectionCache<qid.ModuleId, qid.ModuleId> modules!;
+
+    public init(self) {
+        self.origins = stable_fingerprint.StableFingerprintQuery();
+        self.imports = collections.CollectionCache<qid.ModuleId, Int>();
+        self.modules = collections.CollectionCache<qid.ModuleId, qid.ModuleId>();
+    }
+
+    public Void reset(Self&! self) {
+        self.origins.reset();
+        self.imports.reset();
+        self.modules.reset();
+    }
+
+    @life(return: sources)
+    public UInt8[]& source_name(self, source_store.SourceStore& sources, source.SourceId source_id) {
+        return sources.entry(source_id).name();
+    }
+
+    public Bool is_virtual(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        return !store.sources.entry(store.resolve.module_ref(module).source_id).key.is_file();
+    }
+
+    #doc 文件来源使用普通包相对路径算法；virtual 名称不经过路径规范化。
+    public UInt8[]^ relative_path(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        _ package = store.resolve.module_ref(module).package_id;
+        return cache_identity.package_relative_source_path(
+            store.symbols.text(store.resolve.package_ref(package).dir_path),
+            self.source_name(store.sources$.ref(), store.resolve.module_ref(module).source_id));
+    }
+
+    #doc 模块来源作为一个共同事实编码；原始名称、逻辑路径、包身份和来源类别不按 getter 拆分。
+    public qkey.Fingerprint128? origin_fingerprint(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        _ record = store.resolve.module_ref(module);
+        guard store.incremental.stable_id_for_def(record.def_id) is .some(identity) else { return null; }
+        guard store.incremental.stable_id_for_def(store.resolve.package_ref(record.package_id).def_id)
+            is .some(package) else { return null; }
+        return self.origins.evaluate(identity, { [ref self, ref store, module, package] =>
+            _ source_id = store.resolve.module_ref(module).source_id;
+            _ name = self.source_name(store.sources$.ref(), source_id);
+            qkey.Fingerprint128 name_fingerprint = object_hash.hash_bytes(name);
+            qkey.Fingerprint128 path_fingerprint! = name_fingerprint;
+            Bool virtual_source = self.is_virtual(store, module);
+            if (!virtual_source) {
+                _ path = self.relative_path(store, module);
+                path_fingerprint = object_hash.hash_bytes(path[..]);
+            }
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>(4);
+            parts.add(qkey.Fingerprint128(package.low, package.high));
+            parts.add(name_fingerprint);
+            parts.add(path_fingerprint);
+            parts.add(qkey.Fingerprint128(if virtual_source { UInt64(1) } else { UInt64(0) }, UInt64(0)));
+            return object_key.combine_fingerprints(UInt64(137), parts$.ref());
+        });
+    }
+
+    #doc 直接导入保留重复绑定和外包目标；未求值的成员 alias 不构成生效导入。
+    public Int import_count(Self&! self, resolve.ResolveStore& store, qid.ModuleId module) {
+        self.prepare_imports(store, module);
+        return self.imports.count(module);
+    }
+
+    public resolve.ImportRecord import_at(
+        Self&! self, resolve.ResolveStore& store, qid.ModuleId module, Int index
+    ) {
+        self.prepare_imports(store, module);
+        Int original = self.imports.at(module, index);
+        return store.module_ref(module).imports.get(original);
+    }
+
+    #doc 同包闭包包含 root；根优先、导入深度优先、按身份去重，不穿过外包节点。
+    public Int module_count(Self&! self, resolve.ResolveStore& store, qid.ModuleId root) {
+        self.prepare_modules(store, root);
+        return self.modules.count(root);
+    }
+
+    public qid.ModuleId module_at(Self&! self, resolve.ResolveStore& store, qid.ModuleId root, Int index) {
+        self.prepare_modules(store, root);
+        return self.modules.at(root, index);
+    }
+
+    #doc 只接受已准备的闭包；根与有序模块身份决定结果，不混入 body 或导入别名。
+    public qkey.Fingerprint128? modules_fingerprint(self, store_api.CompilerStore& store, qid.ModuleId root) {
+        return self.modules.fingerprint(root, { [ref store, root] modules =>
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>(modules.len());
+            Int index! = 0;
+            while (index < modules.len()) {
+                _ definition = store.resolve.module_ref(modules.get(index)).def_id;
+            _ identity = store.incremental.stable_id_for_def(definition)$.some();
+                parts.add(qkey.Fingerprint128(identity.low, identity.high));
+                index = index + 1;
+            }
+            return object_key.combine_fingerprints(UInt64(132), parts$.ref());
+        });
+    }
+
+    #doc 空导入也有根身份指纹；边保持次序、重复绑定与外包目标，位置由独立读取记录。
+    public qkey.Fingerprint128? imports_fingerprint(self, store_api.CompilerStore& store, qid.ModuleId module) {
+        return self.imports.fingerprint(module, { [ref store, module] indices =>
+            list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+            _ owner = store.incremental.stable_id_for_def(store.resolve.module_ref(module).def_id)$.some();
+            parts.add(qkey.Fingerprint128(owner.low, owner.high));
+            Int index! = 0;
+            while (index < indices.len()) {
+                _ item = store.resolve.module_ref(module).imports.get(indices.get(index));
+                _ target = store.resolve.module_ref(item.target_module$.some()).def_id;
+                _ identity = store.incremental.stable_id_for_def(target)$.some();
+                parts.add(qkey.Fingerprint128(identity.low, identity.high));
+                UInt8[]& name = if item.alias_symbol is .some(symbol) { store.symbols.text(symbol) } else { "" };
+                parts.add(cache_identity.text_fingerprint("import-name:", name));
+                parts.add(qkey.Fingerprint128(if item.flatten { UInt64(1) } else { UInt64(0) },
+                    if item.visibility == .public_visibility { UInt64(1) } else { UInt64(0) }));
+                index = index + 1;
+            }
+            return object_key.combine_fingerprints(UInt64(133), parts$.ref());
+        });
+    }
+
+    #doc 校验已准备的边索引；已删除的边不能当作零位置或触发越界读取。
+    public resolve.ImportRecord? prepared_import(self, resolve.ResolveStore& store, qid.ModuleId module, Int index) {
+        if (!self.imports.has(module)) { return null; }
+        if (index < 0 || index >= self.imports.count(module)) { return null; }
+        return store.module_ref(module).imports.get(self.imports.at(module, index));
+    }
+
+    Void prepare_imports(Self&! self, resolve.ResolveStore& store, qid.ModuleId module) {
+        if (self.imports.has(module)) { return; }
+        resolve.ModuleRecord& record = store.module_ref(module);
+        list.ArrayList<Int> ordered! = list.ArrayList<Int>();
+        Int index! = 0;
+        while (index < record.imports.len()) {
+            resolve.ImportRecord item = record.imports.get(index);
+            if (item.state == .resolved && item.target_module != null) { ordered.add(index); }
+            index = index + 1;
+        }
+        sort_imports(record, ordered$.mut_ref());
+        self.imports.publish(module, ordered);
+    }
+
+    Void prepare_modules(Self&! self, resolve.ResolveStore& store, qid.ModuleId root) {
+        if (self.modules.has(root)) { return; }
+        qid.PackageId package = store.module_ref(root).package_id;
+        list.ArrayList<qid.ModuleId> result! = list.ArrayList<qid.ModuleId>();
+        list.ArrayList<qid.ModuleId> pending! = list.ArrayList<qid.ModuleId>();
+        set.HashSet<qid.ModuleId> visited! = set.HashSet<qid.ModuleId>();
+        pending.add(root);
+        while (!pending.empty()) {
+            qid.ModuleId module = pending.pop();
+            if (visited.has(module)) { continue; }
+            visited.add(module);
+            result.add(module);
+            Int index! = self.import_count(store, module);
+            while (index > 0) {
+                index = index - 1;
+                qid.ModuleId target = self.import_at(store, module, index).target_module$.some();
+                if (store.module_ref(target).package_id == package) { pending.add(target); }
+            }
+        }
+        self.modules.publish(root, result);
+    }
+}
+
+#doc 导入可能按需求值后才登记；用稳定归并排序恢复源码顺序，同位置保留原登记顺序。
+Void sort_imports(resolve.ModuleRecord& module, list.ArrayList<Int>&! ordered) {
+    if (ordered.len() < 2) { return; }
+    list.ArrayList<Int> scratch! = list.ArrayList<Int>(ordered.len());
+    Int index! = 0;
+    while (index < ordered.len()) { scratch.add(0); index = index + 1; }
+    Int width! = 1;
+    while (width < ordered.len()) {
+        Int begin! = 0;
+        while (begin < ordered.len()) {
+            Int middle = if (begin + width < ordered.len()) { begin + width } else { ordered.len() };
+            Int end = if (middle + width < ordered.len()) { middle + width } else { ordered.len() };
+            merge_imports(module, ordered, scratch$.mut_ref(), begin, middle, end);
+            begin = end;
+        }
+        index = 0;
+        while (index < ordered.len()) { ordered.set(index, scratch.get(index)); index = index + 1; }
+        width = width * 2;
+    }
+}
+
+Void merge_imports(
+    resolve.ModuleRecord& module, list.ArrayList<Int>& ordered, list.ArrayList<Int>&! scratch,
+    Int begin, Int middle, Int end
+) {
+    Int left! = begin;
+    Int right! = middle;
+    Int output! = begin;
+    while (output < end) {
+        Bool take_left = right == end || (left < middle
+            && module.imports.get(ordered.get(left)).span.start <= module.imports.get(ordered.get(right)).span.start);
+        Int selected!;
+        if (take_left) { selected = ordered.get(left); left = left + 1; }
+        else { selected = ordered.get(right); right = right + 1; }
+        scratch.set(output, selected);
+        output = output + 1;
+    }
+}

@@ -1,0 +1,154 @@
+#doc(module)
+    生成调用的产物暂存 owner；执行期间只接收字节，成功后将完整目录发布，失败保留旧目录。
+#end
+
+alias list = import "../support/list.jiang";
+alias string = import "../support/string.jiang";
+alias fs = import "../system/fs.jiang";
+import std;
+
+struct File: Movable {
+    Path path;
+    list.ArrayList<UInt8> data;
+}
+
+public struct Outputs: Movable {
+    list.ArrayList<File> files!;
+    Int bytes! = 0;
+    public std.String error! = "";
+
+    public init(self) { self.files = list.ArrayList<File>(); }
+
+    #doc 路径必须是无空段、点段的相对文件路径；同时拒绝重复文件及文件与目录冲突。
+    public Bool write(Self&! self, UInt8[]& path, UInt8[]& data) {
+        if (self.error.byte_length() != 0) { return false; }
+        if (!valid_path(path)) { self.error = "invalid generated output path"; return false; }
+        if (self.files.len() >= 4096 || data.length > 67108864 - self.bytes) {
+            self.error = "generated output exceeds 4096 files or 64 MiB";
+            return false;
+        }
+        Int index! = 0;
+        while (index < self.files.len()) {
+            UInt8[]& previous = self.files.ref_at(index).path.bytes();
+            if (contains_path(previous, path) || contains_path(path, previous)) {
+                self.error = "conflicting generated output paths";
+                return false;
+            }
+            index = index + 1;
+        }
+        list.ArrayList<UInt8> copied! = list.ArrayList<UInt8>(data.length);
+        index = 0;
+        while (index < data.length) { copied.add(data[index]); index = index + 1; }
+        self.files.add(File(path: Path(path), data: copied));
+        self.bytes = self.bytes + data.length;
+        return true;
+    }
+
+    #doc 调用者保证目录为本任务专用且不包含输入；目录锁保护整次发布，旧产物整体替换。
+    public Bool publish(Self&! self, UInt8[]& directory) {
+        if (self.error.byte_length() != 0) { return false; }
+        Path root = std.path.normalize(directory);
+        UInt8[]& parent = root.dirname();
+        if (root.bytes().length == 0 || string.equal(root.bytes(), ".") || string.equal(root.bytes(), "/")) {
+            self.error = "generation requires a dedicated output directory";
+            return false;
+        }
+        if (parent.length != 0 && !fs.create_dirs(parent)) { return self.io_failed(); }
+        std.String lock_path = string.concat(root.bytes(), ".jiang-lock");
+        guard fs.acquire_file_lock(lock_path.bytes()) is .some(lock) else { return self.io_failed(); }
+        std.String stage = string.concat(root.bytes(), ".jiang-stage");
+        std.String previous = string.concat(root.bytes(), ".jiang-previous");
+        if (fs.exists(stage.bytes()) || fs.exists(previous.bytes())) {
+            self.error = "unfinished generation directory transaction; recover .jiang-stage/.jiang-previous first";
+            return false;
+        }
+        if (fs.exists(root.bytes()) && !fs.dir_exists(root.bytes())) {
+            self.error = "generation output must be a directory";
+            return false;
+        }
+        if (!fs.create_dir(stage.bytes())) { return self.io_failed(); }
+        if (!self.write_stage(stage.bytes())) {
+            fs.remove_tree(stage.bytes());
+            return self.io_failed();
+        }
+        Bool had_previous = fs.dir_exists(root.bytes());
+        if (had_previous && !fs.atomic_replace(root.bytes(), previous.bytes())) {
+            fs.remove_tree(stage.bytes());
+            return self.io_failed();
+        }
+        if (!fs.atomic_replace(stage.bytes(), root.bytes())) {
+            if (had_previous && !fs.atomic_replace(previous.bytes(), root.bytes())) {
+                self.error = "generation publish and rollback failed; previous output remains in .jiang-previous";
+                return false;
+            }
+            fs.remove_tree(stage.bytes());
+            return self.io_failed();
+        }
+        // 提交后只清理本任务旧目录；清理失败保留备份，下轮明确诊断，不影响已提交产物。
+        if (had_previous) { fs.remove_tree(previous.bytes()); }
+        return true;
+    }
+
+    Bool write_stage(self, UInt8[]& stage) {
+        Int index! = 0;
+        while (index < self.files.len()) {
+            File& file = self.files.ref_at(index);
+            Path target = std.path.join(stage, file.path.bytes());
+            if (!fs.create_dirs(target.dirname()) || !fs.write_all(target.bytes(), file.data.slice())) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool io_failed(Self&! self) { self.error = "failed to publish generated output directory"; return false; }
+}
+
+Bool contains_path(UInt8[]& parent, UInt8[]& child) {
+    if (child.length < parent.length || !string.equal(child[0..parent.length], parent)) { return false; }
+    return child.length == parent.length || child[parent.length] == UInt8(47);
+}
+
+Bool valid_path(UInt8[]& path) {
+    if (path.length == 0 || path[0] == UInt8(47)) { return false; }
+    Int start! = 0;
+    Int index! = 0;
+    while (index <= path.length) {
+        if (index == path.length || path[index] == UInt8(47)) {
+            UInt8[]& part = path[start..index];
+            if (part.length == 0 || string.equal(part, ".") || string.equal(part, "..")) { return false; }
+            start = index + 1;
+        } else if (path[index] < UInt8(32) || path[index] == UInt8(92)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+#doc 允许尚未创建的尾部路径，已有前缀必须由文件系统解析；权限和类型错误不能当成不存在。
+public Path? physical_path(UInt8[]& path) {
+    Path normalized = std.path.normalize(path);
+    Path prefix! = Path(normalized.bytes());
+    list.ArrayList<Path> missing! = list.ArrayList<Path>();
+    while (true) {
+        UInt8[]^ resolved = try fs.canonical_path(prefix.bytes()) catch error {
+            if (error != .not_found || string.equal(prefix.bytes(), ".")) { return null; }
+            UInt8[]& parent = prefix.dirname();
+            if (parent.length == prefix.bytes().length) { return null; }
+            Int begin = if (parent.length == 0) { 0 } else if (parent.length == 1 && parent[0] == UInt8(47)) {
+                1
+            } else { parent.length + 1 };
+            missing.add(Path(prefix.bytes()[begin..prefix.bytes().length]));
+            Path next = if (parent.length == 0) { Path(".") } else { Path(parent) };
+            prefix = next;
+            continue;
+        };
+        Path result! = Path(resolved[..]);
+        while (!missing.empty()) {
+            Path component = missing.pop();
+            result = std.path.join(result.bytes(), component.bytes());
+        }
+        return result;
+    }
+    return null;
+}
