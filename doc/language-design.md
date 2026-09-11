@@ -147,6 +147,14 @@ token，再将块身份映射到自己的 K 并 `emit`。扫描不得越过 toke
 自定义 `Parser<K>` 可将保存的块身份和 span 重建为默认 RawBlock token，调用 `parse_raw_block(raw)`；
 该重载不移动自定义 cursor，消费由调用方负责。块身份只在原编译调用的源码／块存储内有效。
 
+公共 `Parser.checkpoint()`／`rewind()` 采用调用期保存点：记录 cursor、诊断位置、AST 保存点与
+列表撤销日志位置。保存点身份同时校验所属 parser／上下文，回退保留目标保存点并使后续保存点失效。
+节点和列表使用不可复用的代际，避免回退后编号复用使旧句柄重新有效；旧节点的 Attribute／Modifier
+修改通过同一 AST 撤销路径恢复。保存点及列表日志在调用结束时回收，AST 历史在外层解析结束时回收。
+默认扫描保留可重复读取的 token；RawBlock 重试重新调用 parse，不重放旧 AST，也不重建语言上下文。
+自定义 Provider 必须自行保证重复解析所需的 token／状态仍可使用；普通容器和外部副作用不在回溯范围。
+
+
 独立 Lang 文件采用普通文件 import，也可直接作为生成输入。Provider 在 `#package` 中用
 `lang { extensions = ["schema", "sch"]; }` 声明自身扩展名；使用方通过
 `lang sql { package = sql; extensions = ["model"]; }` 整组覆盖。两边均未配置时默认使用语言别名。

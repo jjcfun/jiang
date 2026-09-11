@@ -11,6 +11,7 @@ alias store_api = import "../store.jiang";
 alias source = import "../source.jiang";
 alias syntax_lists = import "./lists.jiang";
 alias syntax_abi = import "../../std/jiang/syntax/abi.jiang";
+alias list = import "../support/list.jiang";
 import std;
 
 public enum SyntaxRole: Copyable {
@@ -26,10 +27,39 @@ public enum SyntaxRole: Copyable {
     member_item,
 }
 
+struct ParserSavepoint: Copyable {
+    Int identity;
+    Int owner;
+    Int cursor;
+    ast.AstMark ast_mark;
+    Int list_count;
+    Int list_mark;
+    Int diagnostics;
+    ast.AstId? result;
+    Int result_role;
+    Int fragment_role;
+    init(self, Int identity, Int owner, Int cursor, ast.AstMark ast_mark, Int list_count, Int list_mark,
+        Int diagnostics, ast.AstId? result, Int result_role, Int fragment_role) {
+        self.identity = identity;
+        self.owner = owner;
+        self.cursor = cursor;
+        self.ast_mark = ast_mark;
+        self.list_count = list_count;
+        self.list_mark = list_mark;
+        self.diagnostics = diagnostics;
+        self.result = result;
+        self.result_role = result_role;
+        self.fragment_role = fragment_role;
+    }
+}
+
 // 一次 provider invocation 的 compiler-owned 状态。Context 固定引用它，
 // parse 期间临时绑定调用方 AstUnit；每个 factory callback 直接写该 unit。
 public struct SyntaxInvocation: !Movable {
     public syntax_lists.ListStore lists!;
+    list.ArrayList<ParserSavepoint> savepoints!;
+    Int parser_identity!;
+    Int savepoint_identity!;
     public Int result_role!;
     public Int fragment_role!;
     public Void* lexer_state!;
@@ -64,6 +94,9 @@ public struct SyntaxInvocation: !Movable {
     ) {
         assert(source_length >= 0);
         self.lists = syntax_lists.ListStore();
+        self.savepoints = list.ArrayList<ParserSavepoint>();
+        self.parser_identity = 0;
+        self.savepoint_identity = 0;
         self.result_role = -1;
         self.fragment_role = -1;
         self.lexer_state = null;
@@ -108,12 +141,15 @@ public struct SyntaxInvocation: !Movable {
         self.unit = unsafe { unit$.ptr() };
         self.diagnostic_category = diagnostic_category;
         self.lists.clear();
+        self.savepoints.clear();
         self.expected_kind = expected_kind;
         self.result = null;
     }
 
     public Void end_call(Self&! self) {
         assert(self.store != null);
+        self.savepoints.clear();
+        self.lists.clear();
         self.lexer_state = null;
         self.raw_scan = null;
         self.language_scan = null;
@@ -121,6 +157,47 @@ public struct SyntaxInvocation: !Movable {
         self.store = null;
         self.unit = null;
         self.result = null;
+    }
+
+    #doc 保存点身份不跨调用复用；只保存位置，追加与旧节点修改由原存储撤销。
+    public Int parser_state(Self&! self, Int operation, Int owner, Int value) {
+        assert(self.store != null);
+        if (operation == 0) {
+            self.parser_identity += 1;
+            assert(self.parser_identity > 0);
+            return self.parser_identity;
+        }
+        assert(self.unit != null && owner > 0 && owner <= self.parser_identity);
+        ast.AstUnit&! unit = unsafe { self.unit$.as(ast.AstUnit&!) };
+        store_api.CompilerStore&! store = unsafe { self.store$.as(store_api.CompilerStore&!) };
+        if (operation == 1) {
+            self.savepoint_identity += 1;
+            assert(self.savepoint_identity > 0);
+            _ ast_mark = unit.checkpoint();
+            _ list_count = self.lists.len();
+            _ list_mark = self.lists.checkpoint();
+            self.savepoints.add(ParserSavepoint(self.savepoint_identity, owner, value, ast_mark,
+                list_count, list_mark, store.diagnostics.len(), self.result, self.result_role, self.fragment_role));
+            return self.savepoint_identity;
+        }
+        assert(operation == 2);
+        Int low! = 0;
+        Int high! = self.savepoints.len();
+        while (low < high) {
+            Int middle = low + (high - low) / 2;
+            if (self.savepoints.get(middle).identity < value) { low = middle + 1; } else { high = middle; }
+        }
+        assert(low < self.savepoints.len(), "stale parser checkpoint");
+        _ saved = self.savepoints.get(low);
+        assert(saved.identity == value && saved.owner == owner, "stale parser checkpoint");
+        unit.rewind(saved.ast_mark);
+        self.lists.rewind(saved.list_count, saved.list_mark);
+        store.diagnostics.truncate(saved.diagnostics);
+        self.result = saved.result;
+        self.result_role = saved.result_role;
+        self.fragment_role = saved.fragment_role;
+        self.savepoints.truncate(low + 1);
+        return saved.cursor;
     }
 
     public ast.AstId? take_result(Self&! self) {
@@ -132,8 +209,14 @@ public struct SyntaxInvocation: !Movable {
     public std.Vector<std.jiang.Token<std.jiang.TokenKind>> take_default_tokens(Self&! self) {
         assert(self.store != null, "syntax invocation is not active");
         assert(self.default_tokens_ready, "default syntax tokens are not ready");
-        self.default_tokens_ready = false;
-        return self.default_tokens.take();
+        std.Vector<std.jiang.Token<std.jiang.TokenKind>> tokens! =
+            std.Vector<std.jiang.Token<std.jiang.TokenKind>>(self.default_tokens.length());
+        Int index! = 0;
+        while (index < self.default_tokens.length()) {
+            tokens.append(self.default_tokens[index]);
+            index += 1;
+        }
+        return tokens;
     }
 
     public Void set_fragment_parser(
@@ -2190,7 +2273,7 @@ ast.AstId factory_attach_attributes(
             attributes = attributes,
             body = declaration.body
         );
-        unit.nodes.set(
+        unit.set_node(
             node_id.to_index(), ast.AstNode(span = node.span, data = .member_decl(updated))
         );
         return node_id;
@@ -2221,7 +2304,7 @@ ast.AstId factory_attach_attributes(
         attributes = combined,
         body = declaration.body
     );
-    unit.nodes.set(
+    unit.set_node(
         node_id.to_index(), ast.AstNode(span = node.span, data = .top_level_decl(updated))
     );
     return node_id;
@@ -2383,7 +2466,7 @@ ast.AstId factory_top_level_modifiers(ast.AstUnit&! unit, Int[]& arguments) {
         attributes = declaration.attributes,
         body = declaration.body
     );
-    unit.nodes.set(
+    unit.set_node(
         node_id.to_index(), ast.AstNode(span = node.span, data = .top_level_decl(updated))
     );
     return node_id;
@@ -2402,7 +2485,7 @@ ast.AstId factory_member_modifiers_update(ast.AstUnit&! unit, Int[]& arguments) 
         attributes = declaration.attributes,
         body = declaration.body
     );
-    unit.nodes.set(
+    unit.set_node(
         node_id.to_index(), ast.AstNode(span = node.span, data = .member_decl(updated))
     );
     return node_id;
@@ -2421,7 +2504,7 @@ ast.AstId factory_extern_item_modifiers(ast.AstUnit&! unit, Int[]& arguments) {
         attributes = item.attributes,
         body = item.body
     );
-    unit.nodes.set(
+    unit.set_node(
         node_id.to_index(), ast.AstNode(span = node.span, data = .extern_item(updated))
     );
     return node_id;
@@ -2760,7 +2843,8 @@ public source.SourceId source_id_from_std(std.jiang.syntax.SourceId source_id) {
 public Int factory_inspect(Void* state, Int operation, Int identity, Int index) {
     SyntaxInvocation& invocation = unsafe { state$.as(SyntaxInvocation&) };
     assert(invocation.unit != null);
-    ast.AstUnit& unit = unsafe { invocation.unit$.as(ast.AstUnit&) };
+    ast.AstUnit&! unit = unsafe { invocation.unit$.as(ast.AstUnit&!) };
+    if (operation == 3) { return unit.node_generation(identity); }
     ast.AstData data = unit.get(factory_id(unit, identity)).data;
     if (operation == 2) { return invocation.fragment_role; }
     guard data is .root(root) else { assert(false, "expected syntax sequence"); return -1; }
@@ -2802,4 +2886,10 @@ public syntax_abi.ListView factory_list_view(Void* state, syntax_abi.ListId iden
     SyntaxInvocation&! invocation = unsafe { state$.as(SyntaxInvocation&!) };
     assert(invocation.unit != null);
     return invocation.lists.view(identity);
+}
+
+#doc 将公共 parser 保存点操作交给当前调用；parser 身份不依赖可移动对象的地址。
+public Int factory_parser_state(Void* state, Int operation, Int owner, Int value) {
+    SyntaxInvocation&! invocation = unsafe { state$.as(SyntaxInvocation&!) };
+    return invocation.parser_state(operation, owner, value);
 }

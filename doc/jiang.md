@@ -3149,6 +3149,33 @@ members.append(second); // result 仍然只包含 first。
 不公开可随追加失效的底层切片；`at` 返回语法句柄副本。
 
 
+`parser.checkpoint()` 返回 `ParserCheckpoint`。`parser.rewind(checkpoint)` 同时恢复该 parser 的
+cursor、诊断、AST 构建内容和上下文列表；已有声明／成员的 Attribute 与 Modifier 修改也会恢复。
+保存点只借用语法上下文，不长期借用 parser。成功时直接继续，无需显式 commit。
+
+```jiang
+_ checkpoint = parser.checkpoint();
+guard parser.parse_raw_block() is .some(result) else {
+    parser.rewind(checkpoint); // 撤销这次尝试的诊断与构建结果。
+    // 在这里尝试当前 DSL 的另一条解析分支。
+    return fallback(parser);
+}
+return result;
+```
+
+保存点只属于创建它的 parser 和本次 Provider 解析调用。回退后，该保存点仍可重复使用，
+晚于它的保存点失效；之后创建的节点和列表也失效，复用存储编号不会让旧句柄重新有效。
+保存点之前的列表恢复原内容并继续有效。跨 parser、跨上下文或使用失效句柄会触发断言。
+保存点记录在调用结束时回收，回退会先移除后续记录；AST 撤销历史保留到外层解析阶段结束，
+以便外层保存点仍能撤销嵌套展开。保存点不复制所有列表或整棵 AST。
+
+回溯只恢复 parser 管理的状态。普通 Vector、Provider 字段和文件写入等副作用不会回滚。
+若调用方需要回退暂存的 Attribute，应使用 `parser.list<Attribute>()`。
+RawBlock 的默认扫描 token 可重复读取，默认 parser 可以重新构造；使用自定义 token 的 Provider
+若会被试探解析，应保留 token 内容供下一次 parse 使用，不能依赖一次性的 `take()` 或移动。
+宿主不会缓存并重放已撤销的 AST 结果，也不会重新执行语言上下文的 `create_context`。
+
+
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
