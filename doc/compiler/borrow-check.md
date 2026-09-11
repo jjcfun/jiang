@@ -215,5 +215,5 @@ JIL 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap
 
 - 更精确的 region/lifetime 推导，以及复杂循环和聚合 reborrow 的诊断质量。
 - packed/alignment 对 borrow 的限制。
-- 与 `@life(...)` annotation 的集成。
+- 与 `@life(...)` attribute 的集成。
 - 闭包捕获和 async/generator 状态机中跨挂起点借用的完整规则。

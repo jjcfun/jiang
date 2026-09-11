@@ -23,7 +23,7 @@
 | parameter list | `function` | covered | 默认参数表达式覆盖更多 literal/constructor 场景 |
 | generic params | `generic` | partial | nested generic decl、尾逗号、空参数列表反例 |
 | where constraints | `generic` | partial | projected equality 多关联类型链、负 trait bound 组合 |
-| lifetime annotation | `lifetime` | covered | 参数、`self`、返回值、字段/tuple/callable 路径与非法契约 |
+| lifetime attribute | `lifetime` | covered | 参数、`self`、返回值、字段/tuple/callable 路径与非法契约 |
 | type postfix | `type` | covered | pointer-to-pointer ABI 场景已有基础覆盖 |
 | tuple / Void type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
@@ -76,3 +76,7 @@
 5. `destructure`：补更多局部递归 Tuple 的借用冲突、move/copy 和作用域组合。
 
 任何新增语言规则进入实现前，先在本矩阵中定位到 feature dir 和最小测试层级。
+
+标注统一称为 `Attribute`：公共 builder 使用 `Attribute`／`with_attributes`，
+内部 AST 使用 `attributes`，parser 使用 `parse_attributes`。声明修饰符仍称 Modifier，
+函数／代码块效果仍称 Effect；显式类型标注（type annotation）是不同概念。

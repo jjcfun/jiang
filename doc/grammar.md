@@ -71,7 +71,7 @@ compile_item
 compile_if  <- "if" expr compile_item_block ("else" (compile_if / compile_item_block))?
 
 intrinsic_block
-            <- intrinsic_attribute leading_annotation* "{" member_decl* "}"
+            <- intrinsic_attribute leading_attribute* "{" member_decl* "}"
 
 intrinsic_attribute
             <- "@" "intrinsic" "(" intrinsic_receiver_kind "," type ")"
@@ -90,19 +90,19 @@ extern_item <- "public"? (extern_function_decl / extern_global_decl)
 
 ```peg
 top_level_decl
-            <- leading_annotation* decl_modifier* top_level_decl_body
+            <- leading_attribute* decl_modifier* top_level_decl_body
 
-member_decl <- leading_annotation* member_modifier* member_decl_body
+member_decl <- leading_attribute* member_modifier* member_decl_body
 
-leading_annotation
+leading_attribute
             <- meta_attribute
-             / doc_annotation
+             / doc_attribute
              / "@" "entry" "(" ("main" / "lang" / "generate") ")"
              / "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
              / "@" "alias" "(" alias_attribute_bindings ")"
 
-doc_annotation
+doc_attribute
             <- ("#doc" / "#jiang.doc") doc_body
 
 module_doc  <- ("#doc" / "#jiang.doc") "(" "module" ")" doc_body
@@ -504,7 +504,7 @@ enum_decl   <- "enum" ("[" type "]")? name generic_params? trait_list? enum_body
 enum_body   <- "{" enum_variant ("," enum_variant)* ","? (";" enum_member*)? "}"
 
 enum_variant
-            <- annotation* member_modifier* name enum_payload? ("=" expr)?
+            <- leading_attribute* member_modifier* name enum_payload? ("=" expr)?
 
 enum_payload
             <- "(" enum_payload_field ("," enum_payload_field)* ")"
@@ -538,8 +538,8 @@ trait_decl  <- "trait" name generic_params? (":" path ("," path)*)?
 trait_body  <- "{" trait_member* "}"
 
 trait_member
-            <- leading_annotation* member_modifier* associated_type_decl
-             / leading_annotation* member_modifier* trait_method_decl
+            <- leading_attribute* member_modifier* associated_type_decl
+             / leading_attribute* member_modifier* trait_method_decl
 
 associated_type_decl
             <- "associated" name (":" associated_item_bound)? ";"
