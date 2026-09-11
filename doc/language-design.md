@@ -145,7 +145,8 @@ Attribute 结果由语言作者按自身语法暂存并通过 `with_attributes` 
 自定义 `Tokenizer<K>` 在 `begin_token()` 后于 `#` 位置调用 `scan_raw_block()`，取得默认 RawBlock
 token，再将块身份映射到自己的 K 并 `emit`。扫描不得越过 tokenizer bounds；失败保留诊断。
 自定义 `Parser<K>` 可将保存的块身份和 span 重建为默认 RawBlock token，调用 `parse_raw_block(raw)`；
-该重载不移动自定义 cursor，消费由调用方负责。块身份只在原编译调用的源码／块存储内有效。
+该重载不移动自定义 cursor，消费由调用方负责。块身份只在原编译调用的源码／块存储内有效，
+重建 token 的 span 必须与登记块一致；无效身份、错配或越界 span 报诊断。
 
 公共 `Parser.checkpoint()`／`rewind()` 采用调用期保存点：记录 cursor、诊断位置、AST 保存点与
 列表撤销日志位置。保存点身份同时校验所属 parser／上下文，回退保留目标保存点并使后续保存点失效。

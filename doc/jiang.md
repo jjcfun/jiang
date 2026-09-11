@@ -3127,7 +3127,8 @@ struct SqlProvider: std.jiang.syntax.Provider {
 
 默认 parser 遇到 RawBlock 时，可调用 `parser.parse_raw_block()` 展开，再用 `result.role()`
 判断类别，或通过 `result.as_attribute()`、`result.as_decl()`、`result.as_member()` 等方法取出节点。
-展开失败返回 null 并保留诊断。文档结果是普通 Attribute，使用 `with_attributes` 附着到目标节点。
+展开失败返回 null 并保留诊断：当前位置不是 RawBlock 时不消费 token，RawBlock 展开失败时该 token 已消费。
+文档结果是普通 Attribute，使用 `with_attributes` 附着到目标节点。
 
 `parser.ast(member)` 返回单成员；`parser.members(span, values)` 返回成员序列。
 声明序列由 `parser.declarations(span, values)` 构造。空序列和单元素序列也保持序列类别；
@@ -3138,7 +3139,10 @@ struct SqlProvider: std.jiang.syntax.Provider {
 `kind.block_id()` 保存到自定义 token 中，然后调用 `emit`。解析时消费自定义 token，
 用保存的身份和原 span 构造 `Token<TokenKind>(.raw_block(identity), span)`，传给
 `parser.parse_raw_block(raw)`。这个带参数的重载只展开给定块，不消费自定义 cursor。
+重建 token 必须保留扫描接口返回的原 span；无效块 ID、错配或越界 span 会报诊断。
 块身份不得跨源码或编译周期保存。
+
+完整示例见 [公共 parser 组合示例](../example/parser_composition/README.md)，包含可运行的应用和独立语言包。
 
 `parser.list<T>()` 创建当前语法调用持有的强类型列表，T 必须是标准语法句柄类型。
 列表支持 `append(value)`、`len()` 和 `at(index)`；列表存在期间仍可继续调用 parser 或创建其他列表。
