@@ -1049,13 +1049,14 @@ Int add(Int base = 1, Int extra) {
 - 默认参数可以出现在参数列表任意位置
 - 位置参数不会按类型跳过默认参数，而是绑定最早尚未绑定的参数
 - 当前默认值只支持 literal，并按参数 expected type 检查
-- 命名参数使用 `name: value`，可以重排或跳过带默认值的参数
+- 命名参数使用 `name = value`，可以重排或跳过带默认值的参数
+- 命名 keyword options 也使用等号，例如 `async [domain = ui_domain]` 和 `struct [align = 8]`
 - 命名参数出现后，后续普通参数也必须使用命名形式
 - overload 决议必须能按参数数量和参数类型区分候选，否则诊断为歧义
 
 ```c
 add(10, 20);
-add(extra: 20);
+add(extra = 20);
 ```
 
 #### 函数调用
@@ -1160,7 +1161,7 @@ struct User {
 
 RawFn<Int, User&, Int> add = User.add;
 
-User user = User(id: 40);
+User user = User(id = 40);
 Int value = add(user$.ref(), 2);
 ```
 
@@ -1300,7 +1301,7 @@ payload。raw pointer 不自动满足 `Sendable`，只能留在显式 `unsafe` �
 
 ```jiang
 Mutex<Int>^ counter = new Mutex<Int>(0);
-Task(domain: global_domain) {
+Task(domain = global_domain) {
     counter.with_lock { value =>
         value$.set(value$.get() + 1);
     };
@@ -1354,7 +1355,7 @@ async [global_domain] Int load_page(Int id) {
 
 Int main() {
     coroutine.sync(main_domain) {
-        Task<Int> page = Task(domain: global_domain) {
+        Task<Int> page = Task(domain = global_domain) {
             load_page(1)
         };
         page.await()
@@ -1373,7 +1374,7 @@ async Int load_both() {
 }
 ```
 
-`Task { ... }` 继承 current Domain；`Task(domain: global_domain) { ... }` 显式指定
+`Task { ... }` 继承 current Domain；`Task(domain = global_domain) { ... }` 显式指定
 execution domain。Task closure 使用最后一个表达式作为结果，不支持显式 `return`；`return`
 只用于普通或 async 函数体。Task 与 `coroutine.sync(domain) { ... }` 的尾随 closure 均按
 `FnOnce<async ...>` 检查：启动会消费 capture environment，后者的 domain 必填。
@@ -1429,9 +1430,9 @@ Domain 不需要分成两种类型。它的使用方式由 binding 决定：
   选择它时传入共享引用：
 
 ```jiang
-SceneDomain scene_domain = SceneDomain(config: config);
+SceneDomain scene_domain = SceneDomain(config = config);
 
-Task<Int> task = Task(domain: scene_domain$.ref()) {
+Task<Int> task = Task(domain = scene_domain$.ref()) {
     load_scene()
 };
 
@@ -1441,7 +1442,7 @@ Int value = coroutine.sync(scene_domain$.ref()) {
 ```
 
 `async [domain]` 是函数类型的静态 effect，因此只接受命名 `const` Domain；需要在运行时
-选择 Domain 时，使用 `Task(domain: value$.ref())`、`coroutine.sync(value$.ref())` 或在已有
+选择 Domain 时，使用 `Task(domain = value$.ref())`、`coroutine.sync(value$.ref())` 或在已有
 current Domain 中使用 `Task { ... }`。
 
 普通 Domain 离开作用域时不会隐式取消已创建的 Task，也不会阻塞等待它们。已启动的 Task
@@ -1489,7 +1490,7 @@ struct State: Movable {
     Int count;
 }
 
-Mutex<State> state = Mutex<State>(State(count: 0));
+Mutex<State> state = Mutex<State>(State(count = 0));
 Int count = state.with_lock { value =>
     value.count = value.count + 1;
     value.count
@@ -1503,7 +1504,7 @@ callback 是普通同步 `Fn`，不能在持锁期间 `await`；它的返回值�
 需要 detached 执行时，直接把 Task initializer 作为语句启动，不形成 Task handle：
 
 ```c
-Task(domain: global_domain) {
+Task(domain = global_domain) {
     refresh_cache()
 };
 ```
@@ -1999,16 +2000,16 @@ struct Offset {
 }
 
 // 定义一个结构体常量
-Point point1 = Point(x: 0, y: 0)
+Point point1 = Point(x = 0, y = 0)
 // 与以下两种方式等价
-_ point1 = Point(x: 0, y: 0)
-Point point1 = Point(x: 0, y: 0)
+_ point1 = Point(x = 0, y = 0)
+Point point1 = Point(x = 0, y = 0)
 
 Point move_point(Point point, Offset offset) {
   // 返回一个新的point
-  return Point(x: point.x + offset.x, y: point.y + offset.y)
+  return Point(x = point.x + offset.x, y = point.y + offset.y)
   // 与以下方式等价
-  // return Point(x: point.x + offset.x, y: point.y + offset.y)
+  // return Point(x = point.x + offset.x, y = point.y + offset.y)
 }
 ```
 
@@ -2028,7 +2029,7 @@ struct 可以自定义 `init` 函数。
 - named init 只参与同名构造调用；例如 `Point.polar(...)` 不会参与 `Point(...)` 的选择
 - named init 不是普通类型函数，不能脱离构造调用作为函数值使用
 - `init` 支持普通位置参数、命名参数和默认参数，规则与普通函数一致
-- 如果类型没有定义 `init`，默认构造器使用 `Point(field: value)`
+- 如果类型没有定义 `init`，默认构造器使用 `Point(field = value)`
 - 只要类型定义了 unnamed init，`Point(...)` 就只在这些 unnamed init 中选择
 - 泛型 named init 可以从目标类型推断类型参数，也可以写成 `Box<Int>.make(...)`
 - `new` 只接受构造形式，不支持任意表达式
@@ -2065,11 +2066,11 @@ struct Point {
 ```
 
 ```c
-Point p1 = Point(x: 1, y: 2);
+Point p1 = Point(x = 1, y = 2);
 Point p2 = Point(3);
-Point^ p3 = new .(x: 4, y: 5);
+Point^ p3 = new .(x = 4, y = 5);
 Point p4 = Point.offset(6);
-Point^ p5 = new Point.offset(y: 8, x: 7);
+Point^ p5 = new Point.offset(y = 8, x = 7);
 ```
 
 #### deinit函数
@@ -2122,7 +2123,7 @@ struct Box: Movable {
 }
 
 Int use() {
-    Box box = Box(value: 1);
+    Box box = Box(value = 1);
     box.consume()
 }
 ```
@@ -2158,7 +2159,7 @@ struct User {
 }
 
 Int a = User.zero();
-User user = User(id: 42);
+User user = User(id = 42);
 Int b = user.value();
 ```
 
@@ -2214,12 +2215,12 @@ Jiang语言中，结构体即可以是值类型，也可以是引用类型。这
 
 ```c
 // p1为值
-Point p1 = Point(x: 0, y: 0)
+Point p1 = Point(x = 0, y = 0)
 // p1赋值给p2是值拷贝
 Point p2 = p1
 
 // p3为 owning pointer，此时为引用类型
-Point^ p3 = new Point(x: 100, y: 200)
+Point^ p3 = new Point(x = 100, y = 200)
 
 // 由于Jiang语言的 owning pointer 默认自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
@@ -2239,9 +2240,9 @@ struct User {
 
 // 定义一个结构体常量并初始化
 // 注意：可空属性可以不传，此时该属性初始化为null
-User user1 = User(id: 123, age: 18)
+User user1 = User(id = 123, age = 18)
 // 与以下定义等价：
-// User user1 = User(id: 123, age: 18, nick_name: null)
+// User user1 = User(id = 123, age = 18, nick_name = null)
 
 print("user age = %d", user1.age); // 输出：user age = 18
 
@@ -2398,15 +2399,15 @@ struct Foo<T> {
 }
 
 // 显式给出实例类型，并使用 expected type 构造简写
-Foo<Int> x = .(value: 123);
+Foo<Int> x = .(value = 123);
 // generic nominal head 相同时也可以省略重复的类型实参
-Foo<Int> inferred = Foo(value: 123);
+Foo<Int> inferred = Foo(value = 123);
 // `_` 只推断对应位置，显式实参保持不变
 Pair<Int, _> pair = Pair(1, true);
 // 此时 T 明确为 Float
-Foo<Float> y = Foo<Float>(value: 3.14);
+Foo<Float> y = Foo<Float>(value = 3.14);
 // 也可以写成
-_ z = Foo<Float>(value: 3.14);
+_ z = Foo<Float>(value = 3.14);
 ```
 
 省略全部泛型实参时必须有明确的 expected type；`_` 是独立 inference hole，编译器联合
@@ -2426,7 +2427,7 @@ struct MutableBox<T> {
   T value;
 }
 
-MutableBox<Int*!> a = MutableBox<Int*!>(value: null);
+MutableBox<Int*!> a = MutableBox<Int*!>(value = null);
 ```
 
 其中：
@@ -2528,7 +2529,7 @@ struct Counter: AddInt, FlagValue {
   }
 }
 
-Counter counter = Counter(base: 30);
+Counter counter = Counter(base = 30);
 Int a = counter.apply(2);
 Int b = counter.apply(true);
 ```
@@ -2550,7 +2551,7 @@ Int b = counter.apply(true);
 Value.Any& any = Value$.ref(box);
 Int a = any.value();
 
-Value.Any^ owned = Value$.new(Box(data: 1));
+Value.Any^ owned = Value$.new(Box(data = 1));
 Value.Any& owned_ref = owned$.ref();
 Int b = owned_ref.value();
 
@@ -3183,8 +3184,8 @@ public extern Int errno;
 
 ```jiang
 struct Route: Copyable { Int code; }
-@meta(module: Route(code: 1))
-@meta(Route(code: 2))
+@meta(module: Route(code = 1))
+@meta(Route(code = 2))
 Void handle() {}
 ```
 

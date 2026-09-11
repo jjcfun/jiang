@@ -79,12 +79,11 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.5 开发源码使用原生 `#package` 配置。严格冷启动链为：
+当前 0.5.5 开发源码使用原生 `#package` 配置和等号命名实参。严格冷启动链为：
 
 ```text
 0.5.4 stable
   -> bootstrap/0.5.5 next
-  -> bootstrap/0.5.5 stable
   -> 0.5.5 next
   -> 0.5.5 stable
 ```
@@ -93,7 +92,7 @@ macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh

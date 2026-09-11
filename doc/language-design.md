@@ -947,14 +947,21 @@ Int add(Int left = 1, Int right) {
 }
 ```
 
+命名 keyword options 同样使用等号，例如 `async [domain = ui_domain]` 和 `struct [align = 8]`；
+无名选项、`packed` 等独立 flag 及类型／lifetime 约束不受影响。
+
+命名实参使用 `name = value`；`:` 保留给类型／trait 约束与 lifetime 关系。实参开头的
+`name =` 表示参数绑定，不修改调用者同名变量；`name == value` 仍是普通位置表达式。
+赋值仍然只允许作为语句，不支持把括号赋值或链式赋值作为实参。旧 `name: value` 调用给出迁移诊断。
+
 位置实参总是绑定最早尚未绑定的参数，不会按类型跳过默认参数。命名参数可以重排，也可以跳过
 带默认值的参数；第一个命名参数出现后，后续普通参数都必须使用命名形式：
 
 ```jiang
 add(10, 20);
-add(right: 20);
-add(left: 10, right: 20);
-draw(x: 1, y: 2);
+add(right = 20);
+add(left = 10, right = 20);
+draw(x = 1, y = 2);
 ```
 
 type check 会把 call args 重排成函数签名顺序，并把缺失参数替换成默认值。这个结果写入
@@ -1297,7 +1304,7 @@ lifetime：
 
 ```jiang
 Mutex<Int>^ counter = new Mutex<Int>(0);
-Task(domain: global_domain) {
+Task(domain = global_domain) {
     counter.with_lock { value =>
         value$.set(value$.get() + 1);
     };
@@ -1313,8 +1320,8 @@ handle，使用 Task initializer：
 
 ```jiang
 async [main_domain] Int render() {
-    Task<Int> first = Task(domain: global_domain) { load(1) };
-    Task<Int> second = Task(domain: global_domain) { load(2) };
+    Task<Int> first = Task(domain = global_domain) { load(1) };
+    Task<Int> second = Task(domain = global_domain) { load(2) };
     first.await() + second.await()
 }
 ```
@@ -1344,7 +1351,7 @@ Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T
 `const` Domain，也可以是普通 Domain value 的共享引用。在 async context 中，它挂起
 当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain；它不创建用户可见 Task。普通同步函数
 用最外层 `coroutine.sync(Domain)` 进入 runtime 时，会阻塞当前线程等待 closure 完成。
-`Task { ... }` 可以继承已有 current Domain；`Task(domain: D) { ... }` 显式选择 execution Domain。
+`Task { ... }` 可以继承已有 current Domain；`Task(domain = D) { ... }` 显式选择 execution Domain。
 
 `main_domain` 是绑定进程启动线程的标准串行 Domain，`global_domain`
 是进程共享的标准并发 Domain。
@@ -1374,8 +1381,8 @@ trait、`Executor` contract、serial gate 和 Task ABI，不引入第二套协�
 参数、返回值、字段和 generic 流转；Task 和 `coroutine.sync` 通过共享引用选择它：
 
 ```jiang
-SceneDomain domain = SceneDomain(config: config);
-Task<Int> task = Task(domain: domain$.ref()) { load_scene() };
+SceneDomain domain = SceneDomain(config = config);
+Task<Int> task = Task(domain = domain$.ref()) { load_scene() };
 Int value = coroutine.sync(domain$.ref()) { update_scene() };
 ```
 

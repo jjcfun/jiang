@@ -35,12 +35,12 @@ generate_source() {
         printf '%s\n' '    }'
       elif [ "$JIANG_COMPILE_BENCH_SHAPE" = "task" ]; then
         printf '%s\n' '    {'
-        printf '        Task<Int> task = Task(domain: CompileBench) { leaf(%s) };\n' "$index"
+        printf '        Task<Int> task = Task(domain = CompileBench) { leaf(%s) };\n' "$index"
         printf '%s\n' '        total = total + task.await();'
         printf '%s\n' '    }'
       else
         printf '%s\n' '    if (total >= 0) {'
-        printf '        Task<Int> task = Task(domain: CompileBench) { leaf(%s) };\n' "$index"
+        printf '        Task<Int> task = Task(domain = CompileBench) { leaf(%s) };\n' "$index"
         printf '%s\n' '        total = total + task.await();'
         printf '%s\n' '    } else {'
         printf '        total = total - leaf(%s);\n' "$index"

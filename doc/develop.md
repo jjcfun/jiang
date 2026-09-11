@@ -6,13 +6,17 @@
 ## 常规开发
 
 当前 0.5.5 在独立功能分支开发，使用并排 `bootstrap/0.5.5` worktree 的固定阶段。
-阶段源码提交为 `81d958fc57c2b1bc2a40f6dbceef29b2f6ef373d`，保留旧配置加载入口，
-只加入编译新源码必需的包声明与常量物化能力。该阶段从 0.5.4 stable 开始，完成
-`next -> stable` 后，其 stable 才能作为后续种子；身份记录位于阶段的 `build/strict/identity.json`。
+阶段源码提交为 `b56c5d4905002ef2255d3d644f00b6f4da4d50b8`，保留旧配置加载入口，
+加入编译新源码必需的包声明与常量物化能力，并同时接受 `foo(a: 123)` 和 `foo(a = 123)`。
+bootstrap 自身源码保留冒号，feat 分支直接迁移为只接受等号；不需要第二个 bootstrap 阶段。
+
+该固定提交由 0.5.4 stable 编译出 bootstrap next，通过相关回归后直接作为 feat 的种子；
+无需生成 bootstrap stable。feat 自身完成 `next -> stable`。
+身份与验证记录位于阶段的 `build/named-arguments/identity.json`；该独立目录保留旧阶段产物。
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=next VERIFY=none \
 bash ./script/build_next.sh
@@ -37,7 +41,7 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
@@ -62,7 +66,7 @@ previous stable
 ```
 
 阶段数量不受单个 bootstrap 限制，但新增阶段必须由固定的前一阶段以 strict 模式编译，
-并以自身产物严格编译同一阶段源码；最终仍须完成 release `next -> stable`。
+只需生成并验证该阶段 next；最终仍须完成 release `next -> stable`。
 不得通过关闭类型、借用或 lifetime 检查打通交接；临时工作区产物不能自行串接成 bootstrap 链。
 只有固定前一阶段确实无法编译下一阶段时，才补充必要的 bootstrap 能力。
 

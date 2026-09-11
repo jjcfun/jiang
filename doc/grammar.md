@@ -130,7 +130,7 @@ keyword_options
             <- "[" keyword_option ("," keyword_option)* ","? "]"
 
 keyword_option
-            <- name (":" expr)?
+            <- name ("=" expr)?
              / type
 
 top_level_decl_body
@@ -177,7 +177,9 @@ reference 字段的第一个位置固定绑定外层 borrow。只写第一项时
 `@alias(Name = Type)` 是声明局部类型别名。一个 `@alias(...)` 可以包含多个逗号分隔的绑定；
 这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字。
 
-关键字 options 使用 `keyword [options] ...` 形式。`extern [builtin]` 当前只用于标准库、
+关键字 options 使用 `keyword [options] ...` 形式。命名绑定使用 `name = value`，例如
+`async [domain = ui_domain]`、`struct [align = 8]`；旧冒号命名绑定给出迁移诊断。
+无名选项和独立 flag 保持原样。`extern [builtin]` 当前只用于标准库、
 core 或编译器内部源码，用来声明编译器内建常量和函数；普通用户源码不应依赖这个内部入口。
 其中 builtin 函数定义按 public visibility 收集，无需额外书写 `public`。
 旧的 `keyword(...)` options 写法不再作为 release 分支语法保留。
@@ -420,14 +422,14 @@ name        <- ident / "self"
   `kind`、`ExecutorType` 和同步 `make_executor`；编译器通过 `Domain.kind` 区分
   serial/concurrent 语义。
 - 函数声明和 callable type 中的 `async [domain]` 只接受 canonical const Domain binding。
-- `Task(domain: domain) { ... }` 与 `new Task(domain: domain) { ... }` 的 domain 遵守相同规则：
+- `Task(domain = domain) { ... }` 与 `new Task(domain = domain) { ... }` 的 domain 遵守相同规则：
   canonical `const` binding 直接传入，普通 Domain value 使用 `value$.ref()`。
 - 无 domain 的 `Task { ... }` 只能在已有 current domain 的上下文中使用，并继承 current；
   `coroutine.sync` 始终要求显式 domain。
 - 普通同步函数中的最外层 `coroutine.sync(domain) {}` 阻塞进入 runtime；async context 中的
   `coroutine.sync(domain) {}` 挂起当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain，不创建 Task。
-- `Task { ... }` / `Task(domain: domain) { ... }` 使用尾随 closure 创建直接 Task；
-  `new Task { ... }` / `new Task(domain: domain) { ... }` 创建 owner Task。
+- `Task { ... }` / `Task(domain = domain) { ... }` 使用尾随 closure 创建直接 Task；
+  `new Task { ... }` / `new Task(domain = domain) { ... }` 创建 owner Task。
 - Task creation 是 eager 的。`Task` 返回地址固定的 `Task<T>`，`new Task` 返回可移动、非复制的
   `Task<T>^` owner。`task.await()` 和 `task.cancel_and_await()` 消费一次 result；`task.cancel()`
   只同步发布幂等取消请求，不消费 result，也不等待 Task 退出。旧的 `async call()`、
@@ -444,7 +446,7 @@ name        <- ident / "self"
 顶层可见性写在外层 `decl` 的 `decl_modifier` 中，例如
 `public struct User { ... }`。
 `struct` options 顺序无关；重复 option 会报错。`packed` 表示字段按 1 字节排列，
-`align: N` 表示结构体整体对齐至少为 `N`，`N` 必须是 2 的幂。
+`align = N` 表示结构体整体对齐至少为 `N`，`N` 必须是 2 的幂。
 
 ```peg
 struct_decl <- "struct" struct_options? name generic_params? trait_list? struct_body
@@ -454,7 +456,7 @@ struct_options
 
 struct_option
             <- "packed"
-             / "align" ":" int_lit
+             / "align" "=" int_lit
 
 trait_list  <- ":" path ("," path)*
 
@@ -763,7 +765,7 @@ implicit_args
 
 call_args   <- call_arg ("," call_arg)* ","?
 
-call_arg    <- (name ":")? expr
+call_arg    <- (name "=")? expr
 
 trailing_closure
             <- lambda_expr

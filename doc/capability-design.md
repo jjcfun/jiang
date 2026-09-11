@@ -79,7 +79,7 @@ public const WorkerPoolDomain worker_pool_domain = WorkerPoolDomain();
 - `current` 是语言内建特殊值，表示继承当前 async domain context。
 - `ui_domain`、`worker_pool_domain` 等不是语言魔法；它们是 import 后可见的命名 `const`。
 - `async [domain]` 中的 `domain` 必须是实现 `Domain` 的 canonical `const` binding。
-- `Task(domain: ...)` 和 `coroutine.sync(...)` 既接受 canonical `const` binding，也接受
+- `Task(domain = ...)` 和 `coroutine.sync(...)` 既接受 canonical `const` binding，也接受
   普通 Domain value 的共享引用。编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
 
 命名 `const` Domain 适合程序级长期共享 identity，调度开销低于普通 runtime Domain。普通 Domain
@@ -141,7 +141,7 @@ coroutine.sync(app_runtime.ui_domain) {
 Task initializer 使用命名参数选择 execution domain：
 
 ```jiang
-Task(domain: app_runtime.ui_domain) {
+Task(domain = app_runtime.ui_domain) {
     load_data();
 };
 ```
@@ -149,8 +149,8 @@ Task(domain: app_runtime.ui_domain) {
 需要有限生存期的专用 Domain 时，创建普通 value 并传入共享引用：
 
 ```jiang
-SceneDomain scene_domain = SceneDomain(config: config);
-Task(domain: scene_domain$.ref()) {
+SceneDomain scene_domain = SceneDomain(config = config);
+Task(domain = scene_domain$.ref()) {
     load_data()
 };
 ```
@@ -189,7 +189,7 @@ Fn<async [ui_domain] Int, Int> load = { id => fetch(id) };
 
 async `Fn` / `RawFn` 动态调用遵守与直接 async 调用相同的 Domain 切换和 Sendable 检查。
 
-`async [ui_domain]` 是 effect keyword option 中 `async [domain: ui_domain]` 的短写。
+`async [ui_domain]` 是 effect keyword option 中 `async [domain = ui_domain]` 的短写。
 `coroutine.sync(ui_domain) { ... }` 是普通 closure API，不属于 effect keyword option。
 函数声明和 callable type 只使用 canonical const Domain binding。
 
@@ -272,7 +272,7 @@ coroutine.sync(ui_domain) {
 
 ```jiang
 coroutine.sync(ui_domain) {
-    Task(domain: worker_pool_domain) {
+    Task(domain = worker_pool_domain) {
         update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain
     };
 }
@@ -308,7 +308,7 @@ async Void foo(T&! x) {
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
 - `Task { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
-- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果目标 identity 不等于 current，
+- `Task(domain = D) { ... }` 创建 task，是显式 domain 入口；如果目标 identity 不等于 current，
   则是 domain 切换边界。
 - 普通同步函数中的最外层 `coroutine.sync(D) {}` 阻塞调用线程，进入 runtime 并等待 closure 完成。
 - async context 中的 `coroutine.sync(D) {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
@@ -370,7 +370,7 @@ a.await() + b.await()
 Jiang 不提供 `await expr` 或隐式多 Task barrier。需要等待多个 Task 时，分别调用 `await()`；已完成
 Task 走 ready fast path，未完成 Task 才挂起当前 coroutine。
 
-`Task { ... }` / `Task(domain: D) { ... }` 创建显式 task，用于自定义 task body 或显式
+`Task { ... }` / `Task(domain = D) { ... }` 创建显式 task，用于自定义 task body 或显式
 domain 边界：
 
 ```jiang
@@ -387,7 +387,7 @@ Jiang 的 task 语义是 eager、single-completion、cached result、single-cons
 - coroutine 是无栈协程；task 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
 - 如果 body 返回 `Result<T, E>`，task 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
-- task result type 不能是 task；`Task { ... }` / `Task(domain: D) { ... }` 不允许产生
+- task result type 不能是 task；`Task { ... }` / `Task(domain = D) { ... }` 不允许产生
   nested task。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Task<Task<T>>`。
 - `await()` 和 `cancel_and_await()` 消费一次 result；第二个消费位置会被诊断。
 - `cancel()` 只同步、幂等地发布请求，不消费 result，也不等待 Task 退出；取消后仍可 `await()`。
@@ -395,7 +395,7 @@ Jiang 的 task 语义是 eager、single-completion、cached result、single-cons
 因此这里是合法的：
 
 ```jiang
-Task<Int> task = Task(domain: PageDomain) {
+Task<Int> task = Task(domain = PageDomain) {
     load_page() // body type: Int
 };
 ```
@@ -403,8 +403,8 @@ Task<Int> task = Task(domain: PageDomain) {
 但这里应诊断：
 
 ```jiang
-Task<Task<Int>> nested = Task(domain: PageDomain) {
-    Task(domain: PageDomain) {
+Task<Task<Int>> nested = Task(domain = PageDomain) {
+    Task(domain = PageDomain) {
         load_page()
     }
 };
@@ -415,8 +415,8 @@ Task<Task<Int>> nested = Task(domain: PageDomain) {
 公开类型不包含 domain 参数；domain 只保存在创建点和 runtime state 中：
 
 ```jiang
-Task<Int> task = Task(domain: PageDomain) { load_page() };
-Task<Int>^ owned = new Task(domain: PageDomain) { load_page() };
+Task<Int> task = Task(domain = PageDomain) { load_page() };
+Task<Int>^ owned = new Task(domain = PageDomain) { load_page() };
 ```
 
 直接 `Task<T>` 是 `!Movable`，包含它的聚合值也不能移动、按值传参或返回。直接 Task 字段目前只支持
@@ -426,7 +426,7 @@ owner，可以出现在参数、返回值、字段、容器、泛型实例和 pu
 
 ```jiang
 Task<Int>^ make_task() {
-    new Task(domain: PageDomain) { load_page() }
+    new Task(domain = PageDomain) { load_page() }
 }
 ```
 
@@ -440,23 +440,23 @@ Task<Int>^ make_task() {
 
 ```jiang
 coroutine.sync(ui_domain) {
-    Task<Image> image = Task(domain: worker_pool_domain) { load_image() };
+    Task<Image> image = Task(domain = worker_pool_domain) { load_image() };
     Image value = image.await(); // allowed: Task 没有被嵌套 closure 捕获
 }
 ```
 
 ```jiang
-Task<Image> image = Task(domain: worker_pool_domain) { load_image() };
-Task(domain: ui_domain) {
+Task<Image> image = Task(domain = worker_pool_domain) { load_image() };
+Task(domain = ui_domain) {
     image.await() // error: task_capture_not_allowed
 };
 ```
 
-普通 `T&!` 不能被捕获到不同 domain。`Task(domain: D) { ... }` 是严格 domain 切换边界：
+普通 `T&!` 不能被捕获到不同 domain。`Task(domain = D) { ... }` 是严格 domain 切换边界：
 
 ```jiang
 coroutine.sync(ui_domain) {
-    Task(domain: worker_pool_domain) {
+    Task(domain = worker_pool_domain) {
         update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain task
     };
 }
@@ -524,7 +524,7 @@ move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃�
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
 初版不建议把 actor 纳入核心 domain 语法。每个 actor instance 可以拥有一个普通 serial
-Domain value，并通过 `Task(domain: actor.domain$.ref())` 或
+Domain value，并通过 `Task(domain = actor.domain$.ref())` 或
 `coroutine.sync(actor.domain$.ref())` 调度工作。可以先用库层 `Actor<T>` 封装状态；
 未来如果需要让 actor method 自动携带 instance-bound effect，再单独设计 `self domain`。
 

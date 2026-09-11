@@ -78,7 +78,7 @@ String one = "one";
 names.insert(1, one);
 
 std.collection.HashMap<Int, String> sparse_names! =
-    std.collection.HashMap<Int, String>(load_percent: 50);
+    std.collection.HashMap<Int, String>(load_percent = 50);
 
 std.collection.HashSet<Int> seen! = std.collection.HashSet<Int>();
 seen.insert(1);
@@ -360,7 +360,7 @@ kernel readiness IO，也不适合作为完整网络 IO runtime。
 
 | 类别 | 推荐调用 | 不采用 | 原因 |
 | --- | --- | --- | --- |
-| 基本形式 | `map.reserve(additional: 8)` | `map.reserve(map_capacity: 8)` | 参数描述角色，不重复 receiver 类型 |
+| 基本形式 | `map.reserve(additional = 8)` | `map.reserve(map_capacity = 8)` | 参数描述角色，不重复 receiver 类型 |
 | 修改操作 | `values.reverse()` | `values.reversed()` | 祈使动词表示修改 receiver |
 | 非修改操作 | `values.sorted()` | `values.sort()` | 结果式名称表示返回新 value |
 | 名词 operation | `set.union(other)` / `set.form_union(other)` | 两者都叫 `union` | `form_` 明确原地修改版本 |

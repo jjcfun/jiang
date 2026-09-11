@@ -782,7 +782,7 @@ check_public_alias_dependency() {
     'import dep = "./dep.jiang";' \
     '' \
     'Int main() {' \
-    '    dep.Number(value: 0).value' \
+    '    dep.Number(value = 0).value' \
     '}' >"$fixture/main.jiang"
   printf '%s\n' \
     'import api = "./api.jiang";' \
@@ -1126,7 +1126,7 @@ check_trait_interface() {
     'import dep = "./dep.jiang";' \
     '' \
     'Int main() {' \
-    '    dep.Id id! = dep.Id(index: 0);' \
+    '    dep.Id id! = dep.Id(index = 0);' \
     '    dep.write_u64<dep.Id>(id$.mut_ref());' \
     '    id.normalize(0)' \
     '}' >"$fixture/main.jiang"
@@ -1153,7 +1153,7 @@ check_trait_interface() {
     '    }' \
     '' \
     '    public Id from_index(Int index) {' \
-    '        Id(index: index)' \
+    '        Id(index = index)' \
     '    }' \
     '' \
     '    public Int normalize(self, UInt8 value) {' \
