@@ -13,7 +13,7 @@
 - `&A` 表示正向预判，不消耗 token。
 - `!A` 表示负向预判，不消耗 token。
 - 终结符使用双引号，例如 `"struct"`。
-- `ident`、`int_lit`、`string_lit` 等为词法 token。
+- `ident`、`int_lit`、`double_quoted` 等为词法 token。
 
 ## 词法 token
 
@@ -29,8 +29,8 @@ hex_int     <- ("0x" / "0X") hex_digit ("_"? hex_digit)*
 float_lit   <- decimal_int "." decimal_int exponent?
              / decimal_int exponent
 exponent    <- ("e" / "E") ("+" / "-")? decimal_int
-char_lit    <- /* 字符字面量 */
-string_lit  <- /* UTF-8 字符串字面量 */
+single_quoted    <- /* 单引号定界 token，字符语义由 Jiang parser 解释 */
+double_quoted  <- /* 双引号定界 token，字符串语义由 Jiang parser 解释 */
 provider_path
             <- ident ("." ident)*
 raw_block   <- /* `#provider_path { ... }` 中由 lang provider scan 确定边界的原始 block */
@@ -38,8 +38,8 @@ doc_body    <- /* builtin `#doc` 扫描的单行或以独占行 `#end` 结束的
 
 literal     <- int_lit
              / float_lit
-             / char_lit
-             / string_lit
+             / single_quoted
+             / double_quoted
              / "true"
              / "false"
              / "null"
@@ -195,7 +195,7 @@ import_decl <- "import" ((import_alias / "*") "=")? import_path ";"
 import_alias
             <- name
 
-import_path <- string_lit / ident
+import_path <- double_quoted / ident
 
 import_expr <- "import" import_path
 

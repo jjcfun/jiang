@@ -189,6 +189,11 @@ SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态
 
 ## 字面量
 
+公共 tokenizer 使用 `single_quoted(SymbolId)` 和 `double_quoted(SymbolId)` 表示引号形式，
+不在 token 层限定单引号内容的字符数量。payload 为解码文本，span 保留完整原始源码范围；
+默认扫描仍检查闭合与 Jiang 转义规则。Jiang parser 将它们解释为字符／字符串 AST，
+其他 `#lang` 可以按自身语义解释。AST 和 builder 的字符／字符串名称不变。
+
 已确定字面量：
 
 - integer literal

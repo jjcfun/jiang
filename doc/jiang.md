@@ -24,7 +24,7 @@
 ```c
 enum TokenKind {
     kw,
-    string_lit,
+    double_quoted,
     left_paren,
 }
 
@@ -43,7 +43,7 @@ alias store = import "token_store.jiang";
 这样可以稳定区分类型和值：
 
 - `TokenKind`、`SourceFile` 看起来就是类型
-- `kw`、`string_lit` 看起来就是枚举值
+- `kw`、`double_quoted` 看起来就是枚举值
 - `read_source`、`start_offset` 看起来就是函数和字段
 
 当前不建议把枚举成员写成 `SomeField` 这种 `PascalCase` 形式，因为它会和类型名混淆。
