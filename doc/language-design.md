@@ -131,6 +131,22 @@ line/block header）：
   和可选尾表达式，遵循普通 comptime 的词法作用域与求值规则；条件使用普通 `if_expression()` 组合，
   不提供向外发布分支声明的专用 comptime-if 机制。
 
+公共解析结果通过 `Ast.role()` 区分 Expr、Stmt、Decl、Type、Pattern、Attribute、Member、
+声明序列和成员序列；`as_expr()`、`as_decl()`、`as_member()` 等类型化取出在类别不匹配时返回 null。
+`declarations()`／`members()` 即使只有一个元素，也保留序列类别；空序列同样保留声明／成员的区别。
+调用方通过 `parser.len(sequence)` 和 `parser.at(sequence, index)` 读取序列，不能把序列当单个声明。
+顶层只接收声明类结果，成员位置只接收成员类结果；实际节点和序列内容由宿主验证。
+
+默认扫描支持嵌套 RawBlock。默认 parser 的 `parse_raw_block()` 消费当前位置的块，返回 `Ast?`；
+失败保留诊断并返回 null，非 RawBlock 不消费。表达式／类型等 fragment 解析共享当前块存储。
+Attribute 结果由语言作者按自身语法暂存并通过 `with_attributes` 附着；不根据节点创建顺序猜测目标，
+也不要求语言作者识别 #doc 的名字。`doc_attribute` 仅负责构造 Markdown Attribute。
+
+自定义 `Tokenizer<K>` 在 `begin_token()` 后于 `#` 位置调用 `scan_raw_block()`，取得默认 RawBlock
+token，再将块身份映射到自己的 K 并 `emit`。扫描不得越过 tokenizer bounds；失败保留诊断。
+自定义 `Parser<K>` 可将保存的块身份和 span 重建为默认 RawBlock token，调用 `parse_raw_block(raw)`；
+该重载不移动自定义 cursor，消费由调用方负责。块身份只在原编译调用的源码／块存储内有效。
+
 独立 Lang 文件采用普通文件 import，也可直接作为生成输入。Provider 在 `#package` 中用
 `lang { extensions = ["schema", "sch"]; }` 声明自身扩展名；使用方通过
 `lang sql { package = sql; extensions = ["model"]; }` 整组覆盖。两边均未配置时默认使用语言别名。

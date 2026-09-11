@@ -3119,6 +3119,22 @@ struct SqlProvider: std.jiang.syntax.Provider {
 实例中，并在 `parse` 中移入 `Parser<CustomKind>`。`SyntaxContext` 由 compiler 传入，只能在当前
 调用期间借用，不能长期保存。
 
+默认 parser 遇到 RawBlock 时，可调用 `parser.parse_raw_block()` 展开，再用 `result.role()`
+判断类别，或通过 `result.as_attribute()`、`result.as_decl()`、`result.as_member()` 等方法取出节点。
+展开失败返回 null 并保留诊断。文档结果是普通 Attribute，使用 `with_attributes` 附着到目标节点。
+
+`parser.ast(member)` 返回单成员；`parser.members(span, values)` 返回成员序列。
+声明序列由 `parser.declarations(span, values)` 构造。空序列和单元素序列也保持序列类别；
+通过 `as_members()`／`as_declarations()` 取出后，使用 `parser.len(sequence)` 和
+`parser.at(sequence, index)` 读取。顶层与成员位置不能混用。
+
+自定义 tokenizer 在 `begin_token()` 后调用 `tokenizer.scan_raw_block()`，将返回 token 的
+`kind.block_id()` 保存到自定义 token 中，然后调用 `emit`。解析时消费自定义 token，
+用保存的身份和原 span 构造 `Token<TokenKind>(.raw_block(identity), span)`，传给
+`parser.parse_raw_block(raw)`。这个带参数的重载只展开给定块，不消费自定义 cursor。
+块身份不得跨源码或编译周期保存。
+
+
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
 ```c

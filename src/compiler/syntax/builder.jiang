@@ -27,6 +27,12 @@ public enum SyntaxRole: Copyable {
 // 一次 provider invocation 的 compiler-owned 状态。Context 固定引用它，
 // parse 期间临时绑定调用方 AstUnit；每个 factory callback 直接写该 unit。
 public struct SyntaxInvocation: !Movable {
+    public Int result_role!;
+    public Int fragment_role!;
+    public Void* lexer_state!;
+    public RawFn<std.jiang.Token<std.jiang.TokenKind>, Void*, std.jiang.syntax.Source, std.jiang.syntax.Span>? raw_scan!;
+    public Void* block_state!;
+    public RawFn<std.jiang.syntax.ScanResult, Void*, Void*, std.jiang.syntax.Input>? language_scan!;
     // 仅在 provider callback 同步调用期间非空；end_call 立即清除，不携带长期 provenance。
     @life()
     public store_api.CompilerStore* store!;
@@ -37,8 +43,8 @@ public struct SyntaxInvocation: !Movable {
     diagnostic.DiagnosticCategory diagnostic_category!;
     ast.AstId? result!;
     SyntaxRole expected_kind!;
-    std.Vector<std.jiang.Token<std.jiang.TokenKind>> default_tokens!;
-    Bool default_tokens_ready!;
+    public std.Vector<std.jiang.Token<std.jiang.TokenKind>> default_tokens!;
+    public Bool default_tokens_ready!;
     RawFn<
         Int,
         Void*,
@@ -54,6 +60,12 @@ public struct SyntaxInvocation: !Movable {
         Int source_length
     ) {
         assert(source_length >= 0);
+        self.result_role = -1;
+        self.fragment_role = -1;
+        self.lexer_state = null;
+        self.block_state = null;
+        self.raw_scan = null;
+        self.language_scan = null;
         self.store = null;
         self.unit = null;
         self.source_id = source_id;
@@ -97,6 +109,10 @@ public struct SyntaxInvocation: !Movable {
 
     public Void end_call(Self&! self) {
         assert(self.store != null);
+        self.lexer_state = null;
+        self.raw_scan = null;
+        self.language_scan = null;
+        self.block_state = null;
         self.store = null;
         self.unit = null;
         self.result = null;
@@ -158,6 +174,12 @@ public std.jiang.syntax.ScanResult factory_default_scan(
 ) {
     SyntaxInvocation&! invocation = unsafe { state$.as(SyntaxInvocation&!) };
     assert(invocation.store != null);
+    if (invocation.language_scan is .some(scan)) {
+        std.jiang.syntax.ScanResult scanned = scan(invocation.lexer_state, state, input);
+        if (scanned.status == .ok) { return scanned; }
+        store_api.CompilerStore&! store = unsafe { invocation.store$.as(store_api.CompilerStore&!) };
+        return default_scan_unterminated(store, invocation, input, scanned.body_span.end());
+    }
     store_api.CompilerStore&! store = unsafe { invocation.store$.as(store_api.CompilerStore&!) };
     assert(input.body_start >= 0 && input.body_start <= input.source.length());
     if (input.delimiter == .line) {
@@ -223,7 +245,7 @@ public std.jiang.syntax.ScanResult factory_default_scan(
     return std.jiang.syntax.ScanResult.error(input.name_span);
 }
 
-Bool default_scan_open(std.jiang.Token<std.jiang.TokenKind> token, std.jiang.syntax.Delimiter delimiter) {
+public Bool default_scan_open(std.jiang.Token<std.jiang.TokenKind> token, std.jiang.syntax.Delimiter delimiter) {
     return switch delimiter {
         .brace => token.kind is .left_brace,
         .paren => token.kind is .left_paren,
@@ -234,7 +256,7 @@ Bool default_scan_open(std.jiang.Token<std.jiang.TokenKind> token, std.jiang.syn
     };
 }
 
-Bool default_scan_close(std.jiang.Token<std.jiang.TokenKind> token, std.jiang.syntax.Delimiter delimiter) {
+public Bool default_scan_close(std.jiang.Token<std.jiang.TokenKind> token, std.jiang.syntax.Delimiter delimiter) {
     return switch delimiter {
         .brace => token.kind is .right_brace,
         .paren => token.kind is .right_paren,
@@ -274,7 +296,7 @@ std.jiang.syntax.ScanResult default_scan_line(
     ));
 }
 
-std.jiang.syntax.ScanResult default_scan_unterminated(
+public std.jiang.syntax.ScanResult default_scan_unterminated(
     store_api.CompilerStore&! store,
     SyntaxInvocation&! invocation,
     std.jiang.syntax.Input input,
@@ -686,6 +708,7 @@ public Bool factory_finish(Void* state, Int node_identity, Int role) {
         return false;
     }
     invocation.result = result;
+    invocation.result_role = role;
     return true;
 }
 
@@ -2734,8 +2757,25 @@ public Int factory_inspect(Void* state, Int operation, Int identity, Int index) 
     assert(invocation.unit != null);
     ast.AstUnit& unit = unsafe { invocation.unit$.as(ast.AstUnit&) };
     ast.AstData data = unit.get(factory_id(unit, identity)).data;
+    if (operation == 2) { return invocation.fragment_role; }
     guard data is .root(root) else { assert(false, "expected syntax sequence"); return -1; }
     if (operation == 0) { return root.items.length; }
     assert(operation == 1 && index >= 0 && index < root.items.length);
     return unit.child_at(root.items, index).to_index();
+}
+
+#doc 自定义 tokenizer 的嵌套扫描仍使用活跃 Lexer 的语言注册表与块存储。
+public std.jiang.Token<std.jiang.TokenKind> factory_scan_raw_block(
+    Void* state, std.jiang.syntax.Source input, std.jiang.syntax.Span bounds
+) {
+    SyntaxInvocation& invocation = unsafe { state$.as(SyntaxInvocation&) };
+    assert(invocation.store != null && invocation.raw_scan != null);
+    assert(input.source_id.to_index() == invocation.source_id.to_index());
+    _ scan = invocation.raw_scan$.some();
+    _ raw = scan(invocation.lexer_state, input, bounds);
+    if (raw.kind is .error) {
+        store_api.CompilerStore&! store = unsafe { invocation.store$.as(store_api.CompilerStore&!) };
+        syntax_diagnostics.add_lexer_error(store, invocation.source_id, raw.span, "invalid_nested_lang_block");
+    }
+    return raw;
 }
