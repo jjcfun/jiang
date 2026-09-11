@@ -3134,6 +3134,21 @@ struct SqlProvider: std.jiang.syntax.Provider {
 `parser.parse_raw_block(raw)`。这个带参数的重载只展开给定块，不消费自定义 cursor。
 块身份不得跨源码或编译周期保存。
 
+`parser.list<T>()` 创建当前语法调用持有的强类型列表，T 必须是标准语法句柄类型。
+列表支持 `append(value)`、`len()` 和 `at(index)`；列表存在期间仍可继续调用 parser 或创建其他列表。
+AST 构造方法直接接收列表，也保留原有切片参数，并允许混用。构造后继续追加列表，不改变已有 AST：
+
+```jiang
+_ members = parser.list<std.jiang.syntax.Member>();
+members.append(first);
+_ result = parser.members(span, members);
+members.append(second); // result 仍然只包含 first。
+```
+
+列表仅属于创建它的语法调用，不能传给其他上下文的 parser，也不能追加其他上下文的节点。
+不公开可随追加失效的底层切片；`at` 返回语法句柄副本。
+
+
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
