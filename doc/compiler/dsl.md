@@ -34,7 +34,8 @@ dependency alias 覆盖，完整路径始终指向内建 provider。`doc` 的 li
 公开边界由以下类型组成：
 
 - `Input`：当前 `Source`、provider 名字 span、body 起点和外层 delimiter。
-- `SyntaxContext`：单次 invocation 的 opaque capability；compiler 传入，provider 只在调用期间借用。
+- `Session`：语言上下文初始化时的编译会话能力，提供宿主 symbol intern。
+- `SyntaxContext<L>`：单次调用借用的上下文，`lang` 引用共享语言对象，`syntax` 引用块级回调。
 - `Token<K>`、`Tokenizer<K>`：可选的通用词法 cursor、token storage、trivia 和 checkpoint。
 - `Parser<K>`：token cursor、诊断、恢复和 typed Jiang syntax factory。
 - `Ast`：单次 invocation 的 opaque AST 根句柄。
@@ -48,9 +49,9 @@ struct SqlProvider: std.jiang.syntax.Provider {
     public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
-        std.jiang.syntax.SyntaxContext&! syntax
+        std.jiang.syntax.SyntaxContext<std.jiang.syntax.EmptyLangContext>& syntax
     ) {
-        _ parser! = std.jiang.syntax.default_parser(syntax, input);
+        _ parser! = std.jiang.syntax.default_parser(syntax.syntax, input);
         std.jiang.syntax.Expr value = parser.int_literal(input.name_span, "0");
         return parser.ast(value);
     }
@@ -92,6 +93,17 @@ message catalog。
 identifier 判定使用 ASCII fast path 和 Unicode `XID_Start` / `XID_Continue`。压缩表由
 `script/gen_unicode_xid.js` 生成到 `src/std/jiang/text/generated/xid.jiang`。
 
+## 语言共享状态
+
+Provider 的关联类型 `LangContext` 由静态 `create_context(Session&)` 创建，宿主按语言的实际
+产物身份缓存到编译周期结束。不同文件及不同别名共享同一个对象，各块 Provider 独立创建。
+`SyntaxContext.lang` 为强类型只读引用，关键词 ID 在这里保存；它与默认 token 使用同一宿主符号表。
+无共享数据时默认使用 `EmptyLangContext`，可省略关联类型和初始化方法。
+默认初始化方法只适用于空上下文；自定义 `LangContext` 需要提供自己的工厂。
+
+上下文工厂不得捕获 Session 借用。块先于语言对象销毁，语言对象先于动态库关闭；这保证
+块内借用及动态析构代码的有效性。新的编译周期会重新创建语言上下文。
+
 ## Compiler Boundary
 
 ```text
@@ -106,8 +118,8 @@ source
 
 普通 Jiang lexer/parser 使用 compiler-private 静态调用路径。provider 的 typed factory 通过固定 ABI
 callback 写同一个 `AstUnit`；两条路径复用同一 token、span、diagnostic 和 AST 语义，但普通热路径
-不经过 `Provider.Any` 或 callback dispatch。builtin `asm`、`doc` 与第三方 lang 都通过统一的
-`Provider.Any` invocation 路径。
+不经过 `Invocation.Any` 或 callback dispatch。builtin `asm`、`doc` 与第三方 lang 都通过统一的
+`Invocation.Any` invocation 路径。
 
 每个 invocation 持有固定地址的 compiler-owned state。`scan` 期间只临时绑定 `CompilerStore`；
 `parse` 期间再临时绑定目标 `AstUnit`。调用返回后立即解除绑定，因此 `SyntaxContext` 不能
@@ -119,7 +131,7 @@ callback 写同一个 `AstUnit`；两条路径复用同一 token、span、diagno
 registry：
 
 ```text
-language alias -> registered dependency -> package id -> provider dylib -> Provider.Any
+language alias -> registered dependency -> package id -> provider dylib -> Language factory -> Invocation.Any
 ```
 
 宿主层负责 Provider 的入口适配、按需构建、加载和生命周期管理；语法调用通过统一的 Provider 契约完成。

@@ -14,9 +14,16 @@ bootstrap 自身源码保留冒号，feat 分支直接迁移为只接受等号�
 无需生成 bootstrap stable。feat 自身完成 `next -> stable`。
 身份与验证记录位于阶段的 `build/named-arguments/identity.json`；该独立目录保留旧阶段产物。
 
+Provider 上下文重构进一步要求 trait 方法签名能替换泛型容器内部的关联类型。
+同一 bootstrap worktree 的 `fb606a4c8898874675b130d615081e000a788d79` 加入这项必要修复，
+仍由固定 0.5.4 stable 生成 next，产物位于 `build/lang-context/bin/jiangc.next`。
+此后的语言上下文分支直接使用该 next，自举仍只有一个 bootstrap 阶段。
+默认空上下文进一步需要关联类型默认值及默认静态方法的按需签名和实例化支持；
+同一阶段更新为 `fb264686`，由 0.5.4 stable 生成的 next 位于 `build/provider-defaults-demand/bin/jiangc.next`。
+
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/provider-defaults-demand/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=next VERIFY=none \
 bash ./script/build_next.sh
@@ -41,7 +48,7 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/provider-defaults-demand/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh

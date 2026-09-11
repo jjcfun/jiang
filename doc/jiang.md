@@ -8,7 +8,6 @@
 
 > Jiang语言的目标是成为系统编程语言的“银弹”。`All in one`是Jiang语言的核心思想。
 
-
 ### 命名规范
 
 当前仓库建议采用下面这套命名风格：
@@ -158,7 +157,6 @@ Float c = two + f;      // 错误：Int 变量不会隐式提升为 Float
 `%` 仍然只允许整数参与；`Double -> Float`、`Float/Double -> Int` 等窄化转换需要显式写出目标类型。
 
 
-
 ### 可选类型 (Optional)
 
 Optional 只使用 `T?` 表示；compiler-owned constructor 名称不对外开放。
@@ -243,7 +241,6 @@ defer {
 语法，不改变 public provider invocation：
 
 - `defer` 体内不支持 `return`、`break`、`continue`
-
 
 
 ### 类型转换与隐式操作层
@@ -343,7 +340,6 @@ Int[count] values = [1, 2, 3];
 ```c
 // 定义不可变数组
 Int[3] a = [1, 2, 3] // a: [1, 2, 3]
-
 
 // 初始化数组时，如果元素个数与数组长度不想等，将会报编译错误
 Int[5] a = [1, 2, 3]
@@ -3069,6 +3065,14 @@ provider root 用 `@entry(lang)` 标记一个可无参数构造、实现 `std.ji
 取得生成结果。provider 使用 `Parser<K>` 的 typed method 构造普通 Jiang syntax，返回的节点继续走普通
 resolve、type check、JIL 和 backend。
 
+Provider 声明关联类型 `LangContext`，并由静态 `create_context(Session& session)` 返回该语言
+在本次编译中共享的数据。`session.intern("schema")` 得到的 SymbolId 可以直接和默认 token 比较，
+无需为每个块重新驻留关键词。`scan`、`parse` 接收 `SyntaxContext<LangContext>& context`：
+`context.lang` 是共享数据的只读引用，`context.syntax` 传给 Parser／Tokenizer 的底层构造接口。
+没有共享数据时可省略 `LangContext` 和 `create_context`，默认使用 `EmptyLangContext`。
+指定自定义 `LangContext` 时应实现对应的 `create_context`。
+同一语言的不同文件和别名复用上下文；不同编译会话相互隔离。
+
 `Parser.import_expression(span, package_name)` 或 `Parser.import_expression(span, string_path)`
 构造返回 namespace 的导入表达式；文件路径使用字符串字面量的内容，不包含源码引号。
 结果可交给 `if_expression()`、`comptime_block()` 或 `alias_declaration()`，
@@ -3102,9 +3106,9 @@ struct SqlProvider: std.jiang.syntax.Provider {
     public std.jiang.syntax.Ast parse(
         Self&! self,
         std.jiang.syntax.Input input,
-        std.jiang.syntax.SyntaxContext&! syntax
+        std.jiang.syntax.SyntaxContext<std.jiang.syntax.EmptyLangContext>& syntax
     ) {
-        _ parser! = std.jiang.syntax.default_parser(syntax, input);
+        _ parser! = std.jiang.syntax.default_parser(syntax.syntax, input);
         std.jiang.syntax.Expr value = parser.int_literal(input.name_span, "0");
         return parser.ast(value);
     }

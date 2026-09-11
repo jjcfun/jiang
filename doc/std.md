@@ -116,14 +116,15 @@ family 或第二套 scheduler/cancellation API。使用方式见[语言指南的
 
 ## std.jiang
 
-`std.jiang.syntax` 是 lang provider 的公共 syntax API。核心类型是 `Input`、opaque
-`SyntaxContext`、`Token<K>`、`Tokenizer<K>`、`Parser<K>`、typed syntax handle 和 opaque `Ast`。
+`std.jiang.syntax` 是 lang provider 的公共 syntax API。核心类型是 `Input`、
+`Session`、`SyntaxContext<L>`、`Token<K>`、`Tokenizer<K>`、`Parser<K>`、typed syntax handle 和 opaque `Ast`。
 provider 通过 `Parser<K>` 的 typed method 生成 Jiang syntax，不公开 AST data、node index、child
 range 或 arena，也不允许用户手工组装 compiler AST。
 
 `std.jiang.syntax.Provider` 是 `type = lang` package root `Lang` 需要实现的 trait。采用 Jiang 默认
-词法规则时只需实现 `parse`；默认 `scan` 会把连续 token storage 交给 `default_parser`。自定义词法
-规则可以使用 `Tokenizer<CustomKind>`，由 provider 自己保存并解释 custom kind。
+词法规则且不需要共享状态时只需实现 `parse`；默认上下文是 `EmptyLangContext`。
+自定义 `LangContext` 时实现 `create_context(Session&)`；
+默认 `scan` 会把连续 token storage 交给 `default_parser`。自定义词法规则可以使用 `Tokenizer<CustomKind>`，由 provider 自己保存并解释 custom kind。
 
 `Token<K>` 不复制 token text；调用方通过 `Token.span` 从 `Source.bytes` 读取。`Tokenizer<K>` 管理
 source cursor、trivia、连续 storage 和 `checkpoint/rewind`，但不理解 `K`。诊断由

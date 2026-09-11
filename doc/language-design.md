@@ -107,6 +107,12 @@ User user = #sql {
 lang package root 用 `@entry(lang)` 标记一个可无参数构造、满足 `std.jiang.syntax.Provider` 的具体类型。
 入口类型名称任意，可保持私有；标记不能附着 alias／重导出，也不从导入文件继承。
 编译器在 host 上把该 package 编译成 dynamic library，lexer/parser 在 syntax 阶段调用 provider。
+Provider 通过关联类型 `LangContext` 和静态 `create_context(Session&)` 创建语言级状态。
+无状态 Provider 默认使用 `EmptyLangContext`，可以省略关联类型与初始化方法；
+自定义上下文应提供自己的 `create_context`。
+Session 提供宿主符号表的 `intern`；该状态按实际语言身份在一个编译周期内共享，块实例独立创建。
+`scan`、`parse` 接收 `SyntaxContext<LangContext>&`，通过只读 `lang` 引用访问状态，
+通过 `syntax` 访问块级回调。共享对象不捕获 Session 借用，释放顺序为块、语言状态、动态库。
 
 语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` provider 自己扫描
 line/block header）：
@@ -981,7 +987,6 @@ T add<T>(T left, T right);
 `init` / `deinit` 是目标语言的一部分。`init(self, ...)` 定义构造函数，
 `deinit(self)` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
 
-
 ### 显式入口
 
 `@entry(kind)` 标记 root file 中的直接声明。每个 root、每个 kind 至多一个入口；
@@ -1158,7 +1163,6 @@ PatternExtent 保留长度或 sentinel 的 absent／wildcard、字面量种类�
 `read<T>()` 在值已求出且类型精确匹配时返回 `T&?` 的只读借用，否则返回 null；不隐式转换类型。
 借用的数据不可写，读取出的普通值可用于后续计算，Constant 句柄本身不能物化。
 ArrayType／SliceType／HandleType 的 `sentinel()` 返回 optional Constant，保留具体值或符号参数。
-
 
 `Type.members()` 返回该类型直接拥有的成员，并按类型实参替换字段、参数和返回类型。
 方法自己的泛型参数保留符号身份；不合并 extension，也不沿指针或字段类型递归展开。

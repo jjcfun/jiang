@@ -15,6 +15,9 @@ alias store_api = import "../store.jiang";
 alias string_support = import "../support/string.jiang";
 alias syntax_builder = import "../syntax/builder.jiang";
 alias syntax_diagnostics = import "../syntax/diagnostics.jiang";
+alias package_provider = import "../../lang/package/provider.jiang";
+alias asm_provider = import "../../lang/asm/provider.jiang";
+alias doc_provider = import "../../lang/doc/provider.jiang";
 import std;
 
 public enum CallStatus {
@@ -81,16 +84,26 @@ public ScanBlockResult scan_block(
         return ScanBlockResult.failure(.unsupported_version, scan_error(fallback));
     }
     qid.SymbolId dylib_path = info_ref.dylib_path;
-    if (!ensure_loaded(compiler_store, dependency, dylib_path, lang_block)) {
-        return ScanBlockResult.failure(.not_loaded, scan_error(fallback));
+    if (!lang_block.has_provider_instance()) {
+        Int index!;
+        if (compiler_store.lang_contexts.find(dylib_path) is .some(existing)) {
+            index = existing;
+        } else {
+            if (!ensure_loaded(compiler_store, dependency, dylib_path, lang_block)) {
+                return ScanBlockResult.failure(.not_loaded, scan_error(fallback));
+            }
+            std.jiang.syntax.Session session = unsafe {
+                std.jiang.syntax.Session(compiler_store$.ptr()$.as(Void*), session_intern)
+            };
+            _ language = call_create_entry(dependency.create_pointer, session$.ref());
+            index = compiler_store.lang_contexts.add(dylib_path, language, dependency.dylib_handle);
+            dependency.dylib_handle = null;
+        }
+        lang_block.set_provider(create_instance(compiler_store.lang_contexts.ref_at(index)));
     }
-    CallStatus create_status = ensure_provider_instance(dependency, lang_block);
-    if (create_status != .ok) {
-        return ScanBlockResult.failure(create_status, scan_error(fallback));
-    }
-    std.jiang.syntax.Provider.Any&! provider_ref = lang_block.provider$.mut_ref();
+    std.jiang.syntax.Invocation.Any&! provider_ref = lang_block.provider$.mut_ref();
     syntax_builder.SyntaxInvocation&! invocation = lang_block.invocation$.mut_ref();
-    std.jiang.syntax.SyntaxContext&! syntax = lang_block.syntax_context$.mut_ref();
+    std.jiang.syntax.SyntaxCallbacks&! syntax = lang_block.syntax_context$.mut_ref();
     invocation.provider_package = provider_id;
     invocation.begin_scan(compiler_store, .lexer);
     std.jiang.syntax.ScanResult result = provider_ref.scan(lang_block.input, syntax);
@@ -113,15 +126,15 @@ public ParseIntoResult parse_into(
     if (lang_block.scan_result.status == .error) {
         return ParseIntoResult.failure(.invalid_request);
     }
-    std.jiang.syntax.Provider.Any&! provider_ref = lang_block.provider$.mut_ref();
+    std.jiang.syntax.Invocation.Any&! provider_ref = lang_block.provider$.mut_ref();
     syntax_builder.SyntaxInvocation&! invocation = lang_block.invocation$.mut_ref();
-    std.jiang.syntax.SyntaxContext&! syntax = lang_block.syntax_context$.mut_ref();
+    std.jiang.syntax.SyntaxCallbacks&! syntax = lang_block.syntax_context$.mut_ref();
     Int node_mark = unit.nodes.len();
     Int child_mark = unit.children.len();
     Int diagnostic_mark = compiler_store.diagnostics.len();
     invocation.begin_parse(compiler_store, unit, .parser, lang_block.entry_kind);
     std.jiang.syntax.Ast provider_ast = provider_ref.parse(lang_block.input, syntax);
-    std.jiang.syntax.SyntaxContext& finish_context = lang_block.syntax_context$.ref();
+    std.jiang.syntax.SyntaxCallbacks& finish_context = lang_block.syntax_context$.ref();
     Bool finished = std.jiang.syntax.finish_ast(finish_context, provider_ast);
     ast.AstId? result = invocation.take_result();
     invocation.end_call();
@@ -224,25 +237,61 @@ Void report_dlsym_error(
     );
 }
 
-CallStatus ensure_provider_instance(
-    registry.LangDependency&! dependency,
-    block.LangBlock&! lang_block
-) {
-    if (lang_block.has_provider_instance()) {
-        return .ok;
-    }
-
-    if (dependency.create_pointer == null) {
-        return .invalid_request;
-    }
-    lang_block.set_provider(call_create_entry(dependency.create_pointer));
-    return .ok;
+public std.jiang.syntax.SymbolId session_intern(Void* state, UInt8[]& text) {
+    store_api.CompilerStore&! store = unsafe { state$.as(store_api.CompilerStore&!) };
+    return std.jiang.syntax.SymbolId(store.symbols.intern(text).to_index());
 }
 
 @life()
-std.jiang.syntax.Provider.Any^ call_create_entry(Void* entry_pointer) {
-    RawFn<std.jiang.syntax.Provider.Any^> entry = unsafe {
-        entry_pointer$.as(RawFn<std.jiang.syntax.Provider.Any^>)
+std.jiang.syntax.Language.Any^ call_create_entry(Void* entry_pointer, std.jiang.syntax.Session& session) {
+    RawFn<std.jiang.syntax.Language.Any^, std.jiang.syntax.Session&> entry = unsafe {
+        entry_pointer$.as(RawFn<std.jiang.syntax.Language.Any^, std.jiang.syntax.Session&>)
     };
-    return entry();
+    return entry(session);
+}
+
+#doc 内置语言与动态语言共用编译周期缓存；内置身份不与动态库路径混用。
+public std.jiang.syntax.Invocation.Any^ builtin_provider(store_api.CompilerStore&! store, Int kind) {
+    _ key = store.symbols.intern(if kind == 0 { "builtin:package" } else if kind == 1 { "builtin:asm" } else { "builtin:doc" });
+    Int index!;
+    if (store.lang_contexts.find(key) is .some(found)) {
+        index = found;
+    } else {
+        std.jiang.syntax.Session session = unsafe {
+            std.jiang.syntax.Session(store$.ptr()$.as(Void*), session_intern)
+        };
+        _ language = builtin_language(kind, session$.ref());
+        index = store.lang_contexts.add(key, language);
+    }
+    return create_instance(store.lang_contexts.ref_at(index));
+}
+
+@life()
+std.jiang.syntax.Language.Any^ builtin_language(Int kind, std.jiang.syntax.Session& session) {
+    if (kind == 0) {
+        return std.jiang.syntax.Language$.new(
+            std.jiang.syntax.LanguageAdapter<package_provider.Provider, package_provider.Provider.LangContext>(
+                package_provider.Provider.create_context(session), create_package));
+    }
+    if (kind == 1) {
+        return std.jiang.syntax.Language$.new(
+            std.jiang.syntax.LanguageAdapter<asm_provider.Provider, asm_provider.Provider.LangContext>(
+                asm_provider.Provider.create_context(session), create_asm));
+    }
+    return std.jiang.syntax.Language$.new(
+        std.jiang.syntax.LanguageAdapter<doc_provider.Provider, std.jiang.syntax.EmptyLangContext>(
+            doc_provider.Provider.create_context(session), create_doc));
+}
+
+@life()
+package_provider.Provider create_package() { return package_provider.Provider(); }
+@life()
+asm_provider.Provider create_asm() { return asm_provider.Provider(); }
+@life()
+doc_provider.Provider create_doc() { return doc_provider.Provider(); }
+
+#doc 调用语言工厂得到独立拥有的块实例；上下文指针的有效期由编译周期持有关系保证。
+@life()
+std.jiang.syntax.Invocation.Any^ create_instance(std.jiang.syntax.Language.Any& language) {
+    return unsafe { language.create() };
 }

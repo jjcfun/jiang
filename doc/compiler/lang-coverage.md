@@ -86,3 +86,20 @@
 `match_keyword`／`expect_keyword` 比较 SymbolId；转义标识符和 literal 不作为关键字。
 SymbolId 只在同一宿主符号表内有效，不能跨编译器进程或独立符号表持久缓存。
 `#package` 与 `#asm` 使用该机制；`#doc` 的原始 Markdown 边界扫描不需要 token 化。
+
+
+## 语言上下文生命周期
+
+Provider 用关联类型 `LangContext` 声明语言级状态，静态
+`create_context(Session& session)` 返回该状态。`Session.intern(text)` 与宿主默认 token
+使用同一符号表；不能持有 Session 的借用。语言对象按实际产物身份在编译周期内复用，
+不同别名或源文件不会各自初始化。重新开始编译时释放旧语言对象。
+
+每个块仍有独立 Provider 实例。`scan`、`parse` 接收
+`SyntaxContext<LangContext>&`，其中 `lang` 为只读语言对象引用，`syntax` 为块级
+`SyntaxCallbacks`。Parser、Tokenizer 的底层构造接口接收 `syntax.syntax`。
+不需要共享状态的 Provider 可使用 `EmptyLangContext`，并返回它的空实例。
+
+动态库 wrapper 返回拥有语言对象的工厂，各块借用其内部数据。宿主必须先销毁块，再销毁
+语言对象，最后关闭动态库；内部工厂的 `create` 是 unsafe 操作，显式表达这一持有约束。
+这项契约不要求 Provider 作者使用裸指针。Session 和 SyntaxContext 都不允许被搬出调用。
