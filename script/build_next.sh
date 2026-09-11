@@ -9,11 +9,11 @@ JIANGC_BIN="${JIANGC_BIN:-$BUILD_BIN_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 COMPILER_BUILD_MODE="${COMPILER_BUILD_MODE:-debug}"
-PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+PACKAGE_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([A-Za-z0-9._+-]+)"[[:space:]]*;[[:space:]]*$/\1/p' "$ROOT_DIR/package.jiang" | head -n 1)"
 JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.2}"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.4}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
@@ -49,7 +49,6 @@ mkdir -p \
   "$BUILD_DIR" \
   "$BUILD_BIN_DIR" \
   "$NEXT_ARTIFACT_CACHE_DIR"
-cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
 
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then

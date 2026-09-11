@@ -5,8 +5,10 @@
 alias context = import "../context.jiang";
 alias diagnostic_helper = import "../diagnostic/helper.jiang";
 alias options_api = import "../driver/options.jiang";
-alias manifest_api = import "../source/package_manifest.jiang";
 alias source_entry = import "../source/entry.jiang";
+alias package_load = import "../source/package_load.jiang";
+alias qid = import "../id.jiang";
+alias value = import "../sema/comptime/value.jiang";
 alias string = import "../support/string.jiang";
 import std;
 
@@ -22,62 +24,68 @@ public struct Task: Movable {
     }
 }
 
-#doc 默认使用本包 root；命名入口引用依赖或内部文件，同名生成配置优先于 Lang 别名。
+#doc 从已求值包信息选择默认或命名入口；生成始终以显式加载的包 root 为输入。
 public Task? select(
     context.CompilerContext&! ctx, source_entry.PackageHandle& package, options_api.CompileOptions& options
 ) {
-    UInt8[]& package_dir = manifest_api.find_enclosing_dir(package.root_path.bytes());
-    if (package_dir.length == 0) {
-        fail(ctx, "generation requires a package root");
+    if (package.configuration_directory.byte_length() == 0) {
+        fail(ctx, "generation requires an explicitly loaded package");
         return null;
     }
-    manifest_api.PackageManifest manifest = manifest_api.read(package_dir);
-    if (!manifest.ok) { fail(ctx, manifest.error); return null; }
-    Path input = manifest_api.root_file_path(package_dir, manifest$.ref());
-    Path generator! = std.path.normalize(input.bytes());
-    if (options.generate_name.length != 0) {
-        UInt8[]& dependency! = "";
-        UInt8[]& module! = "";
-        for task in manifest.generate_tasks.slice() {
-            if (string.equal(task.name, options.generate_name)) {
-                dependency = task.package; module = task.module;
-            }
-        }
-        if (dependency.length == 0 && module.length == 0) {
-            for lang in manifest.lang_extensions.slice() {
-                if (string.equal(lang.name, options.generate_name)) {
-                    dependency = if lang.package.length != 0 { lang.package } else { lang.name };
-                }
-            }
-        }
-        if (dependency.length == 0 && module.length == 0) {
-            fail(ctx, "unknown generate alias; declare it in package.ini");
-            return null;
-        }
-        Path path = std.path.join(package_dir,
-            if dependency.length != 0 { manifest.dependency_path(dependency) } else { module });
-        if (dependency.length != 0 && !manifest_api.exists(path.bytes())) {
-            fail(ctx, "generator dependency requires package.ini");
-            return null;
-        }
-        if (module.length != 0) {
-            Path local = std.path.normalize(module);
-            UInt8[]& bytes = local.bytes();
-            if (std.path.is_absolute(bytes) || string.equal(bytes, "..")
-                || (bytes.length >= 3 && string.equal(bytes[0..3], "../")) || manifest_api.exists(path.bytes())) {
-                fail(ctx, "generator module must be a file inside the package");
-                return null;
-            }
-        }
-        source_entry.PackageHandle loaded = source_entry.load_package(ctx, path.bytes());
-        if (!loaded.ok) { return null; }
-        generator = loaded.root_path$.move();
+    UInt8[]& directory = package.configuration_directory.bytes();
+    _ symbol = ctx.store.symbols.intern(directory);
+    _ owner = ctx.store.resolve.package_for_dir(symbol)$.some();
+    _ declaration = ctx.store.resolve.package_ref(owner).configuration_info$.some();
+    _ info = ctx.store.comptime_store.const_value(declaration)$.some();
+    Path generator! = Path(package.root_path.bytes());
+    if (options.generate_name.length > 0) {
+        guard native_generator(ctx, owner, directory, info, options.generate_name) is .some(path) else { return null; }
+        generator = path;
     }
-    Path output = if options.output_path.length != 0 { std.path.normalize(options.output_path) }
-        else { std.path.join(package_dir, "build/generated") };
-    return Task(input, generator, output);
+    Path output = if options.output_path.length > 0 { std.path.normalize(options.output_path) }
+        else { std.path.join(directory, "build/generated") };
+    return Task(Path(package.root_path.bytes()), generator, output);
 }
 
 Void fail(context.CompilerContext&! ctx, UInt8[]& message) {
     diagnostic_helper.add_package_error(ctx.store.diagnostics$.mut_ref(), message, "generate_configuration_invalid");
+}
+
+Path? native_generator(context.CompilerContext&! ctx, qid.PackageId owner, UInt8[]& directory,
+    value.ComptimeValue info, UInt8[]& name) {
+    _ task = named_configuration(ctx, info, "generate", name);
+    _ mapping = if task != null { task } else { named_configuration(ctx, info, "lang", name) };
+    guard mapping is .some(configuration) else {
+        fail(ctx, "unknown generate alias; declare it in package.jiang");
+        return null;
+    }
+    _ dependency = package_load.string_field(ctx, configuration, "package")$.some();
+    if (task is .some(selected)) {
+        _ module = package_load.string_field(ctx, selected, "module")$.some();
+        if (ctx.store.symbols.text(module).length > 0) {
+            return std.path.join(directory, ctx.store.symbols.text(module));
+        }
+    }
+    _ dependency_name = if ctx.store.symbols.text(dependency).length > 0 { dependency }
+        else { ctx.store.symbols.intern(name) };
+    guard ctx.store.resolve.package_dependency(owner, dependency_name) is .some(record) else {
+        fail(ctx, "generator requires a declared package dependency");
+        return null;
+    }
+    _ target = ctx.store.resolve.package_for_dir(record.path_symbol)$.some();
+    return Path(ctx.store.symbols.text(ctx.store.resolve.package_ref(target).root_path));
+}
+
+value.ComptimeValue? named_configuration(context.CompilerContext& ctx,
+    value.ComptimeValue info, UInt8[]& section, UInt8[]& name) {
+    _ values = package_load.field(ctx, info, section)$.some();
+    guard values.data is .array_value(items) else { return null; }
+    Int index! = 0;
+    while (index < ctx.store.comptime_store.item_count(items)) {
+        _ item = ctx.store.comptime_store.item_at(items, index);
+        _ symbol = package_load.string_field(ctx, item, "name")$.some();
+        if (string.equal(ctx.store.symbols.text(symbol), name)) { return item; }
+        index = index + 1;
+    }
+    return null;
 }

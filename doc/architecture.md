@@ -282,9 +282,11 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 
 - `driver` 把进程参数转换成编译请求，直接创建 `CompilerContext` 并调用 pipeline。
 - `pipeline` 以已加载 package 的 root file 为入口串联各阶段，并负责跨阶段错误处理。CLI 兼容入口
-  先加载 package 再执行；长驻 service 可以复用 `PackageHandle`。目录入口只在加载时读取
-  `package.ini`，文件入口把该文件作为 root source。
-- `source` 负责 package manifest、路径处理、文件读取和 source ID。
+  先加载 package 再执行；长驻 service 可以复用 `PackageHandle`。目录入口显式加载
+  `package.jiang`，通过普通语义检查与编译期求值取得包信息后选择 root；文件入口把该文件
+  作为 root source。配置源码变更时重新求值并更新入口，不自动发现上层或子目录中的原生包。
+- `source` 负责包加载、路径处理、文件读取和 source ID；包信息保存在普通常量存储中，
+  PackageRecord 关联配置声明、包身份和依赖，不复制一份配置值。
 - `core` 在 root module 前加载，提供 compiler-known trait、builtin type namespace 壳和
   intrinsic 声明；它不参与用户 import 解析。
 - `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。

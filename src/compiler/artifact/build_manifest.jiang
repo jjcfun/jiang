@@ -12,6 +12,7 @@ alias qkey = import "../incremental/key.jiang";
 alias system_fs = import "../system/fs.jiang";
 alias list = import "../support/list.jiang";
 alias string = import "../support/string.jiang";
+alias source_store = import "../source/store.jiang";
 import std;
 
 public const Int format_version = 3;
@@ -196,7 +197,8 @@ public Bool is_no_op(
     qkey.Fingerprint128 expected_context,
     qkey.Fingerprint128 expected_invocation,
     UInt8[]& source_base,
-    UInt8[]& output_path
+    UInt8[]& output_path,
+    source_store.SourceStore&? sources = null
 ) {
     guard load(
         context_root,
@@ -208,11 +210,47 @@ public Bool is_no_op(
     if (!state.has_last_success || state.invocation != expected_invocation) {
         return false;
     }
-    guard source_snapshot_from_files(state$.ref(), source_base) is .some(snapshot) else {
+    guard source_snapshot_from_files(state$.ref(), source_base, sources) is .some(snapshot) else {
         return false;
     }
     if (snapshot != state.source_snapshot) { return false; }
     return output_matches(state$.ref(), output_path);
+}
+
+#doc 初始化前通过目标索引定位清单，仍完整验证上次成功快照、调用参数及最终产物。
+public Bool is_no_op_from_lookup(UInt8[]& cache_root, cache_identity.ContextKey environment,
+    qkey.Fingerprint128 target, qkey.Fingerprint128 invocation, UInt8[]& output_path,
+    source_store.SourceStore& sources) {
+    UInt8[]^ path = artifact_path.build_context_lookup_path(cache_root, environment, target);
+    guard system_fs.read_all(path[..]) is .some(bytes) else { return false; }
+    BuildManifestReader reader! = BuildManifestReader(bytes);
+    guard reader.read_uint64() is .some(version) else { return false; }
+    if (version != UInt64(1)) { return false; }
+    guard reader.read_fingerprint() is .some(context) else { return false; }
+    guard reader.read_sized_bytes() is .some(source_base) else { return false; }
+    if (!reader.finished()) { return false; }
+    UInt8[]^ root = artifact_path.context_cache_root(cache_root, cache_identity.ContextKey(context));
+    return is_no_op(root[..], target, context, invocation, source_base, output_path, sources);
+}
+
+#doc 只为已验证成功的构建原子发布上下文位置；损坏或过期索引退回普通编译。
+public Void publish_context_lookup(UInt8[]& cache_root, cache_identity.ContextKey environment,
+    qkey.Fingerprint128 target, qkey.Fingerprint128 context, qkey.Fingerprint128 invocation,
+    UInt8[]& source_base, UInt8[]& output_path, source_store.SourceStore& sources) {
+    UInt8[]^ root = artifact_path.context_cache_root(cache_root, cache_identity.ContextKey(context));
+    if (!is_no_op(root[..], target, context, invocation, source_base, output_path, sources)) { return; }
+    UInt8[]^ path = artifact_path.build_context_lookup_path(cache_root, environment, target);
+    if (!system_fs.create_dirs(std.path.dirname(path[..]))) { return; }
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    write_uint64(bytes$.mut_ref(), UInt64(1));
+    write_fingerprint(bytes$.mut_ref(), context);
+    write_uint64(bytes$.mut_ref(), UInt64(source_base.length));
+    append_bytes(bytes$.mut_ref(), source_base);
+    UInt8[]^ temporary = artifact_path.temporary_artifact_path(path[..], ".context.tmp.");
+    if (system_fs.write_all(temporary[..], bytes.slice()) && system_fs.atomic_replace(temporary[..], path[..])) {
+        return;
+    }
+    system_fs.remove_file(temporary[..]);
 }
 
 // 语义阶段只有在对应 object 仍可复用时才能跳过源码 body。
@@ -241,15 +279,24 @@ public qkey.Fingerprint128? source_snapshot_from_files(BuildManifest& state) {
     return source_snapshot_from_files(state, "");
 }
 
+#doc overlay 使用实际内容哈希和独立标记，避免内存源码产物被后续磁盘构建误认为无需重建。
 public qkey.Fingerprint128? source_snapshot_from_files(
     BuildManifest& state,
-    UInt8[]& source_base
+    UInt8[]& source_base,
+    source_store.SourceStore&? sources = null
 ) {
     list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
     Int index! = 0;
     while (index < state.reachable_source_count()) {
         UInt8[]& relative_path = state.reachable_source_at(index);
         UInt8[]^ path = resolved_source_path(source_base, relative_path);
+        if (sources is .some(store) && store.has_overlay_path(path[..])) {
+            _ source_id = store.find(.file(path[..]))$.some();
+            parts.add(cache_identity.text_fingerprint("build-overlay-source:", relative_path));
+            parts.add(qkey.Fingerprint128(store.content_hash(source_id), UInt64(0)));
+            index = index + 1;
+            continue;
+        }
         guard system_fs.file_metadata(path[..]) is .some(metadata) else { return null; }
         if (metadata.size < 0) { return null; }
         parts.add(cache_identity.text_fingerprint("build-source:", relative_path));

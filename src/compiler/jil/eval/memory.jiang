@@ -3,6 +3,7 @@
     聚合字段保持稳定身份，复制不复制引用目标；结果导出时才固化为不可变编译期值。
 #end
 
+alias token = import "../../syntax/token.jiang";
 alias compiler_store = import "../../store.jiang";
 alias source = import "../../source.jiang";
 alias qid = import "../../id.jiang";
@@ -601,7 +602,12 @@ public struct Memory: Movable {
             return address;
         }
         if (source.data is .tuple_value(aggregate)) { return self.import_items(store, query, address, aggregate); }
-        if (source.data is .array_value(aggregate)) { return self.import_items(store, query, address, aggregate); }
+        if (source.data is .array_value(aggregate)) {
+            if (store.types.get(source.type_id).data is .handle_type(handle) && handle.kind == .slice) {
+                return self.import_slice(store, query, address, handle.element, aggregate);
+            }
+            return self.import_items(store, query, address, aggregate);
+        }
         self.set_data(address, .scalar(source.data));
         return address;
     }
@@ -775,7 +781,11 @@ public struct Memory: Movable {
             return self.export_error_union(store, query, cell.type_id, start);
         }
         if (store.types.get(cell.type_id).data is .handle_type(handle) && handle.kind == .slice) {
-            return self.export_string(store, cell.type_id, start);
+            if (store.types.same_type(handle.element, store.types.uint8_type())) {
+                return self.export_string(store, cell.type_id, start);
+            }
+            if (handle.sentinel != null) { return null; }
+            return self.export_slice(store, query, cell.type_id, start);
         }
         if (store.types.get(cell.type_id).data is .named(named)) {
             if (store.model.def_enum_has_payload_variants(named.def_id)) {
@@ -848,6 +858,44 @@ public struct Memory: Movable {
             index = index + 1;
         }
         return null;
+    }
+
+    #doc 只读序列以元素值导出，不保留执行器地址；可写或失效的借用仍禁止逃逸。
+    value.ComptimeValue? export_slice(Self&! self, compiler_store.CompilerStore&! store,
+        database.QueryEngine&! query, qid.TypeId type_id, Int start) {
+        guard self.get(start + 1).data is .scalar(length_data) else { return null; }
+        guard length_data is .uint_value(bits) else { return null; }
+        list.ArrayList<value.ComptimeValue> items! = list.ArrayList<value.ComptimeValue>();
+        if (self.get(start).data is .null_pointer && bits == 0) {
+            return store.comptime_store.array_value(type_id, items.slice());
+        }
+        guard self.get(start).data is .element_reference(root, first, offset) else { return null; }
+        if (!self.sequence_live(root, first) || !self.get(root).read_only) { return null; }
+        guard self.get(root).data is .aggregate(_, available) else { return null; }
+        if (offset < 0 || offset > available || bits > UInt64(available - offset)) { return null; }
+        Int index! = 0;
+        while (index < Int(bits)) {
+            guard self.export_value(store, query, first + offset + index) is .some(item) else { return null; }
+            items.add(item);
+            index = index + 1;
+        }
+        return store.comptime_store.array_value(type_id, items.slice());
+    }
+
+    #doc 从序列常量恢复只读元素存储和普通切片描述符，字段类型由目标元素类型补全。
+    Int? import_slice(Self&! self, compiler_store.CompilerStore&! store, database.QueryEngine&! query,
+        Int address, qid.TypeId element, value.ComptimeAggregateId aggregate) {
+        Int count = store.comptime_store.item_count(aggregate);
+        qid.TypeId array_type = store.types.array_type(element, count, token.Span());
+        guard self.allocate(array_type) is .some(root) else { return null; }
+        if (self.import_items(store, query, root, aggregate) == null) { return null; }
+        self.freeze(root);
+        guard self.child(store, query, address, 0) is .some(pointer) else { return null; }
+        guard self.child(store, query, address, 1) is .some(length) else { return null; }
+        guard self.get(root).data is .aggregate(first, _) else { return null; }
+        self.set_data(pointer, .element_reference(root, first, 0));
+        self.set_data(length, .scalar(.uint_value(UInt64(count))));
+        return address;
     }
 
     #doc 生成输出读取仍然存活的字节切片；复制内容，不让切片地址逃逸出本轮逻辑内存。

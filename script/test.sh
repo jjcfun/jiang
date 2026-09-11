@@ -196,6 +196,9 @@ collect_llvm_link_args() {
 case_selected() {
   local source="$1"
   local platform
+  if [ "${source##*/}" = package.jiang ]; then
+    return 1
+  fi
   if [ -n "$TEST_LIST" ] && ! grep -Fqx "$source" "$TEST_LIST"; then
     return 1
   fi
@@ -298,6 +301,16 @@ print_log_prefix() {
   sed -n '1,120p' "$path"
 }
 
+# 显式标记的包测试从目录加载配置，断言、平台和伴随 C 文件仍取自测试源码。
+case_input() {
+  local source="$1"
+  if grep -Fqx '// test-package' "$source"; then
+    dirname "$source"
+  else
+    printf '%s\n' "$source"
+  fi
+}
+
 run_check_case() {
   local source="$1"
   local work_dir="$2"
@@ -306,7 +319,7 @@ run_check_case() {
   local started=$SECONDS
   local code
 
-  if "$JIANGC" --artifact-cache-dir "$cache_dir" --check "$source" >"$log" 2>&1; then
+  if "$JIANGC" --artifact-cache-dir "$cache_dir" --check "$(case_input "$source")" >"$log" 2>&1; then
     echo "PASS check $source"
     timing_line "check $source compile=$((SECONDS - started))s"
     return 0
@@ -327,7 +340,7 @@ run_fail_case() {
   local started=$SECONDS
   local expected
 
-  if "$JIANGC" --artifact-cache-dir "$cache_dir" --check "$source" >"$log" 2>&1; then
+  if "$JIANGC" --artifact-cache-dir "$cache_dir" --check "$(case_input "$source")" >"$log" 2>&1; then
     echo "FAIL fail $source unexpectedly passed"
     timing_line "fail $source compile=$((SECONDS - started))s"
     return 1
@@ -354,7 +367,8 @@ run_emit_case() {
   local started=$SECONDS
   local code
 
-  if "$JIANGC" --artifact-cache-dir "$cache_dir" --emit-llvm -o "$output" "$source" >"$log" 2>&1; then
+  if "$JIANGC" --artifact-cache-dir "$cache_dir" --emit-llvm -o "$output" \
+    "$(case_input "$source")" >"$log" 2>&1; then
     echo "PASS emit $source"
     timing_line "emit $source compile=$((SECONDS - started))s"
     return 0
@@ -424,7 +438,7 @@ run_run_case() {
     companion_args+=("$companion")
   fi
   if ! "$JIANGC" --artifact-cache-dir "$cache_dir" \
-    --emit-llvm -o "$llvm_output" "$source" >"$emit_log" 2>&1
+    --emit-llvm -o "$llvm_output" "$(case_input "$source")" >"$emit_log" 2>&1
   then
     echo "FAIL run $source emit failed"
     print_log_prefix "$emit_log"
@@ -543,7 +557,7 @@ run_release_case() {
     "${jiang_llvm_link_args[@]}" \
     ${companion_link_args[@]+"${companion_link_args[@]}"} \
     -o "$executable" \
-    "$source" >"$build_log" 2>&1
+    "$(case_input "$source")" >"$build_log" 2>&1
   then
     echo "FAIL release-run $source build failed"
     print_log_prefix "$build_log"

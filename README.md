@@ -79,20 +79,21 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.4 源码使用显式入口、定义级反射与生成能力。严格冷启动链为：
+当前 0.5.5 开发源码使用原生 `#package` 配置。严格冷启动链为：
 
 ```text
-0.5.3 stable
-  -> bootstrap/0.5.4 next
-  -> release/0.5.4 next
-  -> release/0.5.4 stable
+0.5.4 stable
+  -> bootstrap/0.5.5 next
+  -> bootstrap/0.5.5 stable
+  -> 0.5.5 next
+  -> 0.5.5 stable
 ```
 
-先按[编译器开发流程](doc/develop.md)构建固定的 bootstrap 阶段，再在 release worktree 中运行：
+先按[编译器开发流程](doc/develop.md)构建固定的 bootstrap 阶段，再在独立开发 worktree 中运行：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
@@ -103,7 +104,7 @@ bash ./script/build_next.sh
 构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 
-构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
+构建脚本默认从根目录 `package.jiang` 的 `version` 字面量 读取编译器版本，并校验
 `build/bin/jiangc.next --version` 的输出。
 
 破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。其中记录各版本的完整
@@ -197,7 +198,7 @@ bash ./script/package_macos_release.sh
 bash ./script/package_linux_release.sh
 ```
 
-两个入口复用 `package_release.sh` 的公共 staging/install 流程，默认从 `package.ini` 读取版本，
+两个入口复用 `package_release.sh` 的公共 staging/install 流程，默认从 `package.jiang` 读取版本，
 并要求 `build/bin/jiangc --version` 与包版本一致。macOS 产物是 `.zip`，Linux x86_64 产物是
 `.tar.gz`。发行包把该产物安装为主命令 `jiang`，并保留 `jiangc` 兼容链接；`jiang` 静态链接 LLVM，
 不动态依赖 `libLLVM` / `liblld`。包内 `install.sh` 会安装到 `~/.jiang/versions/<version>` 并更新

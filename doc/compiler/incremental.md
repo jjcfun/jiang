@@ -5,7 +5,7 @@
 
 ## 持久边界
 
-当前只持久化三类内容：
+语义与产物持久化为三类内容，另有构建目标到成功上下文的轻量索引：
 
 ```text
 cache/<context-key>/
@@ -13,6 +13,7 @@ cache/<context-key>/
   objects/<stable-source-id>.o
   objects/<stable-source-id>.mono.o
   builds/<target-id>.jbuild
+cache/targets/<environment-and-invocation-key>/builds/<target-id>.context
 ```
 
 - `.ji` 是单个 source 的纯语义 interface。
@@ -36,6 +37,10 @@ stable source identity；旧文件由显式 cache clean 清理，当前不实现
 源码内容变化不改变 context。stable source identity 由 package identity 与规范化包内相对路径
 生成，不包含 `SourceId` 或源码 hash。同一 source 的 `.ji`、`.o` 和 `.mono.o` 共用这个 identity，
 只由目录与固定后缀区分。
+
+原生包配置及其初始化 helper 属于本次编译输入。完成求值的配置模块连同导入闭包纳入最终
+模块图，即使 root 没有显式导入 `package.jiang`，也与源码依赖图使用同一调度范围；初始化
+阶段已完成的声明和常量继续复用。
 
 ## `.ji`：纯语义 source interface
 
@@ -177,6 +182,11 @@ Semantic Model、绝对源码路径或 link closure。
 编译启动时先加载 `.jbuild`，对旧 reachable source 执行 `stat`。invocation、source snapshot 和
 最终输出均命中时，在 parse、sema、JIL、codegen 和 linker 之前返回成功。新建但不可达的源码不属于
 输入。metadata 变化会进入正常 source graph；这只能扩大重编范围，不能改变程序语义。
+
+原生包初始化前，由工具链、编译器、目标、模式与调用参数定位 `.context` 索引，取得上次成功的
+context key 和源码路径基准，再按上述规则验证原有 `.jbuild`。配置及求值 helper 都属于源码快照，
+变化时进入完整包初始化。索引不保存 `PackageInfo`、声明或求值结果；缺失、损坏及清单不匹配
+均视为 miss。成功构建和常规 no-op 命中后原子刷新索引，因此不需要为了查找缓存再次求值配置。
 
 ## 发布与并发
 

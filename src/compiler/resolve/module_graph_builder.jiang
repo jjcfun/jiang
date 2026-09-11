@@ -21,9 +21,8 @@ alias map = import "../support/map.jiang";
 alias qid = import "../id.jiang";
 alias qkey = import "../incremental/key.jiang";
 alias source_graph = import "../incremental/source_graph.jiang";
-alias sem = import "../sema/model.jiang";
 alias source = import "../source.jiang";
-alias package_manifest = import "../source/package_manifest.jiang";
+alias package_load = import "../source/package_load.jiang";
 alias fs = import "../system/fs.jiang";
 alias target = import "../system/target.jiang";
 alias string = import "../support/string.jiang";
@@ -105,7 +104,7 @@ public struct ModuleGraphBuilder: Movable {
         if (compiler_version_hash is .some(hash)) {
             self.compiler_version_hash = hash;
         } else {
-            self.compiler_version_hash = source_ji.artifact_version_hash(driver_options.compiler_version_fallback());
+            self.compiler_version_hash = source_ji.artifact_version_hash(driver_options.compiler_version());
         }
         self.use_source_artifacts = use_source_artifacts;
         if (mode is .some(compile_mode)) {
@@ -150,6 +149,20 @@ public struct ModuleGraphBuilder: Movable {
         self.discover_module_imports(graph, root_module);
         self.discover_std_prelude_imports(graph);
         self.discover_target_startup_imports(graph);
+        self.discover_package_configurations(graph);
+    }
+
+    #doc 已求值的包配置及 helper 也是编译输入；即使 root 没有显式导入，也纳入同一调度图。
+    Void discover_package_configurations(Self&! self, module_graph.ModuleGraph&! graph) {
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.packages.len()) {
+            _ package = self.ctx.store.resolve.package_ref(qid.PackageId.from_index(index));
+            index = index + 1;
+            if (package.configuration_info == null) { continue; }
+            _ source_id = package.configuration_source$.some();
+            _ module = self.ctx.store.resolve.module_for_source(source_id)$.some();
+            self.discover_module_imports(graph, module);
+        }
     }
 
     public Void finish_module_graph(Self&! self, module_graph.ModuleGraph&! graph) {
@@ -385,7 +398,10 @@ public struct ModuleGraphBuilder: Movable {
         qid.DefId alias_def,
         qid.SymbolId alias_symbol
     ) {
-        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
+        _ package_record = self.ctx.store.resolve.package_ref(package_id);
+        qid.SymbolId package_name = if package_record.configuration_source != null {
+            package_record.dir_path
+        } else { package_record.name };
         qkey.StableSymbolId? owner = self.ctx.store.incremental.stable_id_for_def(module_def);
         self.ctx.store.incremental.record_symbol(
             self.ctx.store.symbols$.ref(),
@@ -696,7 +712,9 @@ public struct ModuleGraphBuilder: Movable {
             return false;
         }
         guard self.resolve_import_target(module_id, import_record$.ref()) is .some(target_module) else {
-            self.add_import_not_found_diagnostic(module_source, import_record);
+            if (!self.ctx.store.model.has_errors()) {
+                self.add_import_not_found_diagnostic(module_source, import_record);
+            }
             self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
             graph.mark_error();
             return false;
@@ -767,10 +785,12 @@ public struct ModuleGraphBuilder: Movable {
             return self.ensure_module(target_source);
         }
         guard self.resolve_import_source(module_id, import_record) is .some(target_source) else { return null; }
+        qid.ModuleId target_module = self.ensure_module(target_source);
+        if (self.module_state(target_module) == .resolved) { return target_module; }
         if (!self.source_has_ast_or_summary(target_source)) {
             return null;
         }
-        return self.ensure_module(target_source);
+        return target_module;
     }
 
     source.SourceId? resolve_import_source(Self&! self,
@@ -778,11 +798,11 @@ public struct ModuleGraphBuilder: Movable {
         store.ImportRecord& import_record
     ) {
         if (import_record.kind == .provider_import) {
-            UInt8[]& directory = self.ctx.store.symbols.text(import_record.path_symbol);
-            package_manifest.PackageManifest manifest = package_manifest.read(directory);
-            if (!manifest.ok) { return null; }
-            Path root = package_manifest.root_file_path(directory, manifest$.ref());
-            return self.load_file_import(root.bytes(), true);
+            guard self.ctx.store.resolve.package_for_dir(import_record.path_symbol) is .some(provider) else {
+                return null;
+            }
+            _ root = self.ctx.store.resolve.package_ref(provider).root_path;
+            return self.load_file_import(self.ctx.store.symbols.text(root), true);
         }
         if (import_record.kind == .package_import) {
             if (self.load_package_import_target(module_id, import_record) is .some(source_id)) {
@@ -803,7 +823,7 @@ public struct ModuleGraphBuilder: Movable {
         if (!source_info.key.is_file()) {
             return false;
         }
-        return self.load_file_import(source_info.name(), false) != null && self.source_has_ast(source_id);
+        return self.load_file_import(source_info.name(), false, true) != null && self.source_has_ast(source_id);
     }
 
     Bool source_has_ast_or_summary(Self&! self, source.SourceId source_id) {
@@ -854,8 +874,13 @@ public struct ModuleGraphBuilder: Movable {
         store.ModuleRecord& module,
         store.ModuleRecord& target
     ) {
-        Path source_path = std.path.normalize(self.ctx.store.symbols.text(module.path_symbol));
-        Path target_path = std.path.normalize(self.ctx.store.symbols.text(target.path_symbol));
+        return self.repository_internal_paths(self.ctx.store.sources.entry(module.source_id).name(),
+            self.ctx.store.sources.entry(target.source_id).name());
+    }
+
+    Bool repository_internal_paths(Self&! self, UInt8[]& from, UInt8[]& to) {
+        Path source_path = std.path.normalize(from);
+        Path target_path = std.path.normalize(to);
         Int source_layer = self.repository_source_layer(source_path.bytes());
         Int target_layer = self.repository_source_layer(target_path.bytes());
         if (source_layer < 0 || target_layer < 0) { return false; }
@@ -907,13 +932,12 @@ public struct ModuleGraphBuilder: Movable {
         qid.PackageId package_id = module.package_id;
         qid.SymbolId path_symbol = import_record.path_symbol;
         if (self.ctx.store.resolve.package_dependency(package_id, path_symbol) is .some(dependency)) {
-            UInt8[]& dependency_dir = self.ctx.store.symbols.text(dependency.path_symbol);
-            package_manifest.PackageManifest manifest = package_manifest.read(dependency_dir);
-            if (!manifest.ok) {
+            guard self.ctx.store.resolve.package_for_dir(dependency.path_symbol) is .some(target_package) else {
                 return null;
             }
-            Path root_path = package_manifest.root_file_path(dependency_dir, manifest$.ref());
-            return self.load_file_import(root_path.bytes(), true);
+            _ record = self.ctx.store.resolve.package_ref(target_package);
+            std.String root = std.String.from_valid_utf8(self.ctx.store.symbols.text(record.root_path));
+            return self.load_file_import(root.bytes(), true);
         }
 
         UInt8[]& import_path = self.ctx.store.symbols.text(path_symbol);
@@ -990,6 +1014,24 @@ public struct ModuleGraphBuilder: Movable {
     ) {
         UInt8[]& import_path = self.ctx.store.symbols.text(import_record.path_symbol);
         Path primary = self.import_paths.primary_file_import_path(module_id, import_path);
+        qid.PackageId? target = package_load.registered_for_path(self.ctx, primary.bytes());
+        _ owner = self.ctx.store.resolve.module_ref(module_id);
+        Bool crosses = if (target is .some(target_package)) { owner.package_id != target_package } else {
+            self.ctx.store.resolve.package_ref(owner.package_id).configuration_source != null
+        };
+        Bool core_boundary = self.ctx.store.resolve.package_ref(owner.package_id).kind == .core
+            || self.is_core_or_builtin_source(primary.bytes());
+        Bool internal_core = core_boundary
+            && self.repository_internal_paths(self.ctx.store.sources.entry(owner.source_id).name(), primary.bytes());
+        UInt8[]& owner_path = self.ctx.store.sources.entry(owner.source_id).name();
+        Int owner_layer = self.repository_source_layer(owner_path);
+        Int target_layer = self.repository_source_layer(primary.bytes());
+        Bool internal_source = owner_layer >= 0 && owner_layer <= 3 && target_layer >= 0 && target_layer <= 3
+            && self.repository_internal_paths(owner_path, primary.bytes());
+        if (crosses && !internal_core && !internal_source) {
+            self.add_cross_package_file_import_diagnostic(owner.source_id, import_record$.get());
+            return null;
+        }
         return self.load_file_import(primary.bytes(), true);
     }
 
@@ -1050,7 +1092,9 @@ public struct ModuleGraphBuilder: Movable {
         return true;
     }
 
-    source.SourceId? load_file_import(Self&! self, UInt8[]& source_path, Bool allow_summary) {
+    source.SourceId? load_file_import(
+        Self&! self, UInt8[]& source_path, Bool allow_summary, Bool require_ast = false
+    ) {
         Path normalized_text = std.path.normalize(source_path);
         Bool use_summary = allow_summary && !self.is_std_source(normalized_text.bytes());
         if (use_summary && self.load_file_import_from_header(normalized_text.bytes()) is .some(cached)) {
@@ -1061,6 +1105,7 @@ public struct ModuleGraphBuilder: Movable {
         UInt64 content_hash = source.content_hash(source_bytes[..]);
         source.SourceId source_id = self.ctx.store.sources.intern_path(normalized_text.bytes(), source_bytes[..]);
         qid.ModuleId module_id = self.ensure_module(source_id);
+        if (!require_ast && self.module_state(module_id) == .resolved) { return source_id; }
         // std facade 的公开 alias 会跨多个 std 子模块绑定；当前 source
         // interface 尚不能完整恢复这组 target，先保留源码解析边界。
         if (self.source_has_ast(source_id)) {
@@ -1237,6 +1282,25 @@ public struct ModuleGraphBuilder: Movable {
             self.artifact_cache_dir,
             source_identity
         );
+    }
+
+    #doc 初始化阶段尚无正式缓存上下文；切换后重新核验已加载源码，并保留完整依赖边。
+    public Void refresh_source_dependencies(Self&! self) {
+        self.ctx.store.source_dependencies = source_graph.SourceDependencyGraph();
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.modules.len()) {
+            qid.ModuleId module_id = qid.ModuleId.from_index(index);
+            self.record_source_node(module_id);
+            Int imported! = 0;
+            while (imported < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+                _ record = self.ctx.store.resolve.module_ref(module_id).imports.get(imported);
+                if (record.target_module is .some(target)) { self.record_source_dependency(module_id, target); }
+                imported = imported + 1;
+            }
+            self.record_implicit_core_dependency(module_id);
+            self.record_implicit_prelude_dependency(module_id);
+            index = index + 1;
+        }
     }
 
     Void record_source_node(Self&! self, qid.ModuleId module_id) {
@@ -1528,7 +1592,10 @@ public struct ModuleGraphBuilder: Movable {
         qid.PackageId package_id = self.ensure_package_for_source(source_id);
         qid.NamespaceId package_namespace = self.ctx.store.resolve.package_ref(package_id).namespace_id;
         qid.DefId package_def = self.ctx.store.resolve.package_ref(package_id).def_id;
-        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
+        _ package_record = self.ctx.store.resolve.package_ref(package_id);
+        qid.SymbolId package_name = if package_record.configuration_source != null {
+            package_record.dir_path
+        } else { package_record.name };
         qid.SymbolId module_symbol = self.ctx.store.symbols.intern(source_name.bytes());
         qid.ModuleId module_id = self.ctx.store.resolve.next_module_id();
 
@@ -1620,7 +1687,7 @@ public struct ModuleGraphBuilder: Movable {
         return created_module;
     }
 
-    qid.PackageId ensure_root_package(Self&! self) {
+    public qid.PackageId ensure_root_package(Self&! self) {
         if (self.ctx.store.resolve.root_package is .some(package_id)) {
             return package_id;
         }
@@ -1636,113 +1703,11 @@ public struct ModuleGraphBuilder: Movable {
         if (self.is_core_or_builtin_source(source_path.bytes())) {
             return self.ensure_core_package(source_id);
         }
-        std.String package_dir! =
-            std.String.from_valid_utf8(package_manifest.find_enclosing_dir(source_path.bytes()));
-        if (package_dir.byte_length() == 0) {
-            return self.ensure_root_package();
+        if (self.text_has_path_part(source_path.bytes(), "src/compiler/system/")) {
+            return self.ensure_system_package(source_id);
         }
-        return self.ensure_manifest_package(package_dir.bytes(), source_id);
-    }
-
-    qid.PackageId ensure_manifest_package(Self&! self, UInt8[]& package_dir, source.SourceId source_id) {
-        Path normalized_dir = std.path.normalize(package_dir);
-        UInt8[]& normalized_text = normalized_dir.bytes();
-        qid.SymbolId dir_symbol = self.ctx.store.symbols.intern(normalized_text);
-        if (self.ctx.store.resolve.package_for_dir(dir_symbol) is .some(package_id)) {
-            // Lang 注册先创建包壳；进入普通模块图时补齐同一包的稳定身份。
-            _ record = self.ctx.store.resolve.package_ref(package_id);
-            if (self.ctx.store.incremental.stable_id_for_def(record.def_id) == null) {
-                self.record_package_stable_key(record.def_id, record.name, record.root_path, source_id, token.Span());
-            }
-            return package_id;
-        }
-
-        package_manifest.PackageManifest manifest = package_manifest.read(normalized_text);
-        if (!manifest.ok) {
-            self.add_package_manifest_diagnostic(source_id, manifest.error);
-            return self.ensure_root_package();
-        }
-        return self.create_manifest_package(normalized_text, manifest$.ref(), source_id);
-    }
-
-    qid.PackageId create_manifest_package(Self&! self,
-        UInt8[]& package_dir,
-        package_manifest.PackageManifest& manifest,
-        source.SourceId source_id
-    ) {
-        token.Span span = token.Span();
-        qid.SymbolId package_symbol = self.ctx.store.symbols.intern(manifest.name);
-        qid.SymbolId dir_symbol = self.ctx.store.symbols.intern(package_dir);
-        Path root_path = package_manifest.root_file_path(package_dir, manifest);
-        qid.SymbolId root_symbol = self.ctx.store.symbols.intern(root_path.bytes());
-        qid.NamespaceId package_namespace = self.ctx.store.resolve.create_namespace(
-            .package_namespace,
-            null,
-            null,
-            null,
-            span
-        );
-        qid.DefId package_def = self.ctx.store.defs.create(
-            .package_def,
-            .namespace_name,
-            .public_visibility,
-            def.Name (symbol: package_symbol, span: span),
-            null,
-            null,
-            package_namespace,
-            package_namespace
-        );
-        self.ctx.store.model.declare_def(package_def, .package_decl);
-        self.record_package_stable_key(package_def, package_symbol, root_symbol, source_id, span);
-        store.PackageKind package_kind = self.manifest_package_kind(manifest);
-        qid.PackageId package_id = self.ctx.store.resolve.create_package(
-            package_def,
-            package_symbol,
-            dir_symbol,
-            root_symbol,
-            package_kind,
-            package_namespace
-        );
-        self.add_manifest_dependencies(package_id, package_dir, manifest);
-        if (self.ctx.store.resolve.root_package == null) {
-            self.ctx.store.resolve.set_root_package(package_id);
-        }
-        return package_id;
-    }
-
-    store.PackageKind manifest_package_kind(Self&! self, package_manifest.PackageManifest& manifest) {
-        if (string.equal(manifest.package_type, "lang")) {
-            return .lang;
-        }
-        return .ordinary;
-    }
-
-    Void add_manifest_dependencies(Self&! self,
-        qid.PackageId package_id,
-        UInt8[]& package_dir,
-        package_manifest.PackageManifest& manifest
-    ) {
-        Int index! = 0;
-        while (index < manifest.dependencies.len()) {
-            package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
-            Path joined = std.path.join(package_dir, dependency.path);
-            Path dependency_dir = std.path.normalize(joined.bytes());
-            self.ctx.store.resolve.add_package_dependency(
-                package_id,
-                store.PackageDependencyRecord (
-                    alias_symbol: self.ctx.store.symbols.intern(dependency.name),
-                    path_symbol: self.ctx.store.symbols.intern(dependency_dir.bytes())
-                )
-            );
-            index = index + 1;
-        }
-    }
-
-    Void add_package_manifest_diagnostic(Self&! self, source.SourceId source_id, UInt8[]& message) {
-        diagnostics.add_package_manifest_error(
-            self.ctx.store.diagnostics$.mut_ref(), source_id, message
-        );
-        self.ctx.store.model.mark_error();
+        if (package_load.registered_for_path(self.ctx, source_path.bytes()) is .some(package_id)) { return package_id; }
+        return self.ensure_root_package();
     }
 
     qid.PackageId create_root_package(Self&! self) {
@@ -1784,12 +1749,24 @@ public struct ModuleGraphBuilder: Movable {
         if (self.ctx.store.resolve.package_for_dir(core_dir) is .some(package_id)) {
             return package_id;
         }
-        return self.create_core_package(core_dir, source_id);
+        qid.SymbolId name = self.ctx.store.symbols.intern("core");
+        return self.create_internal_package(core_dir, name, name, .core, source_id);
     }
 
-    qid.PackageId create_core_package(Self&! self, qid.SymbolId core_dir, source.SourceId source_id) {
+    #doc 私有系统实现独立于用户包和标准库；该内部身份不注册为可导入的依赖别名。
+    qid.PackageId ensure_system_package(Self&! self, source.SourceId source_id) {
+        UInt8[]^ directory = cache_identity.absolute_path("src/compiler/system");
+        qid.SymbolId symbol = self.ctx.store.symbols.intern(directory[..]);
+        if (self.ctx.store.resolve.package_for_dir(symbol) is .some(package_id)) { return package_id; }
+        UInt8[]^ root = cache_identity.absolute_path("src/compiler/system/startup.jiang");
+        return self.create_internal_package(symbol, self.ctx.store.symbols.intern("jiang_system"),
+            self.ctx.store.symbols.intern(root[..]), .ordinary, source_id);
+    }
+
+    #doc 为编译器隐式基础模块建立稳定的内部包身份，不读取用户配置。
+    qid.PackageId create_internal_package(Self&! self, qid.SymbolId directory, qid.SymbolId name,
+        qid.SymbolId root, store.PackageKind kind, source.SourceId source_id) {
         token.Span span = token.Span();
-        qid.SymbolId core_symbol = self.ctx.store.symbols.intern("core");
         qid.NamespaceId package_namespace = self.ctx.store.resolve.create_namespace(
             .package_namespace,
             null,
@@ -1801,20 +1778,20 @@ public struct ModuleGraphBuilder: Movable {
             .package_def,
             .namespace_name,
             .public_visibility,
-            def.Name(symbol: core_symbol, span: span),
+            def.Name(symbol: name, span: span),
             null,
             null,
             package_namespace,
             package_namespace
         );
         self.ctx.store.model.declare_def(package_def, .package_decl);
-        self.record_package_stable_key(package_def, core_symbol, core_symbol, source_id, span);
+        self.record_package_stable_key(package_def, name, root, source_id, span);
         return self.ctx.store.resolve.create_package(
             package_def,
-            core_symbol,
-            core_dir,
-            core_symbol,
-            .core,
+            name,
+            directory,
+            root,
+            kind,
             package_namespace
         );
     }

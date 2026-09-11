@@ -13,6 +13,7 @@ alias diagnostic = import "./diagnostic.jiang";
 alias diagnostic_helper = import "./diagnostic/helper.jiang";
 alias qkey = import "./incremental/key.jiang";
 alias source_ji = import "./artifact/source_ji.jiang";
+alias build_manifest = import "./artifact/build_manifest.jiang";
 alias artifact_path = import "./artifact/path.jiang";
 alias cache_identity = import "./artifact/cache_identity.jiang";
 alias import_context = import "./artifact/import_context.jiang";
@@ -31,6 +32,7 @@ alias module_graph = import "./resolve/module_graph.jiang";
 alias syntax = import "./syntax.jiang";
 alias compilation = import "./analysis.jiang";
 alias source_entry = import "./source/entry.jiang";
+alias package_load = import "./source/package_load.jiang";
 alias source = import "./source.jiang";
 alias system_fs = import "./system/fs.jiang";
 alias system_io = import "./system/io.jiang";
@@ -45,7 +47,32 @@ import std;
 public Void compile(context.CompilerContext&! ctx, driver_options.CompileOptions& options) {
     ctx.output = build_output_kind(options.emit);
     ctx.begin_compilation();
-    source_entry.PackageHandle package! = source_entry.load_package(ctx, options.input_path);
+    ctx.configure_lang_build(options);
+    compile_input_after_begin(ctx, options.input_path, options);
+}
+
+Void compile_input_after_begin(
+    context.CompilerContext&! ctx, UInt8[]& input_path, driver_options.CompileOptions& options
+) {
+    if (package_load.exists(input_path)) {
+        if (options.emit == .executable && build_manifest.is_no_op_from_lookup(options.artifact_cache_dir,
+            build_lookup_environment(ctx, options), cache_identity.build_target_identity(options.input_path),
+            cache_identity.build_invocation_fingerprint(
+                options.output_path, options.linker_path, options.link_args$.ref()),
+            options.output_path, ctx.store.sources$.ref())) {
+            ctx.store.object_artifacts.record_no_op_hit();
+            if (options.artifact_stats) { print_artifact_stats(ctx); }
+            return;
+        }
+        resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_source_expression,
+            options.artifact_cache_dir, source_artifact_version_hash(options.compiler_version), false,
+            options.mode, options.jil_stats, compilation.prepare_observed_fact);
+        source_entry.PackageHandle package = package_load.load(ctx, resolver$.mut_ref(), input_path);
+        if (!package.ok) { return; }
+        compile_loaded_package_after_begin(ctx, package$.ref(), options, resolver$.mut_ref());
+        return;
+    }
+    source_entry.PackageHandle package! = source_entry.load_package(ctx, input_path);
     if (!package.ok) {
         return;
     }
@@ -62,20 +89,27 @@ public Void compile_loaded_package(
 ) {
     ctx.output = build_output_kind(options.emit);
     ctx.begin_compilation();
+    ctx.configure_lang_build(options);
+    if (package.configuration_directory.byte_length() > 0) {
+        compile_input_after_begin(ctx, package.configuration_directory.bytes(), options);
+        return;
+    }
     compile_loaded_package_after_begin(ctx, package, options);
 }
 
 Void compile_loaded_package_after_begin(
     context.CompilerContext&! ctx,
     source_entry.PackageHandle& package,
-    driver_options.CompileOptions& options
+    driver_options.CompileOptions& options,
+    resolve.ModuleResolver&!? package_resolver = null
 ) {
     if (options.emit == .generate) {
         guard generation.select(ctx, package, options) is .some(task) else { return; }
         source_entry.PackageHandle input = source_entry.load_package(ctx, task.input.bytes());
         source_entry.Entry entry! = source_entry.read_root(ctx, input$.ref());
         if (!entry.ok) { return; }
-        compile_package_with_emit(ctx, entry.source_id, input.root_path.bytes(), entry.text[..], options, task$.ref());
+        compile_package_with_emit(ctx, entry.source_id, input.root_path.bytes(), entry.text[..],
+            options, task$.ref(), package_resolver);
         publish_layout_diagnostics(ctx);
         return;
     }
@@ -88,7 +122,9 @@ Void compile_loaded_package_after_begin(
         entry.source_id,
         package.root_path.bytes(),
         entry.text$.ref(),
-        options
+        options,
+        null,
+        package_resolver
     );
     publish_layout_diagnostics(ctx);
 }
@@ -106,7 +142,8 @@ Void compile_package_with_emit(
     UInt8[]& root_path,
     UInt8[]& source_text,
     driver_options.CompileOptions& options,
-    generation.Task&? generate_task = null
+    generation.Task&? generate_task = null,
+    resolve.ModuleResolver&!? package_resolver = null
 ) {
     if (!backend.validate_output_request(ctx, options)) {
         return;
@@ -152,8 +189,10 @@ Void compile_package_with_emit(
             target_key,
             artifact_cache_dir.bytes(),
             package_source_base[..],
-            options.output_path
+            options.output_path,
+            ctx.store.sources$.ref()
         )) {
+            publish_build_lookup(ctx, options, context_key.fingerprint, package_source_base[..]);
             ctx.store.object_artifacts.record_no_op_hit();
             if (options.artifact_stats) {
                 print_artifact_stats(ctx);
@@ -187,8 +226,10 @@ Void compile_package_with_emit(
             target_key,
             artifact_cache_dir.bytes(),
             package_source_base[..],
-            options.output_path
+            options.output_path,
+            ctx.store.sources$.ref()
         )) {
+            publish_build_lookup(ctx, options, context_key.fingerprint, package_source_base[..]);
             ctx.store.object_artifacts.record_no_op_hit();
             if (options.artifact_stats) {
                 print_artifact_stats(ctx);
@@ -221,7 +262,7 @@ Void compile_package_with_emit(
     // source/monomorph object 时才允许 clean source 保持 interface-only。
     Bool debug_incremental = options.emit == .executable && options.mode == .debug;
     Bool use_source_artifacts = options.emit == .check_only || options.emit == .generate || debug_incremental;
-    resolve.ModuleResolver resolver! = resolve.ModuleResolver(compilation.evaluate_source_expression,
+    resolve.ModuleResolver ordinary_resolver! = resolve.ModuleResolver(compilation.evaluate_source_expression,
         artifact_cache_dir.bytes(),
         compiler_version_hash,
         use_source_artifacts,
@@ -229,6 +270,11 @@ Void compile_package_with_emit(
         options.jil_stats,
         compilation.prepare_observed_fact
     );
+    resolve.ModuleResolver&! resolver = if (package_resolver$.move() is .some(existing)) {
+        existing.configure_source_artifacts(ctx, artifact_cache_dir.bytes(), use_source_artifacts);
+        existing
+    }
+        else { ordinary_resolver$.mut_ref() };
     module_graph.ModuleGraph^ graph! = resolver.begin_module_graph(ctx, syntax_result.take_unit());
     if (!resolver.prepare_root_entry_environment(ctx, graph$.mut_ref())) {
         return;
@@ -343,10 +389,37 @@ Void compile_package_with_emit(
         );
     }
     stage_started = print_jil_stage_if_enabled(options, "backend_done", stage_started);
+    publish_build_lookup(ctx, options, context_key.fingerprint, package_source_base[..]);
     stage_started = print_jil_stage_if_enabled(options, "artifact_done", stage_started);
     if (options.artifact_stats) {
         print_artifact_stats(ctx);
     }
+}
+
+#doc 不依赖包求值结果的工具链／目标／调用身份，用于查找既有成功构建上下文。
+cache_identity.ContextKey build_lookup_environment(
+    context.CompilerContext& ctx, driver_options.CompileOptions& options
+) {
+    std.String target = system_target.build_cache_key(ctx.target$.ref(), ctx.output);
+    std.String toolchain = backend.llvm_version_text();
+    return cache_identity.context_key(object_key_builder.compiler_fingerprint(options.compiler_build),
+        object_key_builder.language_version_fingerprint(options.compiler_version),
+        object_key_builder.target_fingerprint(target.bytes()),
+        object_key_builder.toolchain_fingerprint(toolchain.bytes()),
+        object_key_builder.backend_profile_fingerprint(options.mode),
+        cache_identity.build_invocation_fingerprint(
+            options.output_path, options.linker_path, options.link_args$.ref()));
+}
+
+#doc 成功构建及索引缺失后的常规 no-op 命中共用同一个清单位置发布点。
+Void publish_build_lookup(context.CompilerContext& ctx, driver_options.CompileOptions& options,
+    qkey.Fingerprint128 context_key, UInt8[]& source_base) {
+    if (options.emit != .executable || !package_load.exists(options.input_path)) { return; }
+    build_manifest.publish_context_lookup(options.artifact_cache_dir, build_lookup_environment(ctx, options),
+        cache_identity.build_target_identity(options.input_path), context_key,
+        cache_identity.build_invocation_fingerprint(
+            options.output_path, options.linker_path, options.link_args$.ref()),
+        source_base, options.output_path, ctx.store.sources$.ref());
 }
 
 system_target.BuildOutputKind build_output_kind(driver_options.EmitKind emit) {

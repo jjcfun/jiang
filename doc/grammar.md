@@ -51,7 +51,8 @@ literal     <- int_lit
 file        <- top_level_item* eof
 
 top_level_item
-            <- module_meta
+            <- package_decl
+             / module_meta
              / module_doc
              / compile_block
              / intrinsic_block
@@ -920,3 +921,20 @@ pattern_list
   - `struct_lit` 与 `block` 在语法上都使用 `{ ... }`，parser 依赖上下文和有序选择区分。
   - 泛型类型参数中的 `>>` 可能由 lexer 合并为一个 token，
     parser 在类型参数上下文中会按两个 `>` 处理。
+
+## 内置包信息语法
+
+`#package` 的 body 由内置 Provider 解析；字段表达式复用 Jiang parser。
+以下规则描述 Provider 内部语法，展开结果是普通声明集合。
+
+```peg
+package_decl <- ("#package" / "#jiang.package") "{" package_item* "}"
+package_item <- "dependencies" "{" package_dependency* "}"
+              / "lang" name? "{" package_alias_field* "}"
+              / "generate" name "{" package_alias_field* "}"
+              / name "=" expr ";"
+package_dependency <- name "=" expr ";"
+package_alias_field <- "package" "=" name ";"
+                     / "extensions" "=" "[" (expr ("," expr)* ","?)? "]" ";"
+                     / name "=" expr ";"
+```

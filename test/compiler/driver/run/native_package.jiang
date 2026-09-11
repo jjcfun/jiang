@@ -1,0 +1,383 @@
+// compiler-integration
+#doc(module) 从目录加载原生包，验证早期求值后 root 导入相同配置并运行。
+alias context = import "../../../../src/compiler/context.jiang";
+alias options_api = import "../../../../src/compiler/driver/options.jiang";
+alias pipeline = import "../../../../src/compiler/pipeline.jiang";
+alias reporter = import "../../../../src/compiler/diagnostic/reporter.jiang";
+alias list = import "../../../../src/compiler/support/list.jiang";
+alias fs = import "../../../../src/compiler/system/fs.jiang";
+alias process = import "../../../../src/compiler/system/process.jiang";
+alias string = import "../../../../src/compiler/support/string.jiang";
+alias package_load = import "../../../../src/compiler/source/package_load.jiang";
+alias resolver_api = import "../../../../src/compiler/resolve/module_resolver.jiang";
+alias analysis = import "../../../../src/compiler/analysis.jiang";
+alias session_api = import "../../../../src/compiler/session.jiang";
+alias io = import "../../../../src/compiler/system/io.jiang";
+alias import_context = import "../../../../src/compiler/artifact/import_context.jiang";
+alias qkey = import "../../../../src/compiler/incremental/key.jiang";
+import std;
+
+Int main() {
+    assert(fs.remove_tree("build/test-native-package"));
+    verify_configuration();
+    verify_configuration_defaults();
+    assert(fs.create_dirs("build/test-native-package"));
+    options_api.CompileOptions options = options_api.CompileOptions(.executable,
+        "test/compiler/fixture/native_package", "build/test-native-package/program",
+        "build/test-native-package/cache");
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), options$.ref());
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+    verify_shared_dependency(ctx$.mut_ref());
+    _ package = ctx.store.resolve.package_ref(ctx.store.resolve.root_package$.some());
+    assert(package.configuration_source != null);
+    assert(package.configuration_info != null);
+    assert(ctx.store.comptime_store.const_value(package.configuration_info$.some()) != null);
+    Int configuration_modules! = 0;
+    Int index! = 0;
+    while (index < package.modules.len()) {
+        _ module = ctx.store.resolve.module_ref(package.modules.get(index));
+        if (module.source_id == package.configuration_source$.some()) {
+            configuration_modules = configuration_modules + 1;
+            assert(ctx.store.defs.get(package.configuration_info$.some()).module_id == package.modules.get(index));
+        }
+        index = index + 1;
+    }
+    assert(configuration_modules == 1);
+    list.ArrayList<UInt8[]&> args! = list.ArrayList<UInt8[]&>();
+    assert(process.run("build/test-native-package/program", args$.ref()).ok());
+    reject_ordinary_info();
+    reject_dependency_cycle();
+    reject_cross_package_path();
+    reject_configuration_escape();
+    reject_empty_dependency();
+    verify_session_reload();
+    verify_native_generate();
+    reject_generate_configuration();
+    reject_initialization_dependencies();
+    verify_native_context();
+    verify_standard_library_configuration();
+    return 0;
+}
+
+#doc 标准库原生入口允许预先加载提供 PackageInfo 的基础模块及内部系统依赖。
+Void verify_standard_library_configuration() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(analysis.evaluate_source_expression,
+        "build/test-native-package/std-cache", null, false);
+    _ package = package_load.load(ctx$.mut_ref(), resolver$.mut_ref(), "src/std");
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(package.ok);
+    assert(!ctx.store.diagnostics.has_errors());
+    _ record = ctx.store.resolve.package_ref(ctx.store.resolve.root_package$.some());
+    assert(record.configuration_info != null);
+}
+
+#doc 原生包解析上下文取自 info，不受上层遗留 INI 干扰；配置值变更必须产生新上下文。
+Void verify_native_context() {
+    assert(fs.create_dirs("build/test-native-package/context/app"));
+    assert(fs.write_all("build/test-native-package/context/package.ini", "[package]\nname=outer\nversion=1\n"));
+    assert(fs.write_all("build/test-native-package/context/app/package.jiang",
+        "#package { name=\"app\"; version=\"1\"; }"));
+    _ before = native_context();
+    assert(fs.write_all("build/test-native-package/context/package.ini", "[package]\nname=changed\nversion=2\n"));
+    assert(native_context() == before);
+    assert(fs.write_all("build/test-native-package/context/app/package.jiang",
+        "#package { name=\"app\"; version=\"2\"; }"));
+    assert(native_context() != before);
+}
+
+qkey.Fingerprint128 native_context() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(analysis.evaluate_source_expression,
+        "build/test-native-package/context-cache", null, false);
+    _ package = package_load.load(ctx$.mut_ref(), resolver$.mut_ref(), "build/test-native-package/context/app");
+    assert(package.ok);
+    return import_context.fingerprint_for_source_path(ctx$.mut_ref(), package.root_path.bytes());
+}
+
+#doc 配置可调用独立 helper，但 root 和尚待登记的依赖不能反过来参与配置求值。
+Void reject_initialization_dependencies() {
+    UInt8[]&[2] imports = ["root.jiang", "helper.jiang"];
+    for imported in imports {
+        context.CompilerContext ctx! = context.CompilerContext();
+        ctx.store.sources.set_overlay("test/compiler/fixture/native_package/root.jiang",
+            "@life() public UInt8[]& version() { \"0.5.5\" }");
+        ctx.store.sources.set_overlay("test/compiler/fixture/native_package/helper.jiang",
+            "import r=\"root.jiang\"; @life() public UInt8[]& version() { r.version() }");
+        std.StringBuilder configuration! = std.StringBuilder();
+        configuration.append("import h=\"");
+        configuration.append(imported);
+        configuration.append("\"; #package { name=\"app\"; version=h.version(); root=\"root.jiang\"; }");
+        ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", configuration.slice());
+        assert_rejected(ctx$.mut_ref(), "package_initialization_root");
+        UInt8[]& origin = if string.equal(imported, "root.jiang") {
+            "test/compiler/fixture/native_package/package.jiang"
+        } else { "test/compiler/fixture/native_package/helper.jiang" };
+        assert(ctx.store.diagnostics.get(0).range.source_id == ctx.store.sources.find(.file(origin)));
+    }
+    context.CompilerContext child! = context.CompilerContext();
+    std.StringBuilder configuration! = std.StringBuilder();
+    configuration.append("import h=\"child/helper.jiang\"; #package { name=\"app\"; version=h.version(); ");
+    configuration.append("dependencies { child=\"child\"; } }");
+    child.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", configuration.slice());
+    child.store.sources.set_overlay("test/compiler/fixture/native_package/child/helper.jiang",
+        "@life() public UInt8[]& version() { \"0.5.5\" }");
+    child.store.sources.set_overlay("test/compiler/fixture/native_package/child/package.jiang",
+        "#package { name=\"child\"; }");
+    assert_rejected(child$.mut_ref(), "package_initialization_dependency");
+    UInt8[]&[3] roots = ["../native_dependency/native_dependency.jiang", "src", "package.jiang"];
+    for root in roots {
+        context.CompilerContext escaped! = context.CompilerContext();
+        std.StringBuilder invalid! = std.StringBuilder();
+        invalid.append("#package { name=\"app\"; root=\"");
+        invalid.append(root);
+        invalid.append("\"; }");
+        escaped.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", invalid.slice());
+        assert_rejected(escaped$.mut_ref(), "package_root_invalid");
+    }
+}
+
+#doc 本包与依赖生成器共享已加载配置；未选择的生成器文件不应被读取。
+Void verify_native_generate() {
+    assert(fs.create_dirs("build/test-native-package/generate-app/src"));
+    assert(fs.create_dirs("build/test-native-package/generate-tool"));
+    std.StringBuilder configuration! = std.StringBuilder();
+    configuration.append("#package { name=\"app\"; version=\"local\"; root=\"src/model.jiang\"; ");
+    configuration.append("dependencies { tools=\"../generate-tool\"; } ");
+    configuration.append("generate docs { module=\"src/generate.jiang\"; } ");
+    configuration.append("generate remote { package=tools; } generate unused { module=\"missing.jiang\"; } }");
+    assert(fs.write_all("build/test-native-package/generate-app/package.jiang", configuration.slice()));
+    assert(fs.write_all("build/test-native-package/generate-app/src/model.jiang", "struct Model { Int value; }"));
+    std.StringBuilder local! = std.StringBuilder();
+    local.append("import \"../package.jiang\"; @entry(generate) Void emit(reflect.Module root) { ");
+    local.append("generate.write(\"version.txt\", package.info.version); }");
+    assert(fs.write_all("build/test-native-package/generate-app/src/generate.jiang", local.slice()));
+    assert(fs.write_all("build/test-native-package/generate-tool/package.jiang",
+        "#package { name=\"tool\"; version=\"remote\"; }"));
+    std.StringBuilder remote! = std.StringBuilder();
+    remote.append("import \"package.jiang\"; @entry(generate) Void emit(reflect.Module root) { ");
+    remote.append("generate.write(\"version.txt\", package.info.version); }");
+    assert(fs.write_all("build/test-native-package/generate-tool/tool.jiang", remote.slice()));
+    options_api.CompileOptions options! = options_api.CompileOptions(.generate,
+        "build/test-native-package/generate-app", "build/test-native-package/generated",
+        "build/test-native-package/generate-cache");
+    UInt8[]&[2] names = ["docs", "remote"];
+    UInt8[]&[2] expected = ["local", "remote"];
+    Int index! = 0;
+    while (index < names[..].length) {
+        options.generate_name = names[index];
+        context.CompilerContext ctx! = context.CompilerContext();
+        pipeline.compile(ctx$.mut_ref(), options$.ref());
+        if (ctx.store.diagnostics.has_errors()) {
+            reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+        }
+        assert(!ctx.store.diagnostics.has_errors());
+        assert(string.equal(fs.read_all("build/test-native-package/generated/version.txt")$.some(), expected[index]));
+        index = index + 1;
+    }
+    assert(fs.create_dirs("build/test-native-package/generate-app/inner"));
+    assert(fs.write_all("build/test-native-package/generate-app/inner/package.jiang",
+        "#package { name=\"inner\"; }"));
+    std.StringBuilder invalid! = std.StringBuilder();
+    invalid.append("#package { name=\"app\"; dependencies { child=\"inner\"; } ");
+    invalid.append("generate docs { module=\"inner/inner.jiang\"; } }");
+    context.CompilerContext rejected! = context.CompilerContext();
+    rejected.store.sources.set_overlay("build/test-native-package/generate-app/package.jiang", invalid.slice());
+    pipeline.compile(rejected$.mut_ref(), options$.ref());
+    assert(rejected.store.diagnostics.has_errors());
+    assert(string.equal(rejected.store.diagnostics.get(0).code.text, "package_generate_module_invalid"));
+}
+
+#doc generate 的无效来源在普通检查阶段拒绝，不等到任务被执行。
+Void reject_generate_configuration() {
+    UInt8[]&[6] bodies = [
+        "generate bad {}",
+        "generate bad { module=\"a.jiang\"; package=missing; }",
+        "generate bad { package=missing; }",
+        "generate same { module=\"a.jiang\"; } generate same { module=\"b.jiang\"; }",
+        "generate bad { module=\"../a.jiang\"; }",
+        "generate bad { module=\"src\"; }",
+    ];
+    UInt8[]&[6] codes = [
+        "package_generate_source_invalid", "package_generate_source_invalid",
+        "package_generate_dependency_missing", "package_duplicate_generate", "package_generate_module_invalid",
+        "package_generate_module_invalid",
+    ];
+    Int index! = 0;
+    while (index < bodies[..].length) {
+        context.CompilerContext ctx! = context.CompilerContext();
+        std.StringBuilder configuration! = std.StringBuilder();
+        configuration.append("#package { name=\"app\"; ");
+        configuration.append(bodies[index]);
+        configuration.append(" }");
+        ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", configuration.slice());
+        assert_rejected(ctx$.mut_ref(), codes[index]);
+        index = index + 1;
+    }
+}
+
+Void verify_shared_dependency(context.CompilerContext&! ctx) {
+    _ util_name = ctx.store.symbols.intern("util");
+    _ common_name = ctx.store.symbols.intern("common");
+    _ root = ctx.store.resolve.root_package$.some();
+    _ util_path = ctx.store.resolve.package_dependency(root, util_name)$.some().path_symbol;
+    _ common_path = ctx.store.resolve.package_dependency(root, common_name)$.some().path_symbol;
+    _ util = ctx.store.resolve.package_for_dir(util_path)$.some();
+    _ indirect = ctx.store.resolve.package_dependency(util, common_name)$.some().path_symbol;
+    assert(common_path == indirect);
+    assert(ctx.store.resolve.package_for_dir(common_path) == ctx.store.resolve.package_for_dir(indirect));
+}
+
+Void verify_configuration() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(analysis.evaluate_source_expression,
+        "build/test-native-package/early-cache", null, false);
+    _ loaded = package_load.load(ctx$.mut_ref(), resolver$.mut_ref(), "test/compiler/fixture/native_package");
+    if (ctx.store.diagnostics.has_errors()) {
+        reporter.report_to_stderr(ctx.store.diagnostics$.ref(), ctx.store.sources$.mut_ref());
+    }
+    assert(loaded.ok);
+}
+
+#doc 加载默认值不改写普通 info 常量，包名和非空版本仍执行入口校验。
+Void verify_configuration_defaults() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", "#package {}");
+    resolver_api.ModuleResolver resolver! = resolver_api.ModuleResolver(analysis.evaluate_source_expression,
+        "build/test-native-package/default-cache", null, false);
+    _ loaded = package_load.load(ctx$.mut_ref(), resolver$.mut_ref(), "test/compiler/fixture/native_package");
+    assert(loaded.ok);
+    _ record = ctx.store.resolve.package_ref(ctx.store.resolve.root_package$.some());
+    assert(string.equal(ctx.store.symbols.text(record.name), "native_package"));
+    _ info = ctx.store.comptime_store.const_value(record.configuration_info$.some())$.some();
+    _ declared_name = package_load.string_field(ctx$.mut_ref(), info, "name")$.some();
+    assert(ctx.store.symbols.text(declared_name).length == 0);
+    _ root = std.path.join(ctx.store.symbols.text(record.dir_path), "native_package.jiang");
+    assert(string.equal(loaded.root_path.bytes(), root.bytes()));
+    context.CompilerContext invalid! = context.CompilerContext();
+    invalid.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang",
+        "#package { name=\"native_package\"; version=\"0.5 5\"; }");
+    assert_rejected(invalid$.mut_ref(), "package_version_invalid");
+}
+
+Void reject_ordinary_info() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", "public const Int info = 1;");
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "test/compiler/fixture/native_package", "", "build/test-native-package/cache");
+    pipeline.compile(ctx$.mut_ref(), options$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+    assert(string.equal(ctx.store.diagnostics.get(0).code.text, "package_declaration_missing"));
+}
+
+Void reject_dependency_cycle() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_dependency/package.jiang",
+        "#package { name = \"native_dependency\"; dependencies { app = \"../native_package\"; } }");
+    assert_rejected(ctx$.mut_ref(), "package_dependency_cycle");
+}
+
+Void reject_cross_package_path() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/src/main.jiang",
+        "import \"../../native_dependency/native_dependency.jiang\"; Int main() { 0 }");
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_dependency/native_dependency.jiang",
+        "this source must not be parsed");
+    assert_rejected(ctx$.mut_ref(), "cross_package_file_import");
+}
+
+Void reject_configuration_escape() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang",
+        "import \"../native_dependency/native_dependency.jiang\"; #package { name = \"native_package\"; }");
+    _ forbidden = ctx.store.sources.set_overlay("test/compiler/fixture/native_dependency/native_dependency.jiang",
+        "this source must not be parsed");
+    assert_rejected(ctx$.mut_ref(), "cross_package_file_import");
+    assert(ctx.store.resolve.module_for_source(forbidden) == null);
+}
+
+Void reject_empty_dependency() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang",
+        "#package { name = \"native_package\"; dependencies { missing = \"\"; } }");
+    assert_rejected(ctx$.mut_ref(), "package_dependency_path_invalid");
+}
+
+Void assert_rejected(context.CompilerContext&! ctx, UInt8[]& expected) {
+    options_api.CompileOptions options = options_api.CompileOptions(.check_only,
+        "test/compiler/fixture/native_package", "", "build/test-native-package/reject-cache");
+    pipeline.compile(ctx, options$.ref());
+    if (!ctx.store.diagnostics.has_errors()) { assert(false); return; }
+    assert(string.equal(ctx.store.diagnostics.get(0).code.text, expected));
+}
+
+Void verify_session_reload() {
+    session_api.CompilerSession compiler! = session_api.CompilerSession();
+    _ package = compiler.load_package("test/compiler/fixture/native_package");
+    assert(package.ok);
+    assert(package.configuration_directory.byte_length() > 0);
+    options_api.CompileOptions options = options_api.CompileOptions(.executable,
+        "test/compiler/fixture/native_package", "build/test-native-package/session-program",
+        "build/test-native-package/session-cache");
+    compiler.set_source("test/compiler/fixture/native_package/src/session.jiang",
+        "import \"../package.jiang\"; Int main() { Int(package.info.version[4]) }");
+    compiler.set_source("test/compiler/fixture/native_package/package.jiang",
+        "#package { name = \"native_package\"; version = \"0.5.6\"; root = \"src/session.jiang\"; }");
+    compiler.compile_loaded(package$.ref(), options$.ref());
+    assert_session_ok(compiler$.ref());
+    assert(compiler.generation() == 1);
+    list.ArrayList<UInt8[]&> args! = list.ArrayList<UInt8[]&>();
+    assert(process.run("build/test-native-package/session-program", args$.ref()).exit_code == 54);
+    compiler.set_source("test/compiler/fixture/native_package/package.jiang",
+        "#package { name = \"native_package\"; version = \"0.5.7\"; root = \"src/session.jiang\"; }");
+    compiler.compile_loaded(package$.ref(), options$.ref());
+    assert_session_ok(compiler$.ref());
+    assert(compiler.generation() == 2);
+    assert(process.run("build/test-native-package/session-program", args$.ref()).exit_code == 55);
+    compiler.set_source("test/compiler/fixture/native_package/v.jiang",
+        "@life() public UInt8[]& current() { \"0.5.8\" }");
+    compiler.set_source("test/compiler/fixture/native_package/package.jiang",
+        "import h=\"v.jiang\"; #package { name=\"native\"; version=h.current(); root=\"src/session.jiang\"; }");
+    compiler.compile_loaded(package$.ref(), options$.ref());
+    assert_session_ok(compiler$.ref());
+    assert(process.run("build/test-native-package/session-program", args$.ref()).exit_code == 56);
+    compiler.set_source("test/compiler/fixture/native_package/v.jiang",
+        "@life() public UInt8[]& current() { \"0.5.9\" }");
+    compiler.compile_loaded(package$.ref(), options$.ref());
+    assert_session_ok(compiler$.ref());
+    Int warm_result = process.run("build/test-native-package/session-program", args$.ref()).exit_code;
+    options_api.CompileOptions cold = options_api.CompileOptions(.executable,
+        "test/compiler/fixture/native_package", "build/test-native-package/session-cold-program",
+        "build/test-native-package/session-cold-cache");
+    compiler.compile_loaded(package$.ref(), cold$.ref());
+    assert_session_ok(compiler$.ref());
+    Int cold_result = process.run("build/test-native-package/session-cold-program", args$.ref()).exit_code;
+    if (cold_result == 57 && warm_result != 57) { io.stderr().write_all("only warm helper result is stale\n"); }
+    assert(cold_result == 57);
+    assert(warm_result == cold_result);
+    compiler.set_source("test/compiler/fixture/native_package/package.jiang",
+        "#package { name = \"native_package\"; version = 55; }");
+    compiler.compile_loaded(package$.ref(), options$.ref());
+    assert(compiler.diagnostics().has_errors());
+    assert(compiler.generation() == 6);
+    assert(string.equal(compiler.diagnostics().get(0).code.text, "field_initializer_type_mismatch"));
+}
+
+Void assert_session_ok(session_api.CompilerSession& compiler) {
+    if (!compiler.diagnostics().has_errors()) { return; }
+    Int index! = 0;
+    while (index < compiler.diagnostics().len()) {
+        io.stderr().write_all(compiler.diagnostics().get(index).code.text);
+        io.stderr().write_all("\n");
+        io.stderr().write_all(compiler.diagnostics().get(index).message.bytes());
+        io.stderr().write_all("\n");
+        index = index + 1;
+    }
+    assert(false);
+}

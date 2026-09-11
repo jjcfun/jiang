@@ -75,6 +75,10 @@ LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 
 ## 统一 runner
 
+包目录测试在测试源码中用独占一行的 `// test-package` 标记。runner 将所在目录作为编译输入，
+由编译器加载 `package.jiang` 并确定 root；测试筛选、预期诊断、退出码及伴随 C 文件仍使用
+原测试源码。配置文件 `package.jiang` 本身不作为独立用例发现。普通文件测试不受此标记影响。
+
 `script/test.sh` 是语言测试和编译器模块测试共用的执行器。`script/smoke.sh` 只提供日常快速
 profile，仍把清单交给同一个 runner；它不定义另一套成功、失败或运行语义。
 

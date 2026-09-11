@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
-PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+PACKAGE_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([A-Za-z0-9._+-]+)"[[:space:]]*;[[:space:]]*$/\1/p' "$ROOT_DIR/package.jiang" | head -n 1)"
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/bin/jiangc}"
@@ -72,7 +72,7 @@ write_install_script() {
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([A-Za-z0-9._+-]+)"[[:space:]]*;[[:space:]]*$/\1/p' "$ROOT_DIR/package.jiang" | head -n 1)"
 PREFIX="${PREFIX:-$HOME/.jiang}"
 VERSION_DIR="$PREFIX/versions/$VERSION"
 
@@ -86,8 +86,8 @@ esac
 mkdir -p "$VERSION_DIR" "$PREFIX/bin"
 rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
-cp "$ROOT_DIR/package.ini" "$VERSION_DIR/package.ini"
-cp "$ROOT_DIR/package.ini" "$PREFIX/package.ini"
+cp "$ROOT_DIR/package.jiang" "$VERSION_DIR/package.jiang"
+cp "$ROOT_DIR/package.jiang" "$PREFIX/package.jiang"
 chmod +x "$VERSION_DIR/bin/jiang"
 ln -sfn "../versions/$VERSION/bin/jiang" "$PREFIX/bin/jiang"
 ln -sfn "../versions/$VERSION/bin/jiangc" "$PREFIX/bin/jiangc"
@@ -173,7 +173,7 @@ cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiang"
 cp "$JIANGC_BIN.build-id" "$PACKAGE_DIR/bin/jiang.build-id"
 ln -s "jiang" "$PACKAGE_DIR/bin/jiangc"
 ln -s "jiang.build-id" "$PACKAGE_DIR/bin/jiangc.build-id"
-cp "$ROOT_DIR/package.ini" "$PACKAGE_DIR/package.ini"
+cp "$ROOT_DIR/package.jiang" "$PACKAGE_DIR/package.jiang"
 cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
 chmod +x "$PACKAGE_DIR/bin/jiang" "$PACKAGE_DIR/script/install_llvm.sh"
 

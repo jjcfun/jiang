@@ -267,15 +267,49 @@ check_dependency_invalidation() {
   expect_exit "$WORK_DIR/public-change" 53
 }
 
+check_build_context_lookup() {
+  local fixture="$WORK_DIR/context-lookup"
+  local cache="$WORK_DIR/context-lookup-cache"
+  local output="$WORK_DIR/context-lookup-output"
+  local lookup
+  mkdir -p "$fixture"
+  printf '%s\n' \
+    '#doc(module) 目标索引回归的配置；版本变化属于构建输入。' \
+    '#package { name = "lookup"; root = "main.jiang"; version = "1"; }' >"$fixture/package.jiang"
+  printf '%s\n' \
+    '#doc(module) 通过普通导入把配置版本用于运行结果。' \
+    'import "package.jiang";' \
+    'Int main() { package.info.version.length - 1 }' >"$fixture/main.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-cold.log" "$output" "$fixture"
+  expect_exit "$output" 0
+  lookup="$(find "$cache/targets" -type f -name '*.context' -print | head -n 1)"
+  [ -n "$lookup" ] || fail "build context lookup was not published"
+  printf 'broken' >"$lookup"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-recover.log" "$output" "$fixture"
+  require_stat_ge "$WORK_DIR/lookup-recover.log" artifact_parsed_sources 1
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-hot.log" "$output" "$fixture"
+  require_stat_eq "$WORK_DIR/lookup-hot.log" artifact_parsed_sources 0
+  require_stat_eq "$WORK_DIR/lookup-hot.log" artifact_no_op_hits 1
+  rm "$lookup"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-missing.log" "$output" "$fixture"
+  [ -f "$lookup" ] || fail "missing build context lookup was not restored"
+  perl -0pi -e 's/version = "1"/version = "20"/' "$fixture/package.jiang"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-version.log" "$output" "$fixture"
+  require_stat_eq "$WORK_DIR/lookup-version.log" artifact_no_op_hits 0
+  expect_exit "$output" 1
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-version-hot.log" "$output" "$fixture"
+  require_stat_eq "$WORK_DIR/lookup-version-hot.log" artifact_parsed_sources 0
+  expect_exit "$output" 1
+}
+
 check_hidden_caller_coverage() {
   local fixture="$WORK_DIR/hidden-caller-coverage"
   local cache="$WORK_DIR/hidden-caller-cache"
   local output="$WORK_DIR/hidden-caller"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '[package]' \
-    'name = hidden_caller_coverage' \
-    'root = main.jiang' >"$fixture/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "hidden_caller_coverage"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'import api = "./api.jiang";' \
     'Int main() { api.value() }' >"$fixture/main.jiang"
@@ -369,9 +403,8 @@ write_import_graph_fixture() {
   local fixture="$1"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '[package]' \
-    'name = import_graph' \
-    'root = main.jiang' >"$fixture/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "import_graph"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'import api = "./api.jiang";' \
     'Int main() { api.value() - 7 }' >"$fixture/main.jiang"
@@ -520,7 +553,7 @@ check_compiler_build_invalidation() {
   require_stat_ge "$WORK_DIR/compiler-b.log" artifact_object_miss 1
   require_stat_ge "$WORK_DIR/compiler-b.log" artifact_emitted_units 1
   local context_count
-  context_count="$(find "$cache" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+  context_count="$(find "$cache" -mindepth 1 -maxdepth 1 -type d ! -name targets | wc -l | tr -d ' ')"
   [ "$context_count" = "2" ] || fail "compiler build identity created ${context_count} contexts"
   expect_exit "$WORK_DIR/compiler-b" 52
 }
@@ -567,9 +600,8 @@ check_shared_generic_callers() {
   local cache="$WORK_DIR/shared-generic-cache"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '[package]' \
-    'name = shared_generic_callers' \
-    'root = main.jiang' >"$fixture/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "shared_generic_callers"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'public T identity<T>(T value) {' \
     '    value' \
@@ -713,12 +745,11 @@ check_global_only_dependency() {
   local cache="$WORK_DIR/global-only-cache"
   mkdir -p "$app" "$dependency"
   printf '%s\n' \
-    '[package]' \
-    'name = app' \
-    'root = main.jiang' \
-    '' \
-    '[dependencies]' \
-    'globals = ../globals' >"$app/package.ini"
+    '#doc(module) 显式加载只包含全局变量的依赖包。' \
+    '#package {' \
+    '    name = "app"; root = "main.jiang";' \
+    '    dependencies { globals = "../globals"; }' \
+    '}' >"$app/package.jiang"
   printf '%s\n' \
     'import globals;' \
     '' \
@@ -726,9 +757,8 @@ check_global_only_dependency() {
     '    globals.value - 7' \
     '}' >"$app/main.jiang"
   printf '%s\n' \
-    '[package]' \
-    'name = globals' \
-    'root = globals.jiang' >"$dependency/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "globals"; root = "globals.jiang"; }' >"$dependency/package.jiang"
   printf '%s\n' 'public Int value! = 7;' >"$dependency/globals.jiang"
 
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/global-only-cold.log" \
@@ -746,9 +776,8 @@ check_public_alias_dependency() {
   local cache="$WORK_DIR/public-alias-cache"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '[package]' \
-    'name = public_alias' \
-    'root = main.jiang' >"$fixture/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "public_alias"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'import dep = "./dep.jiang";' \
     '' \
@@ -1091,9 +1120,8 @@ check_trait_interface() {
   local cache="$WORK_DIR/trait-interface-cache"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '[package]' \
-    'name = trait_interface' \
-    'root = main.jiang' >"$fixture/package.ini"
+    '#doc(module) 声明缓存回归的包入口。' \
+    '#package { name = "trait_interface"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'import dep = "./dep.jiang";' \
     '' \
@@ -1360,6 +1388,7 @@ command -v "$CC_BIN" >/dev/null 2>&1 || fail "missing C linker: $CC_BIN"
 command -v nm >/dev/null 2>&1 || fail "missing nm"
 
 run_check cold_hot "cold/hot and profiles" check_cold_hot_and_profiles
+run_check context_lookup "build context lookup recovery and configuration change" check_build_context_lookup
 run_check invalidation "dependency invalidation" check_dependency_invalidation
 run_check coverage "hidden caller object coverage" check_hidden_caller_coverage
 run_check callable_values "cached function values and constructors" check_cached_callable_values

@@ -5,19 +5,21 @@
 
 ## 常规开发
 
-当前 0.5.4 release 源码使用固定 `bootstrap/0.5.4` 阶段的 `0.5.4-bootstrap` 编译器：
+当前 0.5.5 在独立功能分支开发，使用并排 `bootstrap/0.5.5` worktree 的固定阶段。
+阶段源码提交为 `81d958fc57c2b1bc2a40f6dbceef29b2f6ef373d`，保留旧配置加载入口，
+只加入编译新源码必需的包声明与常量物化能力。该阶段从 0.5.4 stable 开始，完成
+`next -> stable` 后，其 stable 才能作为后续种子；身份记录位于阶段的 `build/strict/identity.json`。
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
 COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=stable VERIFY=full \
+BOOTSTRAP_DEPTH=next VERIFY=none \
 bash ./script/build_next.sh
 ```
 
-bootstrap 阶段从 0.5.3 stable 开始，并须完成自身严格自举。固定各阶段源码与种子身份后，
-再构建 release 的 next 和 stable；不能用未记录的开发产物替换种子。
-发布后的后续开发可改用已安装的 0.5.4 stable，并显式设置 `BOOTSTRAP_RELEASE_VERSION=0.5.4`。
+脚本默认版本仍为 0.5.4，适用于该版本开始开发时；原生配置迁移后须显式指定上述固定阶段。
+开发保留在功能分支，bootstrap 改动仅在自己的分支提交。
 
 bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
 清理该目录；current compiler 使用独立的
@@ -34,8 +36,8 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.4-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.4/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
+BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/strict/bin/jiangc \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh

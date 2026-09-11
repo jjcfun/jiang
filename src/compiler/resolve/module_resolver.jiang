@@ -21,6 +21,7 @@ alias comptime_value = import "../sema/comptime/value.jiang";
 alias qid = import "../id.jiang";
 alias qkey = import "../incremental/key.jiang";
 alias source = import "../source.jiang";
+alias package_load = import "../source/package_load.jiang";
 alias list = import "../support/list.jiang";
 alias map = import "../support/map.jiang";
 alias set = import "../support/set.jiang";
@@ -80,7 +81,7 @@ public struct ModuleResolver: Movable {
     map.WyHashMap<qid.DefId, ast.AstId> declaration_items!;
     map.WyHashMap<qid.DefId, ast.AstId> declaration_containers!;
     set.HashSet<qid.ModuleId> extension_skeletons!;
-    std.String artifact_cache_dir;
+    std.String artifact_cache_dir!;
     UInt64 compiler_version_hash;
     Bool use_source_artifacts!;
     qid.PackageId? required_source_package!;
@@ -114,7 +115,7 @@ public struct ModuleResolver: Movable {
             self.compiler_version_hash = hash;
         } else {
             self.compiler_version_hash = source_ji.artifact_version_hash(
-                driver_options.compiler_version_fallback()
+                driver_options.compiler_version()
             );
         }
         self.use_source_artifacts = use_source_artifacts;
@@ -127,6 +128,16 @@ public struct ModuleResolver: Movable {
         } else {
             self.mode = .debug;
         }
+    }
+
+    #doc 包信息求值后接入正式缓存上下文，重新核验源码状态而不重建声明和常量。
+    public Void configure_source_artifacts(Self&! self, context.CompilerContext&! ctx,
+        UInt8[]& directory, Bool enabled) {
+        self.artifact_cache_dir = std.String.from_valid_utf8(directory);
+        self.use_source_artifacts = enabled;
+        ModuleResolvePhase phase! = ModuleResolvePhase(ctx, self);
+        module_graph_builder.ModuleGraphBuilder builder! = phase.graph_builder();
+        builder.refresh_source_dependencies();
     }
 
     public Void add_ast(Self&! self, ast.AstUnit unit) {
@@ -364,8 +375,26 @@ struct ModuleResolvePhase: Movable {
         Self&! self,
         source.SourceId source_id
     ) {
+        {
+            module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
+            builder.ensure_root_package();
+        }
+        Bool standard_ready = self.ensure_standard_package();
         module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
-        return builder.begin_module_graph_for_source(source_id);
+        module_graph.ModuleGraph^ graph! = builder.begin_module_graph_for_source(source_id);
+        if (!standard_ready) { graph.mark_error(); }
+        return graph;
+    }
+
+    #doc 隐式标准库先取得独立包身份；初始化自身时复用已登记的包，保留调用方的 root。
+    Bool ensure_standard_package(Self&! self) {
+        UInt8[]^ directory = cache_identity.absolute_path("src/std");
+        qid.SymbolId symbol = self.ctx.store.symbols.intern(directory[..]);
+        if (self.ctx.store.resolve.package_for_dir(symbol) != null) { return true; }
+        qid.PackageId? root = self.ctx.store.resolve.root_package;
+        _ standard = package_load.load(self.ctx, self.owner, directory[..]);
+        self.ctx.store.resolve.root_package = root;
+        return standard.ok;
     }
 
     public Void seal_module_graph(Self&! self, module_graph.ModuleGraph&! graph) {
@@ -841,6 +870,11 @@ struct ModuleResolvePhase: Movable {
                 return false;
             }
             self.refresh_import_aliases(module_id);
+            // 同一 resolver 可先求值配置再构建 root 图；已完成的模块不能重新登记声明。
+            if (self.module_state(module_id) == .resolved) {
+                index = index + 1;
+                continue;
+            }
             if (use_source) {
                 self.ctx.store.resolve.set_module_interface_only(module_id, false);
                 db.begin_source_observations(
@@ -3108,6 +3142,7 @@ struct ModuleResolvePhase: Movable {
             if (state == .declarations_ready
                 || state == .declarations_collected
                 || state == .interface_loaded
+                || state == .resolved
             ) {
                 index = index + 1;
                 continue;
@@ -3196,6 +3231,11 @@ struct ModuleResolvePhase: Movable {
         if (module_interface.source_hash != self.ctx.store.sources.content_hash(source_id)) {
             self.ctx.store.artifacts.record_interface_lookup(.stale);
             return false;
+        }
+        // 失败编译留下的内存接口尚不能证明 metadata 为空；没有完整来源时必须回源。
+        if (!self.ctx.query.metadata.module_ready(module_id)) {
+            guard self.ctx.store.artifacts.metadata_source(source_id) is .some(origin) else { return false; }
+            if (origin.section == null) { return false; }
         }
         return true;
     }

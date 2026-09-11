@@ -8,15 +8,13 @@ alias package_artifact = import "../artifact/package_artifact.jiang";
 alias package_fingerprint = import "../artifact/package_fingerprint.jiang";
 alias diagnostic_helper = import "../diagnostic/helper.jiang";
 alias driver_options = import "../driver/options.jiang";
-alias package_manifest = import "../source/package_manifest.jiang";
+alias package_load = import "../source/package_load.jiang";
+alias value = import "../sema/comptime/value.jiang";
 alias qid = import "../id.jiang";
-alias token = import "../syntax/token.jiang";
 alias hash = import "../support/hash.jiang";
-alias string = import "../support/string.jiang";
 alias system_target = import "../system/target.jiang";
 alias abi = import "./abi.jiang";
 alias registry = import "./registry.jiang";
-alias def = import "../resolve/def.jiang";
 alias store = import "../resolve/store.jiang";
 import std;
 
@@ -24,7 +22,7 @@ public struct BuildResult: Movable {
     // 本次发现的所有自定义语法 provider。
     public registry.Registry registry!;
 
-    // 依赖 manifest 读取或 provider 校验产生错误时为 false。
+    // 包信息或 provider 校验产生错误时为 false。
     public Bool ok!;
 
     public init(self, registry.Registry registry, Bool ok) {
@@ -40,251 +38,19 @@ public BuildResult build_for_source_path(
     UInt64 compiler_version_hash,
     driver_options.CompileMode mode
 ) {
-    // root source 可能位于普通目录，也可能位于 package 目录内部。
-    // 只有找到上层 package manifest 时，才需要收集 lang provider。
-    UInt8[]& package_dir = package_manifest.find_enclosing_dir(source_path);
-    if (package_dir.length == 0) {
-        return empty_result();
+    if (package_load.registered_for_path(ctx, source_path) is .some(package)) {
+        if (ctx.store.resolve.package_ref(package).configuration_info == null) { return empty_result(); }
+        return build_for_registered(ctx, package, artifact_cache_dir, compiler_version_hash, mode);
     }
-    Path normalized = std.path.normalize(package_dir);
-    return build_for_manifest_dir(ctx, normalized.bytes(), artifact_cache_dir, compiler_version_hash, mode);
-}
-
-public BuildResult build_for_manifest_dir(
-    context.CompilerContext&! ctx,
-    UInt8[]& package_dir,
-    UInt8[]& artifact_cache_dir,
-    UInt64 compiler_version_hash,
-    driver_options.CompileMode mode
-) {
-    // 从 package 目录读取 manifest，然后按 manifest.dependencies 构建注册表。
-    package_manifest.PackageManifest manifest = package_manifest.read(package_dir);
-    if (!manifest.ok) {
-        String message = string.concat("failed to read package manifest: ", package_dir);
-        add_registry_error(
-            ctx,
-            message.bytes(),
-            "package_manifest_error"
-        );
-        return BuildResult(registry.Registry(), false);
-    }
-    return build_for_manifest(ctx, package_dir, manifest$.ref(), artifact_cache_dir, compiler_version_hash, mode);
-}
-
-public BuildResult build_for_manifest(
-    context.CompilerContext&! ctx,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest,
-    UInt8[]& artifact_cache_dir,
-    UInt64 compiler_version_hash,
-    driver_options.CompileMode mode
-) {
-    // manifest 里的依赖别名就是 #sql/#html 这类自定义语法前缀的来源。
-    // 普通 Jiang import/name lookup 不参与 provider 定位。
-    registry.Registry providers! = registry.Registry();
-    Bool ok! = true;
-    Int index! = 0;
-    while (index < manifest.dependencies.len()) {
-        package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
-        Path joined = std.path.join(package_dir, dependency.path);
-        Path dependency_dir = std.path.normalize(joined.bytes());
-        Bool mapped! = false;
-        for mapping in manifest.lang_extensions.slice() {
-            if (mapping.name.length == 0) { continue; }
-            UInt8[]& package = if mapping.package.length != 0 { mapping.package } else { mapping.name };
-            if (!string.equal(package, dependency.name)) { continue; }
-            mapped = true;
-            if (!add_lang_dependency_dir(ctx, providers$.mut_ref(), mapping.name, mapping.extensions,
-                dependency_dir.bytes(), null, artifact_cache_dir, compiler_version_hash, mode)) { ok = false; }
-            if (providers.find_mut_ref(mapping.name) == null) {
-                add_registry_error(ctx, "lang alias requires a lang provider", "lang_extension_not_provider");
-                ok = false;
-            }
-        }
-        if (!mapped && !add_lang_dependency_dir(ctx, providers$.mut_ref(), dependency.name, "",
-            dependency_dir.bytes(), null, artifact_cache_dir, compiler_version_hash, mode)) { ok = false; }
-        index = index + 1;
-    }
-    if (!providers.extensions_unique()) {
-        add_registry_error(ctx, "conflicting lang source extensions", "lang_extension_conflict");
-        ok = false;
-    }
-    return BuildResult(providers, ok);
-}
-
-Bool add_lang_dependency_dir(
-    context.CompilerContext&! ctx,
-    registry.Registry&! providers,
-    UInt8[]& dependency_name,
-    UInt8[]& extensions_override,
-    UInt8[]& dependency_dir,
-    qid.PackageId? package_id,
-    UInt8[]& artifact_cache_dir,
-    UInt64 compiler_version_hash,
-    driver_options.CompileMode mode
-) {
-    // 非 lang 依赖也会记录下来，方便后续区分“依赖存在但不是 provider”
-    // 和“依赖别名完全不存在”。
-    package_manifest.PackageManifest manifest = package_manifest.read(dependency_dir);
-    if (!manifest.ok) {
-        String message = string.concat("failed to read lang dependency manifest: ", dependency_dir);
-        add_registry_error(
-            ctx,
-            message.bytes(),
-            "lang_dependency_manifest_error"
-        );
-        return false;
-    }
-    if (!string.equal(manifest.package_type, "lang")) {
-        if (extensions_override.length != 0) {
-            add_registry_error(ctx, "extension override requires a lang dependency", "lang_extension_not_provider");
-            return false;
-        }
-        providers.add_non_lang_dependency(dependency_name);
-        return true;
-    }
-    Int error_count = ctx.store.diagnostics.error_count;
-    UInt8[]^ dylib_path = provider_dylib_path(
-        ctx,
-        artifact_cache_dir,
-        dependency_dir,
-        manifest$.ref(),
-        compiler_version_hash,
-        mode
-    );
-    if (ctx.store.diagnostics.error_count != error_count) { return false; }
-    qid.PackageId id = ensure_lang_package_record(ctx, dependency_dir, manifest$.ref(), package_id);
-    store.PackageRecord&! package_record = ctx.store.resolve.package_mut_ref(id);
-    Path source_path = package_manifest.root_file_path(dependency_dir, manifest$.ref());
-    package_record.set_lang_info(store.LangPackageInfo(
-        ctx.store.symbols.intern(dylib_path[..]),
-        ctx.store.symbols.intern(source_path.bytes()),
-        abi.wrapper_version(),
-        true
-    ));
-    providers.add(dependency_name, id);
-    UInt8[]& configured = if (extensions_override.length != 0) {
-        extensions_override
-    } else { manifest.extensions_for("") };
-    if (configured.length != 0) {
-        registry.LangDependency&! provider = providers.find_mut_ref(dependency_name)$.some();
-        provider.extensions.clear();
-        _ parts = package_manifest.split_extensions(configured);
-        Int index! = 0;
-        while (index < parts.len()) {
-            provider.extensions.add(std.String.from_valid_utf8(parts.get(index)));
-            index = index + 1;
-        }
-    }
-    return true;
-}
-
-qid.PackageId ensure_lang_package_record(
-    context.CompilerContext&! ctx,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest,
-    qid.PackageId? existing
-) {
-    // lang package 可能已经由普通 package graph 创建过；这里复用已有记录，
-    // 只补充 provider 信息和 manifest dependencies。
-    if (existing is .some(id)) {
-        add_manifest_dependencies(ctx, id, package_dir, manifest);
-        return id;
-    }
-    qid.SymbolId dir_symbol = ctx.store.symbols.intern(package_dir);
-    if (ctx.store.resolve.package_for_dir(dir_symbol) is .some(id)) {
-        add_manifest_dependencies(ctx, id, package_dir, manifest);
-        return id;
-    }
-    qid.PackageId id = create_lang_package_record(ctx, package_dir, manifest);
-    add_manifest_dependencies(ctx, id, package_dir, manifest);
-    return id;
-}
-
-qid.PackageId create_lang_package_record(
-    context.CompilerContext&! ctx,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest
-) {
-    // provider 动态库构建仍需要把 lang package 放入 ResolveStore，
-    // 这样 wrapper/package artifact 可以复用统一的 package id 和 namespace。
-    token.Span span = token.Span();
-    qid.SymbolId package_symbol = ctx.store.symbols.intern(manifest.name);
-    qid.SymbolId dir_symbol = ctx.store.symbols.intern(package_dir);
-    Path root_path = package_manifest.root_file_path(package_dir, manifest);
-    qid.SymbolId root_symbol = ctx.store.symbols.intern(root_path.bytes());
-    qid.NamespaceId package_namespace = ctx.store.resolve.create_namespace(
-        .package_namespace,
-        null,
-        null,
-        null,
-        span
-    );
-    qid.DefId package_def = ctx.store.defs.create(
-        .package_def,
-        .namespace_name,
-        .public_visibility,
-        def.Name(symbol: package_symbol, span: span),
-        null,
-        null,
-        package_namespace,
-        package_namespace
-    );
-    ctx.store.model.declare_def(package_def, .package_decl);
-    return ctx.store.resolve.create_package(
-        package_def,
-        package_symbol,
-        dir_symbol,
-        root_symbol,
-        .lang,
-        package_namespace
-    );
-}
-
-Void add_manifest_dependencies(
-    context.CompilerContext&! ctx,
-    qid.PackageId package_id,
-    UInt8[]& package_dir,
-    package_manifest.PackageManifest& manifest
-) {
-    // 将 provider 自己的 dependencies 写回 package record，后续构建 wrapper
-    // 或分析 provider package 时可以继续沿用 package dependency graph。
-    Int index! = 0;
-    while (index < manifest.dependencies.len()) {
-        package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
-        qid.SymbolId alias_symbol = ctx.store.symbols.intern(dependency.name);
-        if (ctx.store.resolve.package_dependency(package_id, alias_symbol) == null) {
-            Path joined = std.path.join(package_dir, dependency.path);
-            Path dependency_dir = std.path.normalize(joined.bytes());
-            ctx.store.resolve.add_package_dependency(
-                package_id,
-                store.PackageDependencyRecord(
-                    alias_symbol: alias_symbol,
-                    path_symbol: ctx.store.symbols.intern(dependency_dir.bytes())
-                )
-            );
-        }
-        index = index + 1;
-    }
+    return empty_result();
 }
 
 BuildResult empty_result() {
     return BuildResult(registry.Registry(), true);
 }
 
-UInt8[]^ provider_dylib_path(
-    context.CompilerContext&! ctx,
-    UInt8[]& artifact_cache_dir,
-    UInt8[]& dependency_dir,
-    package_manifest.PackageManifest& manifest,
-    UInt64 compiler_version_hash,
-    driver_options.CompileMode mode
-) {
-    Path root_path = package_manifest.root_file_path(dependency_dir, manifest);
-    if (ctx.store.lang_build_active(root_path.bytes())) {
-        std.StringBuilder empty! = std.StringBuilder();
-        return empty.into_slice();
-    }
+UInt8[]^ provider_artifact_path(context.CompilerContext&! ctx, UInt8[]& artifact_cache_dir,
+    UInt64 package_hash, UInt64 compiler_version_hash, driver_options.CompileMode mode) {
     // provider dylib cache key 同时包含 provider package 指纹、编译器版本、
     // wrapper ABI 版本、目标平台和编译模式。
     system_target.TargetInfo host = system_target.host_target();
@@ -297,7 +63,7 @@ UInt8[]^ provider_dylib_path(
     compiler.write(toolchain.bytes());
     package_artifact.PackageArtifactKey key! = package_artifact.PackageArtifactKey(
         .lang_provider_dynamic_library,
-        package_fingerprint.from_manifest(ctx, dependency_dir, manifest),
+        package_hash,
         compiler.finish(),
         UInt64(abi.wrapper_version()),
         target_key.bytes(),
@@ -335,14 +101,106 @@ public Bool dependency_exists(context.CompilerContext&! ctx, qid.PackageId packa
 }
 
 Bool dependency_record_is_lang(context.CompilerContext&! ctx, store.PackageDependencyRecord dependency) {
-    UInt8[]& dependency_dir = ctx.store.symbols.text(dependency.path_symbol);
-    package_manifest.PackageManifest manifest = package_manifest.read(dependency_dir);
-    if (!manifest.ok) {
-        return false;
-    }
-    return string.equal(manifest.package_type, "lang");
+    guard ctx.store.resolve.package_for_dir(dependency.path_symbol) is .some(package) else { return false; }
+    return ctx.store.resolve.package_ref(package).kind == .lang;
 }
 
 Void add_registry_error(context.CompilerContext&! ctx, UInt8[]& message, UInt8[]& code) {
     diagnostic_helper.add_package_error(ctx.store.diagnostics$.mut_ref(), message, code);
+}
+
+#doc 从已求值配置合并直接依赖和语言别名；Provider 构建仍复用现有动态库缓存。
+BuildResult build_for_registered(context.CompilerContext&! ctx, qid.PackageId package,
+    UInt8[]& cache, UInt64 version, driver_options.CompileMode mode) {
+    registry.Registry providers! = registry.Registry();
+    _ definition = ctx.store.resolve.package_ref(package).configuration_info$.some();
+    _ info = ctx.store.comptime_store.const_value(definition)$.some();
+    _ languages = package_load.field(ctx, info, "lang")$.some();
+    guard languages.data is .array_value(mappings) else { return BuildResult(providers, false); }
+    Int index! = 0;
+    while (index < ctx.store.resolve.package_ref(package).dependencies.len()) {
+        _ dependency = ctx.store.resolve.package_ref(package).dependencies.get(index);
+        _ target = ctx.store.resolve.package_for_dir(dependency.path_symbol)$.some();
+        Bool mapped! = false;
+        Int mapping_index! = 0;
+        while (mapping_index < ctx.store.comptime_store.item_count(mappings)) {
+            _ mapping = ctx.store.comptime_store.item_at(mappings, mapping_index);
+            mapping_index = mapping_index + 1;
+            _ name = package_load.string_field(ctx, mapping, "name")$.some();
+            _ source = package_load.string_field(ctx, mapping, "package")$.some();
+            if (ctx.store.symbols.text(name).length == 0) { continue; }
+            _ alias_symbol = if ctx.store.symbols.text(source).length > 0 { source } else { name };
+            if (alias_symbol != dependency.alias_symbol) { continue; }
+            mapped = true;
+            if (!add_registered(ctx, providers$.mut_ref(), target, name, mapping, cache, version, mode)) {
+                return BuildResult(providers, false);
+            }
+        }
+        if (!mapped && !add_registered(ctx, providers$.mut_ref(), target, dependency.alias_symbol,
+            null, cache, version, mode)) { return BuildResult(providers, false); }
+        index = index + 1;
+    }
+    if (!providers.extensions_unique()) {
+        add_registry_error(ctx, "conflicting lang source extensions", "lang_extension_conflict");
+        return BuildResult(providers, false);
+    }
+    return BuildResult(providers, true);
+}
+
+Bool add_registered(context.CompilerContext&! ctx, registry.Registry&! providers,
+    qid.PackageId package, qid.SymbolId name, value.ComptimeValue? mapping,
+    UInt8[]& cache, UInt64 version, driver_options.CompileMode mode) {
+    if (ctx.store.resolve.package_ref(package).kind != .lang) {
+        providers.add_non_lang_dependency(ctx.store.symbols.text(name));
+        return true;
+    }
+    if (providers.find(ctx.store.symbols.text(name)) != null) {
+        add_registry_error(ctx, "conflicting lang aliases", "lang_alias_conflict");
+        return false;
+    }
+    _ root = ctx.store.resolve.package_ref(package).root_path;
+    std.String dylib! = "";
+    if (!ctx.store.lang_build_active(ctx.store.symbols.text(root))) {
+        Int errors = ctx.store.diagnostics.error_count;
+        UInt64 package_hash = package_fingerprint.from_registered(ctx, package);
+        if (ctx.store.diagnostics.error_count != errors) { return false; }
+        UInt8[]^ path = provider_artifact_path(ctx, cache, package_hash, version, mode);
+        dylib = std.String.from_valid_utf8(path[..]);
+    }
+    _ path = ctx.store.symbols.intern(dylib.bytes());
+    ctx.store.resolve.package_mut_ref(package).set_lang_info(
+        store.LangPackageInfo(path, root, abi.wrapper_version(), true));
+    providers.add(ctx.store.symbols.text(name), package);
+    registry.LangDependency&! provider = providers.find_mut_ref(ctx.store.symbols.text(name))$.some();
+    if (mapping is .some(override_mapping) && append_extensions(ctx, provider, override_mapping)) { return true; }
+    _ definition = ctx.store.resolve.package_ref(package).configuration_info$.some();
+    _ info = ctx.store.comptime_store.const_value(definition)$.some();
+    _ languages = package_load.field(ctx, info, "lang")$.some();
+    guard languages.data is .array_value(mappings) else { return false; }
+    Int index! = 0;
+    while (index < ctx.store.comptime_store.item_count(mappings)) {
+        _ own = ctx.store.comptime_store.item_at(mappings, index);
+        _ own_name = package_load.string_field(ctx, own, "name")$.some();
+        if (ctx.store.symbols.text(own_name).length == 0) {
+            append_extensions(ctx, provider, own);
+            break;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool append_extensions(context.CompilerContext& ctx, registry.LangDependency&! provider, value.ComptimeValue mapping) {
+    _ extensions = package_load.field(ctx, mapping, "extensions")$.some();
+    guard extensions.data is .array_value(items) else { return false; }
+    if (ctx.store.comptime_store.item_count(items) == 0) { return false; }
+    provider.extensions.clear();
+    Int index! = 0;
+    while (index < ctx.store.comptime_store.item_count(items)) {
+        _ item = ctx.store.comptime_store.item_at(items, index);
+        guard item.data is .string_value(text) else { return false; }
+        provider.extensions.add(std.String.from_valid_utf8(ctx.store.symbols.text(text)));
+        index = index + 1;
+    }
+    return true;
 }

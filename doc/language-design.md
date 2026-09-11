@@ -83,21 +83,25 @@ User user = #sql {
 };
 ```
 
-`#sql` 中的 `sql` 不是普通名字，也不通过 `import` / resolve 查找。它只来自当前 package
-manifest 的 dependency alias：
+`#sql` 中的 `sql` 不是普通名字，也不通过 `import` / resolve 查找。它来自当前包配置的语言别名；
+未单独配置 `lang` 别名时，默认使用 Lang 依赖别名：
 
-```ini
-[dependencies]
-sql = ../sql-lang
+```jiang
+#package {
+    name = "app";
+    root = "main.jiang";
+    dependencies { sql = "../sql-lang"; }
+}
 ```
 
 被调用 dependency 必须声明为 lang package：
 
-```ini
-[package]
-name = sql-lang
-root = lang.jiang
-type = lang
+```jiang
+#package {
+    name = "sql_lang";
+    root = "lang.jiang";
+    type = .lang;
+}
 ```
 
 lang package root 用 `@entry(lang)` 标记一个可无参数构造、满足 `std.jiang.syntax.Provider` 的具体类型。
@@ -121,8 +125,9 @@ line/block header）：
   和可选尾表达式，遵循普通 comptime 的词法作用域与求值规则；条件使用普通 `if_expression()` 组合，
   不提供向外发布分支声明的专用 comptime-if 机制。
 
-独立 Lang 文件采用普通文件 import，也可直接作为生成输入。Provider 在 `[lang] extensions` 声明
-扩展名，使用方通过 `[lang.<依赖别名>] extensions` 整组覆盖，未配置时默认使用依赖别名。
+独立 Lang 文件采用普通文件 import，也可直接作为生成输入。Provider 在 `#package` 中用
+`lang { extensions = ["schema", "sch"]; }` 声明自身扩展名；使用方通过
+`lang sql { package = sql; extensions = ["model"]; }` 整组覆盖。两边均未配置时默认使用语言别名。
 映射只作用于文件所属包，`.jiang` 保留原生语法；无映射或映射冲突均报错，不猜测解析语言。
 文件 invocation 的 `Input.delimiter` 为 `.none`，`body_start` 为 0，扫描范围必须覆盖整个文件，
 结果必须是声明或声明集合。源码身份及位置保持原文件，不生成带有虚构前缀的包装源码。
@@ -762,7 +767,7 @@ alias dep = import "foo/bar.jiang";
 ```
 
 `import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它会优先按当前 package
-manifest 的 `[dependencies]` alias 解析到依赖 package root；未命中 dependency 时，再按当前
+配置的 `dependencies` alias 解析到依赖 package root；未命中 dependency 时，再按当前
 编译上下文中已登记的 module/package 名称解析。
 
 `alias dep = import "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
@@ -799,40 +804,78 @@ namespace validation 会枚举直接目标的 public binding，使未引用的�
 namespace skeleton，并由 import 状态截断，不复制或递归展开 wildcard alias。
 
 file import 只允许引用当前 package 内的 source file。跨 package 源码依赖必须通过
-`[dependencies]` 和 `import dep;` 进入；直接用字符串路径导入另一个 package 的 source 会报错。
+`dependencies` 和 `import dep;` 进入；直接用字符串路径导入另一个 package 的 source 会报错。
+
+### 包信息声明
+
+内置 `#package { ... }`（也可写作 `#jiang.package`）生成公开的 `info` 常量，类型为
+`std.jiang.PackageInfo`。它使用普通构造表达式、类型检查和编译期求值，不定义每包独有的 struct。
+
+```jiang
+#package {
+    name = "app";
+    version = "0.5.5";
+    type = .bin;
+    root = "src/main.jiang";
+    dependencies {
+        tools = "../tools";
+    }
+    lang schema {
+        package = tools;
+        extensions = ["schema", "model"];
+    }
+    generate docs {
+        module = "src/docs.jiang";
+    }
+}
+```
+
+普通字段值使用 Jiang 表达式；依赖名和 `package = tools` 中的 `tools` 是配置别名，后者不执行
+模块导入。扩展名使用字符串表达式列表。无别名的 `lang { extensions = [...] ; }` 描述 Provider
+自身的扩展名。`type` 使用 `.lib`、`.bin` 或 `.lang`，默认 `.lib`；未填写的文本和列表为空。
+
+`.lang` 依赖默认以依赖别名注册；Provider 未声明扩展名时使用该别名作为扩展名。宿主可用
+`lang <name> { package = <dependency>; }` 指定语言别名，非空 `extensions` 列表覆盖 Provider 的
+声明。扩展名须符合标识符规则，不得重复或使用保留的 `jiang`；合并后的映射也不能相互冲突。
+
+`generate <name>` 必须指定 `package` 或 `module` 其中之一；前者引用已声明的依赖，后者为本包
+内部相对文件路径。包加载阶段校验来源和重复名称，只有被选择的生成器源码才加入编译图。
+`--name` 选择对应入口，生成器接收的反射输入仍为本包 root；不指定名称时使用 root 自身的入口。
+
+把声明放在 `package.jiang` 后，其他源码可用 `import "../package.jiang";` 导入，再通过
+`package.info.version` 读取版本，或把 `package.info` 整体传给接受 `std.jiang.PackageInfo` 的函数。
+不提供默认导出或隐式的包信息全局绑定；`info` 与用户同名声明冲突时遵循普通重名诊断。
+生成的数组使用私有常量提供只读存储，不进入公开导出面。
+
+包信息初始化可使用基础类型、标准库及本包独立 helper；不能直接或间接导入正在声明的 root，
+也不能先把依赖源码当成本包 helper 加载、再把它登记为另一个包。root 必须是本包内部文件。
+依赖和 Provider 在包信息求值后准备，生成任务不会参与配置初始化。
+标准库自身的包入口也使用这套流程；内置 `std` 入口预先提供 `PackageInfo`，允许在配置阶段加载，
+不依赖标准库的包信息完成登记。这个基础入口不受上述 root 限制，实际常量循环仍按普通语义报错。
 
 ### Package
 
-目标语言支持把目录作为 package 入口。目录入口使用固定文件名 `package.ini` 描述 package：
+目录或依赖路径显式加载固定入口 `package.jiang`。`#package` 展开为普通 `PackageInfo`
+常量，求值后登记依赖、选择 root，再构建源码模块图；不通过向上搜索配置来自动发现子包。
 
-```ini
-[package]
-name = frontend
-root = src/main.jiang
-
-[dependencies]
-util = ../util_pkg
+```jiang
+#package {
+    name = "frontend";
+    root = "src/main.jiang";
+    dependencies {
+        util = "../util_pkg";
+    }
+}
 ```
 
-当前 manifest 只固定这些字段：
+`PackageInfo` 的字符串字段默认留空，包种类默认 `.lib`，配置列表默认为空。
+加载时，空 name 使用配置所在目录名，空 root 使用 `<有效包名>.jiang`；这两个加载默认值
+不回写普通常量。空 version 表示未指定，非空版本只允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
+有效包名及依赖别名复用 Jiang lexer 的标识符规则，包括其 Unicode 标识符规则。
 
-- `[package].name`：package 名称。未写时默认取 package 目录名。
-- `[package].root`：package 入口源文件。未写时默认取 `<name>.jiang`。
-- `[dependencies]`：本地依赖表，key 是依赖 package alias，value 是依赖 package 路径。
-
-manifest 中的 `name` 和 dependency key 使用 Jiang lexer 的 identifier 规则，而不是 ASCII-only
-正则：ASCII 字母或 `_` 可作为首字符，ASCII 数字可作为后续字符，UTF-8 标识符字符也可作为
-首字符和后续字符；具体 UTF-8 判定复用 lexer 的 Unicode `XID_Start` / `XID_Continue` 规则。
-manifest 必须复用 lexer 语义，不能另起一套名字规则。
-
-当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
-manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向上查找 `package.ini`，
-创建或复用对应 package，并登记 `[dependencies]`。依赖 package 内部继续按自己的 manifest
-解析相对 dependency path，因此 `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
-
-package dependency cycle 不允许；module import cycle 允许。也就是说，同一 package 内的
-source file 可以形成 import cycle，resolve 会用 visited set 截断递归；不同 package 之间通过
-manifest dependency 形成闭环时必须诊断。
+依赖路径相对声明它的包目录解释，递归加载后进入同一编译闭包。包依赖环必须诊断；
+同一包内的模块导入环仍允许。已登记的包形成源码边界，跨包通过依赖别名导入 root，
+不能使用相对源码路径绕过边界。普通导入与包初始化复用配置模块、声明和常量结果。
 
 package 对外导出面固定为 root file 的 public namespace：
 
@@ -960,7 +1003,7 @@ Lang factory 的 `declaration_meta(span, expr)` 返回附着到后续声明的 a
 ### 生成器来源
 
 `jiang generate` 默认执行输入包 root 的 `@entry(generate)`；没有入口时报错，不自动选择第三方工具。
-`[dependencies]` 统一注册包；`[lang.<name>] package` 和 `[generate.<name>] package` 引用依赖别名。
+`#package` 的 `dependencies` 块统一注册包；`lang <name>` 和 `generate <name>` 的 `package` 字段引用依赖别名。
 命名生成器也可用 `module` 指定本包内部文件，与 `package` 互斥。每个所选 root 只允许一个生成入口。
 `--name` 选择别名，输入始终是本包 root；不提供 `--generator` 路径覆盖或任务输入 root 覆盖。
 Lang 别名可复用同包的生成入口，显式同名 generate 配置优先；普通 build/check 不执行生成器。

@@ -19,13 +19,18 @@ resolver.lower_module_graph_to_model(graph$.ref())
 ```
 
 `pipeline.compile(ctx, options)` 是当前 source/syntax/resolve 的路径入口：
-如果 `input_path` 可直接读取为文件，就按单文件 root 编译；否则按 package 目录处理，
-读取 `input_path/package.ini`，再编译 manifest 指定的 root source。
+目录入口显式加载 `input_path/package.jiang`，通过普通语义检查与编译期求值得到
+`PackageInfo`，登记依赖后再编译其 root。文件入口以该文件为 root，不自动发现上层原生包。
+包目录必须包含 `package.jiang`，旧 INI 不再参与加载。
+
+建立模块图前，隐式标准库通过同一配置求值流程取得独立包身份，不改变调用方的 root。
+core 与私有 system 模块使用稳定的内部包身份；它们不归入用户包，也不注册为用户依赖别名。
 
 ## Module Graph
 
-module graph 只描述 root 可达 module 的 import closure。它不替代 namespace，也不保存
-declaration/reference 的解析结果。
+module graph 包含 root 的 import closure，以及已加载包的配置模块及其求值依赖。配置阶段
+已完成的模块身份、声明与常量在最终图中复用；图不替代 namespace，也不保存 declaration/reference
+的解析结果。
 
 ```text
 build_module_graph(root_unit)
@@ -40,13 +45,13 @@ build_module_graph(root_unit)
 
 `ModuleGraph.package_id` 只记录入口 root package。`ModuleGraph.modules` 可以包含多个
 package 的 module；后续 Semantic Model、type check、JIL、layout、borrow check 和 backend
-都消费同一张 root import closure。
+都消费同一张包含 root 与配置依赖的模块图。
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
 
-- 如果 `source_modules` 中没有这个 `SourceId`，先根据 source 文件路径向上查找
-  `package.ini`。找到 manifest 时创建或复用对应 package owner；找不到 manifest 或
-  source 是 virtual/buffer 时，复用默认 root package。
+- 如果 `source_modules` 中没有这个 `SourceId`，根据已登记包目录确定 package owner；
+  已显式加载的包形成独立源码边界，不扫描目录中的配置文件来发现子包。
+  没有匹配包或 source 是 virtual/buffer 时，使用相应的默认 root package。
 - `PackageId` 表示 package owner，`ModuleId` 表示单个 source file module，`SourceId`
   表示输入源文件或虚拟文本。
 - 一个 package 可以拥有多个 module，一个 source 当前对应一个 module。
@@ -104,10 +109,11 @@ resolved Semantic Model。
 每个 import 使用 `unresolved/resolving/resolved/failed` 状态，并由
 `ensure_import_target(module, import_index)` 独立推进：
 
-- 对普通 `import dep`，优先在当前 package 的 `[dependencies]` 中查找 `dep`。
-- 命中 dependency 时读取依赖 package 的 manifest root 文件。
-- dependency package 内部继续按它自己的 `package.ini` 解析 `[dependencies]`，因此
-  `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
+- 对普通 `import dep`，优先在当前包已登记的 `dependencies` 中查找 `dep`。
+- 命中依赖时加载对应 PackageRecord 的 root；包信息已在配置阶段求值，不重复解释配置。
+- 每个依赖包使用自己的依赖别名，`app -> util -> base` 进入同一编译 closure。声明依赖环
+  在递归包加载时诊断；跨包导入须经过依赖别名，不能用相对路径绕过包边界。
+- Provider 生成的 `provider_import` 复用调用记录中的包身份及已登记 root。
 - 未命中 dependency 时，再按已登记 virtual/module 名称查 `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。
 - 如果目标 source 的 `AstUnit` 已经登记到 resolver 的 active AST map，会递归推进目标 module pass。
@@ -118,7 +124,7 @@ resolved Semantic Model。
   private 同名声明不能遮住其他 public re-export；不为目标 declaration 批量创建 alias `DefId`。
 - 对 string/file import，当前取字符串字面量的 symbol 文本，
   按当前源文件目录解析显式文件路径。
-- file import 只能跨当前 package 内部 source。跨 package 必须使用 manifest dependency
+- file import 只能跨当前 package 内部 source。跨 package 必须使用 已声明的 dependency
   alias；如果 string import 解析到另一个 package，会报 `cross_package_file_import`。
 
 module import cycle 允许。package dependency cycle 不允许：ModuleGraph 构建完成后会从
@@ -229,7 +235,6 @@ function 和 JIL arena 用量。峰值 RSS 使用平台 `/usr/bin/time -l`（mac
 
 ## 待完成
 
-- package manifest 诊断还比较粗，只记录错误文本，没有 `package.ini` 的精确行列 span。
 - reset 后旧 namespace/def 的回收或版本化。
 - 跨轮复用 session-local semantic/query facts 仍需要版本化与精确 invalidation；持久 artifact identity
   已使用 `StableSymbolId`，不能把 `DefId` 直接写入缓存。

@@ -5,7 +5,7 @@ trap 'case $- in *e*) echo "backend CLI smoke failed at line $LINENO" >&2 ;; esa
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_backend_cli"
-PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+PACKAGE_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([A-Za-z0-9._+-]+)"[[:space:]]*;[[:space:]]*$/\1/p' "$ROOT_DIR/package.jiang" | head -n 1)"
 EXPECTED_COMPILER_VERSION="${EXPECTED_COMPILER_VERSION:-$PACKAGE_VERSION}"
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
