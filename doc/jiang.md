@@ -3125,6 +3125,14 @@ struct SqlProvider: std.jiang.syntax.Provider {
 实例中，并在 `parse` 中移入 `Parser<CustomKind>`。`SyntaxContext` 由 compiler 传入，只能在当前
 调用期间借用，不能长期保存。
 
+默认 `TokenKind` 用 `single_quoted(SymbolId)`／`double_quoted(SymbolId)` 区分引号形式。
+从 0.5.4 迁移自定义语言时，将 token 匹配中的 `char_lit`／`string_lit` 替换为这两个名字；
+AST 的字符／字符串类别及 builder 的 `char_literal`／`string_literal` 不改名。
+单引号 token 可以包含多个字符或空内容，具体语义由消费它的语言决定；默认扫描仍检查转义与闭合。
+SymbolId 对应解码后的内容，原始引号和转义可通过 token 的 span 对应源码读取。
+Jiang 字符字面量要求解码后恰好一个 Unicode 标量：`'中'` 合法，`''` 和 `'abc'` 报诊断。
+该校验也适用于字符 sentinel 与 builder 创建的字符字面量；不将多个标量静默截断为首字符。
+
 默认 parser 遇到 RawBlock 时，可调用 `parser.parse_raw_block()` 展开，再用 `result.role()`
 判断类别，或通过 `result.as_attribute()`、`result.as_decl()`、`result.as_member()` 等方法取出节点。
 展开失败返回 null 并保留诊断：当前位置不是 RawBlock 时不消费 token，RawBlock 展开失败时该 token 已消费。

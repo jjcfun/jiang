@@ -203,7 +203,10 @@ SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态
 - bool literal: `true` / `false`
 - null literal: `null`
 
-字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
+字符字面量在转义解码后必须恰好包含一个 Unicode 标量；空内容、多标量或无效 UTF-8 报诊断。
+例如 `'中'`、`'😀'` 合法，`''`、`'abc'`、`'e\u{301}'` 不合法。
+原生字符表达式、字符 sentinel 与公共 AST builder 共用这项校验，字符和字符串之间不隐式转换。
+`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
 字符串字面量是 UTF-8 字节序列。字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8*` 或 `UInt8[N:0]`。
 

@@ -5,21 +5,17 @@
 
 ## 常规开发
 
-当前 0.5.5 在独立功能分支开发，使用并排 `bootstrap/0.5.5` worktree 的固定阶段。
-阶段源码提交为 `b56c5d4905002ef2255d3d644f00b6f4da4d50b8`，保留旧配置加载入口，
-加入编译新源码必需的包声明与常量物化能力，并同时接受 `foo(a: 123)` 和 `foo(a = 123)`。
-bootstrap 自身源码保留冒号，feat 分支直接迁移为只接受等号；不需要第二个 bootstrap 阶段。
+0.5.5 的当前固定 bootstrap 源码为 `fb264686f5b35374aa7d979a732784a312c38e2f`，
+保留在并排 `bootstrap/0.5.5` worktree。该阶段由已安装的 0.5.4 stable 直接生成 next：
+`build/provider-defaults-demand/bin/jiangc.next`。
 
-该固定提交由 0.5.4 stable 编译出 bootstrap next，通过相关回归后直接作为 feat 的种子；
-无需生成 bootstrap stable。feat 自身完成 `next -> stable`。
-身份与验证记录位于阶段的 `build/named-arguments/identity.json`；该独立目录保留旧阶段产物。
+这一个阶段包含原生包交接、冒号／等号命名实参兼容，以及 Provider 所需的关联类型和默认方法支持。
+阶段内历史提交及验证记录保留在版本 TODO；后续功能始终使用上述固定 next，
+不把临时开发或性能测量产物串联为种子。bootstrap 只需生成 next，正式源码完成 `next -> stable`。
+公共 parser 组合与 single_quoted／double_quoted token 命名迁移均可由该固定种子直接编译。
 
-Provider 上下文重构进一步要求 trait 方法签名能替换泛型容器内部的关联类型。
-同一 bootstrap worktree 的 `fb606a4c8898874675b130d615081e000a788d79` 加入这项必要修复，
-仍由固定 0.5.4 stable 生成 next，产物位于 `build/lang-context/bin/jiangc.next`。
-此后的语言上下文分支直接使用该 next，自举仍只有一个 bootstrap 阶段。
-默认空上下文进一步需要关联类型默认值及默认静态方法的按需签名和实例化支持；
-同一阶段更新为 `fb264686`，由 0.5.4 stable 生成的 next 位于 `build/provider-defaults-demand/bin/jiangc.next`。
+开发期间保留功能分支；功能冻结后再建立 release 分支，bootstrap 改动仅在自己的分支提交。
+每轮使用独立 BUILD_DIR，构建期间保持源码不变，并记录源码、种子和工具链身份。
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
@@ -30,7 +26,7 @@ bash ./script/build_next.sh
 ```
 
 脚本默认版本仍为 0.5.4，适用于该版本开始开发时；原生配置迁移后须显式指定上述固定阶段。
-开发保留在功能分支，bootstrap 改动仅在自己的分支提交。
+
 
 bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
 清理该目录；current compiler 使用独立的
@@ -40,7 +36,6 @@ bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 
 提交功能前优先运行相关语言测试。需要检查完整语言测试时：
 
 ```bash
-VERIFY=none bash ./script/build_next.sh
 JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 ```
 
@@ -49,10 +44,22 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
 BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/provider-defaults-demand/bin/jiangc.next \
+COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
 ```
+
+## 0.5.5 发布收尾
+
+发布说明与迁移入口见 [0.5.5 release notes](releases/0.5.5.md)。最终源码冻结后，
+严格自举和全量回归必须使用同一源码及生成的 stable；不能把较早提交的全量结果当作最终发布验收。
+小改动在开发期间只做聚焦回归，最终门禁集中执行。
+
+发布前核对命名实参／options、package.ini → package.jiang、Provider 上下文、Attribute 与
+引号 token 名称的迁移。macOS arm64 与 Linux x86_64 分别验证自举、平台测试、打包与隔离安装，
+检查版本、归档及校验和，并编译运行随包示例。详细待办与实际结果记录在版本 TODO。
+文档的“待发布”状态、安装版本和下载链接在正式产物可用后统一更新。
 
 ## 破坏性升级
 

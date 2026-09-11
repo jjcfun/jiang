@@ -12,6 +12,8 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 [官网与语言文档](https://jiang-lang.org/)
 
+当前源码为 **0.5.5（准备发布）**，主要变更和迁移事项见 [0.5.5 release notes](doc/releases/0.5.5.md)。
+
 ## 安装发行版
 
 Jiang 0.5.4 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
@@ -217,9 +219,10 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
-- [Jiang 0.5.4 release notes](doc/releases/0.5.4.md)（当前源码版本）
+- [Jiang 0.5.5 release notes](doc/releases/0.5.5.md)（待发布）
+- [Jiang 0.5.4 release notes](doc/releases/0.5.4.md)（已发布）
 - [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)
-- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)（上一版本）
+- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)
 - [架构文档](doc/architecture.md)
 - [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)
