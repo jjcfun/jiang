@@ -9,7 +9,8 @@
 - 共享 `std.jiang.PackageInfo` 值类型和私有数组／只读切片存储。
 - 只读结构体切片的编译期值导入、导出及 JIL 静态物化。
 - 标准库 builtin 声明按源码位置识别，移除 INI 后不依赖清单中的 `std` 包名。
-- 对应声明、普通导入、字段／整体读取和切片回归。
+- 命名实参同时接受 `foo(a: 123)` 和 `foo(a = 123)`；工程源码仍保留旧语法。
+- 对应声明、普通导入、字段／整体读取、切片和命名实参回归。
 
 此阶段保留 INI 包加载，不包含正式版本的目录入口、依赖、Lang、generate 或缓存迁移。
 版本标识为 `0.5.5-bootstrap`。不得用未固定的开发产物替代本阶段。
@@ -19,16 +20,16 @@
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.4 \
 BOOTSTRAP_BIN=/Users/jjc/.jiang/versions/0.5.4/bin/jiangc \
-BUILD_DIR="$PWD/build/strict" COMPILER_BUILD_MODE=release \
+BUILD_DIR="$PWD/build/named-arguments" COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=none bash script/build_next.sh
 
-JIANGC=./build/strict/bin/jiangc.next TEST_ROOT=test/lang \
-TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang' bash script/test.sh
+JIANGC=./build/named-arguments/bin/jiangc.next TEST_ROOT=test/lang \
+TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang|named_argument|default_parameter' bash script/test.sh
 
-JIANGC=./build/strict/bin/jiangc TEST_ROOT=test/lang \
-TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang' bash script/test.sh
+JIANGC=./build/named-arguments/bin/jiangc TEST_ROOT=test/lang \
+TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang|named_argument|default_parameter' bash script/test.sh
 
-JIANGC=./build/strict/bin/jiangc TEST_ROOT=test/compiler \
+JIANGC=./build/named-arguments/bin/jiangc TEST_ROOT=test/compiler \
 TEST_FILTER='syntax/run/syntax.jiang' bash script/test.sh
 ```
 
