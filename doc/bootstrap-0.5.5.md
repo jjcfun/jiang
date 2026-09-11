@@ -15,24 +15,24 @@
 此阶段保留 INI 包加载，不包含正式版本的目录入口、依赖、Lang、generate 或缓存迁移。
 版本标识为 `0.5.5-bootstrap`。不得用未固定的开发产物替代本阶段。
 
-固定源码提交后，在此 worktree 内执行：
+兼容实现固定于提交 `b56c5d4905002ef2255d3d644f00b6f4da4d50b8`。
+bootstrap 只需由 0.5.4 stable 生成 next；feat 直接使用该 next 作种子。
+
+固定实现提交后，在此 worktree 内执行：
 
 ```bash
 BOOTSTRAP_RELEASE_VERSION=0.5.4 \
 BOOTSTRAP_BIN=/Users/jjc/.jiang/versions/0.5.4/bin/jiangc \
 BUILD_DIR="$PWD/build/named-arguments" COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=stable VERIFY=none bash script/build_next.sh
+BOOTSTRAP_DEPTH=next VERIFY=none bash script/build_next.sh
 
 JIANGC=./build/named-arguments/bin/jiangc.next TEST_ROOT=test/lang \
 TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang|named_argument|default_parameter' bash script/test.sh
 
-JIANGC=./build/named-arguments/bin/jiangc TEST_ROOT=test/lang \
-TEST_FILTER='package/.*package_info|constant/run/global_const_struct_slice.jiang|named_argument|default_parameter' bash script/test.sh
-
-JIANGC=./build/named-arguments/bin/jiangc TEST_ROOT=test/compiler \
+JIANGC=./build/named-arguments/bin/jiangc.next TEST_ROOT=test/compiler \
 TEST_FILTER='syntax/run/syntax.jiang' bash script/test.sh
 ```
 
-`BOOTSTRAP_DEPTH=stable` 使 0.5.4 先编译本阶段 next，再由 next 严格编译同一阶段源码。
-`VERIFY=none` 只分离脚本测试执行，不关闭语义检查。测试及严格自举通过前，不用于正式迁移。
-保留源码 commit、种子和工具链身份、两个产物哈希及测试日志；构建期间不得修改源码。
+`BOOTSTRAP_DEPTH=next` 只生成 bootstrap next，不要求 bootstrap 自身再生成 stable。
+`VERIFY=none` 只分离脚本测试执行，不关闭语义检查。next 和相关回归通过后，用于 feat 的
+`next -> stable`。保留实现 commit、种子和工具链身份、next 产物哈希及测试日志；构建期间不修改源码。
