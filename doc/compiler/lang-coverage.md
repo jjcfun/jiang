@@ -80,3 +80,9 @@
 标注统一称为 `Attribute`：公共 builder 使用 `Attribute`／`with_attributes`，
 内部 AST 使用 `attributes`，parser 使用 `parse_attributes`。声明修饰符仍称 Modifier，
 函数／代码块效果仍称 Effect；显式类型标注（type annotation）是不同概念。
+
+`std.jiang.syntax.intern(context, text)`、`Parser.intern` 和 `Tokenizer.intern` 复用默认 lexer
+的符号表。provider 在每次调用内驻留局部关键字，再用 `is_keyword`／`at_keyword`／
+`match_keyword`／`expect_keyword` 比较 SymbolId；转义标识符和 literal 不作为关键字。
+SymbolId 只在同一宿主符号表内有效，不能跨编译器进程或独立符号表持久缓存。
+`#package` 与 `#asm` 使用该机制；`#doc` 的原始 Markdown 边界扫描不需要 token 化。
