@@ -87,6 +87,7 @@ mkdir -p "$VERSION_DIR" "$PREFIX/bin"
 rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
 cp "$ROOT_DIR/package.jiang" "$VERSION_DIR/package.jiang"
+cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE" "$VERSION_DIR/"
 cp "$ROOT_DIR/package.jiang" "$PREFIX/package.jiang"
 chmod +x "$VERSION_DIR/bin/jiang"
 ln -sfn "../versions/$VERSION/bin/jiang" "$PREFIX/bin/jiang"
@@ -125,6 +126,8 @@ PREFIX=/usr/local ./install.sh
 \`\`\`
 
 Build-time LLVM: $llvm_version
+
+Licensed under the Apache License, Version 2.0. See LICENSE and NOTICE.
 README
 }
 
@@ -174,6 +177,7 @@ cp "$JIANGC_BIN.build-id" "$PACKAGE_DIR/bin/jiang.build-id"
 ln -s "jiang" "$PACKAGE_DIR/bin/jiangc"
 ln -s "jiang.build-id" "$PACKAGE_DIR/bin/jiangc.build-id"
 cp "$ROOT_DIR/package.jiang" "$PACKAGE_DIR/package.jiang"
+cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE" "$PACKAGE_DIR/"
 cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
 chmod +x "$PACKAGE_DIR/bin/jiang" "$PACKAGE_DIR/script/install_llvm.sh"
 

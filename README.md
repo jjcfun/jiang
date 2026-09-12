@@ -238,4 +238,6 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 
 ## License
 
-Apache License 2.0。详见 [LICENSE](./LICENSE)。
+Copyright 2026 JiangJunChen。
+
+采用 Apache License 2.0。详见 [LICENSE](./LICENSE) 和 [NOTICE](./NOTICE)。
