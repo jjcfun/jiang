@@ -5,28 +5,18 @@
 
 ## 常规开发
 
-0.5.5 的当前固定 bootstrap 源码为 `fb264686f5b35374aa7d979a732784a312c38e2f`，
-保留在并排 `bootstrap/0.5.5` worktree。该阶段由已安装的 0.5.4 stable 直接生成 next：
-`build/provider-defaults-demand/bin/jiangc.next`。
-
-这一个阶段包含原生包交接、冒号／等号命名实参兼容，以及 Provider 所需的关联类型和默认方法支持。
-阶段内历史提交及验证记录保留在版本 TODO；后续功能始终使用上述固定 next，
-不把临时开发或性能测量产物串联为种子。bootstrap 只需生成 next，正式源码完成 `next -> stable`。
-公共 parser 组合与 single_quoted／double_quoted token 命名迁移均可由该固定种子直接编译。
+0.5.6 直接使用已发布的 0.5.5 stable，不需要 bootstrap 过渡分支。默认种子为
+`~/.jiang/versions/0.5.5/bin/jiangc`；构建脚本会检查其版本，随后完成
+`0.5.5 stable -> 0.5.6 next -> 0.5.6 stable`。不得使用 0.6.0 产物或临时编译器替代该输入。
 
 开发期间保留功能分支；功能冻结后再建立 release 分支，bootstrap 改动仅在自己的分支提交。
 每轮使用独立 BUILD_DIR，构建期间保持源码不变，并记录源码、种子和工具链身份。
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/provider-defaults-demand/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=next VERIFY=none \
 bash ./script/build_next.sh
 ```
-
-脚本默认版本仍为 0.5.4，适用于该版本开始开发时；原生配置迁移后须显式指定上述固定阶段。
-
 
 bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
 清理该目录；current compiler 使用独立的
@@ -42,24 +32,27 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/provider-defaults-demand/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-## 0.5.5 发布收尾
+## 0.5.6 发布收尾
 
-发布说明与迁移入口见 [0.5.5 release notes](releases/0.5.5.md)。最终源码冻结后，
+发布说明见 [0.5.6 release notes](releases/0.5.6.md)。最终源码冻结后，
 严格自举和全量回归必须使用同一源码及生成的 stable；不能把较早提交的全量结果当作最终发布验收。
 小改动在开发期间只做聚焦回归，最终门禁集中执行。
 
-发布前核对命名实参／options、package.ini → package.jiang、Provider 上下文、Attribute 与
-引号 token 名称的迁移。macOS arm64 与 Linux x86_64 分别验证自举、平台测试、打包与隔离安装，
+发布前核对函数默认表达式、接口缓存恢复、Bool atomic、所有权和取消竞争修复。
+macOS arm64 与 Linux x86_64 分别验证自举、平台测试、打包与隔离安装，
 检查版本、归档及校验和，并编译运行随包示例。详细待办与实际结果记录在版本 TODO。
-文档的“待发布”状态、安装版本和下载链接在正式产物可用后统一更新。
+发布提交必须同步安装版本、下载链接和当前版本标记；正式产物由通过门禁的同一提交生成。
+
+### 0.5.5 历史 bootstrap
+
+0.5.5 使用固定 bootstrap 源码 `fb264686f5b35374aa7d979a732784a312c38e2f`，由 0.5.4 stable
+生成 next，再编译 0.5.5 release。该流程只用于复现 0.5.5 历史版本，不是 0.5.6 的构建输入。
 
 ## 破坏性升级
 

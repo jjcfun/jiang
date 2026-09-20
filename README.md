@@ -12,19 +12,19 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 [官网与语言文档](https://jiang-lang.org/)
 
-当前源码为 **0.5.5**，主要变更和迁移事项见 [0.5.5 release notes](doc/releases/0.5.5.md)。
+当前源码为 **0.5.6**，主要变更见 [0.5.6 release notes](doc/releases/0.5.6.md)。
 
 ## 安装发行版
 
-Jiang 0.5.5 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
+Jiang 0.5.6 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
 
 ```bash
-cd jiang-0.5.5-<platform>
+cd jiang-0.5.6-<platform>
 ./install.sh
 ```
 
 默认安装到 `~/.jiang`，主命令是 `jiang`；如有需要，把 `~/.jiang/bin` 加入 `PATH`。
-安装包和 SHA-256 校验文件见 [Jiang 0.5.5 release](https://github.com/jjcfun/jiang/releases/tag/0.5.5)。
+安装包和 SHA-256 校验文件见 [Jiang 0.5.6 release](https://github.com/jjcfun/jiang/releases/tag/0.5.6)。
 
 
 
@@ -81,20 +81,17 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.5 开发源码使用原生 `#package` 配置和等号命名实参。严格冷启动链为：
+当前 0.5.6 源码直接使用已发布的 0.5.5 stable。严格冷启动链为：
 
 ```text
-0.5.4 stable
-  -> bootstrap/0.5.5 next
-  -> 0.5.5 next
-  -> 0.5.5 stable
+0.5.5 stable
+  -> 0.5.6 next
+  -> 0.5.6 stable
 ```
 
-先按[编译器开发流程](doc/develop.md)构建固定的 bootstrap 阶段，再在独立开发 worktree 中运行：
+安装 0.5.5 stable 后，在源码 worktree 中运行：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.5-bootstrap \
-BOOTSTRAP_BIN=/path/to/bootstrap-0.5.5/build/named-arguments/bin/jiangc.next \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
@@ -102,7 +99,8 @@ bash ./script/build_next.sh
 
 产出 `build/bin/jiangc.next` 与 `build/bin/jiangc`，并运行完整验证。
 
-构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
+构建脚本默认读取 `~/.jiang/versions/0.5.5/bin/jiangc` 并校验版本。如只想构建不跑验证，
+可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.jiang` 的 `version` 字面量 读取编译器版本，并校验
@@ -219,6 +217,7 @@ Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMO
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
+- [Jiang 0.5.6 release notes](doc/releases/0.5.6.md)（当前版本）
 - [Jiang 0.5.5 release notes](doc/releases/0.5.5.md)
 - [Jiang 0.5.4 release notes](doc/releases/0.5.4.md)（已发布）
 - [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)

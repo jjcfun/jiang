@@ -853,7 +853,7 @@ file import 只允许引用当前 package 内的 source file。跨 package 源�
 ```jiang
 #package {
     name = "app";
-    version = "0.5.5";
+    version = "0.5.6";
     type = .bin;
     root = "src/main.jiang";
     dependencies {
@@ -977,8 +977,8 @@ Int add(Int left, Int right) {
 }
 ```
 
-函数参数支持默认值。默认参数可以出现在任意位置；当前默认值只支持 literal，并按参数的
-expected type 检查：
+函数参数支持默认值。默认参数可以出现在任意位置；默认值可以是声明作用域中的普通表达式，并按参数的
+expected type 检查。省略实参时在调用点求值，显式传入实参时不求值：
 
 ```jiang
 Int add(Int left = 1, Int right) {

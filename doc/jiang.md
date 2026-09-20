@@ -1044,7 +1044,8 @@ Int add(Int base = 1, Int extra) {
 - 位置参数按定义顺序匹配
 - 默认参数可以出现在参数列表任意位置
 - 位置参数不会按类型跳过默认参数，而是绑定最早尚未绑定的参数
-- 当前默认值只支持 literal，并按参数 expected type 检查
+- 默认值可以是声明作用域中的普通表达式，并按参数 expected type 检查
+- 省略实参时，默认表达式在调用点求值；显式传入实参时不会求值
 - 命名参数使用 `name = value`，可以重排或跳过带默认值的参数
 - 命名 keyword options 也使用等号，例如 `async [domain = ui_domain]` 和 `struct [align = 8]`
 - 命名参数出现后，后续普通参数也必须使用命名形式
@@ -2793,7 +2794,7 @@ extend User: HasValue {
 ```jiang
 #package {
     name = "app";
-    version = "0.5.5";
+    version = "0.5.6";
     type = .bin;
     root = "src/main.jiang";
     dependencies {

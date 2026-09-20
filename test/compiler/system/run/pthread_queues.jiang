@@ -1,0 +1,258 @@
+// compiler-integration
+// run-pass
+// expected-exit: 0
+#doc(module) 检查线程池复用、栈配置、串行 FIFO、等待协作及队列销毁。
+
+alias thread = import "../../../../src/compiler/system/thread.jiang";
+
+extern unsafe Void record_pthread_probe(Int concurrent, Int expected_stack, Int ordinal);
+extern unsafe Void set_serial_probe_identity(Void* identity);
+extern unsafe Void* serial_probe_identity();
+extern unsafe Int pthread_probe_worker_count();
+extern unsafe Void first_pool_probe_record(Void* identity);
+extern unsafe Void second_pool_probe_record(Void* identity);
+extern unsafe Void nested_pool_probe_enter();
+extern unsafe Void nested_pool_probe_done(Int leaf);
+extern unsafe Int pthread_probe_result();
+
+extern unsafe Int main_probe_notifications();
+extern unsafe Void main_probe_flush();
+Int main_count! = 0;
+
+@life()
+Void main_probe(Void* ordinal) {
+    assert(thread.is_main_thread());
+    assert(unsafe { ordinal$.as(Int) } == main_count);
+    main_count = main_count + 1;
+}
+
+@life()
+Void main_probe_chain(Void* handle) {
+    RawFn<Void, Void*> callback = main_probe;
+    assert(unsafe {
+        thread.enqueue(thread.Group(handle), thread.main_queue(), main_count$.as(Void*), callback$.as(Void*))
+    });
+}
+
+Void check_main_notifications(thread.Group group) {
+    RawFn<Void, Void*> callback = main_probe;
+    Int cycle! = 0;
+    while (cycle < 3) {
+        Int index! = 0;
+        while (index < 96) {
+            Int ordinal = cycle * 96 + index;
+            assert(unsafe {
+                thread.enqueue(group, thread.main_queue(), ordinal$.as(Void*), callback$.as(Void*))
+            });
+            index = index + 1;
+        }
+        Int notifications = unsafe { main_probe_notifications() };
+        if (notifications >= 0) { assert(notifications == 1); }
+        if (cycle == 1 || notifications < 0) { thread.wait_group(group); }
+        unsafe { main_probe_flush(); }
+        assert(main_count == (cycle + 1) * 96);
+        thread.wait_group(group);
+        cycle = cycle + 1;
+    }
+    // 手动 pump 清空队列后，新任务仍由原来尚未执行的系统通知处理。
+    assert(unsafe { thread.enqueue(group, thread.main_queue(), main_count$.as(Void*), callback$.as(Void*)) });
+    thread.wait_group(group);
+    RawFn<Void, Void*> chain = main_probe_chain;
+    assert(unsafe {
+        thread.enqueue(group, thread.main_queue(), thread.group_handle(group), chain$.as(Void*))
+    });
+    Int notifications = unsafe { main_probe_notifications() };
+    if (notifications >= 0) { assert(notifications == 1); }
+    else { thread.wait_group(group); }
+    unsafe { main_probe_flush(); }
+    assert(main_count == 290);
+    thread.wait_group(group);
+}
+
+@life()
+Void serial_probe(Void* ordinal) {
+    Void* identity = unsafe { serial_probe_identity() };
+    assert(thread.has_queue_identity(identity));
+    assert(!thread.is_main_thread());
+    Void* nested_identity = unsafe { Int(123)$.as(Void*) };
+    Void* previous = thread.enter_thread_identity(nested_identity);
+    assert(thread.has_thread_identity(nested_identity));
+    assert(thread.has_queue_identity(identity));
+    thread.leave_thread_identity(previous);
+    assert(!thread.has_thread_identity(nested_identity));
+    unsafe { record_pthread_probe(0, 2097152, ordinal$.as(Int) - 1); }
+}
+
+@life()
+Void concurrent_probe(Void* identity) {
+    assert(thread.has_queue_identity(identity));
+    assert(!thread.is_main_thread());
+    unsafe { record_pthread_probe(1, 4194304, 0); }
+}
+
+@life()
+Void first_pool_probe(Void* identity) {
+    assert(thread.has_queue_identity(identity));
+    unsafe { first_pool_probe_record(identity); }
+}
+
+@life()
+Void second_pool_probe(Void* identity) {
+    assert(thread.has_queue_identity(identity));
+    unsafe { second_pool_probe_record(identity); }
+}
+
+@life()
+Void nested_leaf(Void* identity) {
+    assert(thread.has_queue_identity(identity));
+    unsafe { nested_pool_probe_done(1); }
+}
+
+@life()
+Void nested_parent(Void* identity) {
+    unsafe { nested_pool_probe_enter(); }
+    thread.Group children = thread.create_group();
+    RawFn<Void, Void*> callback = nested_leaf;
+    assert(unsafe { thread.enqueue(children, thread.Queue(identity), identity, callback$.as(Void*)) });
+    thread.wait_group(children);
+    assert(thread.has_queue_identity(identity));
+    thread.destroy_group(children);
+    unsafe { nested_pool_probe_done(0); }
+}
+
+@life()
+Void destroy_current_queue(Void* handle) {
+    thread.destroy_queue(thread.Queue(handle), false);
+}
+
+Void check_pool_reuse(thread.Queue first, thread.Group group) {
+    thread.Queue second = thread.concurrent_queue(stack_size = 4194304);
+    Void* identity = thread.queue_handle(second);
+    assert(identity != null);
+    thread.set_queue_identity(second, identity);
+    Int count = unsafe { pthread_probe_worker_count() };
+    RawFn<Void, Void*> first_callback = first_pool_probe;
+    RawFn<Void, Void*> second_callback = second_pool_probe;
+    RawFn<Void, Void*> parent_callback = nested_parent;
+    Int index! = 0;
+    while (index < count) {
+        assert(unsafe { thread.enqueue(group, first, thread.queue_handle(first), first_callback$.as(Void*)) });
+        index = index + 1;
+    }
+    thread.wait_group(group);
+    index = 0;
+    while (index < count) {
+        assert(unsafe { thread.enqueue(group, second, identity, second_callback$.as(Void*)) });
+        index = index + 1;
+    }
+    thread.wait_group(group);
+    index = 0;
+    while (index < count) {
+        assert(unsafe { thread.enqueue(group, second, identity, parent_callback$.as(Void*)) });
+        index = index + 1;
+    }
+    thread.wait_group(group);
+    thread.destroy_queue(second, true);
+}
+
+extern unsafe Void group_probe_write(Int index);
+extern unsafe Void group_probe_waiters(Void* group, Void* wait_fn, Void* leave_fn);
+
+@life()
+Void write_group_result(Void* index) {
+    unsafe { group_probe_write(index$.as(Int)); }
+}
+
+@life()
+Void wait_group_result(Void* handle) {
+    thread.wait_group(thread.Group(handle));
+}
+
+@life()
+Void leave_group_result(Void* handle) {
+    thread.leave_group(thread.Group(handle));
+}
+
+Void check_group_waiters(thread.Queue queue) {
+    RawFn<Void, Void*> write = write_group_result;
+    RawFn<Void, Void*> wait = wait_group_result;
+    RawFn<Void, Void*> leave = leave_group_result;
+    Int round! = 0;
+    while (round < 16) {
+        thread.Group group = thread.create_group();
+        assert(thread.enter_group(group));
+        Int index! = 0;
+        while (index < 96) {
+            assert(unsafe { thread.enqueue(group, queue, index$.as(Void*), write$.as(Void*)) });
+            index = index + 1;
+        }
+        unsafe { group_probe_waiters(thread.group_handle(group), wait$.as(Void*), leave$.as(Void*)); }
+        thread.destroy_group(group);
+        round = round + 1;
+    }
+}
+
+extern unsafe Int concurrent_close_probe_enter();
+extern unsafe Void concurrent_close_probe_release();
+extern unsafe Int concurrent_close_probe_result();
+
+@life()
+Void concurrent_close_probe(Void* handle) {
+    if (unsafe { concurrent_close_probe_enter() } == 0) {
+        thread.destroy_queue(thread.Queue(handle), true);
+    }
+}
+
+#doc 并发队列在自身回调中关闭后，仍排空此前接受的整个批次。
+Void check_concurrent_close(thread.Group group) {
+    thread.Queue queue = thread.concurrent_queue(stack_size = 4194304);
+    Void* handle = thread.queue_handle(queue);
+    assert(handle != null);
+    RawFn<Void, Void*> callback = concurrent_close_probe;
+    Int index! = 0;
+    while (index < 128) {
+        assert(unsafe { thread.enqueue(group, queue, handle, callback$.as(Void*)) });
+        index = index + 1;
+    }
+    unsafe { concurrent_close_probe_release(); }
+    thread.wait_group(group);
+    assert(unsafe { concurrent_close_probe_result() } == 128);
+}
+
+Int main() {
+    assert(thread.queue_handle(thread.serial_queue(stack_size = 1)) == null);
+    assert(thread.queue_handle(thread.concurrent_queue(stack_size = -1)) == null);
+    thread.Queue serial = thread.serial_queue(stack_size = 2097152);
+    thread.Queue concurrent = thread.concurrent_queue(stack_size = 4194304);
+    thread.Group group = thread.create_group();
+    Void* serial_identity = thread.queue_handle(serial);
+    Void* concurrent_identity = thread.queue_handle(concurrent);
+    assert(serial_identity != null && concurrent_identity != null);
+    assert(thread.group_handle(group) != null);
+    unsafe { set_serial_probe_identity(serial_identity); }
+    thread.set_queue_identity(serial, serial_identity);
+    thread.set_queue_identity(concurrent, concurrent_identity);
+    RawFn<Void, Void*> serial_callback = serial_probe;
+    RawFn<Void, Void*> concurrent_callback = concurrent_probe;
+    Int index! = 0;
+    while (index < 96) {
+        assert(unsafe { thread.enqueue(group, serial, (index + 1)$.as(Void*), serial_callback$.as(Void*)) });
+        assert(unsafe { thread.enqueue(group, concurrent, concurrent_identity, concurrent_callback$.as(Void*)) });
+        index = index + 1;
+    }
+    thread.wait_group(group);
+    check_pool_reuse(concurrent, group);
+    check_group_waiters(concurrent);
+    check_concurrent_close(group);
+    check_main_notifications(group);
+    thread.Queue self_destroying = thread.serial_queue(stack_size = 2097152);
+    Void* self_handle = thread.queue_handle(self_destroying);
+    assert(self_handle != null);
+    RawFn<Void, Void*> destroy_callback = destroy_current_queue;
+    assert(unsafe { thread.enqueue(group, self_destroying, self_handle, destroy_callback$.as(Void*)) });
+    thread.wait_group(group);
+    thread.destroy_queue(serial, false);
+    thread.destroy_queue(concurrent, true);
+    thread.destroy_group(group);
+    return unsafe { pthread_probe_result() };
+}
