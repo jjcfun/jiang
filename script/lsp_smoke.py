@@ -231,6 +231,7 @@ def check_completion(binary, directory):
     helper.write_text("public Int value() { 0 }\n", encoding="utf-8")
     uri = (root / "completion main.jiang").as_uri()
     header = 'alias helper = import "./completion helper.jiang";\n'
+    header += "#doc Computes a local value.\n"
     header += "Int local_helper() { 0 }\n"
 
     def source(local_name, expression):
@@ -239,7 +240,7 @@ def check_completion(binary, directory):
                 + f"    {expression}\n}}\n")
 
     def position(expression):
-        return {"line": 4, "character": 4 + len(expression)}
+        return {"line": 5, "character": 4 + len(expression)}
 
     def request(identifier, expression):
         return {"jsonrpc": "2.0", "id": identifier, "method": "textDocument/completion",
@@ -267,10 +268,18 @@ def check_completion(binary, directory):
         request(6, "loc"),
         change(6, "other_count", "helper."),
         request(7, "helper."),
-        change(7, "local_count", "local_count"),
+        change(7, "local_count", "Int selected = loc"),
+        request(10, "Int selected = loc"),
+        change(8, "local_count", "local_count"),
         {"jsonrpc": "2.0", "id": 8, "method": "textDocument/definition",
          "params": {"textDocument": {"uri": uri},
-                    "position": {"line": 4, "character": 7}}},
+                    "position": {"line": 5, "character": 7}}},
+        {"jsonrpc": "2.0", "id": 11, "method": "textDocument/hover",
+         "params": {"textDocument": {"uri": uri},
+                    "position": {"line": 5, "character": 7}}},
+        {"jsonrpc": "2.0", "id": 12, "method": "textDocument/hover",
+         "params": {"textDocument": {"uri": uri},
+                    "position": {"line": 4, "character": 10}}},
         {"jsonrpc": "2.0", "id": 9, "method": "shutdown"},
         {"jsonrpc": "2.0", "method": "exit"},
     ]
@@ -287,17 +296,287 @@ def check_completion(binary, directory):
         return {item["label"] for item in by_id[identifier]["result"]}
 
     assert {"local_count", "local_helper"} <= labels(2), by_id[2]
+    first_items = {item["label"]: item for item in by_id[2]["result"]}
+    assert first_items["local_count"]["kind"] == 6, first_items["local_count"]
+    assert first_items["local_count"]["detail"] == "Int local_count", first_items["local_count"]
+    assert first_items["local_helper"]["kind"] == 3, first_items["local_helper"]
+    assert first_items["local_helper"]["documentation"] == {
+        "kind": "markdown", "value": "Computes a local value."
+    }, first_items["local_helper"]
     assert "param_count" in labels(3), by_id[3]
     assert "helper" in labels(4), by_id[4]
     assert "other_count" in labels(5) and "local_count" not in labels(5), by_id[5]
     assert "local_helper" in labels(6) and "local_count" not in labels(6), by_id[6]
     assert by_id[7]["result"] == [], by_id[7]
+    assert "local_count" in labels(10), by_id[10]
     assert by_id[8]["result"] == {
         "uri": uri,
-        "range": {"start": {"line": 3, "character": 8},
-                  "end": {"line": 3, "character": 19}},
+        "range": {"start": {"line": 4, "character": 8},
+                  "end": {"line": 4, "character": 19}},
     }, by_id[8]
+    assert by_id[11]["result"]["contents"] == {
+        "kind": "plaintext", "value": "Int local_count"
+    }, by_id[11]
+    assert by_id[12]["result"]["contents"] == by_id[11]["result"]["contents"], by_id[12]
     assert by_id[9]["result"] is None
+
+
+def check_hover_documentation(binary, directory):
+    uri = (Path(directory) / "hover documentation.jiang").as_uri()
+    original = ("#doc Adds **one**.\n"
+                "Int documented(Int value) { value + 1 }\n"
+                "Int plain() { 0 }\n"
+                "Int main() { documented(plain()) }\n")
+    changed = original.replace("Adds **one**.", "Adds **two**.")
+    undocumented = original.replace("#doc Adds **one**.\n", "")
+
+    def position(text, needle, last=False):
+        offset = (text.rindex(needle) if last else text.index(needle)) + 1
+        before = text[:offset]
+        return {"line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1])}
+
+    def hover(identifier, text, needle, last=False):
+        return {"jsonrpc": "2.0", "id": identifier, "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri},
+                           "position": position(text, needle, last)}}
+
+    def change(version, text):
+        return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": uri, "version": version},
+                           "contentChanges": [{"text": text}]}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang",
+                                     "version": 1, "text": original}}},
+        hover(2, original, "documented"),
+        hover(3, original, "documented", True),
+        hover(4, original, "plain"),
+        change(2, changed),
+        hover(5, changed, "documented", True),
+        change(3, undocumented),
+        hover(6, undocumented, "documented", True),
+        {"jsonrpc": "2.0", "id": 7, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+    documented = {"kind": "markdown", "value":
+                  "```jiang\nInt documented(Int value)\n```\n\nAdds **one**."}
+    assert by_id[2]["result"]["contents"] == documented, by_id[2]
+    assert by_id[3]["result"]["contents"] == documented, by_id[3]
+    assert by_id[4]["result"]["contents"] == {"kind": "plaintext", "value": "Int plain()"}, by_id[4]
+    assert by_id[5]["result"]["contents"]["value"].endswith("Adds **two**."), by_id[5]
+    assert by_id[6]["result"]["contents"] == {
+        "kind": "plaintext", "value": "Int documented(Int value)"
+    }, by_id[6]
+
+
+def check_imported_hover_documentation(binary, directory):
+    root = Path(directory) / "hover import"
+    root.mkdir()
+    (root / "helper.jiang").write_text(
+        "#doc Returns **42**.\npublic Int answer() { 42 }\n", encoding="utf-8")
+    uri = (root / "main.jiang").as_uri()
+    source = 'alias helper = import "./helper.jiang";\nInt main() { helper.answer() }\n'
+    answer = source.index("answer") + 1
+    before = source[:answer]
+    position = {"line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1])}
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang",
+                                     "version": 1, "text": source}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
+         "params": {"textDocument": {"uri": uri}, "position": position}},
+        {"jsonrpc": "2.0", "id": 3, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    for _ in range(2):
+        process = subprocess.run(
+            [binary, "lsp"], input=b"".join(map(frame, messages)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+        )
+        assert process.returncode == 0, (process.returncode, process.stderr.decode())
+        assert not process.stderr, process.stderr.decode()
+        by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+        assert by_id[2]["result"]["contents"] == {
+            "kind": "markdown", "value": "```jiang\nInt answer()\n```\n\nReturns **42**."
+        }, by_id[2]
+
+
+def check_request_lifecycle(binary, directory):
+    uri = (Path(directory) / "lifecycle.jiang").as_uri()
+    original = "Int value() { 1 }\nInt main() { value() }\n"
+    reopened = "Int revised() { 1 }\nInt main() { revised() }\n"
+
+    def open_document(text):
+        return {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+                "params": {"textDocument": {"uri": uri, "languageId": "jiang",
+                                            "version": 1, "text": text}}}
+
+    def change_document(version, text):
+        return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": uri, "version": version},
+                           "contentChanges": [{"text": text}]}}
+
+    def request(identifier, method):
+        return {"jsonrpc": "2.0", "id": identifier, "method": method,
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": 1, "character": 13}}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        open_document(original),
+        request(2, "textDocument/definition"),
+        change_document(1, "Int stale() { 0 }\n"),
+        request(3, "textDocument/definition"),
+        {"jsonrpc": "2.0", "method": "textDocument/didClose",
+         "params": {"textDocument": {"uri": uri}}},
+        change_document(2, "Int closed() { 0 }\n"),
+        request(4, "textDocument/definition"),
+        request(5, "textDocument/hover"),
+        request(6, "textDocument/completion"),
+        open_document(reopened),
+        request(7, "textDocument/definition"),
+        request(8, "textDocument/definition"),
+        {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 8}},
+        request(9, "textDocument/definition"),
+        {"jsonrpc": "2.0", "id": 10, "method": "shutdown"},
+        request(11, "textDocument/definition"),
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    items = responses(process.stdout)
+    by_id = {item["id"]: item for item in items if "id" in item}
+    assert set(by_id) == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, items
+    original_target = {"uri": uri,
+                       "range": {"start": {"line": 0, "character": 4},
+                                 "end": {"line": 0, "character": 9}}}
+    reopened_target = {"uri": uri,
+                       "range": {"start": {"line": 0, "character": 4},
+                                 "end": {"line": 0, "character": 11}}}
+    assert by_id[2]["result"] == original_target, by_id[2]
+    assert by_id[3]["result"] == original_target, by_id[3]
+    assert by_id[4]["result"] is None and by_id[5]["result"] is None
+    assert by_id[6]["result"] == [], by_id[6]
+    assert all(by_id[index]["result"] == reopened_target for index in (7, 8, 9)), by_id
+    assert by_id[10]["result"] is None
+    assert by_id[11]["error"]["code"] == -32002, by_id[11]
+    diagnostics = [item["params"] for item in items
+                   if item.get("method") == "textDocument/publishDiagnostics"]
+    assert [(item["uri"], item.get("version")) for item in diagnostics] == [
+        (uri, 1), (uri, None), (uri, 1),
+    ], diagnostics
+
+
+def check_frontend_and_save_diagnostics(binary, directory):
+    root = Path(directory) / "staged diagnostics"
+    root.mkdir()
+    (root / "package.jiang").write_text(
+        '#package { name = "lsp_stage"; root = "main.jiang"; }\n', encoding="utf-8")
+    uri = (root / "main.jiang").as_uri()
+    helper_uri = (root / "helper.jiang").as_uri()
+    unrelated_uri = (Path(directory) / "staged unrelated.jiang").as_uri()
+    header = "struct Value { Int value; }\n"
+    invalid = (header + "Int main() { Value first = Value(value = 1); "
+               "Value second = first; first.value + second.value }\n")
+    valid = (header + "Int main() { Value first = Value(value = 1); "
+             "Value second = first; second.value }\n")
+    (root / "main.jiang").write_text(invalid, encoding="utf-8")
+    (root / "helper.jiang").write_text("Int helper() { 0 }\n", encoding="utf-8")
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang",
+                                     "version": 1, "text": invalid}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": helper_uri, "languageId": "jiang",
+                                     "version": 1, "text": "Int helper() { 0 }\n"}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didSave",
+         "params": {"textDocument": {"uri": helper_uri}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": unrelated_uri, "languageId": "jiang",
+                                     "version": 1, "text": "Int unrelated() { 0 }\n"}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didChange",
+         "params": {"textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": valid}]}},
+        {"jsonrpc": "2.0", "id": 2, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    items = responses(process.stdout)
+    diagnostics = [item["params"] for item in items
+                   if item.get("method") == "textDocument/publishDiagnostics"]
+    assert [(item["uri"], item["version"]) for item in diagnostics] == [
+        (uri, 1), (helper_uri, 1), (uri, 1), (unrelated_uri, 1), (uri, 2),
+    ], diagnostics
+    assert diagnostics[0]["diagnostics"] == [], diagnostics[0]
+    assert diagnostics[1]["diagnostics"] == [], diagnostics[1]
+    assert any(item["code"] == "use_after_move" for item in diagnostics[2]["diagnostics"])
+    assert diagnostics[3]["diagnostics"] == [], diagnostics[3]
+    assert diagnostics[4]["diagnostics"] == [], diagnostics[4]
+
+
+def check_dependency_roots(binary, directory):
+    root = Path(directory) / "dependency roots"
+    app = root / "app"
+    dep = root / "dep"
+    app.mkdir(parents=True)
+    dep.mkdir()
+    (app / "package.jiang").write_text(
+        '#package { name = "lsp_root_app"; root = "main.jiang"; '
+        'dependencies { dep = "../dep"; } }\n', encoding="utf-8")
+    (dep / "package.jiang").write_text(
+        '#package { name = "lsp_root_dep"; root = "lib.jiang"; }\n', encoding="utf-8")
+    main = "import dep;\nInt main() { dep.answer() }\n"
+    (app / "main.jiang").write_text(main, encoding="utf-8")
+    (dep / "lib.jiang").write_text("public Int answer() { 1 }\n", encoding="utf-8")
+    main_uri = (app / "main.jiang").as_uri()
+    dep_uri = (dep / "lib.jiang").as_uri()
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": main_uri, "languageId": "jiang",
+                                     "version": 1, "text": main}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": dep_uri, "languageId": "jiang",
+                                     "version": 1, "text": "public Int wrong() { 1 }\n"}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didChange",
+         "params": {"textDocument": {"uri": dep_uri, "version": 2},
+                    "contentChanges": [{"text": "public Int answer() { 2 }\n"}]}},
+        {"jsonrpc": "2.0", "id": 2, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    diagnostics = [item["params"] for item in responses(process.stdout)
+                   if item.get("method") == "textDocument/publishDiagnostics"]
+    app_diagnostics = [item for item in diagnostics if item["uri"] == main_uri]
+    assert [item["diagnostics"] == [] for item in app_diagnostics] == [True, False, True], diagnostics
+    assert any(item["code"] == "unresolved_value" for item in app_diagnostics[1]["diagnostics"])
+    dep_diagnostics = [item for item in diagnostics if item["uri"] == dep_uri]
+    assert [item["version"] for item in dep_diagnostics] == [1, 2], diagnostics
 
 
 def main():
@@ -337,7 +616,8 @@ def main():
         assert len(items) == 7, items
         capabilities = items[0]["result"]["capabilities"]
         assert capabilities["positionEncoding"] == "utf-16"
-        assert capabilities["textDocumentSync"] == {"openClose": True, "change": 1}
+        assert capabilities["textDocumentSync"] == {"openClose": True, "change": 1,
+                                                     "save": True}
         first = items[1]["params"]
         assert first["uri"] == uri and first["version"] == 1
         assert len(first["diagnostics"]) > 0, first
@@ -357,6 +637,11 @@ def main():
         check_package_documents(binary, directory)
         check_semantics(binary, directory)
         check_completion(binary, directory)
+        check_hover_documentation(binary, directory)
+        check_imported_hover_documentation(binary, directory)
+        check_request_lifecycle(binary, directory)
+        check_frontend_and_save_diagnostics(binary, directory)
+        check_dependency_roots(binary, directory)
     print("PASS jiang lsp smoke")
 
 

@@ -86,6 +86,8 @@ esac
 mkdir -p "$VERSION_DIR" "$PREFIX/bin"
 rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
+rm -rf "$VERSION_DIR/src"
+cp -R "$ROOT_DIR/src" "$VERSION_DIR/src"
 cp "$ROOT_DIR/package.jiang" "$VERSION_DIR/package.jiang"
 cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE" "$VERSION_DIR/"
 cp "$ROOT_DIR/package.jiang" "$PREFIX/package.jiang"
@@ -110,6 +112,7 @@ write_package_readme() {
 # Jiang $VERSION ($TARGET)
 
 This package statically links LLVM into \`jiang\`; users do not need an LLVM runtime.
+The bundled \`src\` directory contains the language resources used by \`jiang lsp\`.
 A hosted C linker driver named \`cc\` must be available when building executables.
 The \`jiangc\` command remains as a compatibility link for existing build scripts.
 
@@ -174,6 +177,7 @@ rm -rf "$PACKAGE_DIR" "$PACKAGE_ARCHIVE"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiang"
 cp "$JIANGC_BIN.build-id" "$PACKAGE_DIR/bin/jiang.build-id"
+cp -R "$ROOT_DIR/src" "$PACKAGE_DIR/src"
 ln -s "jiang" "$PACKAGE_DIR/bin/jiangc"
 ln -s "jiang.build-id" "$PACKAGE_DIR/bin/jiangc.build-id"
 cp "$ROOT_DIR/package.jiang" "$PACKAGE_DIR/package.jiang"
