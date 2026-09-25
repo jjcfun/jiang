@@ -1,15 +1,16 @@
 #doc(module)
-    维护单个 LSP 连接的文档版本与 CompilerSession；首阶段同步处理全文编辑并发布诊断。
+    维护单个 LSP 连接的文档版本与 CompilerSession；按 package 入口同步检查并发布诊断。
 #end
 
 alias diagnostic = import "../diagnostic.jiang";
 alias options = import "../driver/options.jiang";
+alias qid = import "../id.jiang";
 alias session = import "../session.jiang";
 alias service = import "../service.jiang";
 alias source = import "../source.jiang";
 alias source_map = import "../source/source_map.jiang";
-alias source_entry = import "../source/entry.jiang";
 alias env = import "../system/env.jiang";
+alias fs = import "../system/fs.jiang";
 alias list = import "../support/list.jiang";
 alias string = import "../support/string.jiang";
 alias json = import "./json.jiang";
@@ -22,6 +23,7 @@ struct Document: Movable {
     source.SourceId source_id;
     Int version!;
     Bool open!;
+    std.String? published_diagnostics!;
 
     init(self, std.String uri, std.String path, source.SourceId source_id, Int version) {
         self.uri = uri;
@@ -29,6 +31,7 @@ struct Document: Movable {
         self.source_id = source_id;
         self.version = version;
         self.open = true;
+        self.published_diagnostics = null;
     }
 }
 
@@ -91,6 +94,9 @@ struct Server: Movable {
         else if (string.equal(method.bytes(), "textDocument/hover") && id is .some(request_id)) {
             self.semantic_request(request_id, params, true);
         }
+        else if (string.equal(method.bytes(), "textDocument/completion") && id is .some(request_id)) {
+            self.completion_request(request_id, params);
+        }
         else if (id is .some(request_id)) { self.write_error(request_id.raw(), -32601, "Method not found"); }
         return true;
     }
@@ -111,7 +117,7 @@ struct Server: Movable {
         std.StringBuilder result! = std.StringBuilder();
         result.append("{\"capabilities\":{\"positionEncoding\":\"utf-16\",");
         result.append("\"textDocumentSync\":{\"openClose\":true,\"change\":1},");
-        result.append("\"definitionProvider\":true,\"hoverProvider\":true},");
+        result.append("\"definitionProvider\":true,\"hoverProvider\":true,\"completionProvider\":{}},");
         result.append("\"serverInfo\":{\"name\":\"Jiang\",\"version\":\"0.6.0\"}}");
         self.write_result(id.raw(), result.slice());
     }
@@ -129,15 +135,15 @@ struct Server: Movable {
             && version <= self.documents.ref_at(index).version) { return; }
         source.SourceId source_id = self.compiler.set_source(path.bytes(), text.bytes());
         self.checked_path = null;
-        std.String compilation_path = std.String.from_valid_utf8(path.bytes());
         if (self.document_index(uri.bytes()) is .some(index)) {
             Document&! document = self.documents.mut_ref_at(index);
             document.version = version;
             document.open = true;
+            document.published_diagnostics = null;
         } else {
             self.documents.add(Document(uri, path, source_id, version));
         }
-        self.compile_document(compilation_path.bytes());
+        self.recheck_open_documents();
     }
 
     Void did_change(Self&! self, json.Value params) {
@@ -159,7 +165,8 @@ struct Server: Movable {
         self.checked_path = null;
         Document&! document = self.documents.mut_ref_at(index);
         document.version = version;
-        self.compile_document(path.bytes());
+        document.published_diagnostics = null;
+        self.recheck_open_documents();
     }
 
     Void did_close(Self&! self, json.Value params) {
@@ -173,6 +180,7 @@ struct Server: Movable {
         self.checked_path = null;
         self.documents.mut_ref_at(index).open = false;
         self.publish_empty(uri.bytes(), null);
+        self.recheck_open_documents();
     }
 
     Int? document_index(self, UInt8[]& uri) {
@@ -184,24 +192,87 @@ struct Server: Movable {
         return null;
     }
 
-    Void compile_document(Self&! self, UInt8[]& path) {
-        self.check_document(path);
+    #doc 按打开顺序检查不同入口；每轮只发布版本更新或诊断变化的文档。
+    Void recheck_open_documents(Self&! self) {
         Int index! = 0;
         while (index < self.documents.len()) {
-            Document& document = self.documents.ref_at(index);
-            if (document.open && string.equal(document.path.bytes(), path)) {
-                self.publish_diagnostics(document);
+            if (!self.documents.ref_at(index).open) { index = index + 1; continue; }
+            std.String input = self.compilation_input(self.documents.ref_at(index).path.bytes());
+            if (!self.earlier_open_input(index, input.bytes())) {
+                self.check_input(input.bytes());
+                self.publish_input_documents(index, input.bytes());
             }
             index = index + 1;
         }
     }
 
-    Void check_document(Self&! self, UInt8[]& path) {
-        if (self.checked_path is .some(ref _ checked) && string.equal(checked.bytes(), path)) { return; }
-        source_entry.PackageHandle package = self.compiler.load_package(path);
-        options.CompileOptions check! = options.CompileOptions(.check_only, path, "");
-        if (package.ok) { self.compiler.compile_loaded(package$.ref(), check$.ref()); }
-        self.checked_path = std.String.from_valid_utf8(path);
+    Bool earlier_open_input(self, Int index, UInt8[]& input) {
+        Int previous! = 0;
+        while (previous < index) {
+            if (self.documents.ref_at(previous).open) {
+                std.String earlier = self.compilation_input(self.documents.ref_at(previous).path.bytes());
+                if (string.equal(earlier.bytes(), input)) { return true; }
+            }
+            previous = previous + 1;
+        }
+        return false;
+    }
+
+    Void publish_input_documents(Self&! self, Int start, UInt8[]& input) {
+        list.ArrayList<Int> detached! = list.ArrayList<Int>();
+        Path configuration = std.path.join(input, "package.jiang");
+        Int member! = start;
+        while (member < self.documents.len()) {
+            Document& document = self.documents.ref_at(member);
+            if (!document.open) { member = member + 1; continue; }
+            std.String member_input = self.compilation_input(document.path.bytes());
+            if (!string.equal(member_input.bytes(), input)) { member = member + 1; continue; }
+            if (!string.equal(input, document.path.bytes())
+                && !string.equal(configuration.bytes(), document.path.bytes())
+                && !self.compiler.source_in_compilation(document.source_id)) {
+                detached.add(member);
+            } else {
+                self.publish_diagnostics(member);
+            }
+            member = member + 1;
+        }
+        Int detached_index! = 0;
+        while (detached_index < detached.len()) {
+            Int document_index = detached.get(detached_index);
+            self.check_input(self.documents.ref_at(document_index).path.bytes());
+            self.publish_diagnostics(document_index);
+            detached_index = detached_index + 1;
+        }
+    }
+
+    Void check_document(Self&! self, UInt8[]& path, source.SourceId source_id) {
+        std.String input = self.compilation_input(path);
+        self.check_input(input.bytes());
+        if (!string.equal(input.bytes(), path) && !self.compiler.source_in_compilation(source_id)) {
+            self.check_input(path);
+        }
+    }
+
+    Void check_input(Self&! self, UInt8[]& input) {
+        if (self.checked_path is .some(ref _ checked) && string.equal(checked.bytes(), input)) { return; }
+        options.CompileOptions check! = options.CompileOptions(.check_only, input, "");
+        self.compiler.compile(check$.ref());
+        self.checked_path = std.String.from_valid_utf8(input);
+    }
+
+    #doc 使用最近的 package.jiang 目录；独立源码仍以自身路径编译。
+    std.String compilation_input(self, UInt8[]& path) {
+        Path directory! = std.path.normalize(std.path.dirname(path));
+        while (true) {
+            Path configuration = std.path.join(directory.bytes(), "package.jiang");
+            if (fs.file_exists(configuration.bytes())) {
+                return std.String.from_valid_utf8(directory.bytes());
+            }
+            Path parent = std.path.normalize(std.path.dirname(directory.bytes()));
+            if (string.equal(parent.bytes(), directory.bytes())) { break; }
+            directory = parent;
+        }
+        return std.String.from_valid_utf8(path);
     }
 
     #doc 基于当前 overlay 编译请求文档，再读取这一轮的语义事实。
@@ -219,7 +290,7 @@ struct Server: Movable {
         if (!self.documents.ref_at(index).open) { self.write_result(id.raw(), "null"); return; }
         std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
         source.SourceId source_id = self.documents.ref_at(index).source_id;
-        self.check_document(path.bytes());
+        self.check_document(path.bytes(), source_id);
         guard self.compiler.lsp_offset(source_id, line, character) is .some(offset) else {
             self.write_result(id.raw(), "null");
             return;
@@ -234,6 +305,43 @@ struct Server: Movable {
             self.definition_result(source_id, offset)
         };
         self.write_result(id.raw(), result.bytes());
+    }
+
+    #doc 从本轮解析与语义事实返回光标处的基础名称补全。
+    Void completion_request(Self&! self, json.Value id, json.Value params) {
+        guard params.field("textDocument") is .some(text_document) else { self.invalid_params(id); return; }
+        guard text_document.field("uri") is .some(uri_value) else { self.invalid_params(id); return; }
+        guard uri_value.as_string() is .some(uri) else { self.invalid_params(id); return; }
+        guard params.field("position") is .some(position) else { self.invalid_params(id); return; }
+        guard position.field("line") is .some(line_value) else { self.invalid_params(id); return; }
+        guard line_value.as_int() is .some(line) else { self.invalid_params(id); return; }
+        guard position.field("character") is .some(character_value) else { self.invalid_params(id); return; }
+        guard character_value.as_int() is .some(character) else { self.invalid_params(id); return; }
+        if (line < 0 || character < 0) { self.invalid_params(id); return; }
+        guard self.document_index(uri.bytes()) is .some(index) else { self.write_result(id.raw(), "[]"); return; }
+        if (!self.documents.ref_at(index).open) { self.write_result(id.raw(), "[]"); return; }
+        std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
+        source.SourceId source_id = self.documents.ref_at(index).source_id;
+        self.check_document(path.bytes(), source_id);
+        guard self.compiler.lsp_offset(source_id, line, character) is .some(offset) else {
+            self.write_result(id.raw(), "[]");
+            return;
+        }
+        service.CompilerQueries queries = self.compiler.queries();
+        list.ArrayList<qid.DefId> definitions = queries.completion_defs(source_id, offset);
+        std.StringBuilder result! = std.StringBuilder();
+        result.append("[");
+        Int candidate! = 0;
+        while (candidate < definitions.len()) {
+            if (candidate > 0) { result.append(","); }
+            std.String label = queries.completion_label(definitions.get(candidate));
+            result.append("{\"label\":");
+            json.append_string(result$.mut_ref(), label.bytes());
+            result.append("}");
+            candidate = candidate + 1;
+        }
+        result.append("]");
+        self.write_result(id.raw(), result.slice());
     }
 
     Void invalid_params(Self&! self, json.Value id) {
@@ -306,26 +414,34 @@ struct Server: Movable {
         return uri.into_string();
     }
 
-    Void publish_diagnostics(self, Document& document) {
-        std.StringBuilder body! = std.StringBuilder();
-        body.append("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
-        body.append("\"uri\":");
-        json.append_string(body$.mut_ref(), document.uri.bytes());
-        body.append(",\"version\":");
-        body.append(document.version);
-        body.append(",\"diagnostics\":[");
+    Void publish_diagnostics(Self&! self, Int document_index) {
+        Document& document = self.documents.ref_at(document_index);
+        std.StringBuilder diagnostics! = std.StringBuilder();
+        diagnostics.append("[");
         Int index! = 0;
         Bool first! = true;
         while (index < self.compiler.diagnostics().len()) {
             diagnostic.Diagnostic& item = self.compiler.diagnostics().get(index);
             index = index + 1;
             if (item.range.source_id is .some(id) && id != document.source_id) { continue; }
-            if (!first) { body.append(","); }
+            if (!first) { diagnostics.append(","); }
             first = false;
-            self.append_diagnostic(body$.mut_ref(), item);
+            self.append_diagnostic(diagnostics$.mut_ref(), item);
         }
-        body.append("]}}");
+        diagnostics.append("]");
+        if (document.published_diagnostics is .some(ref _ previous)
+            && string.equal(previous.bytes(), diagnostics.slice())) { return; }
+        std.StringBuilder body! = std.StringBuilder();
+        body.append("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
+        body.append("\"uri\":");
+        json.append_string(body$.mut_ref(), document.uri.bytes());
+        body.append(",\"version\":");
+        body.append(document.version);
+        body.append(",\"diagnostics\":");
+        body.append(diagnostics.slice());
+        body.append("}}");
         transport.write_message(body.slice());
+        self.documents.mut_ref_at(document_index).published_diagnostics = diagnostics.into_string();
     }
 
     Void append_diagnostic(self, std.StringBuilder&! body, diagnostic.Diagnostic& item) {

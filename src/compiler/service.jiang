@@ -15,6 +15,11 @@ alias source = import "./source.jiang";
 alias source_map = import "./source/source_map.jiang";
 alias sem = import "./sema/model.jiang";
 alias token = import "./syntax/token.jiang";
+alias namespace = import "./resolve/namespace.jiang";
+alias def = import "./resolve/def.jiang";
+alias list = import "./support/list.jiang";
+alias string = import "./support/string.jiang";
+alias table = import "./support/table.jiang";
 import std;
 
 @region(a)
@@ -136,6 +141,119 @@ public struct CompilerQueries: Copyable {
         return preview;
     }
 
+    #doc 返回光标前的参数、局部声明及当前模块绑定，按名称去重。
+    public list.ArrayList<qid.DefId> completion_defs(self, source.SourceId source_id, Int byte_offset) {
+        list.ArrayList<qid.DefId> result! = list.ArrayList<qid.DefId>();
+        if (!self.store.sources.has_source(source_id)) { return result; }
+        UInt8[]& text = self.store.sources.get(source_id).text$.ref();
+        if (byte_offset < 0 || byte_offset > text.length) { return result; }
+        Int prefix_start! = byte_offset;
+        while (prefix_start > 0 && completion_ident_byte(text[prefix_start - 1])) {
+            prefix_start = prefix_start - 1;
+        }
+        if (prefix_start > 0 && text[prefix_start - 1] == UInt8(46)) { return result; }
+        UInt8[]& prefix = text[prefix_start..byte_offset];
+        guard self.store.resolve.module_for_source(source_id) is .some(module_id) else { return result; }
+        if (self.enclosing_completion_owner(source_id, byte_offset, module_id) is .some(owner_def)) {
+            self.append_body_completions(owner_def, source_id, byte_offset, prefix, result$.mut_ref());
+            self.append_resolved_completions(owner_def, source_id, byte_offset, prefix, result$.mut_ref());
+        }
+        qid.NamespaceId module_namespace = self.store.resolve.modules.ref_at(module_id).namespace_id;
+        table.MultiTableCursor cursor! = self.store.resolve.first_namespace_binding(module_namespace);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.namespace_binding_at(cursor);
+            if (binding.domain == .value_name || binding.domain == .type_name
+                || binding.domain == .namespace_name || binding.domain == .alias_name) {
+                self.append_completion(binding.def_id, prefix, result$.mut_ref());
+            }
+            cursor = self.store.resolve.next_namespace_binding(cursor);
+        }
+        return result;
+    }
+
+    #doc 供协议层显示已解析定义的名称。
+    public std.String completion_label(self, qid.DefId def_id) {
+        return std.String.from_valid_utf8(self.store.symbols.text(self.store.defs.get(def_id).name.symbol));
+    }
+
+    qid.DefId? enclosing_completion_owner(self, source.SourceId source_id, Int offset, qid.ModuleId module_id) {
+        if (offset > 0 && self.node_at(source_id, offset - 1) is .some(node_id)) {
+            return node_id.owner_def;
+        }
+        qid.DefId? best! = null;
+        Int best_length! = 0;
+        Int index! = 0;
+        while (index < self.store.defs.records.len()) {
+            qid.DefId candidate = qid.DefId(index);
+            def.DefRecord record = self.store.defs.records.get(candidate);
+            if (record.kind == .function_def && record.module_id == module_id) {
+                if (self.span_for_def(candidate) is .some(location)
+                    && location.source_id == source_id
+                    && location.span.start <= offset && offset <= location.span.end()
+                    && (best == null || location.span.length < best_length)) {
+                    best = candidate;
+                    best_length = location.span.length;
+                }
+            }
+            index = index + 1;
+        }
+        return best;
+    }
+
+    Void append_resolved_completions(
+        self, qid.DefId owner_def, source.SourceId source_id, Int offset,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        Int index! = 0;
+        while (index < self.store.defs.records.len()) {
+            qid.DefId candidate = qid.DefId(index);
+            def.DefRecord record = self.store.defs.records.get(candidate);
+            if ((record.kind == .parameter_def || record.kind == .local_def) && record.owner_def == owner_def) {
+                if (self.span_for_def(candidate) is .some(location)
+                    && location.source_id == source_id && location.span.start < offset) {
+                    self.append_completion(candidate, prefix, result);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    Void append_body_completions(
+        self, qid.DefId owner_def, source.SourceId source_id, Int offset,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        guard self.store.model.body(owner_def) is .some(body) else { return; }
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            sem.Local local = body.locals.get(sem.LocalId(index));
+            if (local.kind == .parameter || local.kind == .local_variable) {
+                if (self.local_before_offset(local, source_id, offset)) {
+                    self.append_completion(local.def_id, prefix, result);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool local_before_offset(self, sem.Local local, source.SourceId source_id, Int offset) {
+        if (local.kind == .parameter) { return true; }
+        guard self.span_for_def(local.def_id) is .some(declaration) else { return false; }
+        return declaration.source_id == source_id && declaration.span.start < offset;
+    }
+
+    Void append_completion(self, qid.DefId def_id, UInt8[]& prefix, list.ArrayList<qid.DefId>&! result) {
+        UInt8[]& name = self.store.symbols.text(self.store.defs.get(def_id).name.symbol);
+        if (name.length < prefix.length) { return; }
+        if (!string.equal(name[0..prefix.length], prefix)) { return; }
+        Int index! = 0;
+        while (index < result.len()) {
+            UInt8[]& existing = self.store.symbols.text(self.store.defs.get(result.get(index)).name.symbol);
+            if (string.equal(existing, name)) { return; }
+            index = index + 1;
+        }
+        result.add(def_id);
+    }
+
     qid.DefId? definition_for_name_ref(self, qid.DefId owner_def, sem.NameRef name_ref) {
         if (name_ref is .def_ref(def_id)) { return def_id; }
         if (name_ref is .local(local_id)) { return self.local_def(owner_def, local_id); }
@@ -154,4 +272,11 @@ public struct CompilerQueries: Copyable {
         if (byte_offset < name_span.start || byte_offset >= name_span.end()) { return null; }
         return def_id;
     }
+}
+
+Bool completion_ident_byte(UInt8 byte) {
+    return (byte >= UInt8(65) && byte <= UInt8(90))
+        || (byte >= UInt8(97) && byte <= UInt8(122))
+        || (byte >= UInt8(48) && byte <= UInt8(57))
+        || byte == UInt8(95) || byte >= UInt8(128);
 }
