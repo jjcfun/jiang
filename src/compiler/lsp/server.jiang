@@ -1,0 +1,328 @@
+#doc(module)
+    维护单个 LSP 连接的文档版本与 CompilerSession；首阶段同步处理全文编辑并发布诊断。
+#end
+
+alias diagnostic = import "../diagnostic.jiang";
+alias options = import "../driver/options.jiang";
+alias session = import "../session.jiang";
+alias source = import "../source.jiang";
+alias source_entry = import "../source/entry.jiang";
+alias list = import "../support/list.jiang";
+alias string = import "../support/string.jiang";
+alias json = import "./json.jiang";
+alias transport = import "./transport.jiang";
+import std;
+
+struct Document: Movable {
+    std.String uri;
+    std.String path;
+    source.SourceId source_id;
+    Int version!;
+    Bool open!;
+
+    init(self, std.String uri, std.String path, source.SourceId source_id, Int version) {
+        self.uri = uri;
+        self.path = path;
+        self.source_id = source_id;
+        self.version = version;
+        self.open = true;
+    }
+}
+
+struct Server: Movable {
+    session.CompilerSession compiler!;
+    list.ArrayList<Document> documents!;
+    Bool initialized!;
+    Bool shutdown!;
+
+    init(self) {
+        self.compiler = session.CompilerSession();
+        self.documents = list.ArrayList<Document>();
+        self.initialized = false;
+        self.shutdown = false;
+    }
+
+    #doc 处理一条完整 JSON-RPC 消息；收到 exit 后返回 false。
+    Bool handle(Self&! self, UInt8[]& message) {
+        guard json.parse(message) is .some(root) else {
+            self.write_error("null", -32700, "Parse error");
+            return true;
+        }
+        if (root.kind != .object) {
+            self.write_error("null", -32600, "Invalid Request");
+            return true;
+        }
+        guard root.field("jsonrpc") is .some(version) else { return self.invalid_request(root); }
+        guard version.as_string() is .some(protocol) else { return self.invalid_request(root); }
+        if (!string.equal(protocol.bytes(), "2.0")) { return self.invalid_request(root); }
+        guard root.field("method") is .some(method_value) else { return self.invalid_request(root); }
+        guard method_value.as_string() is .some(method) else { return self.invalid_request(root); }
+        json.Value? id = root.field("id");
+        if (string.equal(method.bytes(), "initialize")) {
+            if (id is .some(request_id)) { self.initialize(request_id); }
+            return true;
+        }
+        if (string.equal(method.bytes(), "exit")) { return false; }
+        if (string.equal(method.bytes(), "shutdown")) {
+            self.shutdown = true;
+            if (id is .some(request_id)) { self.write_result(request_id.raw(), "null"); }
+            return true;
+        }
+        if (!self.initialized || self.shutdown) {
+            if (id is .some(request_id)) { self.write_error(request_id.raw(), -32002, "Server not initialized"); }
+            return true;
+        }
+        if (string.equal(method.bytes(), "initialized")) { return true; }
+        guard root.field("params") is .some(params) else {
+            if (id is .some(request_id)) { self.write_error(request_id.raw(), -32602, "Invalid params"); }
+            return true;
+        }
+        if (string.equal(method.bytes(), "textDocument/didOpen")) { self.did_open(params); }
+        else if (string.equal(method.bytes(), "textDocument/didChange")) { self.did_change(params); }
+        else if (string.equal(method.bytes(), "textDocument/didClose")) { self.did_close(params); }
+        else if (id is .some(request_id)) { self.write_error(request_id.raw(), -32601, "Method not found"); }
+        return true;
+    }
+
+    Bool invalid_request(Self&! self, json.Value root) {
+        UInt8[]& id! = "null";
+        if (root.field("id") is .some(request_id)) { id = request_id.raw(); }
+        self.write_error(id, -32600, "Invalid Request");
+        return true;
+    }
+
+    Void initialize(Self&! self, json.Value id) {
+        if (self.initialized) {
+            self.write_error(id.raw(), -32600, "Already initialized");
+            return;
+        }
+        self.initialized = true;
+        std.StringBuilder result! = std.StringBuilder();
+        result.append("{\"capabilities\":{\"positionEncoding\":\"utf-16\",");
+        result.append("\"textDocumentSync\":{\"openClose\":true,\"change\":1}},");
+        result.append("\"serverInfo\":{\"name\":\"Jiang\",\"version\":\"0.6.0\"}}");
+        self.write_result(id.raw(), result.slice());
+    }
+
+    Void did_open(Self&! self, json.Value params) {
+        guard params.field("textDocument") is .some(text_document) else { return; }
+        guard text_document.field("uri") is .some(uri_value) else { return; }
+        guard uri_value.as_string() is .some(uri) else { return; }
+        guard file_path(uri.bytes()) is .some(path) else { return; }
+        guard text_document.field("text") is .some(text_value) else { return; }
+        guard text_value.as_string() is .some(text) else { return; }
+        guard text_document.field("version") is .some(version_value) else { return; }
+        guard version_value.as_int() is .some(version) else { return; }
+        if (self.document_index(uri.bytes()) is .some(index) && self.documents.ref_at(index).open
+            && version <= self.documents.ref_at(index).version) { return; }
+        source.SourceId source_id = self.compiler.set_source(path.bytes(), text.bytes());
+        std.String compilation_path = std.String.from_valid_utf8(path.bytes());
+        if (self.document_index(uri.bytes()) is .some(index)) {
+            Document&! document = self.documents.mut_ref_at(index);
+            document.version = version;
+            document.open = true;
+        } else {
+            self.documents.add(Document(uri, path, source_id, version));
+        }
+        self.compile_document(compilation_path.bytes());
+    }
+
+    Void did_change(Self&! self, json.Value params) {
+        guard params.field("textDocument") is .some(text_document) else { return; }
+        guard text_document.field("uri") is .some(uri_value) else { return; }
+        guard uri_value.as_string() is .some(uri) else { return; }
+        guard self.document_index(uri.bytes()) is .some(index) else { return; }
+        if (!self.documents.ref_at(index).open) { return; }
+        guard text_document.field("version") is .some(version_value) else { return; }
+        guard version_value.as_int() is .some(version) else { return; }
+        if (version <= self.documents.ref_at(index).version) { return; }
+        guard params.field("contentChanges") is .some(changes) else { return; }
+        guard changes.item(0) is .some(change) else { return; }
+        if (change.field("range") != null || changes.item(1) != null) { return; }
+        guard change.field("text") is .some(text_value) else { return; }
+        guard text_value.as_string() is .some(text) else { return; }
+        std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
+        self.compiler.set_source(path.bytes(), text.bytes());
+        Document&! document = self.documents.mut_ref_at(index);
+        document.version = version;
+        self.compile_document(path.bytes());
+    }
+
+    Void did_close(Self&! self, json.Value params) {
+        guard params.field("textDocument") is .some(text_document) else { return; }
+        guard text_document.field("uri") is .some(uri_value) else { return; }
+        guard uri_value.as_string() is .some(uri) else { return; }
+        guard self.document_index(uri.bytes()) is .some(index) else { return; }
+        if (!self.documents.ref_at(index).open) { return; }
+        std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
+        self.compiler.clear_source(path.bytes());
+        self.documents.mut_ref_at(index).open = false;
+        self.publish_empty(uri.bytes(), null);
+    }
+
+    Int? document_index(self, UInt8[]& uri) {
+        Int index! = 0;
+        while (index < self.documents.len()) {
+            if (string.equal(self.documents.ref_at(index).uri.bytes(), uri)) { return index; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Void compile_document(Self&! self, UInt8[]& path) {
+        source_entry.PackageHandle package = self.compiler.load_package(path);
+        options.CompileOptions check! = options.CompileOptions(.check_only, path, "");
+        if (package.ok) { self.compiler.compile_loaded(package$.ref(), check$.ref()); }
+        Int index! = 0;
+        while (index < self.documents.len()) {
+            Document& document = self.documents.ref_at(index);
+            if (document.open && string.equal(document.path.bytes(), path)) {
+                self.publish_diagnostics(document);
+            }
+            index = index + 1;
+        }
+    }
+
+    Void publish_diagnostics(self, Document& document) {
+        std.StringBuilder body! = std.StringBuilder();
+        body.append("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
+        body.append("\"uri\":");
+        json.append_string(body$.mut_ref(), document.uri.bytes());
+        body.append(",\"version\":");
+        body.append(document.version);
+        body.append(",\"diagnostics\":[");
+        Int index! = 0;
+        Bool first! = true;
+        while (index < self.compiler.diagnostics().len()) {
+            diagnostic.Diagnostic& item = self.compiler.diagnostics().get(index);
+            index = index + 1;
+            if (item.range.source_id is .some(id) && id != document.source_id) { continue; }
+            if (!first) { body.append(","); }
+            first = false;
+            self.append_diagnostic(body$.mut_ref(), item);
+        }
+        body.append("]}}");
+        transport.write_message(body.slice());
+    }
+
+    Void append_diagnostic(self, std.StringBuilder&! body, diagnostic.Diagnostic& item) {
+        diagnostic.SourceRange range! = item.range;
+        if (item.range.source_id is .some(id)) {
+            if (self.compiler.lsp_range(id, item.range.span) is .some(mapped)) { range = mapped; }
+        }
+        body.append("{\"range\":{");
+        append_position(body, "start", range.start);
+        body.append(",");
+        append_position(body, "end", range.end);
+        body.append("},\"severity\":");
+        body.append(diagnostic.lsp_severity_code(item.severity));
+        body.append(",\"code\":");
+        if (item.code.kind == .numeric) { body.append(item.code.number); }
+        else { json.append_string(body, item.code.text); }
+        body.append(",\"source\":");
+        json.append_string(body, item.source_name);
+        body.append(",\"message\":");
+        json.append_string(body, item.message.bytes());
+        body.append("}");
+    }
+
+    Void publish_empty(Self&! self, UInt8[]& uri, Int? version) {
+        std.StringBuilder body! = std.StringBuilder();
+        body.append("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
+        body.append("\"uri\":");
+        json.append_string(body$.mut_ref(), uri);
+        if (version is .some(current)) {
+            body.append(",\"version\":");
+            body.append(current);
+        }
+        body.append(",\"diagnostics\":[]}}");
+        transport.write_message(body.slice());
+    }
+
+    Void write_result(Self&! self, UInt8[]& id, UInt8[]& result) {
+        std.StringBuilder body! = std.StringBuilder();
+        body.append("{\"jsonrpc\":\"2.0\",\"id\":");
+        body.append_valid_utf8(id);
+        body.append(",\"result\":");
+        body.append_valid_utf8(result);
+        body.append("}");
+        transport.write_message(body.slice());
+    }
+
+    Void write_error(Self&! self, UInt8[]& id, Int code, UInt8[]& message) {
+        std.StringBuilder body! = std.StringBuilder();
+        body.append("{\"jsonrpc\":\"2.0\",\"id\":");
+        body.append_valid_utf8(id);
+        body.append(",\"error\":{\"code\":");
+        body.append(code);
+        body.append(",\"message\":");
+        json.append_string(body$.mut_ref(), message);
+        body.append("}}");
+        transport.write_message(body.slice());
+    }
+}
+
+Void append_position(std.StringBuilder&! body, UInt8[]& name, diagnostic.SourcePosition position) {
+    json.append_string(body, name);
+    body.append(":{\"line\":");
+    body.append(position.line);
+    body.append(",\"character\":");
+    body.append(position.character);
+    body.append("}");
+}
+
+std.String? file_path(UInt8[]& uri) {
+    UInt8[]& prefix = "file://";
+    if (uri.length < prefix.length) { return null; }
+    Int index! = 0;
+    while (index < prefix.length) {
+        if (uri[index] != prefix[index]) { return null; }
+        index = index + 1;
+    }
+    if (uri.length > index && uri[index] != UInt8(47)) {
+        UInt8[]& localhost = "localhost";
+        if (uri.length < index + localhost.length + 1) { return null; }
+        Int offset! = 0;
+        while (offset < localhost.length) {
+            if (uri[index + offset] != localhost[offset]) { return null; }
+            offset = offset + 1;
+        }
+        index = index + localhost.length;
+    }
+    if (index >= uri.length || uri[index] != UInt8(47)) { return null; }
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    while (index < uri.length) {
+        UInt8 byte! = uri[index];
+        if (byte == UInt8(63) || byte == UInt8(35)) { return null; }
+        if (byte == UInt8(37)) {
+            if (index + 2 >= uri.length) { return null; }
+            guard hex_digit(uri[index + 1]) is .some(high) else { return null; }
+            guard hex_digit(uri[index + 2]) is .some(low) else { return null; }
+            byte = UInt8(high * 16 + low);
+            index = index + 2;
+        }
+        if (byte == UInt8(0)) { return null; }
+        bytes.add(byte);
+        index = index + 1;
+    }
+    std.String path = try std.String.from_utf8(bytes.slice()) catch { return null; };
+    return path;
+}
+
+Int? hex_digit(UInt8 byte) {
+    if (byte >= UInt8(48) && byte <= UInt8(57)) { return Int(byte) - 48; }
+    if (byte >= UInt8(65) && byte <= UInt8(70)) { return Int(byte) - 55; }
+    if (byte >= UInt8(97) && byte <= UInt8(102)) { return Int(byte) - 87; }
+    return null;
+}
+
+#doc 在 stdio 上服务一个 LSP 连接；按协议 exit 状态返回进程退出码。
+public Int run() {
+    Server server! = Server();
+    while (true) {
+        guard transport.read_message() is .some(message) else { break; }
+        if (!server.handle(message[..])) { break; }
+    }
+    if (server.shutdown) { return 0; }
+    return 1;
+}

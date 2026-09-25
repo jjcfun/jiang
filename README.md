@@ -12,7 +12,8 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 [官网与语言文档](https://jiang-lang.org/)
 
-当前源码为 **0.5.6**，主要变更见 [0.5.6 release notes](doc/releases/0.5.6.md)。
+当前开发源码为 **0.6.0**；最新发行版是 **0.5.6**，发行版变更见
+[0.5.6 release notes](doc/releases/0.5.6.md)。
 
 ## 安装发行版
 
@@ -25,6 +26,12 @@ cd jiang-0.5.6-<platform>
 
 默认安装到 `~/.jiang`，主命令是 `jiang`；如有需要，把 `~/.jiang/bin` 加入 `PATH`。
 安装包和 SHA-256 校验文件见 [Jiang 0.5.6 release](https://github.com/jjcfun/jiang/releases/tag/0.5.6)。
+
+## LSP 开发预览
+
+0.6.0 开发版通过 `jiang lsp` 在标准输入与标准输出上提供语言服务器。当前阶段支持
+初始化、全文文档同步和未保存文件诊断；跳转定义、悬停与补全仍在开发中。
+从本仓库构建时，可用 `build/bin/jiangc.next lsp` 启动同一入口。
 
 
 
@@ -81,17 +88,18 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.5.6 源码直接使用已发布的 0.5.5 stable。严格冷启动链为：
+当前 0.6.0 源码直接使用已发布的 0.5.6 stable。严格冷启动链为：
 
 ```text
-0.5.5 stable
-  -> 0.5.6 next
-  -> 0.5.6 stable
+0.5.6 stable
+  -> 0.6.0 next
+  -> 0.6.0 stable
 ```
 
-安装 0.5.5 stable 后，在源码 worktree 中运行：
+安装 0.5.6 stable 后，在源码 worktree 中运行：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.6 \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
@@ -99,7 +107,7 @@ bash ./script/build_next.sh
 
 产出 `build/bin/jiangc.next` 与 `build/bin/jiangc`，并运行完整验证。
 
-构建脚本默认读取 `~/.jiang/versions/0.5.5/bin/jiangc` 并校验版本。如只想构建不跑验证，
+构建脚本默认读取 `~/.jiang/versions/0.5.6/bin/jiangc` 并校验版本。如只想构建不跑验证，
 可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 

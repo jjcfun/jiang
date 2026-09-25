@@ -5,14 +5,15 @@
 
 ## 常规开发
 
-0.5.6 直接使用已发布的 0.5.5 stable，不需要 bootstrap 过渡分支。默认种子为
-`~/.jiang/versions/0.5.5/bin/jiangc`；构建脚本会检查其版本，随后完成
-`0.5.5 stable -> 0.5.6 next -> 0.5.6 stable`。不得使用 0.6.0 产物或临时编译器替代该输入。
+0.6.0 直接使用已发布的 0.5.6 stable，不需要 bootstrap 过渡分支。默认种子为
+`~/.jiang/versions/0.5.6/bin/jiangc`；构建脚本会检查其版本，随后完成
+`0.5.6 stable -> 0.6.0 next -> 0.6.0 stable`。不得使用旧 0.6.0 实验产物或临时编译器替代该输入。
 
 开发期间保留功能分支；功能冻结后再建立 release 分支，bootstrap 改动仅在自己的分支提交。
 每轮使用独立 BUILD_DIR，构建期间保持源码不变，并记录源码、种子和工具链身份。
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.6 \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=next VERIFY=none \
 bash ./script/build_next.sh
@@ -32,6 +33,7 @@ JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 正式 release 前生成 stable，并执行完整验证：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.6 \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \

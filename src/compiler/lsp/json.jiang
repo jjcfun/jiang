@@ -1,0 +1,367 @@
+#doc(module)
+    解析 LSP JSON 消息并按输入范围查询字段；只保存借用的消息正文，不复制整棵 JSON 树。
+#end
+
+alias list = import "../support/list.jiang";
+alias string = import "../support/string.jiang";
+import std;
+
+struct Cursor: Movable {
+    Int index!;
+
+    init(self, Int index) { self.index = index; }
+}
+
+public enum Kind {
+    object,
+    array,
+    string,
+    number,
+    boolean,
+    null_value,
+}
+
+@region(a)
+public struct Value: Copyable {
+    @life(a)
+    UInt8[]& input;
+    public Int start;
+    public Int end;
+    public Kind kind;
+
+    public init(self, UInt8[]& input, Int start, Int end, Kind kind) {
+        self.input = input;
+        self.start = start;
+        self.end = end;
+        self.kind = kind;
+    }
+
+    #doc 查询 object 字段；字段名中的 JSON escape 会正常解码。
+    public Value? field(self, UInt8[]& name) {
+        if (self.kind != .object) { return null; }
+        Cursor cursor! = Cursor(self.start + 1);
+        while (true) {
+            skip_space(self.input, cursor$.mut_ref());
+            if (cursor.index >= self.end - 1) { return null; }
+            Int key_start = cursor.index;
+            guard scan_string(self.input, cursor$.mut_ref()) else { return null; }
+            Int key_end = cursor.index;
+            skip_space(self.input, cursor$.mut_ref());
+            if (cursor.index >= self.end || self.input[cursor.index] != UInt8(58)) { return null; }
+            cursor.index = cursor.index + 1;
+            skip_space(self.input, cursor$.mut_ref());
+            Int value_start = cursor.index;
+            guard scan_value(self.input, cursor$.mut_ref(), 0) is .some(kind) else { return null; }
+            if (decoded_equals(self.input[key_start..key_end], name)) {
+                return Value(self.input, value_start, cursor.index, kind);
+            }
+            skip_space(self.input, cursor$.mut_ref());
+            if (cursor.index >= self.end || self.input[cursor.index] != UInt8(44)) { return null; }
+            cursor.index = cursor.index + 1;
+        }
+        return null;
+    }
+
+    #doc 查询 array 第 index 个元素。
+    public Value? item(self, Int requested) {
+        if (self.kind != .array || requested < 0) { return null; }
+        Cursor cursor! = Cursor(self.start + 1);
+        Int current! = 0;
+        while (true) {
+            skip_space(self.input, cursor$.mut_ref());
+            if (cursor.index >= self.end - 1) { return null; }
+            Int value_start = cursor.index;
+            guard scan_value(self.input, cursor$.mut_ref(), 0) is .some(kind) else { return null; }
+            if (current == requested) { return Value(self.input, value_start, cursor.index, kind); }
+            current = current + 1;
+            skip_space(self.input, cursor$.mut_ref());
+            if (cursor.index >= self.end || self.input[cursor.index] != UInt8(44)) { return null; }
+            cursor.index = cursor.index + 1;
+        }
+        return null;
+    }
+
+    public Int? as_int(self) {
+        if (self.kind != .number) { return null; }
+        Int index! = self.start;
+        Bool negative! = false;
+        if (self.input[index] == UInt8(45)) {
+            negative = true;
+            index = index + 1;
+        }
+        Int result! = 0;
+        while (index < self.end) {
+            UInt8 byte = self.input[index];
+            if (byte < UInt8(48) || byte > UInt8(57)) { return null; }
+            Int digit = Int(byte) - 48;
+            if (result > (9223372036854775807 - digit) / 10) { return null; }
+            result = result * 10 + digit;
+            index = index + 1;
+        }
+        if (negative) { return -result; }
+        return result;
+    }
+
+    public std.String? as_string(self) {
+        if (self.kind != .string) { return null; }
+        return decode_string(self.input[self.start..self.end]);
+    }
+
+    @life(return: self.a)
+    public UInt8[]& raw(self) {
+        return self.input[self.start..self.end];
+    }
+}
+
+@life(return: input)
+#doc 校验完整 JSON 消息，返回引用原始输入的 root value。
+public Value? parse(UInt8[]& input) {
+    Cursor cursor! = Cursor(0);
+    skip_space(input, cursor$.mut_ref());
+    Int start = cursor.index;
+    guard scan_value(input, cursor$.mut_ref(), 0) is .some(kind) else { return null; }
+    Int end = cursor.index;
+    skip_space(input, cursor$.mut_ref());
+    if (cursor.index != input.length) { return null; }
+    return Value(input, start, end, kind);
+}
+
+Kind? scan_value(UInt8[]& input, Cursor&! cursor, Int depth) {
+    if (depth > 64 || cursor.index >= input.length) { return null; }
+    UInt8 byte = input[cursor.index];
+    if (byte == UInt8(34)) {
+        if (scan_string(input, cursor)) { return Kind.string; }
+        return null;
+    }
+    if (byte == UInt8(123)) {
+        if (scan_container(input, cursor, depth, true)) { return Kind.object; }
+        return null;
+    }
+    if (byte == UInt8(91)) {
+        if (scan_container(input, cursor, depth, false)) { return Kind.array; }
+        return null;
+    }
+    if (byte == UInt8(116) && scan_literal(input, cursor, "true")) { return Kind.boolean; }
+    if (byte == UInt8(102) && scan_literal(input, cursor, "false")) { return Kind.boolean; }
+    if (byte == UInt8(110) && scan_literal(input, cursor, "null")) { return Kind.null_value; }
+    if (scan_number(input, cursor)) { return Kind.number; }
+    return null;
+}
+
+Bool scan_container(UInt8[]& input, Cursor&! cursor, Int depth, Bool object) {
+    UInt8 close = if (object) { UInt8(125) } else { UInt8(93) };
+    cursor.index = cursor.index + 1;
+    skip_space(input, cursor);
+    if (cursor.index < input.length && input[cursor.index] == close) {
+        cursor.index = cursor.index + 1;
+        return true;
+    }
+    while (cursor.index < input.length) {
+        if (object) {
+            if (!scan_string(input, cursor)) { return false; }
+            skip_space(input, cursor);
+            if (cursor.index >= input.length || input[cursor.index] != UInt8(58)) { return false; }
+            cursor.index = cursor.index + 1;
+            skip_space(input, cursor);
+        }
+        if (scan_value(input, cursor, depth + 1) == null) { return false; }
+        skip_space(input, cursor);
+        if (cursor.index >= input.length) { return false; }
+        if (input[cursor.index] == close) {
+            cursor.index = cursor.index + 1;
+            return true;
+        }
+        if (input[cursor.index] != UInt8(44)) { return false; }
+        cursor.index = cursor.index + 1;
+        skip_space(input, cursor);
+    }
+    return false;
+}
+
+Bool scan_string(UInt8[]& input, Cursor&! cursor) {
+    if (cursor.index >= input.length || input[cursor.index] != UInt8(34)) { return false; }
+    cursor.index = cursor.index + 1;
+    while (cursor.index < input.length) {
+        UInt8 byte = input[cursor.index];
+        cursor.index = cursor.index + 1;
+        if (byte == UInt8(34)) { return true; }
+        if (byte < UInt8(32)) { return false; }
+        if (byte != UInt8(92)) { continue; }
+        if (cursor.index >= input.length) { return false; }
+        UInt8 escaped = input[cursor.index];
+        cursor.index = cursor.index + 1;
+        if (escaped == UInt8(117)) {
+            if (cursor.index + 4 > input.length) { return false; }
+            Int end = cursor.index + 4;
+            while (cursor.index < end) {
+                if (hex_digit(input[cursor.index]) == null) { return false; }
+                cursor.index = cursor.index + 1;
+            }
+        } else if (!simple_escape(escaped)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+Bool scan_literal(UInt8[]& input, Cursor&! cursor, UInt8[]& expected) {
+    if (cursor.index + expected.length > input.length) { return false; }
+    Int offset! = 0;
+    while (offset < expected.length) {
+        if (input[cursor.index + offset] != expected[offset]) { return false; }
+        offset = offset + 1;
+    }
+    cursor.index = cursor.index + expected.length;
+    return true;
+}
+
+Bool scan_number(UInt8[]& input, Cursor&! cursor) {
+    Int start = cursor.index;
+    if (input[cursor.index] == UInt8(45)) { cursor.index = cursor.index + 1; }
+    if (cursor.index >= input.length) { return false; }
+    if (input[cursor.index] == UInt8(48)) {
+        cursor.index = cursor.index + 1;
+    } else {
+        if (!is_digit(input[cursor.index]) || input[cursor.index] == UInt8(48)) { return false; }
+        while (cursor.index < input.length && is_digit(input[cursor.index])) { cursor.index = cursor.index + 1; }
+    }
+    if (cursor.index < input.length && input[cursor.index] == UInt8(46)) {
+        cursor.index = cursor.index + 1;
+        if (cursor.index >= input.length || !is_digit(input[cursor.index])) { return false; }
+        while (cursor.index < input.length && is_digit(input[cursor.index])) { cursor.index = cursor.index + 1; }
+    }
+    if (cursor.index < input.length && (input[cursor.index] == UInt8(101) || input[cursor.index] == UInt8(69))) {
+        cursor.index = cursor.index + 1;
+        if (cursor.index < input.length && (input[cursor.index] == UInt8(43) || input[cursor.index] == UInt8(45))) {
+            cursor.index = cursor.index + 1;
+        }
+        if (cursor.index >= input.length || !is_digit(input[cursor.index])) { return false; }
+        while (cursor.index < input.length && is_digit(input[cursor.index])) { cursor.index = cursor.index + 1; }
+    }
+    return cursor.index > start;
+}
+
+Void skip_space(UInt8[]& input, Cursor&! cursor) {
+    while (cursor.index < input.length) {
+        UInt8 byte = input[cursor.index];
+        if (byte != UInt8(32) && byte != UInt8(9) && byte != UInt8(10) && byte != UInt8(13)) { return; }
+        cursor.index = cursor.index + 1;
+    }
+}
+
+Bool is_digit(UInt8 byte) { return byte >= UInt8(48) && byte <= UInt8(57); }
+
+Bool simple_escape(UInt8 byte) {
+    return byte == UInt8(34) || byte == UInt8(92) || byte == UInt8(47)
+        || byte == UInt8(98) || byte == UInt8(102) || byte == UInt8(110)
+        || byte == UInt8(114) || byte == UInt8(116);
+}
+
+Int? hex_digit(UInt8 byte) {
+    if (byte >= UInt8(48) && byte <= UInt8(57)) { return Int(byte) - 48; }
+    if (byte >= UInt8(65) && byte <= UInt8(70)) { return Int(byte) - 55; }
+    if (byte >= UInt8(97) && byte <= UInt8(102)) { return Int(byte) - 87; }
+    return null;
+}
+
+Int? unicode_escape(UInt8[]& input, Int start) {
+    if (start + 4 > input.length) { return null; }
+    Int value! = 0;
+    Int index! = start;
+    while (index < start + 4) {
+        guard hex_digit(input[index]) is .some(digit) else { return null; }
+        value = value * 16 + digit;
+        index = index + 1;
+    }
+    return value;
+}
+
+std.String? decode_string(UInt8[]& encoded) {
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    Int index! = 1;
+    while (index < encoded.length - 1) {
+        UInt8 byte = encoded[index];
+        index = index + 1;
+        if (byte != UInt8(92)) {
+            bytes.add(byte);
+            continue;
+        }
+        UInt8 escaped = encoded[index];
+        index = index + 1;
+        if (escaped == UInt8(117)) {
+            guard unicode_escape(encoded, index) is .some(first) else { return null; }
+            Int scalar! = first;
+            index = index + 4;
+            if (scalar >= 55296 && scalar <= 56319) {
+                if (index + 6 > encoded.length - 1 || encoded[index] != UInt8(92)
+                    || encoded[index + 1] != UInt8(117)) { return null; }
+                guard unicode_escape(encoded, index + 2) is .some(low) else { return null; }
+                if (low < 56320 || low > 57343) { return null; }
+                scalar = 65536 + (scalar - 55296) * 1024 + low - 56320;
+                index = index + 6;
+            } else if (scalar >= 56320 && scalar <= 57343) {
+                return null;
+            }
+            append_scalar(bytes$.mut_ref(), scalar);
+        } else {
+            bytes.add(unescape_byte(escaped));
+        }
+    }
+    std.String result = try std.String.from_utf8(bytes.slice()) catch { return null; };
+    return result;
+}
+
+UInt8 unescape_byte(UInt8 escaped) {
+    if (escaped == UInt8(98)) { return UInt8(8); }
+    if (escaped == UInt8(102)) { return UInt8(12); }
+    if (escaped == UInt8(110)) { return UInt8(10); }
+    if (escaped == UInt8(114)) { return UInt8(13); }
+    if (escaped == UInt8(116)) { return UInt8(9); }
+    return escaped;
+}
+
+Void append_scalar(list.ArrayList<UInt8>&! bytes, Int scalar) {
+    if (scalar < 128) {
+        bytes.add(UInt8(scalar));
+    } else if (scalar < 2048) {
+        bytes.add(UInt8(192 + scalar / 64));
+        bytes.add(UInt8(128 + scalar % 64));
+    } else if (scalar < 65536) {
+        bytes.add(UInt8(224 + scalar / 4096));
+        bytes.add(UInt8(128 + (scalar / 64) % 64));
+        bytes.add(UInt8(128 + scalar % 64));
+    } else {
+        bytes.add(UInt8(240 + scalar / 262144));
+        bytes.add(UInt8(128 + (scalar / 4096) % 64));
+        bytes.add(UInt8(128 + (scalar / 64) % 64));
+        bytes.add(UInt8(128 + scalar % 64));
+    }
+}
+
+Bool decoded_equals(UInt8[]& encoded, UInt8[]& name) {
+    guard decode_string(encoded) is .some(decoded) else { return false; }
+    return string.equal(decoded.bytes(), name);
+}
+
+#doc 向 JSON 输出追加经过转义的 UTF-8 string。
+public Void append_string(std.StringBuilder&! output, UInt8[]& text) {
+    output.append("\"");
+    Int index! = 0;
+    while (index < text.length) {
+        UInt8 byte = text[index];
+        if (byte == UInt8(34)) { output.append("\\\""); }
+        else if (byte == UInt8(92)) { output.append("\\\\"); }
+        else if (byte == UInt8(10)) { output.append("\\n"); }
+        else if (byte == UInt8(13)) { output.append("\\r"); }
+        else if (byte == UInt8(9)) { output.append("\\t"); }
+        else if (byte < UInt8(32)) {
+            output.append("\\u00");
+            output.append(Int(byte) / 16, 16);
+            output.append(Int(byte) % 16, 16);
+        } else {
+            output.append_valid_utf8(text[index..index + 1]);
+        }
+        index = index + 1;
+    }
+    output.append("\"");
+}
