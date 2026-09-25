@@ -5,8 +5,11 @@
 alias diagnostic = import "../diagnostic.jiang";
 alias options = import "../driver/options.jiang";
 alias session = import "../session.jiang";
+alias service = import "../service.jiang";
 alias source = import "../source.jiang";
+alias source_map = import "../source/source_map.jiang";
 alias source_entry = import "../source/entry.jiang";
+alias env = import "../system/env.jiang";
 alias list = import "../support/list.jiang";
 alias string = import "../support/string.jiang";
 alias json = import "./json.jiang";
@@ -32,12 +35,14 @@ struct Document: Movable {
 struct Server: Movable {
     session.CompilerSession compiler!;
     list.ArrayList<Document> documents!;
+    std.String? checked_path!;
     Bool initialized!;
     Bool shutdown!;
 
     init(self) {
         self.compiler = session.CompilerSession();
         self.documents = list.ArrayList<Document>();
+        self.checked_path = null;
         self.initialized = false;
         self.shutdown = false;
     }
@@ -80,6 +85,12 @@ struct Server: Movable {
         if (string.equal(method.bytes(), "textDocument/didOpen")) { self.did_open(params); }
         else if (string.equal(method.bytes(), "textDocument/didChange")) { self.did_change(params); }
         else if (string.equal(method.bytes(), "textDocument/didClose")) { self.did_close(params); }
+        else if (string.equal(method.bytes(), "textDocument/definition") && id is .some(request_id)) {
+            self.semantic_request(request_id, params, false);
+        }
+        else if (string.equal(method.bytes(), "textDocument/hover") && id is .some(request_id)) {
+            self.semantic_request(request_id, params, true);
+        }
         else if (id is .some(request_id)) { self.write_error(request_id.raw(), -32601, "Method not found"); }
         return true;
     }
@@ -99,7 +110,8 @@ struct Server: Movable {
         self.initialized = true;
         std.StringBuilder result! = std.StringBuilder();
         result.append("{\"capabilities\":{\"positionEncoding\":\"utf-16\",");
-        result.append("\"textDocumentSync\":{\"openClose\":true,\"change\":1}},");
+        result.append("\"textDocumentSync\":{\"openClose\":true,\"change\":1},");
+        result.append("\"definitionProvider\":true,\"hoverProvider\":true},");
         result.append("\"serverInfo\":{\"name\":\"Jiang\",\"version\":\"0.6.0\"}}");
         self.write_result(id.raw(), result.slice());
     }
@@ -116,6 +128,7 @@ struct Server: Movable {
         if (self.document_index(uri.bytes()) is .some(index) && self.documents.ref_at(index).open
             && version <= self.documents.ref_at(index).version) { return; }
         source.SourceId source_id = self.compiler.set_source(path.bytes(), text.bytes());
+        self.checked_path = null;
         std.String compilation_path = std.String.from_valid_utf8(path.bytes());
         if (self.document_index(uri.bytes()) is .some(index)) {
             Document&! document = self.documents.mut_ref_at(index);
@@ -143,6 +156,7 @@ struct Server: Movable {
         guard text_value.as_string() is .some(text) else { return; }
         std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
         self.compiler.set_source(path.bytes(), text.bytes());
+        self.checked_path = null;
         Document&! document = self.documents.mut_ref_at(index);
         document.version = version;
         self.compile_document(path.bytes());
@@ -156,6 +170,7 @@ struct Server: Movable {
         if (!self.documents.ref_at(index).open) { return; }
         std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
         self.compiler.clear_source(path.bytes());
+        self.checked_path = null;
         self.documents.mut_ref_at(index).open = false;
         self.publish_empty(uri.bytes(), null);
     }
@@ -170,9 +185,7 @@ struct Server: Movable {
     }
 
     Void compile_document(Self&! self, UInt8[]& path) {
-        source_entry.PackageHandle package = self.compiler.load_package(path);
-        options.CompileOptions check! = options.CompileOptions(.check_only, path, "");
-        if (package.ok) { self.compiler.compile_loaded(package$.ref(), check$.ref()); }
+        self.check_document(path);
         Int index! = 0;
         while (index < self.documents.len()) {
             Document& document = self.documents.ref_at(index);
@@ -181,6 +194,116 @@ struct Server: Movable {
             }
             index = index + 1;
         }
+    }
+
+    Void check_document(Self&! self, UInt8[]& path) {
+        if (self.checked_path is .some(ref _ checked) && string.equal(checked.bytes(), path)) { return; }
+        source_entry.PackageHandle package = self.compiler.load_package(path);
+        options.CompileOptions check! = options.CompileOptions(.check_only, path, "");
+        if (package.ok) { self.compiler.compile_loaded(package$.ref(), check$.ref()); }
+        self.checked_path = std.String.from_valid_utf8(path);
+    }
+
+    #doc 基于当前 overlay 编译请求文档，再读取这一轮的语义事实。
+    Void semantic_request(Self&! self, json.Value id, json.Value params, Bool hover) {
+        guard params.field("textDocument") is .some(text_document) else { self.invalid_params(id); return; }
+        guard text_document.field("uri") is .some(uri_value) else { self.invalid_params(id); return; }
+        guard uri_value.as_string() is .some(uri) else { self.invalid_params(id); return; }
+        guard params.field("position") is .some(position) else { self.invalid_params(id); return; }
+        guard position.field("line") is .some(line_value) else { self.invalid_params(id); return; }
+        guard line_value.as_int() is .some(line) else { self.invalid_params(id); return; }
+        guard position.field("character") is .some(character_value) else { self.invalid_params(id); return; }
+        guard character_value.as_int() is .some(character) else { self.invalid_params(id); return; }
+        if (line < 0 || character < 0) { self.invalid_params(id); return; }
+        guard self.document_index(uri.bytes()) is .some(index) else { self.write_result(id.raw(), "null"); return; }
+        if (!self.documents.ref_at(index).open) { self.write_result(id.raw(), "null"); return; }
+        std.String path = std.String.from_valid_utf8(self.documents.ref_at(index).path.bytes());
+        source.SourceId source_id = self.documents.ref_at(index).source_id;
+        self.check_document(path.bytes());
+        guard self.compiler.lsp_offset(source_id, line, character) is .some(offset) else {
+            self.write_result(id.raw(), "null");
+            return;
+        }
+        if (!self.compiler.lsp_identifier_at(source_id, offset)) {
+            self.write_result(id.raw(), "null");
+            return;
+        }
+        std.String result = if (hover) {
+            self.hover_result(source_id, offset)
+        } else {
+            self.definition_result(source_id, offset)
+        };
+        self.write_result(id.raw(), result.bytes());
+    }
+
+    Void invalid_params(Self&! self, json.Value id) {
+        self.write_error(id.raw(), -32602, "Invalid params");
+    }
+
+    std.String definition_result(self, source.SourceId source_id, Int offset) {
+        service.CompilerQueries queries = self.compiler.queries();
+        guard queries.definition_at(source_id, offset) is .some(def_id) else { return "null"; }
+        guard queries.definition_span(def_id) is .some(location) else { return "null"; }
+        guard location.source_id is .some(target_id) else { return "null"; }
+        guard self.compiler.lsp_range(target_id, location.span) is .some(range) else { return "null"; }
+        guard self.uri_for_source(target_id) is .some(uri) else { return "null"; }
+        std.StringBuilder result! = std.StringBuilder();
+        result.append("{\"uri\":");
+        json.append_string(result$.mut_ref(), uri.bytes());
+        result.append(",\"range\":{");
+        append_position(result$.mut_ref(), "start", range.start);
+        result.append(",");
+        append_position(result$.mut_ref(), "end", range.end);
+        result.append("}}");
+        return result.into_string();
+    }
+
+    std.String hover_result(self, source.SourceId source_id, Int offset) {
+        service.CompilerQueries queries = self.compiler.queries();
+        guard queries.definition_at(source_id, offset) is .some(def_id) else { return "null"; }
+        guard queries.declaration_preview(def_id) is .some(preview) else { return "null"; }
+        std.StringBuilder result! = std.StringBuilder();
+        result.append("{\"contents\":{\"kind\":\"plaintext\",\"value\":");
+        json.append_string(result$.mut_ref(), preview.bytes());
+        result.append("}}");
+        return result.into_string();
+    }
+
+    std.String? uri_for_source(self, source.SourceId source_id) {
+        Int index! = 0;
+        while (index < self.documents.len()) {
+            Document& document = self.documents.ref_at(index);
+            if (document.open && document.source_id == source_id) {
+                return std.String.from_valid_utf8(document.uri.bytes());
+            }
+            index = index + 1;
+        }
+        guard self.compiler.source_path(source_id) is .some(path) else { return null; }
+        Path absolute! = std.path.normalize(path.bytes());
+        if (!absolute.is_absolute()) {
+            guard env.get("PWD") is .some(cwd) else { return null; }
+            absolute = std.path.join(cwd[..], absolute.bytes());
+        }
+        std.StringBuilder uri! = std.StringBuilder();
+        uri.append("file://");
+        UInt8[]& bytes = absolute.bytes();
+        UInt8[]& digits = "0123456789ABCDEF";
+        index = 0;
+        while (index < bytes.length) {
+            UInt8 byte = bytes[index];
+            if ((byte >= UInt8(65) && byte <= UInt8(90))
+                || (byte >= UInt8(97) && byte <= UInt8(122))
+                || (byte >= UInt8(48) && byte <= UInt8(57))
+                || byte == UInt8(45) || byte == UInt8(46) || byte == UInt8(95)
+                || byte == UInt8(126) || byte == UInt8(47)) {
+                uri.append_valid_utf8(bytes[index..index + 1]);
+            } else {
+                UInt8[3] escaped = [UInt8(37), digits[Int(byte) / 16], digits[Int(byte) % 16]];
+                uri.append_valid_utf8(escaped[..]);
+            }
+            index = index + 1;
+        }
+        return uri.into_string();
     }
 
     Void publish_diagnostics(self, Document& document) {
