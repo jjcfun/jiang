@@ -14,6 +14,7 @@ alias qid = import "./id.jiang";
 alias source = import "./source.jiang";
 alias source_map = import "./source/source_map.jiang";
 alias sem = import "./sema/model.jiang";
+alias types = import "./sema/type.jiang";
 alias token = import "./syntax/token.jiang";
 alias namespace = import "./resolve/namespace.jiang";
 alias def = import "./resolve/def.jiang";
@@ -151,9 +152,12 @@ public struct CompilerQueries: Copyable {
         while (prefix_start > 0 && completion_ident_byte(text[prefix_start - 1])) {
             prefix_start = prefix_start - 1;
         }
-        if (prefix_start > 0 && text[prefix_start - 1] == UInt8(46)) { return result; }
         UInt8[]& prefix = text[prefix_start..byte_offset];
         guard self.store.resolve.module_for_source(source_id) is .some(module_id) else { return result; }
+        if (prefix_start > 0 && text[prefix_start - 1] == UInt8(46)) {
+            self.append_dot_completions(source_id, prefix_start - 1, module_id, prefix, result$.mut_ref());
+            return result;
+        }
         if (self.enclosing_completion_owner(source_id, byte_offset, module_id) is .some(owner_def)) {
             self.append_body_completions(owner_def, source_id, byte_offset, prefix, result$.mut_ref());
             self.append_resolved_completions(owner_def, source_id, byte_offset, prefix, result$.mut_ref());
@@ -169,6 +173,232 @@ public struct CompilerQueries: Copyable {
             cursor = self.store.resolve.next_namespace_binding(cursor);
         }
         return result;
+    }
+
+    Void append_dot_completions(
+        self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        if (dot_offset == 0) { return; }
+        if (self.append_expected_enum_completions(source_id, dot_offset, module_id, prefix, result)) {
+            return;
+        }
+        guard self.node_at(source_id, dot_offset - 1) is .some(base_id) else {
+            self.append_named_receiver_completions(source_id, dot_offset, module_id, prefix, result);
+            return;
+        }
+        qid.DefId use_owner = self.enclosing_completion_owner(source_id, dot_offset, module_id)
+            ?? self.store.resolve.modules.ref_at(module_id).def_id;
+        sem.Node base = self.store.model.node(base_id);
+        qid.DefId? namespace_owner! = self.definition_for_node(base_id);
+        if (base.data is .literal(literal)) {
+            if (literal.value is .namespace_value(owner)) { namespace_owner = owner; }
+        }
+        if (namespace_owner is .some(owner)) {
+            if (self.store.defs.get(owner).owned_namespace_id is .some(namespace_id)) {
+                self.append_namespace_completions(namespace_id, use_owner, prefix, result);
+                return;
+            }
+        }
+        guard self.type_for_node(base_id) is .some(type_id) else {
+            self.append_named_receiver_completions(source_id, dot_offset, module_id, prefix, result);
+            return;
+        }
+        types.TypeInfo info = self.store.types.get(type_id);
+        qid.DefId? type_owner! = self.store.types.type_owner_def(type_id);
+        if (info.data is .named(named)) { type_owner = named.def_id; }
+        guard type_owner is .some(owner) else {
+            self.append_named_receiver_completions(source_id, dot_offset, module_id, prefix, result);
+            return;
+        }
+        guard self.store.defs.get(owner).owned_namespace_id is .some(namespace_id) else { return; }
+        self.append_namespace_completions(namespace_id, use_owner, prefix, result);
+    }
+
+    Bool append_expected_enum_completions(
+        self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        UInt8[]& text = self.store.sources.get(source_id).text$.ref();
+        Int before! = dot_offset;
+        while (before > 0 && (text[before - 1] == UInt8(32) || text[before - 1] == UInt8(9))) {
+            before = before - 1;
+        }
+        if (before == 0 || text[before - 1] != UInt8(61)) { return false; }
+        before = before - 1;
+        while (before > 0 && (text[before - 1] == UInt8(32) || text[before - 1] == UInt8(9))) {
+            before = before - 1;
+        }
+        Int local_start! = before;
+        while (local_start > 0 && completion_ident_byte(text[local_start - 1])) {
+            local_start = local_start - 1;
+        }
+        if (local_start == before) { return false; }
+        before = local_start;
+        while (before > 0 && (text[before - 1] == UInt8(32) || text[before - 1] == UInt8(9))) {
+            before = before - 1;
+        }
+        Int type_start! = before;
+        while (type_start > 0 && completion_ident_byte(text[type_start - 1])) {
+            type_start = type_start - 1;
+        }
+        if (type_start == before) { return false; }
+        UInt8[]& type_name = text[type_start..before];
+        qid.NamespaceId module_namespace = self.store.resolve.modules.ref_at(module_id).namespace_id;
+        qid.DefId use_owner = self.enclosing_completion_owner(source_id, dot_offset, module_id)
+            ?? self.store.resolve.modules.ref_at(module_id).def_id;
+        table.MultiTableCursor cursor! = self.store.resolve.first_namespace_binding(module_namespace);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.namespace_binding_at(cursor);
+            if (binding.domain == .type_name && string.equal(self.store.symbols.text(binding.symbol), type_name)
+                && self.store.defs.get(binding.def_id).kind == .enum_def) {
+                if (self.store.defs.get(binding.def_id).owned_namespace_id is .some(namespace_id)) {
+                    self.append_enum_case_completions(namespace_id, use_owner, prefix, result);
+                    return true;
+                }
+            }
+            cursor = self.store.resolve.next_namespace_binding(cursor);
+        }
+        return false;
+    }
+
+    Void append_enum_case_completions(
+        self, qid.NamespaceId namespace_id, qid.DefId use_owner,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        table.MultiTableCursor cursor! = self.store.resolve.first_namespace_binding(namespace_id);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.namespace_binding_at(cursor);
+            if (self.store.defs.get(binding.def_id).kind == .enum_case_def
+                && self.completion_accessible(binding.def_id, use_owner)) {
+                self.append_completion(binding.def_id, prefix, result);
+            }
+            cursor = self.store.resolve.next_namespace_binding(cursor);
+        }
+    }
+
+    Void append_named_receiver_completions(
+        self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        UInt8[]& text = self.store.sources.get(source_id).text$.ref();
+        Int start! = dot_offset;
+        while (start > 0 && completion_ident_byte(text[start - 1])) { start = start - 1; }
+        if (start == dot_offset) { return; }
+        UInt8[]& receiver = text[start..dot_offset];
+        qid.DefId use_owner = self.enclosing_completion_owner(source_id, dot_offset, module_id)
+            ?? self.store.resolve.modules.ref_at(module_id).def_id;
+        if (self.local_for_receiver(use_owner, source_id, dot_offset, receiver) is .some(local)) {
+            qid.DefId? type_owner! = null;
+            if (local.type_ref is .some(type_ref)) {
+                sem.Node type_node = self.store.model.node(type_ref);
+                if (type_node.data is .named_type_ref(named)) { type_owner = named.def_id; }
+            }
+            if (type_owner == null) {
+                if (self.type_for_def(local.def_id) is .some(type_id)) {
+                    types.TypeInfo info = self.store.types.get(type_id);
+                    if (info.data is .named(named)) { type_owner = named.def_id; }
+                }
+            }
+            if (type_owner is .some(owner)) {
+                if (self.store.defs.get(owner).owned_namespace_id is .some(namespace_id)) {
+                    self.append_namespace_completions(namespace_id, use_owner, prefix, result);
+                }
+            }
+            return;
+        }
+        qid.NamespaceId module_namespace = self.store.resolve.modules.ref_at(module_id).namespace_id;
+        table.MultiTableCursor cursor! = self.store.resolve.first_namespace_binding(module_namespace);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.namespace_binding_at(cursor);
+            if (string.equal(self.store.symbols.text(binding.symbol), receiver)) {
+                if (self.store.defs.get(binding.def_id).owned_namespace_id is .some(namespace_id)) {
+                    self.append_namespace_completions(namespace_id, use_owner, prefix, result);
+                    return;
+                }
+            }
+            cursor = self.store.resolve.next_namespace_binding(cursor);
+        }
+    }
+
+    #doc 返回点号左侧已检查的类型；局部声明在半成品源码中可退回声明类型。
+    public qid.TypeId? completion_receiver_type(
+        self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id
+    ) {
+        if (dot_offset > 0 && self.node_at(source_id, dot_offset - 1) is .some(base_id)) {
+            if (self.type_for_node(base_id) is .some(type_id)) { return type_id; }
+        }
+        if (self.completion_receiver_local(source_id, dot_offset, module_id) is .some(local)) {
+            return self.type_for_def(local.def_id);
+        }
+        return null;
+    }
+
+    #doc 返回点号左侧局部变量的显式类型引用，供未完成表达式的补全查询解析。
+    public sem.NodeId? completion_receiver_type_ref(
+        self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id
+    ) {
+        guard self.completion_receiver_local(source_id, dot_offset, module_id) is .some(local) else {
+            return null;
+        }
+        return local.type_ref;
+    }
+
+    sem.Local? completion_receiver_local(self, source.SourceId source_id, Int dot_offset, qid.ModuleId module_id) {
+        UInt8[]& text = self.store.sources.get(source_id).text$.ref();
+        Int start! = dot_offset;
+        while (start > 0 && completion_ident_byte(text[start - 1])) { start = start - 1; }
+        if (start == dot_offset) { return null; }
+        UInt8[]& receiver = text[start..dot_offset];
+        qid.DefId use_owner = self.enclosing_completion_owner(source_id, dot_offset, module_id)
+            ?? self.store.resolve.modules.ref_at(module_id).def_id;
+        return self.local_for_receiver(use_owner, source_id, dot_offset, receiver);
+    }
+
+    sem.Local? local_for_receiver(
+        self, qid.DefId use_owner, source.SourceId source_id, Int dot_offset, UInt8[]& receiver
+    ) {
+        guard self.store.model.body(use_owner) is .some(body) else { return null; }
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            sem.Local local = body.locals.get(sem.LocalId(index));
+            if (string.equal(self.store.symbols.text(local.symbol), receiver)
+                && self.local_before_offset(local, source_id, dot_offset)) { return local; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Void append_namespace_completions(
+        self, qid.NamespaceId namespace_id, qid.DefId use_owner,
+        UInt8[]& prefix, list.ArrayList<qid.DefId>&! result
+    ) {
+        table.MultiTableCursor cursor! = self.store.resolve.first_namespace_binding(namespace_id);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.namespace_binding_at(cursor);
+            if ((binding.domain == .value_name || binding.domain == .type_name
+                || binding.domain == .namespace_name || binding.domain == .member_name)
+                && self.completion_accessible(binding.def_id, use_owner)
+                && self.store.model.extension_group_for_member(binding.def_id) == null
+                && self.store.defs.get(binding.def_id).kind != .deinit_def) {
+                self.append_completion(binding.def_id, prefix, result);
+            }
+            cursor = self.store.resolve.next_namespace_binding(cursor);
+        }
+    }
+
+    Bool completion_accessible(self, qid.DefId candidate, qid.DefId use_owner) {
+        def.DefRecord target = self.store.defs.get(candidate);
+        if (target.visibility == .public_visibility) { return true; }
+        if (target.module_id != null && target.module_id == self.store.defs.get(use_owner).module_id) {
+            return true;
+        }
+        qid.DefId? current! = use_owner;
+        while (current is .some(owner)) {
+            if (target.owner_def == owner) { return true; }
+            current = self.store.defs.get(owner).owner_def;
+        }
+        return false;
     }
 
     #doc 供协议层显示已解析定义的名称。
@@ -227,7 +457,9 @@ public struct CompilerQueries: Copyable {
         return std.String.from_valid_utf8(self.store.symbols.text(markdown));
     }
 
-    qid.DefId? enclosing_completion_owner(self, source.SourceId source_id, Int offset, qid.ModuleId module_id) {
+    public qid.DefId? enclosing_completion_owner(
+        self, source.SourceId source_id, Int offset, qid.ModuleId module_id
+    ) {
         if (offset > 0 && self.node_at(source_id, offset - 1) is .some(node_id)) {
             return node_id.owner_def;
         }
@@ -325,7 +557,7 @@ public struct CompilerQueries: Copyable {
     }
 }
 
-Bool completion_ident_byte(UInt8 byte) {
+public Bool completion_ident_byte(UInt8 byte) {
     return (byte >= UInt8(65) && byte <= UInt8(90))
         || (byte >= UInt8(97) && byte <= UInt8(122))
         || (byte >= UInt8(48) && byte <= UInt8(57))

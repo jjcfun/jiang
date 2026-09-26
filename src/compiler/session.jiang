@@ -6,7 +6,7 @@
 #doc(module)
     ### Overview
 
-    `CompilerSession` 是 CLI、测试和未来 LSP 共用的长驻编译入口。
+    `CompilerSession` 是 CLI、测试和 LSP 复用的长驻编译入口；各调用方持有独立实例与 QueryEngine。
 
     - source overlay 可以重复更新，不需要重建整个 session；
     - 每次 compile 都建立新的 compilation generation；
@@ -14,14 +14,22 @@
 #end
 
 alias compiler_context = import "./context.jiang";
+alias store_api = import "./store.jiang";
 alias diagnostic = import "./diagnostic.jiang";
 alias diagnostic_helper = import "./diagnostic/helper.jiang";
 alias diagnostic_source_map = import "./diagnostic/source_map.jiang";
 alias driver_options = import "./driver/options.jiang";
 alias qid = import "./id.jiang";
 alias list = import "./support/list.jiang";
+alias string = import "./support/string.jiang";
+alias table = import "./support/table.jiang";
 alias pipeline = import "./pipeline.jiang";
 alias service = import "./service.jiang";
+alias namespace = import "./resolve/namespace.jiang";
+alias sem = import "./sema/model.jiang";
+alias check_state = import "./sema/type_check/state.jiang";
+alias type_ops = import "./sema/type_check/type_ops.jiang";
+alias value = import "./sema/comptime/value.jiang";
 alias source = import "./source.jiang";
 alias source_entry = import "./source/entry.jiang";
 alias token = import "./syntax/token.jiang";
@@ -44,6 +52,12 @@ public struct CompilerSession: Movable {
     #doc 设置或替换一个内存 source overlay，并返回稳定的 `SourceId`。
     public source.SourceId set_source(Self&! self, UInt8[]& path, UInt8[]& text) {
         return self.ctx.store.sources.set_overlay(path, text);
+    }
+
+    #doc 复制当前源码快照，供编辑器临时语义查询后恢复 overlay。
+    public std.String? source_text(self, source.SourceId source_id) {
+        if (!self.ctx.store.sources.has_source(source_id)) { return null; }
+        return std.String.from_valid_utf8(self.ctx.store.sources.get(source_id).text$.ref());
     }
 
     #doc 移除指定路径的 source overlay；不存在时返回 `false`。
@@ -144,6 +158,51 @@ public struct CompilerSession: Movable {
         return service.CompilerQueries(self.ctx.store$.ref());
     }
 
+    #doc 将适用于点号左侧类型的 extension 成员加入普通补全候选。
+    public list.ArrayList<qid.DefId> completion_defs(Self&! self, source.SourceId source_id, Int byte_offset) {
+        list.ArrayList<qid.DefId> result! = list.ArrayList<qid.DefId>();
+        if (!self.ctx.store.sources.has_source(source_id)) { return result; }
+        UInt8[]& text = self.ctx.store.sources.get(source_id).text$.ref();
+        if (byte_offset < 0 || byte_offset > text.length) { return result; }
+        Int prefix_start! = byte_offset;
+        while (prefix_start > 0 && service.completion_ident_byte(text[prefix_start - 1])) {
+            prefix_start = prefix_start - 1;
+        }
+        service.CompilerQueries queries = self.queries();
+        result = queries.completion_defs(source_id, byte_offset);
+        if (prefix_start == 0 || text[prefix_start - 1] != UInt8(46)) { return result; }
+        guard self.ctx.store.resolve.module_for_source(source_id) is .some(module_id) else { return result; }
+        Int dot_offset = prefix_start - 1;
+        qid.DefId use_owner = queries.enclosing_completion_owner(source_id, dot_offset, module_id)
+            ?? self.ctx.store.resolve.modules.ref_at(module_id).def_id;
+        qid.TypeId? receiver_type! = queries.completion_receiver_type(source_id, dot_offset, module_id);
+        sem.NodeId? receiver_type_ref = queries.completion_receiver_type_ref(source_id, dot_offset, module_id);
+        std.String prefix = std.String.from_valid_utf8(text[prefix_start..byte_offset]);
+        Fn<value.ComptimeValue?, compiler_context.CompilerContext&!, sem.NodeId, qid.TypeId?> evaluate =
+            { _, _, _ => null };
+        check_state.CheckState state! = check_state.CheckState(self.ctx$.mut_ref(), module_id, evaluate$.ref());
+        type_ops.TypeOps ops! = type_ops.TypeOps(state$.mut_ref());
+        if (receiver_type == null && receiver_type_ref is .some(type_ref)) {
+            receiver_type = ops.check_type_ref(type_ref);
+        }
+        guard receiver_type is .some(type_id) else { return result; }
+        guard ops.member_namespace_for_type(type_id) is .some(namespace_id) else { return result; }
+        table.MultiTableCursor cursor! = state.ctx.store.resolve.first_namespace_binding(namespace_id);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = state.ctx.store.resolve.namespace_binding_at(cursor);
+            if (state.ctx.store.model.extension_group_for_member(binding.def_id) != null
+                && (binding.domain == .member_name || binding.domain == .value_name)
+                && ops.def_accessible_from(binding.def_id, use_owner)
+                && ops.extension_member_visible_for_type(type_id, use_owner, binding.def_id)) {
+                append_extension_completion(
+                    state.ctx.store$.ref(), result$.mut_ref(), binding.def_id, prefix.bytes()
+                );
+            }
+            cursor = state.ctx.store.resolve.next_namespace_binding(cursor);
+        }
+        return result;
+    }
+
     Bool configure(Self&! self, driver_options.CompileOptions& options) {
         driver_options.BuildContextResult result! =
             driver_options.build_context(options, self.ctx$.mut_ref());
@@ -156,4 +215,19 @@ public struct CompilerSession: Movable {
         );
         return false;
     }
+}
+
+Void append_extension_completion(
+    store_api.CompilerStore& store, list.ArrayList<qid.DefId>&! result,
+    qid.DefId candidate, UInt8[]& prefix
+) {
+    UInt8[]& name = store.symbols.text(store.defs.get(candidate).name.symbol);
+    if (name.length < prefix.length || !string.equal(name[0..prefix.length], prefix)) { return; }
+    Int index! = 0;
+    while (index < result.len()) {
+        UInt8[]& existing = store.symbols.text(store.defs.get(result.get(index)).name.symbol);
+        if (string.equal(existing, name)) { return; }
+        index = index + 1;
+    }
+    result.add(candidate);
 }

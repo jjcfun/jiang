@@ -290,7 +290,7 @@ def check_completion(binary, directory):
     assert process.returncode == 0, (process.returncode, process.stderr.decode())
     assert not process.stderr, process.stderr.decode()
     by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
-    assert "completionProvider" in by_id[1]["result"]["capabilities"]
+    assert by_id[1]["result"]["capabilities"]["completionProvider"]["triggerCharacters"] == ["."]
 
     def labels(identifier):
         return {item["label"] for item in by_id[identifier]["result"]}
@@ -307,7 +307,7 @@ def check_completion(binary, directory):
     assert "helper" in labels(4), by_id[4]
     assert "other_count" in labels(5) and "local_count" not in labels(5), by_id[5]
     assert "local_helper" in labels(6) and "local_count" not in labels(6), by_id[6]
-    assert by_id[7]["result"] == [], by_id[7]
+    assert "value" in labels(7), by_id[7]
     assert "local_count" in labels(10), by_id[10]
     assert by_id[8]["result"] == {
         "uri": uri,
@@ -319,6 +319,196 @@ def check_completion(binary, directory):
     }, by_id[11]
     assert by_id[12]["result"]["contents"] == by_id[11]["result"]["contents"], by_id[12]
     assert by_id[9]["result"] is None
+
+
+def check_dot_completion(binary, directory):
+    root = Path(directory)
+    (root / "dot helper.jiang").write_text(
+        "public Int answer() { 1 }\n"
+        "Int hidden() { 2 }\n"
+        "public struct Imported { public Int value; }\n", encoding="utf-8")
+    uri = (root / "dot main.jiang").as_uri()
+    header = ('alias helper = import "./dot helper.jiang";\n'
+              'struct User {\n'
+              '    Int id;\n'
+              '    Bool active = true;\n'
+              '    #doc Scores the user.\n'
+              '    public Int score(self) { 1 }\n'
+              '}\n'
+              'enum Result { ok(Int), err(Int), }\n')
+
+    def source(expression):
+        return (header + 'Int main() {\n'
+                '    User user = User(id = 1);\n'
+                f'    {expression}\n'
+                '    Int after = 1;\n'
+                '    return after;\n' + '}\n')
+
+    def completion(identifier, expression, character=None):
+        return {"jsonrpc": "2.0", "id": identifier, "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": source(expression).splitlines().index('    ' + expression),
+                                        "character": character if character is not None else 4 + len(expression)}}}
+
+    def change(version, expression):
+        return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": uri, "version": version},
+                           "contentChanges": [{"text": source(expression)}]}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang", "version": 1,
+                                     "text": source('user.')}}},
+        completion(2, 'user.'),
+        completion(10, 'user.'),
+        change(2, 'user.ac'), completion(3, 'user.ac'),
+        change(3, 'helper.'), completion(4, 'helper.'),
+        change(4, 'helper.an'), completion(5, 'helper.an'),
+        change(5, 'Result second = .'), completion(6, 'Result second = .'),
+        change(6, 'Result second = .e'), completion(7, 'Result second = .e'),
+        change(7, 'Result second = .;'),
+        completion(8, 'Result second = .;', 4 + len('Result second = .')),
+        {"jsonrpc": "2.0", "id": 9, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+
+    def labels(identifier):
+        return {item["label"] for item in by_id[identifier]["result"]}
+
+    assert {"id", "active", "score"} <= labels(2), by_id[2]
+    assert by_id[10]["result"] == by_id[2]["result"], by_id[10]
+    assert "helper" not in labels(2), by_id[2]
+    score = next(item for item in by_id[2]["result"] if item["label"] == "score")
+    assert score["kind"] == 3 and score["documentation"] == {
+        "kind": "markdown", "value": "Scores the user."
+    }, score
+    assert labels(3) == {"active"}, by_id[3]
+    assert {"answer", "Imported"} <= labels(4), by_id[4]
+    assert "hidden" not in labels(4) and "user" not in labels(4), by_id[4]
+    assert labels(5) == {"answer"}, by_id[5]
+    assert labels(6) == {"ok", "err"}, by_id[6]
+    assert labels(7) == {"err"}, by_id[7]
+    assert all(item["kind"] == 20 for item in by_id[6]["result"]), by_id[6]
+    assert labels(8) == {"ok", "err"}, by_id[8]
+    assert by_id[9]["result"] is None
+
+
+def check_completion_cache_invalidation(binary, directory):
+    uri = (Path(directory) / "completion revision.jiang").as_uri()
+
+    def source(field):
+        return (f"struct User {{ Int {field} = 1; }}\n"
+                "Int main() { User user = User(); user.\nreturn 0; }\n")
+
+    def completion(identifier):
+        return {"jsonrpc": "2.0", "id": identifier, "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": 1, "character": len("Int main() { User user = User(); user.")}}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang", "version": 1, "text": source("a")}}},
+        completion(2), completion(3),
+        {"jsonrpc": "2.0", "method": "textDocument/didChange",
+         "params": {"textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": source("b")}]}},
+        completion(4), completion(5),
+        {"jsonrpc": "2.0", "id": 6, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+    labels = lambda identifier: {item["label"] for item in by_id[identifier]["result"]}
+    assert "a" in labels(2) and "b" not in labels(2), by_id[2]
+    assert by_id[3]["result"] == by_id[2]["result"], by_id[3]
+    assert "b" in labels(4) and "a" not in labels(4), by_id[4]
+    assert by_id[5]["result"] == by_id[4]["result"], by_id[5]
+
+
+def check_extension_completion(binary, directory):
+    root = Path(directory)
+    (root / "extension helper.jiang").write_text(
+        "public struct Imported { public Int value; }\n"
+        "public extend Imported { public Int exported(self) { 1 } }\n"
+        "extend Imported { public Int concealed(self) { 2 } }\n", encoding="utf-8")
+    uri = (root / "extension main.jiang").as_uri()
+    header = ('import dep = "./extension helper.jiang";\n'
+              'alias Imported = dep.Imported;\n'
+              'struct User { Int id; }\n'
+              'extend User { #doc Extension member.\n public Int extra(self) { 1 } }\n'
+              'struct Other {}\n'
+              'extend Other { public Int wrong(self) { 2 } }\n'
+              'struct Holder<T> { T value; }\n'
+              '@where(T == Int)\n'
+              'extend <T> Holder<T> { public Int only_int(self) { 3 } }\n')
+
+    def source(expression):
+        return header + 'Int main() {\n' + f'    {expression}\n' + '    return 0;\n}\n'
+
+    def completion(identifier, expression):
+        return {"jsonrpc": "2.0", "id": identifier, "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": source(expression).splitlines().index('    ' + expression),
+                                        "character": 4 + len(expression)}}}
+
+    def change(version, expression):
+        return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": uri, "version": version},
+                           "contentChanges": [{"text": source(expression)}]}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": uri, "languageId": "jiang", "version": 1,
+                                     "text": source('User user = User(id = 1); user.')}}},
+        completion(2, 'User user = User(id = 1); user.'),
+        change(2, 'Holder<Int> h = Holder<Int>(value = 1); h.'),
+        completion(3, 'Holder<Int> h = Holder<Int>(value = 1); h.'),
+        change(3, 'Holder<Bool> h = Holder<Bool>(value = true); h.'),
+        completion(4, 'Holder<Bool> h = Holder<Bool>(value = true); h.'),
+        change(4, 'Imported item = Imported(value = 1); item.'),
+        completion(5, 'Imported item = Imported(value = 1); item.'),
+        {"jsonrpc": "2.0", "id": 6, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run(
+        [binary, "lsp"], input=b"".join(map(frame, messages)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False,
+    )
+    assert process.returncode == 0, (process.returncode, process.stderr.decode())
+    assert not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+
+    def labels(identifier):
+        return {item["label"] for item in by_id[identifier]["result"]}
+
+    assert {"id", "extra"} <= labels(2), by_id[2]
+    assert "wrong" not in labels(2) and "only_int" not in labels(2), by_id[2]
+    extra = next(item for item in by_id[2]["result"] if item["label"] == "extra")
+    assert extra["kind"] == 3 and extra["documentation"] == {
+        "kind": "markdown", "value": "Extension member."
+    }, extra
+    assert "only_int" in labels(3), by_id[3]
+    assert "only_int" not in labels(4), by_id[4]
+    assert "exported" in labels(5) and "concealed" not in labels(5), by_id[5]
+    assert by_id[6]["result"] is None
 
 
 def check_hover_documentation(binary, directory):
@@ -637,6 +827,9 @@ def main():
         check_package_documents(binary, directory)
         check_semantics(binary, directory)
         check_completion(binary, directory)
+        check_dot_completion(binary, directory)
+        check_completion_cache_invalidation(binary, directory)
+        check_extension_completion(binary, directory)
         check_hover_documentation(binary, directory)
         check_imported_hover_documentation(binary, directory)
         check_request_lifecycle(binary, directory)
