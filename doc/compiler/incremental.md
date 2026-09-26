@@ -65,6 +65,10 @@ fingerprint；普通编译不需要读取，文档工具可以按需单独读取
 source 共用规范化路径和 `SourceId`，每次内容变化递增 revision；存在 overlay 时不读取旧 `.ji`
 header，也不发布新的 `.ji`。清除 overlay 后，下一轮重新读取磁盘并按内容 hash 正常失效。
 
+单次 compilation 内，同一路径只验证一次磁盘快照。后续 import 复用 `SourceId`、正文及已计算的
+content hash；下一轮清除验证标记，重新读取或校验 `.ji` header。模块的 stable source identity
+按本轮 `ModuleId` 记忆，随 generation 一起清除，避免在每次声明观察时重复路径规范化与哈希。
+
 workspace 打开时先建立 `PackageHandle`，只解析 root path/package manifest。源码路径进入 module graph
 时由 `SourceStore` 建立或复用 `SourceInfo` 与 session-local `SourceId`；`.ji` header 命中不读取正文，
 cache miss 或 overlay 才 materialize 完整 `Source`。stable source identity 只由 stable package identity
@@ -75,6 +79,15 @@ package 对象不缓存旧 `DefId` 或 `TypeId`。
 每轮 check 完成后，`CompilerQueries` 组合当前 `SourceMap`、Semantic Model 和 `TypeCheckStore`，
 按 source byte offset 提供 definition、type 和 span 查询。查询结果是本轮 session-local ID，
 不会写入 `.ji`，调用方不能跨 `begin_compilation` 保留 `NodeId`、`DefId` 或 `TypeId`。
+`QueryEngine` 由每个 `CompilerSession` 独立持有。新一轮编译清空含本轮 ID 的查询；
+稳定声明身份对应的 signature/body fingerprint 完成值留在本会话内，源码模型重算或
+`.ji` 接口恢复时按稳定身份显式失效并发布新值。
+成功解析的纯 Jiang AST 按 `SourceId` 与正文 hash 留在本会话，重建模块图时复制给本轮使用；
+失败解析和依赖 Lang Provider 的解析不缓存。编辑后的源码重新解析，未改源码避免重复词法与语法分析。
+
+编辑器前端允许 imported source 使用错误恢复 AST，并在函数签名已完成时保留部分 body。
+未解析引用形成 invalid node，已有局部声明仍可用于补全；失败状态与诊断继续保留，
+不发布 declaration observations 或 `.ji` 成功缓存。普通编译仍在语法或语义错误处失败。
 
 读取分阶段进行：
 
@@ -102,12 +115,20 @@ documentation tool -> documentation section
 读取源码重新计算 hash。旧 import summary 缺失、损坏、context 不匹配或 source hash 变化时，从
 当前源码重新收集 import。
 
-完整构图后按 dependency SCC 拓扑顺序分析。SCC 内按 stable source identity 排序；任一成员需要
-回源时保守分析整个 SCC。source 重算后先比较旧/新可见 interface fingerprint：同 package importer
-比较 package surface，跨 package importer 比较 public surface；未变化时不产生 candidate。发生变化的
-直接 importer 再用自身 `.ji` observations 验证实际读取的 signature、body、namespace-name 或完整
-namespace surface：全部匹配则恢复 interface/model，任一不匹配才回源。缺少 observation、旧 schema、
-损坏 artifact 或无法定位 stable symbol 时安全回源；不建立通用 declaration dependency graph。
+完整构图后按 dependency SCC 拓扑顺序分析，SCC 内按 stable source identity 排序；调度本身不扩大
+源码失效范围。未改动的 SCC 继续整体恢复 interface；普通编译需要回源时仍保守分析整个 SCC。
+编辑器前端对包含改动的循环依赖先建立当前声明签名，并保留常量初始化、字段默认值及 enum 显式值。
+未改动且未打开的文件，只有自身签名与成功接口一致、实际观察的依赖全部通过校验，才跳过函数体构造。
+观察失效的文件恢复完整源码模型，并继续校验其调用方，直到不再产生新的回源；打开的 overlay 保留完整
+函数体以供编辑器查询。函数体内的 lambda 由成功接口恢复词法声明身份，实际需要执行时再恢复或分析
+函数体；回退源码时复用尚未物化的 lambda 声明，避免父函数保留重复成员。复用文件沿用原来的成功
+`.ji`，不把只有签名的模型发布成完整快照。
+
+source 重算后比较旧/新可见 interface fingerprint：同 package importer 比较 package surface，跨 package
+importer 比较 public surface；未变化时不产生 candidate。发生变化的直接 importer 再用自身 `.ji`
+observations 验证实际读取的 signature、body、namespace-name 或完整 namespace surface：全部匹配则恢复
+interface/model，任一不匹配才回源。缺少 observation、旧 schema、损坏 artifact 或无法定位 stable symbol
+时安全回源；不建立通用 declaration dependency graph。
 
 `--check` 可以直接复用 fresh source 的 interface。debug/release 若未命中 `.jbuild` 快速路径，
 仍需从源码恢复 codegen 所需的普通函数 body；纯语义 `.ji` 不保存这些 body。source graph

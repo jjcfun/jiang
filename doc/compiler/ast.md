@@ -43,9 +43,12 @@ AstId            -> 单个 AstUnit 内部的有效 node index
 
 pipeline 把 owned root `AstUnit` 直接移交给 `ModuleResolver`。resolver 私有持有 root/import
 closure 中尚未完成 lowering 的 AST；每个 module 发布 Semantic Model 后立即释放对应 AST。
+长驻会话在 `CompilerStore` 中按 source 正文 hash 保存最近一次成功的纯 Jiang 解析，
+后续 compilation 复制语法节点使用；缓存中不包含 `DefId`、`TypeId` 或其他本轮语义 handle。
 
 ## 不变量
 
 - syntax 不理解名字解析和类型语义。
-- AST 不直接作为长期缓存对象。
+- AST 不写入磁盘产物；会话内语法复用不包含语义事实。
+- 缺失的名称节点使用 `symbol_id = null`，不能从 missing token 读取真实符号身份。
 - AST span 只服务 source-level 诊断和 lower 阶段定位。

@@ -23,6 +23,9 @@ resolver.lower_module_graph_to_model(graph$.ref())
 `PackageInfo`，登记依赖后再编译其 root。文件入口以该文件为 root，不自动发现上层原生包。
 包目录必须包含 `package.jiang`，旧 INI 不再参与加载。
 
+编辑器前端在配置阶段只准备并求值 `info` 实际读取的声明、类型和函数体；主包分析随后统一检查
+配置及导入闭包中的其余源码，避免配置初始化提前完成整个标准库的 body 分析。
+
 建立模块图前，隐式标准库通过同一配置求值流程取得独立包身份，不改变调用方的 root。
 core 与私有 system 模块使用稳定的内部包身份；它们不归入用户包，也不注册为用户依赖别名。
 
@@ -238,3 +241,15 @@ function 和 JIL arena 用量。峰值 RSS 使用平台 `/usr/bin/time -l`（mac
 - reset 后旧 namespace/def 的回收或版本化。
 - 跨轮复用 session-local semantic/query facts 仍需要版本化与精确 invalidation；持久 artifact identity
   已使用 `StableSymbolId`，不能把 `DefId` 直接写入缓存。
+
+## 编辑器文件检查
+
+LSP 将当前编辑或语义请求的源码作为 demand root，同时先加载所属 package 配置和依赖身份。
+目标文件的所有声明和函数体都参与检查；被导入文件只通过声明 ensure 准备实际读取的签名、
+类型、默认值和常量。执行编译期函数时仍按需准备其函数体，不必先封闭和检查整个 package。
+直接 import 和表达式 alias 选中模块提供的扩展声明先进入成员环境，因为扩展调用可以不引用别名；
+这个步骤只收集扩展成员，不检查依赖模块的所有函数体。
+
+此路径复用普通 parser、Semantic Model 和 type check，不发布局部模型为完整成功接口。
+其他打开文件在目标文件诊断发布后逐个检查；保存和 package 配置变更继续使用完整检查入口。
+语义请求切换文件时按文件路径区分当前结果，避免使用另一个文件的局部模型。

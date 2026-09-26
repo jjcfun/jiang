@@ -81,6 +81,7 @@ public struct ModuleResolver: Movable {
     map.WyHashMap<qid.DefId, ast.AstId> declaration_items!;
     map.WyHashMap<qid.DefId, ast.AstId> declaration_containers!;
     set.HashSet<qid.ModuleId> extension_skeletons!;
+    set.HashSet<qid.ModuleId> extension_imports!;
     std.String artifact_cache_dir!;
     UInt64 compiler_version_hash;
     Bool use_source_artifacts!;
@@ -110,6 +111,7 @@ public struct ModuleResolver: Movable {
         self.declaration_items = map.WyHashMap<qid.DefId, ast.AstId>();
         self.declaration_containers = map.WyHashMap<qid.DefId, ast.AstId>();
         self.extension_skeletons = set.HashSet<qid.ModuleId>();
+        self.extension_imports = set.HashSet<qid.ModuleId>();
         self.artifact_cache_dir = std.String.from_valid_utf8(artifact_cache_dir);
         if (compiler_version_hash is .some(hash)) {
             self.compiler_version_hash = hash;
@@ -207,6 +209,14 @@ public struct ModuleResolver: Movable {
     ) {
         ModuleResolvePhase phase! = ModuleResolvePhase(ctx, self);
         return phase.ensure_root_entry_signature(graph);
+    }
+
+    #doc 编辑器仅完整降低当前源码；依赖声明由普通 ensure 查询按需准备。
+    public Bool ensure_source_file_model(Self&! self, context.CompilerContext&! ctx,
+        module_graph.ModuleGraph&! graph
+    ) {
+        ModuleResolvePhase phase! = ModuleResolvePhase(ctx, self);
+        return phase.ensure_source_file_model(graph);
     }
 
     public Bool ensure_root_entry_model(
@@ -557,6 +567,15 @@ struct ModuleResolvePhase: Movable {
         Int begin,
         Int end
     ) {
+        if (self.ctx.frontend_only && self.owner.use_source_artifacts && end - begin > 1
+            && self.component_has_changed_source(schedule, begin, end)
+            && !self.component_contains_required_source_package(schedule, source_modules, begin, end)) {
+            list.ArrayList<Bool> candidates! = self.component_body_candidates(schedule, source_modules, begin, end);
+            if (self.has_body_candidate(candidates$.ref())) {
+                return self.lower_signature_component(schedule, source_modules, query_graph,
+                    begin, end, candidates$.mut_ref());
+            }
+        }
         UInt64 started! = self.timing_start();
         Bool use_source = self.component_requires_source(schedule, source_modules, query_graph, begin, end);
         self.add_timing_freshness(self.timing_elapsed(started));
@@ -599,6 +618,180 @@ struct ModuleResolvePhase: Movable {
             self.store_component_interfaces(schedule, source_modules, begin, end);
             self.add_timing_store(self.timing_elapsed(started));
         }
+        return true;
+    }
+
+    Bool component_has_changed_source(self, source_graph.SourceSchedule& schedule, Int begin, Int end) {
+        Int index! = begin;
+        while (index < end) {
+            _ node = self.ctx.store.source_dependencies.node(schedule.node_at(index));
+            if (node.source_dirty || node.dependency_candidate) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    #doc SCC 中仅未改动且拥有完整成功接口的关闭文件可跳过 body；overlay 需要完整编辑器语义。
+    list.ArrayList<Bool> component_body_candidates(Self&! self, source_graph.SourceSchedule& schedule,
+        map.WyHashMap<cache_identity.StableSourceId, qid.ModuleId>& modules, Int begin, Int end
+    ) {
+        list.ArrayList<Bool> result! = list.ArrayList<Bool>();
+        Int index! = begin;
+        while (index < end) {
+            source_graph.SourceNodeId node = schedule.node_at(index);
+            qid.ModuleId module = self.module_for_source_node(node, modules)$.some();
+            source.SourceId source_id = self.ctx.store.resolve.module_ref(module).source_id;
+            Bool candidate = !self.ctx.store.source_dependencies.node(node).source_dirty
+                && !self.ctx.store.sources.has_overlay(source_id)
+                && self.module_state(module) != .resolved
+                && self.ctx.store.resolve.module_ref(module).comptime_items.empty()
+                && self.ensure_fresh_module_interface(module)
+                && (self.ctx.store.artifacts.load_observations(source_id) != null
+                    || self.load_module_observations(module));
+            result.add(candidate);
+            index = index + 1;
+        }
+        return result;
+    }
+
+    Bool has_body_candidate(self, list.ArrayList<Bool>& candidates) {
+        Int index! = 0;
+        while (index < candidates.len()) {
+            if (candidates.get(index)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    #doc 先建立当前签名，再迭代校验实际读取；body 失效沿观察传播，直到 SCC 中不再产生新回源。
+    Bool lower_signature_component(Self&! self, source_graph.SourceSchedule& schedule,
+        map.WyHashMap<cache_identity.StableSourceId, qid.ModuleId>& modules,
+        module_graph.ModuleGraph&! graph, Int begin, Int end, list.ArrayList<Bool>&! candidates
+    ) {
+        if (!self.prepare_source_component(schedule, modules, begin, end, true, false)) { return false; }
+        self.collect_component_declaration_names(schedule, modules, begin, end);
+        self.bind_core_declarations_if_ready();
+        self.collect_component_aliases(schedule, modules, begin, end);
+        self.record_core_functions_if_ready();
+        self.collect_component_extend_members(schedule, modules, begin, end);
+        self.bind_std_prelude_aliases();
+        self.validate_component_wildcard_import_conflicts(schedule, modules, begin, end);
+        if (!self.lower_component_signatures(schedule, modules, graph, begin, end)) { return false; }
+        Int index! = begin;
+        while (index < end) {
+            qid.ModuleId module = self.module_for_source_node(schedule.node_at(index), modules)$.some();
+            Bool candidate = candidates.get(index - begin) && self.retain_module_body_fingerprints(module);
+            candidates.set(index - begin, candidate);
+            if (!candidate && !self.lower_changed_module(graph, module)) { return false; }
+            index = index + 1;
+        }
+        Bool changed! = true;
+        while (changed) {
+            changed = false;
+            index = begin;
+            while (index < end) {
+                qid.ModuleId module = self.module_for_source_node(schedule.node_at(index), modules)$.some();
+                if (candidates.get(index - begin)
+                    && !self.module_observations_valid(graph, module, false, true)) {
+                    candidates.set(index - begin, false);
+                    if (!self.lower_changed_module(graph, module)) { return false; }
+                    changed = true;
+                }
+                index = index + 1;
+            }
+        }
+        index = begin;
+        while (index < end) {
+            if (candidates.get(index - begin)) {
+                source_graph.SourceNodeId node = schedule.node_at(index);
+                qid.ModuleId module = self.module_for_source_node(node, modules)$.some();
+                source.SourceId source_id = self.ctx.store.resolve.module_ref(module).source_id;
+                db.retain_declaration_observations(self.ctx.query$.ref(), self.ctx.store.artifacts$.ref(), source_id);
+                self.ctx.store.resolve.set_module_interface_only(module, true);
+                self.ctx.store.source_dependencies.clear_dependency_candidate(node);
+                self.ctx.store.artifacts.record_interface_lookup(.hit);
+            }
+            index = index + 1;
+        }
+        self.store_component_interfaces(schedule, modules, begin, end);
+        return !self.ctx.store.model.has_errors();
+    }
+
+    Bool lower_component_signatures(Self&! self, source_graph.SourceSchedule& schedule,
+        map.WyHashMap<cache_identity.StableSourceId, qid.ModuleId>& modules,
+        module_graph.ModuleGraph&! graph, Int begin, Int end
+    ) {
+        set.HashSet<qid.ModuleId> selected! = set.HashSet<qid.ModuleId>();
+        Int index! = begin;
+        while (index < end) {
+            selected.add(self.module_for_source_node(schedule.node_at(index), modules)$.some());
+            index = index + 1;
+        }
+        index = 0;
+        while (index < self.ctx.store.defs.len()) {
+            qid.DefId definition = qid.DefId.from_index(index);
+            index = index + 1;
+            guard self.ctx.store.defs.get(definition).module_id is .some(module) else { continue; }
+            if (!selected.has(module) || !self.owner.declaration_items.has(definition)) { continue; }
+            _ kind = self.ctx.store.defs.get(definition).kind;
+            if (kind == .global_def || kind == .field_def
+                || kind == .enum_case_def || kind == .associated_type_def) {
+                if (!self.ensure_declaration_model(graph, definition)) { return false; }
+            } else if (!self.ensure_declaration_signature(graph, definition)) { return false; }
+        }
+        index = begin;
+        while (index < end) {
+            qid.ModuleId module = self.module_for_source_node(schedule.node_at(index), modules)$.some();
+            if (!self.ensure_module_metadata(graph, module)) { return false; }
+            incremental_fingerprint.fingerprint_module_signatures(self.ctx$.mut_ref(), module);
+            if (self.module_state(module) != .resolved) { self.set_module_state(module, .signatures_ready); }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    #doc 只有所有声明签名均与成功接口一致时，才保留该文件未物化的函数体及求值模板指纹。
+    Bool retain_module_body_fingerprints(Self&! self, qid.ModuleId module) {
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module).source_id;
+        Int count = self.ctx.store.artifacts.load_interface(source_id)$.some().declarations.len();
+        Int index! = 0;
+        while (index < count) {
+            _ declaration = self.ctx.store.artifacts.load_interface(source_id)$.some().declarations.get(index);
+            if (declaration.is_lambda_function
+                && self.ctx.store.incremental.current_def_for_stable(declaration.stable_id) == null) {
+                index = index + 1;
+                continue;
+            }
+            if (self.ctx.store.incremental.current_def_for_stable(declaration.stable_id) == null
+                || self.ctx.store.incremental.signature_fingerprint(declaration.stable_id)
+                    != declaration.signature_fingerprint) { return false; }
+            index = index + 1;
+        }
+        interface_loader.InterfaceLoader loader! = interface_loader.InterfaceLoader(
+            self.ctx$.mut_ref(), self.owner.module_states$.mut_ref(), self.owner.declaration_defs$.mut_ref());
+        if (!loader.load_body_lambda_declarations(module,
+            self.ctx.store.artifacts.load_interface(source_id)$.some())) { return false; }
+        index = 0;
+        while (index < count) {
+            _ declaration = self.ctx.store.artifacts.load_interface(source_id)$.some().declarations.get(index);
+            qid.DefId definition = self.ctx.store.incremental.current_def_for_stable(declaration.stable_id)$.some();
+            if (self.ctx.store.model.has_body(definition)) {
+                incremental_fingerprint.fingerprint_def_model(self.ctx$.mut_ref(), definition);
+            } else {
+                self.ctx.store.incremental.set_loaded_fingerprints(declaration.stable_id,
+                    declaration.signature_fingerprint, declaration.body_fingerprint);
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool lower_changed_module(Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module) {
+        if (self.module_state(module) == .signatures_ready) {
+            self.set_module_state(module, .declarations_collected);
+        }
+        if (!self.ensure_module_model(graph, module)) { return false; }
+        incremental_fingerprint.fingerprint_module(self.ctx$.mut_ref(), module);
         return true;
     }
 
@@ -771,7 +964,7 @@ struct ModuleResolvePhase: Movable {
     }
 
     Bool module_observations_valid(Self&! self, module_graph.ModuleGraph&! query_graph,
-        qid.ModuleId module_id, Bool nonsemantic_only
+        qid.ModuleId module_id, Bool nonsemantic_only, Bool source_signatures_ready = false
     ) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
         source.SourceId source_id = module.source_id;
@@ -780,7 +973,9 @@ struct ModuleResolvePhase: Movable {
             return false;
         }
         if (!self.ctx.query.prepare_observed_reflection(self.ctx.store$.mut_ref(), source_id)) { return false; }
-        if (!self.prepare_observed_facts(query_graph, source_id, nonsemantic_only)) { return false; }
+        if (!self.prepare_observed_facts(query_graph, source_id, nonsemantic_only, source_signatures_ready)) {
+            return false;
+        }
         guard source_ji.source_identity_for_module(self.ctx$.mut_ref(), module_id) is .some(identity)
             else { return false; }
         qkey.Fingerprint128 reflection_inputs = source_fingerprint.reflection_inputs(
@@ -801,7 +996,7 @@ struct ModuleResolvePhase: Movable {
 
     #doc 语义观察复用编译层的事实准备；未选定模型的同一 SCC 回退源码，不重入正在选择的模块。
     Bool prepare_observed_facts(Self&! self, module_graph.ModuleGraph&! graph,
-        source.SourceId source_id, Bool dependencies_unchanged
+        source.SourceId source_id, Bool dependencies_unchanged, Bool source_signatures_ready = false
     ) {
         Int count = self.ctx.store.artifacts.load_observations(source_id)$.some().entries.len();
         Int index! = 0;
@@ -818,11 +1013,12 @@ struct ModuleResolvePhase: Movable {
                 else { return false; }
             _ module = self.ctx.store.defs.get(definition).module_id$.some();
             if (self.ctx.store.resolve.module_ref(module).source_id == source_id) {
-                if (!dependencies_unchanged) { return false; }
+                if (!dependencies_unchanged && !source_signatures_ready) { return false; }
                 continue;
             }
             _ state = self.module_state(module);
-            if (state != .resolved && state != .interface_loaded) { return false; }
+            if (state != .resolved && state != .interface_loaded
+                && !(source_signatures_ready && state == .signatures_ready)) { return false; }
             guard self.owner.prepare_observed_fact is .some(prepare) else { return false; }
             qid.DefId target = if item.aspect == .declaration_type
                 && self.ctx.store.defs.get(definition).kind == .generic_param_def {
@@ -861,9 +1057,9 @@ struct ModuleResolvePhase: Movable {
         map.WyHashMap<cache_identity.StableSourceId, qid.ModuleId>& source_modules,
         Int begin,
         Int end,
-        Bool use_source
+        Bool use_source, Bool merge_dirty = true
     ) {
-        if (use_source) {
+        if (use_source && merge_dirty) {
             self.mark_component_source_dirty(schedule, begin, end);
         }
         UInt64 started = self.timing_start();
@@ -875,7 +1071,7 @@ struct ModuleResolvePhase: Movable {
             }
             self.refresh_import_aliases(module_id);
             // 同一 resolver 可先求值配置再构建 root 图；已完成的模块不能重新登记声明。
-            if (self.module_state(module_id) == .resolved) {
+            if (self.module_state(module_id) == .resolved || self.module_state(module_id) == .signatures_ready) {
                 index = index + 1;
                 continue;
             }
@@ -1189,7 +1385,8 @@ struct ModuleResolvePhase: Movable {
         while (index < end) {
             source_graph.SourceNodeId node_id = schedule.node_at(index);
             qid.ModuleId module_id = self.module_for_source_node(node_id, source_modules)$.some();
-            if (self.module_state(module_id) != .interface_loaded) {
+            if (self.module_state(module_id) != .interface_loaded
+                && self.module_state(module_id) != .signatures_ready) {
                 incremental_fingerprint.fingerprint_module(self.ctx$.mut_ref(), module_id);
                 if (interface_builder.store_module_interface(self.ctx$.mut_ref(), module_id)) {
                     self.publish_module_interface_change(node_id, module_id);
@@ -1437,7 +1634,8 @@ struct ModuleResolvePhase: Movable {
         Int index! = 0;
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
-            if (self.module_state(module_id) != .interface_loaded) {
+            if (self.module_state(module_id) != .interface_loaded
+                && self.module_state(module_id) != .signatures_ready) {
                 interface_builder.store_module_interface(self.ctx$.mut_ref(), module_id);
             }
             index = index + 1;
@@ -1451,6 +1649,7 @@ struct ModuleResolvePhase: Movable {
     ) {
         module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
         if (state == .resolved) { return true; }
+        if (state == .signatures_ready) { return true; }
         if (state == .interface_loaded) {
             return self.ensure_interface_module_model(graph, module_id);
         }
@@ -1477,6 +1676,26 @@ struct ModuleResolvePhase: Movable {
         }
         db.begin_source_observations(self.ctx.query$.ref(), root.source_id);
         return self.ensure_declaration_signature(graph, binding.def_id);
+    }
+
+    #doc 包内普通函数也属于编辑目标，不能只选 main；依赖模块仍只准备被实际读取的声明。
+    public Bool ensure_source_file_model(Self&! self, module_graph.ModuleGraph&! graph) {
+        qid.ModuleId selected = graph.root_module;
+        {
+            module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
+            builder.discover_module_imports(graph, selected);
+        }
+        db.begin_source_observations(self.ctx.query$.ref(), self.ctx.store.resolve.module_ref(selected).source_id);
+        if (!self.ensure_imported_extend_members(graph, selected)) { return false; }
+        Int index! = 0;
+        while (index < self.ctx.store.defs.len()) {
+            qid.DefId definition = qid.DefId.from_index(index);
+            index = index + 1;
+            if (self.ctx.store.defs.get(definition).module_id != selected
+                || !self.owner.declaration_items.has(definition)) { continue; }
+            if (!self.ensure_declaration_model(graph, definition)) { return false; }
+        }
+        return self.ensure_module_metadata(graph, selected);
     }
 
     public Bool ensure_root_entry_model(
@@ -1916,6 +2135,8 @@ struct ModuleResolvePhase: Movable {
         Bool signature_only,
         module_graph.ModuleGraph&! graph
     ) {
+        if (self.ctx.store.defs.get(def_id).kind != .alias_def
+            && !self.ensure_imported_extend_members(graph, module_id)) { return false; }
         if (!self.ensure_alias_expression(graph, module_id, namespace_id, item_id, def_id)) { return false; }
         qid.NamespaceId lookup_namespace! = namespace_id;
         if (self.ctx.store.defs.get(def_id).kind == .alias_def) {
@@ -1958,7 +2179,11 @@ struct ModuleResolvePhase: Movable {
                     pending_module = state.pending_import_module;
                     pending_index = state.pending_import_index;
                     pending_declaration = state.pending_declaration;
-                } else if (!state.ctx.store.model.has_errors()) {
+                } else if (!state.ctx.store.model.has_errors()
+                    || (state.ctx.frontend_only && !signature_only
+                        && state.ctx.store.defs.get(def_id).kind == .function_def)) {
+                    // 编辑器保留已完成签名的部分函数 body；未解析引用仍 lower 成 invalid node。
+                    // lowered 仍报告失败，不能将半成品模型发布为成功编译缓存。
                     if (target_member) {
                         lowered = model_lower.lower_top_level_member(
                             state$.mut_ref(),
@@ -2104,6 +2329,7 @@ struct ModuleResolvePhase: Movable {
         }
         if (self.module_state(target_module) != .declarations_ready
             && self.module_state(target_module) != .declarations_collected
+            && self.module_state(target_module) != .signatures_ready
             && self.module_state(target_module) != .resolving
             && self.module_state(target_module) != .resolved
             && self.module_state(target_module) != .interface_loaded
@@ -2114,6 +2340,22 @@ struct ModuleResolvePhase: Movable {
         return target_module;
     }
 
+    #doc 扩展调用可以不引用 import 别名；按需声明解析也必须先建立所属文件的扩展环境。
+    Bool ensure_imported_extend_members(Self&! self, module_graph.ModuleGraph&! graph, qid.ModuleId module_id) {
+        if (self.owner.extension_imports.has(module_id)) { return true; }
+        self.owner.extension_imports.add(module_id);
+        if (!self.ensure_module_expression_aliases(graph, module_id)) { return false; }
+        Int index! = 0;
+        while (index < self.ctx.store.resolve.module_ref(module_id).imports.len()) {
+            guard self.ensure_lookup_import_target(graph, module_id, index) is .some(target) else {
+                return false;
+            }
+            if (!self.ensure_module_extend_members(graph, target)) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
     Bool ensure_module_extend_members(
         Self&! self,
         module_graph.ModuleGraph&! graph,
@@ -2121,7 +2363,7 @@ struct ModuleResolvePhase: Movable {
     ) {
         module_graph_builder.ModuleResolvePassState progress = self.module_state(module_id);
         if (progress == .failed) { return false; }
-        if (progress == .resolved || progress == .interface_loaded) { return true; }
+        if (progress == .resolved || progress == .interface_loaded || progress == .signatures_ready) { return true; }
         if (self.owner.extension_skeletons.has(module_id)) { return true; }
         if (progress != .declarations_ready
             && progress != .declarations_collected
@@ -2197,6 +2439,7 @@ struct ModuleResolvePhase: Movable {
     ) {
         return state == .declarations_ready
             || state == .declarations_collected
+            || state == .signatures_ready
             || state == .resolving;
     }
 
@@ -2343,6 +2586,7 @@ struct ModuleResolvePhase: Movable {
         if (state != .collecting_declarations
             && state != .declarations_ready
             && state != .declarations_collected
+            && state != .signatures_ready
             && state != .interface_loaded
         ) {
             return;
@@ -3170,6 +3414,7 @@ struct ModuleResolvePhase: Movable {
             module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
             if (state == .declarations_ready
                 || state == .declarations_collected
+                || state == .signatures_ready
                 || state == .interface_loaded
                 || state == .resolved
             ) {

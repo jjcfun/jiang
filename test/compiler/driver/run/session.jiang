@@ -6,8 +6,18 @@ import service = "../../../../src/compiler/service.jiang";
 import source = "../../../../src/compiler/source.jiang";
 import source_entry = "../../../../src/compiler/source/entry.jiang";
 import string = "../../../../src/compiler/support/string.jiang";
+import context = "../../../../src/compiler/context.jiang";
+import pipeline = "../../../../src/compiler/pipeline.jiang";
+import qid = "../../../../src/compiler/id.jiang";
+import fs = "../../../../src/compiler/system/fs.jiang";
+import env = "../../../../src/compiler/system/env.jiang";
+import std;
 
 public Int run() {
+    test_frontend_native_configuration();
+    test_frontend_focused_file();
+    test_frontend_scc_body_reuse();
+    test_frontend_incomplete_member();
     session.CompilerSession compiler! = session.CompilerSession();
     UInt8[]& source_path = "test/compiler/driver/run/session-overlay/main.jiang";
     UInt8[]& helper_path = "test/compiler/driver/run/session-overlay/helper.jiang";
@@ -41,6 +51,252 @@ public Int run() {
     assert(compiler.diagnostics().has_errors());
     assert(string.equal(compiler.diagnostics().get(0).code.text, "unsupported_target_triple"));
     return 0;
+}
+
+#doc 配置按需调用 helper 求值 info，随后主包仍诊断未参与求值的 helper 函数体。
+Void test_frontend_native_configuration() {
+    UInt8[]& directory = "test/compiler/fixture/native_package";
+    context.CompilerContext ctx! = context.CompilerContext();
+    std.StringBuilder configuration! = std.StringBuilder();
+    configuration.append("import h = \"helper.jiang\"; #package { name=\"native_package\"; version=h.version(); ");
+    configuration.append("type=.bin; root=\"src/main.jiang\"; dependencies { util=\"../native_dependency\"; ");
+    configuration.append("common=\"../native_common\"; } }");
+    ctx.store.sources.set_overlay("test/compiler/fixture/native_package/package.jiang", configuration.slice());
+    UInt8[]& helper = "test/compiler/fixture/native_package/helper.jiang";
+    ctx.store.sources.set_overlay(helper,
+        "@life() public UInt8[]& version() { \"0.5.5\" } public Int unrelated() { true }");
+    options.CompileOptions check! = options.CompileOptions(.check_only, directory, "");
+    check.frontend_only = true;
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    _ package = ctx.store.resolve.package_ref(ctx.store.resolve.root_package$.some());
+    assert(package.configuration_info != null);
+    assert(ctx.store.comptime_store.const_value(package.configuration_info$.some()) != null);
+    assert(ctx.store.diagnostics.has_errors());
+    ctx.store.sources.set_overlay(helper,
+        "@life() public UInt8[]& version() { \"0.5.5\" } public Int unrelated() { 0 }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+}
+
+#doc 当前文件检查不受未使用依赖 body 影响；切换目标和依赖类型变化必须使用新 overlay。
+Void test_frontend_focused_file() {
+    _ work = env.get("JIANG_TEST_WORK_DIR")$.some();
+    Path directory = std.path.join(work[..], "session-focused");
+    assert(fs.create_dirs(directory.bytes()));
+    Path configuration = std.path.join(directory.bytes(), "package.jiang");
+    Path root = std.path.join(directory.bytes(), "main.jiang");
+    Path current = std.path.join(directory.bytes(), "current.jiang");
+    Path dependency = std.path.join(directory.bytes(), "dependency.jiang");
+    assert(fs.write_all(configuration.bytes(),
+        "#package { name=\"focused\"; version=\"0.6.0\"; type=.bin; root=\"main.jiang\"; }"));
+    assert(fs.write_all(root.bytes(), "Int main() { true }"));
+    assert(fs.write_all(current.bytes(), "import d = \"dependency.jiang\"; Int value() { d.answer() }"));
+    assert(fs.write_all(dependency.bytes(), "public Int answer() { 7 } public Int unrelated() { true }"));
+    Path cache = std.path.join(directory.bytes(), "cache");
+    options.CompileOptions check! = options.CompileOptions(.check_only, directory.bytes(), "", cache.bytes(),
+        "test-target", "testc");
+    check.frontend_only = true;
+    check.frontend_file = current.bytes();
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    assert(ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), current.bytes(), "value")));
+    assert(!ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), dependency.bytes(), "answer")));
+    ctx.store.sources.set_overlay(dependency.bytes(),
+        "public Bool answer() { true } public Int unrelated() { true }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+    ctx.store.sources.set_overlay(dependency.bytes(),
+        "public Int answer() { 8 } public Int unrelated() { true }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    check.frontend_file = dependency.bytes();
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+    ctx.store.sources.set_overlay(dependency.bytes(),
+        "public Int answer() { 8 } public Int unrelated() { 0 }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    check.frontend_file = current.bytes();
+    std.String extension = string.concat(
+        "public alias Number = Int; public extend Number { public Int focused_value() { 9 } }",
+        " public Int unrelated() { true }");
+    ctx.store.sources.set_overlay(dependency.bytes(), extension.bytes());
+    ctx.store.sources.set_overlay(current.bytes(),
+        "alias d = import \"dependency.jiang\"; Int value() { Int.focused_value() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    ctx.store.sources.set_overlay(dependency.bytes(),
+        "public Int answer() { 8 } public Int unrelated() { 0 }");
+    ctx.store.sources.set_overlay(current.bytes(),
+        "import d = \"dependency.jiang\"; Int main() { d.answer() } Int unused() { true }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+    check.frontend_file = null;
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+}
+
+#doc 循环 import 内只重建改动文件；未使用签名不扩散，已使用签名变化必须重新检查调用方 body。
+Void test_frontend_scc_body_reuse() {
+    _ work = env.get("JIANG_TEST_WORK_DIR")$.some();
+    Path directory = std.path.join(work[..], "session-scc");
+    assert(fs.create_dirs(directory.bytes()));
+    Path main_path = std.path.join(directory.bytes(), "main.jiang");
+    Path a_path = std.path.join(directory.bytes(), "a.jiang");
+    Path b_path = std.path.join(directory.bytes(), "b.jiang");
+    assert(fs.write_all(main_path.bytes(), "import b = \"b.jiang\"; Int main() { b.compute() }"));
+    assert(fs.write_all(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 1 } public Int link() { b.compute() }"));
+    assert(fs.write_all(b_path.bytes(),
+        "import a = \"a.jiang\"; public Int compute() { Fn<Int> read = { => a.value() + 1 }; read() }"));
+    Path cache = std.path.join(directory.bytes(), "cache");
+    options.CompileOptions check! = options.CompileOptions(.check_only, main_path.bytes(), "", cache.bytes(),
+        "test-target", "testc");
+    check.frontend_only = true;
+    context.CompilerContext ctx! = context.CompilerContext();
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    assert(ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), b_path.bytes(), "compute")));
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 22 } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    assert(ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), a_path.bytes(), "value")));
+    assert(!ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), b_path.bytes(), "compute")));
+    std.String unused = string.concat(
+        "import b = \"b.jiang\"; public Int value() { 22 } public Bool unused() { true }",
+        " public Int link() { b.compute() }");
+    ctx.store.sources.set_overlay(a_path.bytes(), unused.bytes());
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    assert(!ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), b_path.bytes(), "compute")));
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Bool value() { true } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert(ctx.store.diagnostics.has_errors());
+    assert(ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), b_path.bytes(), "compute")));
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 33 } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    assert(fs.write_all(b_path.bytes(),
+        "import a = \"a.jiang\"; public const Int answer = a.value(); public Int compute() { answer }"));
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    qid.DefId answer! = scc_definition(ctx$.mut_ref(), b_path.bytes(), "answer");
+    assert(ctx.store.comptime_store.const_value(answer)$.some().data is .int_value(33));
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 44 } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    answer = scc_definition(ctx$.mut_ref(), b_path.bytes(), "answer");
+    assert(ctx.store.comptime_store.const_value(answer)$.some().data is .int_value(44));
+    assert(ctx.store.model.has_body(scc_definition(ctx$.mut_ref(), b_path.bytes(), "compute")));
+    Path c_path = std.path.join(directory.bytes(), "c.jiang");
+    std.String nested = string.concat("import a = \"a.jiang\"; public Int compute() { ",
+        "Fn<Int> read = { => Fn<Int> inner = { => 17 }; inner() }; read() }");
+    assert(fs.write_all(b_path.bytes(), nested.bytes()));
+    assert(fs.write_all(c_path.bytes(),
+        "import a = \"a.jiang\"; import b = \"b.jiang\"; public const Int answer = a.value() + b.compute();"));
+    assert(fs.write_all(main_path.bytes(), "import c = \"c.jiang\"; Int main() { c.answer }"));
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 55 } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    answer = scc_definition(ctx$.mut_ref(), c_path.bytes(), "answer");
+    assert(ctx.store.comptime_store.const_value(answer)$.some().data is .int_value(72));
+    ctx.store.sources.set_overlay(a_path.bytes(),
+        "import b = \"b.jiang\"; public Int value() { 66 } public Int link() { b.compute() }");
+    pipeline.compile(ctx$.mut_ref(), check$.ref());
+    assert_context_ok(ctx$.ref());
+    answer = scc_definition(ctx$.mut_ref(), c_path.bytes(), "answer");
+    assert(ctx.store.comptime_store.const_value(answer)$.some().data is .int_value(83));
+}
+
+#doc 回归失败时先输出实际诊断，便于区分缓存复用和源码错误。
+Void assert_context_ok(context.CompilerContext& ctx) {
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        _ item = ctx.store.diagnostics.get(index);
+        io.stderr().write_all(item.code.text);
+        io.stderr().write_all(": ");
+        io.stderr().write_all(item.message.bytes());
+        io.stderr().write_all("\n");
+        index = index + 1;
+    }
+    assert(!ctx.store.diagnostics.has_errors());
+}
+
+qid.DefId scc_definition(context.CompilerContext&! ctx, UInt8[]& path, UInt8[]& name) {
+    _ source_id = ctx.store.sources.find(.file(path))$.some();
+    _ module = ctx.store.resolve.module_for_source(source_id)$.some();
+    _ symbol = ctx.store.symbols.intern(name);
+    return ctx.store.resolve.first_binding(ctx.store.resolve.module_ref(module).namespace_id,
+        symbol, .value_name)$.some().def_id;
+}
+
+#doc 编辑器在独立或被 import 的半成品源码中直接查询候选，不再依赖改写 overlay 重编。
+Void test_frontend_incomplete_member() {
+    session.CompilerSession compiler! = session.CompilerSession();
+    UInt8[]& root_path = "test/compiler/driver/run/member-overlay/main.jiang";
+    UInt8[]& member_path = "test/compiler/driver/run/member-overlay/helper.jiang";
+    std.StringBuilder text! = std.StringBuilder();
+    text.append("struct User { Int id; }\n");
+    text.append("extend User { public Int extra(self) { 1 } }\n");
+    text.append("public Int value() { User user = User(id = 1); user.");
+    Int offset = text.slice().length;
+    text.append("\nreturn 1; }");
+    source.SourceId member_id = compiler.set_source(member_path, text.slice());
+    options.CompileOptions check! = options.CompileOptions(.check_only, member_path, "");
+    check.frontend_only = true;
+    compiler.compile(check$.ref());
+    assert_direct_member_candidates(compiler$.mut_ref(), member_id, offset);
+    compiler.set_source(root_path, "import helper = \"helper.jiang\"; Int main() { helper.value() }");
+    check.input_path = root_path;
+    compiler.compile(check$.ref());
+    assert_direct_member_candidates(compiler$.mut_ref(), member_id, offset);
+    std.StringBuilder ambiguous! = std.StringBuilder();
+    ambiguous.append(text.slice()[0..offset]);
+    ambiguous.append("\nInt after = 1; return after; }");
+    compiler.set_source(member_path, ambiguous.slice());
+    check.input_path = member_path;
+    compiler.compile(check$.ref());
+    assert_direct_member_candidates(compiler$.mut_ref(), member_id, offset);
+    check.input_path = root_path;
+    compiler.compile(check$.ref());
+    assert_direct_member_candidates(compiler$.mut_ref(), member_id, offset);
+    compiler.set_source(member_path, text.slice());
+    check.frontend_only = false;
+    compiler.compile(check$.ref());
+    Bool rejected! = false;
+    Int index! = 0;
+    while (index < compiler.diagnostics().len()) {
+        if (string.equal(compiler.diagnostics().get(index).code.text, "import_parse_error")) { rejected = true; }
+        index = index + 1;
+    }
+    assert(rejected);
+}
+
+Void assert_direct_member_candidates(session.CompilerSession&! compiler, source.SourceId source_id, Int offset) {
+    assert(compiler.diagnostics().has_errors());
+    assert(compiler.source_in_compilation(source_id));
+    Int generation = compiler.generation();
+    _ candidates = compiler.completion_defs(source_id, offset);
+    service.CompilerQueries queries = compiler.queries();
+    Bool field! = false;
+    Bool extension! = false;
+    Int index! = 0;
+    while (index < candidates.len()) {
+        std.String label = queries.completion_label(candidates.get(index));
+        if (string.equal(label.bytes(), "id")) { field = true; }
+        if (string.equal(label.bytes(), "extra")) { extension = true; }
+        index = index + 1;
+    }
+    assert(field && extension);
+    assert(compiler.generation() == generation);
 }
 
 Void assert_session_queries(

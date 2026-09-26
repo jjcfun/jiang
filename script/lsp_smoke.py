@@ -66,9 +66,9 @@ def check_overlay_restore(binary, directory):
                    if item.get("method") == "textDocument/publishDiagnostics"]
     assert len(diagnostics) == 7, diagnostics
     assert diagnostics[0]["uri"] == main_uri and diagnostics[0]["diagnostics"] == []
-    assert diagnostics[1]["uri"] == main_uri and diagnostics[1]["version"] == 1
-    assert any(item["code"] == "unresolved_value" for item in diagnostics[1]["diagnostics"])
-    assert diagnostics[2]["uri"] == helper_uri and diagnostics[2]["diagnostics"] == []
+    assert diagnostics[1]["uri"] == helper_uri and diagnostics[1]["diagnostics"] == []
+    assert diagnostics[2]["uri"] == main_uri and diagnostics[2]["version"] == 1
+    assert any(item["code"] == "unresolved_value" for item in diagnostics[2]["diagnostics"])
     assert diagnostics[3]["uri"] == main_uri and diagnostics[3]["version"] == 2
     assert diagnostics[3]["diagnostics"], diagnostics[3]
     assert diagnostics[4]["uri"] == helper_uri and diagnostics[4]["diagnostics"] == []
@@ -137,14 +137,14 @@ def check_package_documents(binary, directory):
     diagnostics = [item["params"] for item in items
                    if item.get("method") == "textDocument/publishDiagnostics"]
     assert [(item["uri"], item.get("version")) for item in diagnostics] == [
-        (main_uri, 1), (other_uri, 1), (main_uri, 1), (helper_uri, 1),
-        (main_uri, 1), (helper_uri, 2), (helper_uri, None),
+        (main_uri, 1), (other_uri, 1), (helper_uri, 1), (main_uri, 1),
+        (helper_uri, 2), (main_uri, 1), (helper_uri, None),
         (orphan_uri, 1), (orphan_uri, 2), (orphan_uri, None),
     ], diagnostics
     assert diagnostics[0]["diagnostics"] == [], diagnostics[0]
     assert diagnostics[1]["diagnostics"], diagnostics[1]
-    assert diagnostics[2]["diagnostics"], diagnostics[2]
-    assert diagnostics[3]["diagnostics"] == [], diagnostics[3]
+    assert diagnostics[2]["diagnostics"] == [], diagnostics[2]
+    assert diagnostics[3]["diagnostics"], diagnostics[3]
     assert diagnostics[4]["diagnostics"] == [], diagnostics[4]
     assert diagnostics[5]["diagnostics"] == [], diagnostics[5]
     assert diagnostics[6]["diagnostics"] == [], diagnostics[6]
@@ -740,11 +740,17 @@ def check_dependency_roots(binary, directory):
     (dep / "lib.jiang").write_text("public Int answer() { 1 }\n", encoding="utf-8")
     main_uri = (app / "main.jiang").as_uri()
     dep_uri = (dep / "lib.jiang").as_uri()
+    other = "Int other() { 0 }\n"
+    (app / "other.jiang").write_text(other, encoding="utf-8")
+    other_uri = (app / "other.jiang").as_uri()
     messages = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
         {"jsonrpc": "2.0", "method": "textDocument/didOpen",
          "params": {"textDocument": {"uri": main_uri, "languageId": "jiang",
                                      "version": 1, "text": main}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": other_uri, "languageId": "jiang",
+                                     "version": 1, "text": other}}},
         {"jsonrpc": "2.0", "method": "textDocument/didOpen",
          "params": {"textDocument": {"uri": dep_uri, "languageId": "jiang",
                                      "version": 1, "text": "public Int wrong() { 1 }\n"}}},
@@ -765,6 +771,8 @@ def check_dependency_roots(binary, directory):
     app_diagnostics = [item for item in diagnostics if item["uri"] == main_uri]
     assert [item["diagnostics"] == [] for item in app_diagnostics] == [True, False, True], diagnostics
     assert any(item["code"] == "unresolved_value" for item in app_diagnostics[1]["diagnostics"])
+    other_diagnostics = [item for item in diagnostics if item["uri"] == other_uri]
+    assert len(other_diagnostics) == 1 and other_diagnostics[0]["diagnostics"] == [], diagnostics
     dep_diagnostics = [item for item in diagnostics if item["uri"] == dep_uri]
     assert [item["version"] for item in dep_diagnostics] == [1, 2], diagnostics
 
