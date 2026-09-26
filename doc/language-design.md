@@ -115,7 +115,7 @@ Session 提供宿主符号表的 `intern`；该状态按实际语言身份在一
 通过 `syntax` 访问块级回调。共享对象不捕获 Session 借用，释放顺序为块、语言状态、动态库。
 
 语言层规则（下列 invocation 限制适用于用户 lang package；内建 `#doc` provider 自己扫描
-line/block header）：
+文档块 header）：
 
 - Jiang 源码内使用 block invocation：`#alias { ... }`；独立 Lang 文件按扩展名选择 Provider。
 - 当前不支持 `#alias(...)`。
@@ -174,8 +174,10 @@ lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`s
 边界，并可把私有 token/cache 保存在 provider 实例字段中。parser 后续读到 `raw_block` token 时
 调用同一实例的 `parse`。provider 通过 `Parser<K>` 的 typed factory 直接把普通 Jiang syntax 写入
 compiler-owned `AstUnit`，最后只返回根节点 `Ast`；不公开 compiler AST data，也不建立 mirror tree。
-编译器内建 provider 包括 inline asm 和
-API 文档：`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
+编译器内建 provider 包括 inline asm 和 API 文档。
+文档语法：`///` 生成单行声明文档；`#doc` / `#jiang.doc` 只接受以独占行 `#end`
+结束的多行 Markdown。两种形式生成相同的文档 attribute，供反射和 LSP 读取。
+`#asm { ... }` / `#jiang.asm { ... }` 生成 inline asm；`#doc` /
 `#jiang.doc` 生成声明 attribute，`#doc(module)` 指向 module semantic owner。短名
 允许被用户的 lang dependency alias 覆盖，`#jiang.*` 始终选择 compiler builtin。
 

@@ -34,7 +34,7 @@ double_quoted  <- /* 双引号定界 token，字符串语义由 Jiang parser 解
 provider_path
             <- ident ("." ident)*
 raw_block   <- /* `#provider_path { ... }` 中由 lang provider scan 确定边界的原始 block */
-doc_body    <- /* builtin `#doc` 扫描的单行或以独占行 `#end` 结束的 Markdown */
+doc_body    <- /* builtin `#doc` 扫描的以独占行 `#end` 结束的 Markdown */
 
 literal     <- int_lit
              / float_lit
@@ -103,7 +103,8 @@ leading_attribute
              / "@" "alias" "(" alias_attribute_bindings ")"
 
 doc_attribute
-            <- ("#doc" / "#jiang.doc") doc_body
+            <- "///" /* 到行末的 Markdown */
+             / ("#doc" / "#jiang.doc") doc_body
 
 module_doc  <- ("#doc" / "#jiang.doc") "(" "module" ")" doc_body
 

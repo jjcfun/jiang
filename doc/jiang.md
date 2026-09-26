@@ -237,7 +237,7 @@ defer {
 - `defer expr;`
 - `defer { ... }`
 
-以下限制适用于用户自定义的 lang package；内建 `#doc` 使用上一节的固定 line/block
+以下限制适用于用户自定义的 lang package；内建文档使用 `///` 单行和 `#doc` / `#end` 多行
 语法，不改变 public provider invocation：
 
 - `defer` 体内不支持 `return`、`break`、`continue`
@@ -906,6 +906,42 @@ Void hello() {
   print("Hello World!");
   return;
 }
+```
+
+#### 标准输出
+
+`print(value)` 将一个值输出到标准输出，并在末尾添加换行，返回 `Void`。它由自动
+prelude 导出，也可以写成 `std.print(value)` 或 `std.io.print(value)`。当前只接受一个参数。
+
+```jiang
+print("Hello, Jiang!");
+print(42);
+print(true);
+```
+
+支持 UTF-8 字节切片、`String`、整数、浮点数和布尔值；已有 `String` 可以通过 `value$.ref()`
+借用打印，直接传 owned `String` 则消费它。字符串插值结果可直接传入：`print("\(foo)_\(bar)")`。
+浮点数沿用 `StringBuilder` 的默认六位小数格式。需要无换行或自定义输出格式时，可以使用
+`std.io.stdout().write_all(bytes)`。`print` 写入失败会 panic；需要处理输出错误时使用 `write_all`。
+
+`String` 保证合法 UTF-8；`print` 对字节切片采用容错解码，无效序列替换为 `�`。需要严格校验的外部输入可先
+通过 `String.from_utf8(bytes)` 获取可恢复的 `Utf8Error`。中文和 emoji 按原始 UTF-8 字节写出。
+
+自定义类型实现 `Formattable`，通过可写的 `StringBuilder` 参数追加文本。借用值打印不会消费它：
+
+```jiang
+struct User: Formattable {
+    Int id;
+
+    public Void format(self, StringBuilder&! out) {
+        out.append("User(id: ");
+        out.append(self.id);
+        out.append(")");
+    }
+}
+
+User user = User(id = 42);
+print(user$.ref());
 ```
 
 #### 生成与模块反射
@@ -3006,19 +3042,21 @@ import util;
 
 #### API 文档
 
-`#doc` 为紧随其后的 declaration 添加 Markdown 文档；`#doc(module)` 为当前 module
+`///` 为紧随其后的 declaration 添加单行 Markdown 文档；`#doc` 用于多行文档；`#doc(module)` 为当前 module
 添加文档，并且必须位于第一个非 import declaration 之前：
 
 ```jiang
-#doc(module) collection module。
+#doc(module)
+    collection module。
+#end
 
-#doc 返回两个整数之和。
+/// 返回两个整数之和。
 public Int add(Int left, Int right) {
     left + right
 }
 ```
 
-header 后同一行有正文时为单行文档。header 所在行没有正文时，使用独占一行的
+`///` 正文到行末结束。`#doc` header 所在行不能有正文，必须使用独占一行的
 `#end` 结束多行文档：
 
 ```jiang
@@ -3031,7 +3069,7 @@ public struct Vector<T> {
 }
 ```
 
-如果正文确实需要独占一行的 `#end`，写成 `\#end`。相邻的多个 `#doc` 按源码顺序用
+如果正文确实需要独占一行的 `#end`，写成 `\#end`。相邻的 `///` 和 `#doc` 文档按源码顺序用
 换行合并。短名 `#doc` 被 lang dependency alias 占用时，可以用 `#jiang.doc` 显式选择
 内建文档语法。
 

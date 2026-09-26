@@ -23,7 +23,9 @@ def main():
     work.mkdir(parents=True, exist_ok=False)
     for name in ("app", "tool", "helper", "logs"):
         (work / name).mkdir()
-    (work / "app/package.jiang").write_text('''#doc(module) 生成任务的原生宿主包；输入类型由 main.jiang 提供。
+    (work / "app/package.jiang").write_text('''#doc(module)
+    生成任务的原生宿主包；输入类型由 main.jiang 提供。
+#end
 #package {
     name = "input";
     root = "main.jiang";
@@ -32,20 +34,26 @@ def main():
 }
 ''')
     (work / "app/main.jiang").write_text("struct Input { Int value; }\n")
-    (work / "tool/package.jiang").write_text('''#doc(module) 生成器通过已登记依赖读取 helper。
+    (work / "tool/package.jiang").write_text('''#doc(module)
+    生成器通过已登记依赖读取 helper。
+#end
 #package {
     name = "generator";
     root = "main.jiang";
     dependencies { helper = "../helper"; }
 }
 ''')
-    (work / "helper/package.jiang").write_text('''#doc(module) 生成缓存依赖指纹的辅助包。
+    (work / "helper/package.jiang").write_text('''#doc(module)
+    生成缓存依赖指纹的辅助包。
+#end
 #package { name = "helper"; root = "main.jiang"; }
 ''')
     helper = work / "helper/main.jiang"
     helper.write_text('@life() public UInt8[]& revision() { return "one"; }\n')
     generator = work / "tool/main.jiang"
-    generator.write_text('''#doc(module) 显式缓存只管理给定 key；payload 故意不纳入 key，以验证不透明内容的复用规则。
+    generator.write_text('''#doc(module)
+    显式缓存只管理给定 key；payload 故意不纳入 key，以验证不透明内容的复用规则。
+#end
 alias helper = import helper;
 @entry(generate)
 Void emit(reflect.Module root) {
@@ -158,10 +166,14 @@ Void emit(reflect.Module root) {
 
     # helper 直接读取普通包常量；只改配置版本必须更新结果及其生成缓存依赖。
     helper_configuration = work / "helper/package.jiang"
-    helper_configuration.write_text('''#doc(module) helper 的版本由普通包常量提供。
+    helper_configuration.write_text('''#doc(module)
+    helper 的版本由普通包常量提供。
+#end
 #package { name = "helper"; root = "main.jiang"; version = "three"; }
 ''')
-    helper.write_text('''#doc(module) 生成器通过公开函数读取本包配置。
+    helper.write_text('''#doc(module)
+    生成器通过公开函数读取本包配置。
+#end
 import "package.jiang";
 @life() public UInt8[]& revision() { return package.info.version; }
 ''')

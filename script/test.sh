@@ -534,6 +534,8 @@ run_release_case() {
   local build_log="$work_dir/build.out"
   local run_log="$work_dir/run.out"
   local companion_link_args=()
+  local companion_compile_args=()
+  local sdk_arg
   local build_started=$SECONDS
   local build_time
   local run_started
@@ -543,7 +545,11 @@ run_release_case() {
   local temp_dir
 
   if [ -f "$companion" ]; then
-    if ! "$LLVM_CLANG" -c "$companion" -o "$companion_object" >"$companion_log" 2>&1; then
+    while IFS= read -r sdk_arg; do
+      companion_compile_args+=("$sdk_arg")
+    done < <(jiang_macos_sdkroot_link_args)
+    if ! "$LLVM_CLANG" ${companion_compile_args[@]+"${companion_compile_args[@]}"} \
+      -c "$companion" -o "$companion_object" >"$companion_log" 2>&1; then
       echo "FAIL release-run $source companion compile failed"
       print_log_prefix "$companion_log"
       return 1

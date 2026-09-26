@@ -231,7 +231,7 @@ def check_completion(binary, directory):
     helper.write_text("public Int value() { 0 }\n", encoding="utf-8")
     uri = (root / "completion main.jiang").as_uri()
     header = 'alias helper = import "./completion helper.jiang";\n'
-    header += "#doc Computes a local value.\n"
+    header += "/// Computes a local value.\n"
     header += "Int local_helper() { 0 }\n"
 
     def source(local_name, expression):
@@ -332,7 +332,7 @@ def check_dot_completion(binary, directory):
               'struct User {\n'
               '    Int id;\n'
               '    Bool active = true;\n'
-              '    #doc Scores the user.\n'
+              '    /// Scores the user.\n'
               '    public Int score(self) { 1 }\n'
               '}\n'
               'enum Result { ok(Int), err(Int), }\n')
@@ -451,7 +451,7 @@ def check_extension_completion(binary, directory):
     header = ('import dep = "./extension helper.jiang";\n'
               'alias Imported = dep.Imported;\n'
               'struct User { Int id; }\n'
-              'extend User { #doc Extension member.\n public Int extra(self) { 1 } }\n'
+              'extend User { /// Extension member.\n public Int extra(self) { 1 } }\n'
               'struct Other {}\n'
               'extend Other { public Int wrong(self) { 2 } }\n'
               'struct Holder<T> { T value; }\n'
@@ -513,12 +513,13 @@ def check_extension_completion(binary, directory):
 
 def check_hover_documentation(binary, directory):
     uri = (Path(directory) / "hover documentation.jiang").as_uri()
-    original = ("#doc Adds **one**.\n"
+    original = ("/// Adds **one**.\n"
                 "Int documented(Int value) { value + 1 }\n"
                 "Int plain() { 0 }\n"
+                "#doc\nBlock **documentation**.\n#end\nInt block_doc() { 0 }\n"
                 "Int main() { documented(plain()) }\n")
     changed = original.replace("Adds **one**.", "Adds **two**.")
-    undocumented = original.replace("#doc Adds **one**.\n", "")
+    undocumented = original.replace("/// Adds **one**.\n", "")
 
     def position(text, needle, last=False):
         offset = (text.rindex(needle) if last else text.index(needle)) + 1
@@ -543,6 +544,7 @@ def check_hover_documentation(binary, directory):
         hover(2, original, "documented"),
         hover(3, original, "documented", True),
         hover(4, original, "plain"),
+        hover(8, original, "block_doc"),
         change(2, changed),
         hover(5, changed, "documented", True),
         change(3, undocumented),
@@ -562,6 +564,9 @@ def check_hover_documentation(binary, directory):
     assert by_id[2]["result"]["contents"] == documented, by_id[2]
     assert by_id[3]["result"]["contents"] == documented, by_id[3]
     assert by_id[4]["result"]["contents"] == {"kind": "plaintext", "value": "Int plain()"}, by_id[4]
+    assert by_id[8]["result"]["contents"] == {
+        "kind": "markdown", "value": "```jiang\nInt block_doc()\n```\n\nBlock **documentation**."
+    }, by_id[8]
     assert by_id[5]["result"]["contents"]["value"].endswith("Adds **two**."), by_id[5]
     assert by_id[6]["result"]["contents"] == {
         "kind": "plaintext", "value": "Int documented(Int value)"
@@ -572,7 +577,7 @@ def check_imported_hover_documentation(binary, directory):
     root = Path(directory) / "hover import"
     root.mkdir()
     (root / "helper.jiang").write_text(
-        "#doc Returns **42**.\npublic Int answer() { 42 }\n", encoding="utf-8")
+        "/// Returns **42**.\npublic Int answer() { 42 }\n", encoding="utf-8")
     uri = (root / "main.jiang").as_uri()
     source = 'alias helper = import "./helper.jiang";\nInt main() { helper.answer() }\n'
     answer = source.index("answer") + 1

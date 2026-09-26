@@ -88,23 +88,30 @@ unpack_archive() {
   tar -xzf "$PACKAGE_ARCHIVE" -C "$UNPACK_DIR"
 }
 
-compile_and_run_samples() {
+compile_and_run_samples() (
   local compiler="$1"
   local hello="$SMOKE_DIR/hello"
   local capability="$SMOKE_DIR/hosted-capability"
   local hello_output
+  local user_dir
 
-  "$compiler" --linker "$LINKER" -o "$hello" "$ROOT_DIR/test/release/hello.jiang"
+  # 用户项目必须在源码仓库之外，防止本地 src 掩盖发行包的资源定位错误。
+  user_dir="$(mktemp -d "${TMPDIR:-/tmp}/jiang-release-user.XXXXXX")"
+  trap 'rm -rf "$user_dir"' EXIT
+  cp "$ROOT_DIR/test/release/hello.jiang" "$user_dir/hello.jiang"
+  cp "$ROOT_DIR/test/release/hosted_capability.jiang" "$user_dir/hosted_capability.jiang"
+  cd "$user_dir"
+
+  "$compiler" --linker "$LINKER" -o "$hello" hello.jiang
   hello_output="$("$hello")"
   if [ "$hello_output" != "Hello from Jiang" ]; then
     echo "unexpected Hello output: $hello_output" >&2
     exit 1
   fi
 
-  "$compiler" --linker "$LINKER" -o "$capability" \
-    "$ROOT_DIR/test/release/hosted_capability.jiang"
+  "$compiler" --linker "$LINKER" -o "$capability" hosted_capability.jiang
   "$capability" release-smoke
-}
+)
 
 cd "$ROOT_DIR"
 configure_host

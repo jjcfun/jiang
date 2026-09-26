@@ -2,262 +2,67 @@
   <img src="doc/logo.svg" alt="Jiang" width="160">
 </p>
 
-# Jiang语言
+# Jiang 语言
 
-当前 Jiang 语言编译器已经可以稳定自举。常规版本开发只依赖上一版稳定 compiler 作为
-bootstrap 输入；如果新版本包含旧 release 编译器无法直接编译的破坏性升级，则使用
-`bootstrap/<version>` 和 `release/<version>` 双 worktree 流程。
+Jiang 编程语言。项目仍处于早期阶段，语言与标准库会持续迭代。
 
-Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构会继续快速迭代。
+[官网与语言文档](https://jiang-lang.org/) · [发行版](https://github.com/jjcfun/jiang/releases)
 
-[官网与语言文档](https://jiang-lang.org/)
+## 安装
 
-当前开发源码为 **0.6.0**；最新发行版是 **0.5.6**，发行版变更见
-[0.5.6 release notes](doc/releases/0.5.6.md)。
-
-## 安装发行版
-
-Jiang 0.5.6 提供 macOS arm64 和 Linux x86_64 预构建包。下载并解压对应平台的 archive 后运行：
+支持 **macOS Apple Silicon** 和 **Linux x86_64**。在终端粘贴以下命令：
 
 ```bash
-cd jiang-0.5.6-<platform>
-./install.sh
+curl -fsSL https://github.com/jjcfun/jiang/releases/latest/download/install.sh | bash && . "$HOME/.jiang/env"
 ```
 
-默认安装到 `~/.jiang`，主命令是 `jiang`；如有需要，把 `~/.jiang/bin` 加入 `PATH`。
-安装包和 SHA-256 校验文件见 [Jiang 0.5.6 release](https://github.com/jjcfun/jiang/releases/tag/0.5.6)。
-
-## LSP 开发预览
-
-0.6.0 开发版通过 `jiang lsp` 在标准输入与标准输出上提供语言服务器。当前阶段支持
-初始化、全文文档同步、未保存文件诊断、跳转定义、悬停和名称补全。
-补全提供模块绑定、函数参数、已声明局部名称、`value.member`（含适用的 extension 成员）、`namespace.decl`，
-以及显式 enum 类型局部声明中的 `Result second = .` 变体候选；
-输入 `.` 会自动触发。精确的块作用域筛选仍待实现。
-打开多个文件时，LSP 会按最近的 `package.jiang` 选择编译入口，只重查包含变更源码的入口及导入者；
-`package.jiang` 变化会保守重查所有打开入口。
-编辑时优先完整检查当前文件，依赖的声明和类型按需准备；先发布当前文件诊断，再更新相关打开文件。
-补全、悬停和跳转同样以请求文件为检查入口。保存文件时再运行完整检查，补充借用检查等后期诊断。
-缺失成员名时保留 receiver 和后续语句；编辑器可从半成品函数 body 查询已解析的局部声明与成员候选。
-从本仓库构建时，可用 `build/bin/jiangc.next lsp` 启动同一入口。
-VS Code 扩展维护在独立的 [vscode-jiang 仓库](https://github.com/jjcfun/vscode-jiang)。
-安装包会随 `jiang` 命令包含标准库与内建源码；扩展可通过 `jiang.serverPath` 指向 `bin/jiang`，
-无需配置编译器源码仓库路径。
-当前服务器逐条同步处理消息：取消通知不会中断正在编译的请求；关闭文档后的语义请求返回空结果，
-过期版本的全文更新会被忽略。增量检查的计算复用与请求调度仍需继续优化。
-
-
-
-## 构建自举编译器
-
-当前 release 分支使用精确锁定的 LLVM 22.1.8。Jiang 提供 Linux x86_64 和 macOS arm64 的预构建
-LLVM SDK，普通构建不需要下载或编译 LLVM 源码：
-
-```text
-release: jiang-sdk-llvm-22.1.8-1
-https://github.com/jjcfun/llvm-project/releases/tag/jiang-sdk-llvm-22.1.8-1
-```
-
-LLVM 本地工具链默认安装在仓库 build 目录下：
-
-```text
-build/llvm/<host>/install
-```
-
-CMake build tree 放在同一组本地缓存目录：
-
-```text
-build/llvm/<host>/build
-```
-
-也可以把 LLVM 安装到 Jiang home，供多个 worktree 复用：
-
-```text
-$JIANG_HOME/toolchains/llvm/<version>/<host>
-```
-
-未设置 `JIANG_HOME` 时使用 `~/.jiang`。构建脚本会通过 `script/llvm_env.sh` 查找 Jiang
-托管的 LLVM：优先使用 `build/llvm/<host>/install/bin/llvm-config`，再 fallback 到
-`$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。脚本不会 fallback 到系统全局
-LLVM，也不接受外部 `LLVM_CONFIG` 覆盖。
+自动下载最新发行版、校验 SHA-256、安装到 `~/.jiang` 并为 bash/zsh 配置 PATH。验证安装：
 
 ```bash
-bash ./script/install_llvm.sh --local
-bash ./script/install_llvm.sh --user
+jiang --version
 ```
 
-`install_llvm.sh` 默认等价于 `--local`，下载 SDK、校验锁定的 SHA-256，并安装到
-`build/llvm/<host>/install`；下载归档缓存在 `build/downloads`。`--user` 会安装到
-`$JIANG_HOME/toolchains/llvm/<version>/<host>`。只有排查或维护 LLVM 时才使用源码兜底：
+一键安装入口从 0.6.0 发行版开始提供。也可以在 [Releases](https://github.com/jjcfun/jiang/releases)
+下载对应平台的压缩包，解压后运行 `./install.sh`。
+
+编译程序需要系统 C 工具链：macOS 可运行 `xcode-select --install`；Ubuntu/Debian 可运行
+`sudo apt install build-essential`。无需安装 LLVM 或下载编译器源码。
+
+## 第一个程序
+
+保存为 `hello.jiang`：
+
+```jiang
+Int main() {
+    print("Hello, Jiang!");
+    return 0;
+}
+```
+
+编译并运行：
 
 ```bash
-bash ./script/install_llvm.sh --local --from-source
+jiang -o hello hello.jiang
+./hello
 ```
 
-源码模式从 Jiang LLVM fork 浅克隆锁定的 `llvmorg-22.1.8`，源码位于
-`build/llvm-source/22.1.8`（可用 `JIANG_LLVM_SOURCE_DIR` 覆盖）。`JIANG_LLVM_FORCE_BUILD=1`
-仍表示强制源码重建。LLVM 库默认以静态库形式
-链接进 `jiang`，release 用户不需要安装 LLVM runtime。
-macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
-调整最低系统版本时应统一设置这个变量。
+## VS Code
 
-当前 0.6.0 源码直接使用已发布的 0.5.6 stable。严格冷启动链为：
+在扩展市场搜索并安装 **Jiang Language**，然后打开 `.jiang` 文件。
+Jiang 0.6.0 及更新版本提供诊断、补全、悬停文档和定义跳转。
 
-```text
-0.5.6 stable
-  -> 0.6.0 next
-  -> 0.6.0 stable
-```
-
-安装 0.5.6 stable 后，在源码 worktree 中运行：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.6 \
-COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=stable VERIFY=full \
-bash ./script/build_next.sh
-```
-
-产出 `build/bin/jiangc.next` 与 `build/bin/jiangc`，并运行完整验证。
-
-构建脚本默认读取 `~/.jiang/versions/0.5.6/bin/jiangc` 并校验版本。如只想构建不跑验证，
-可设置 `VERIFY=none`；
-只跑 smoke 可设置 `VERIFY=smoke`。
-
-构建脚本默认从根目录 `package.jiang` 的 `version` 字面量 读取编译器版本，并校验
-`build/bin/jiangc.next --version` 的输出。
-
-破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。其中记录各版本的完整
-冷启动链、各阶段产物边界和历史版本复现流程。
-
-正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
-glibc、pthread、dl 和 C++ runtime；安装包内的 `ABI.txt` 根据最终 ELF symbol version requirements
-记录最低 glibc 版本，不把 CI runner 版本直接当作兼容性承诺。Linux aarch64 暂不提供正式安装包。
-源码中另有 Linux aarch64、Wasm `wasm32-unknown-unknown`、WASI `wasm32-wasi` 和 Windows MSVC
-x86_64/aarch64 的 LLVM IR/object 输出 smoke。
-WASI executable 依赖本地 wasi-sdk，默认安装在：
-
-```text
-$JIANG_HOME/toolchains/wasi-sdk/<version>/<host>
-```
-
-未设置 `JIANG_HOME` 时使用 `~/.jiang`。可通过以下脚本安装：
-
-```bash
-bash ./script/install_wasi.sh
-```
-
-其他 target 的 executable、linker 和 startup 路径仍是实验能力。inline asm 已作为内建
-DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
-syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
-
-Jiang 使用 builtin `#doc` 为 module 和 declaration 保存 Markdown 文档。语法见
-[语言指南](doc/jiang.md#api-文档)。
-
-
-
-## 测试与发布
-
-基础测试：
-
-```bash
-JIANGC=./build/bin/jiangc bash ./script/test.sh
-TEST_ROOT=test/compiler JIANGC=./build/bin/jiangc bash ./script/test.sh
-JIANGC=./build/bin/jiangc bash ./script/smoke.sh
-JIANGC=./build/bin/jiangc bash ./script/backend_cli_smoke.sh
-```
-
-`script/test.sh` 统一发现 `check/`、`fail/`、`emit/` 和 `run/` 用例。默认运行
-`test/lang`，通过 `TEST_ROOT` 可选择编译器内部测试。runner 默认使用逻辑 CPU 数和 4
-中的较小值并行执行；`TEST_JOBS=1` 可用于串行复现。每个用例都有独立的工作目录和
-artifact cache，避免并发编译共享可写状态。`TEST_FILTER` 可用正则选择任意类别的用例，
-`TEST_LIST` 可指定按仓库相对路径逐行列出的用例清单：
-
-```bash
-TEST_JOBS=1 TEST_FILTER='tuple' JIANGC=./build/bin/jiangc bash ./script/test.sh
-TEST_JOBS=4 TEST_TIMEOUT=120 JIANGC=./build/bin/jiangc bash ./script/test.sh
-```
-
-依赖宿主系统 API 的用例可用 `// test-platform: macos` 或 `// test-platform: linux`
-限定运行平台；普通用例不应添加平台限制。
-
-默认在首个失败后停止派发新用例，并等待已经启动的用例结束；设置
-`TEST_KEEP_GOING=1` 可完成全部已选择用例。失败时 runner 会打印保留目录，其中的
-`cases/<序号>-<类别>-<用例>/` 保存编译、链接、运行日志和独立 cache。成功用例默认清理；
-调试时可用 `TEST_KEEP_WORK=1` 保留全部产物。`TEST_TIMING=1` 会输出每个阶段、每个用例和
-整个 suite 的耗时。
-`script/lang_check.sh` 暂时作为兼容入口。
-
-`script/smoke.sh` 使用显式用例清单运行日常快速测试，不定义另一套测试语义。它默认
-跳过较慢的 lang provider dylib 用例；需要覆盖该路径时，显式打开：
-
-```bash
-JIANG_SLOW_SMOKE=1 JIANGC=./build/bin/jiangc bash ./script/smoke.sh
-```
-
-`test.sh` 默认的 `run/` 用例仍走 `--emit-llvm` 后用 LLVM clang 链接。需要验证
-release object/executable 路径和 LLVM O2 pass pipeline 时，打开 release run：
-
-```bash
-TEST_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/test.sh
-```
-
-`test/compiler` 的聚合测试程序默认使用 debug 模式；性能敏感的完整验证可设置
-`COMPILER_TEST_MODE=release`。这只改变聚合测试程序的优化级别，不改变 case 集合。
-
-runner 自身的调度契约可独立验证：
-
-```bash
-bash ./script/test_runner_self_test.sh
-```
-
-生成当前 host 的 release 包：
-
-```bash
-bash ./script/package_macos_release.sh
-bash ./script/package_linux_release.sh
-```
-
-两个入口复用 `package_release.sh` 的公共 staging/install 流程，默认从 `package.jiang` 读取版本，
-并要求 `build/bin/jiangc --version` 与包版本一致。macOS 产物是 `.zip`，Linux x86_64 产物是
-`.tar.gz`。发行包把该产物安装为主命令 `jiang`，并保留 `jiangc` 兼容链接；`jiang` 静态链接 LLVM，
-不动态依赖 `libLLVM` / `liblld`。包内 `install.sh` 会安装到 `~/.jiang/versions/<version>` 并更新
-`~/.jiang/bin/jiang`。Linux 包额外包含 `ABI.txt`。
-
-验证完整 release 链路：
-
-```bash
-bash ./script/release_smoke.sh
-```
-
-该脚本会复用或安装本地 LLVM，执行 stable bootstrap 构建，生成当前 host 的 release archive，
-用临时 `PREFIX` 验证包内 `install.sh`，并使用安装后的 compiler 编译运行 Hello 和 hosted capability
-sample。macOS 使用 `otool`，Linux 使用 `readelf` / `ldd` 检查产物不动态依赖 `libLLVM` / `liblld`。
-Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMOKE_BUILD=0` 避免重复自举。
+扩展默认从 PATH 查找 `jiang`。安装 CLI 后重新打开 VS Code；如果未找到，在扩展设置中将
+`Jiang: Server Path` 设置为 `~/.jiang/bin` 对应的绝对路径。
+[扩展使用说明](https://github.com/jjcfun/vscode-jiang)
 
 ## 文档
 
-- [官网与语言文档](https://jiang-lang.org/)
-- [Jiang 0.5.6 release notes](doc/releases/0.5.6.md)（当前版本）
-- [Jiang 0.5.5 release notes](doc/releases/0.5.5.md)
-- [Jiang 0.5.4 release notes](doc/releases/0.5.4.md)（已发布）
-- [Jiang 0.5.3 release notes](doc/releases/0.5.3.md)
-- [Jiang 0.5.2 release notes](doc/releases/0.5.2.md)
-- [架构文档](doc/architecture.md)
+- [语言指南](doc/jiang.md)
+- [版本说明](doc/releases/0.6.0.md)
+- [构建、测试与发布](doc/build-and-test.md)
 - [编译器开发流程](doc/develop.md)
-- [Std incubator](doc/std.md)
-- 阶段设计：[AST](doc/compiler/ast.md)、[Resolve](doc/compiler/resolve.md)、[Semantic Model](doc/compiler/semantic-model.md)、
-  [Type Check](doc/compiler/type-check.md)、[JIL Monomorphization](doc/compiler/monomorph.md)、
-  [JIL](doc/compiler/jil.md)、[Layout](doc/compiler/layout.md)、
-  [Borrow Check](doc/compiler/borrow-check.md)、[Backend](doc/compiler/backend.md)、
-  [Startup](doc/compiler/startup.md)、[Targets](doc/compiler/targets.md)、[反射与生成](doc/compiler/reflection.md)
-- [PEG 语法](doc/grammar.md)
-- [语言设计](doc/language-design.md)
-
-
+- [架构](doc/architecture.md) · [语法](doc/grammar.md) · [语言设计](doc/language-design.md)
 
 ## License
 
-Copyright 2026 JiangJunChen。
-
-采用 Apache License 2.0。详见 [LICENSE](./LICENSE) 和 [NOTICE](./NOTICE)。
+Copyright 2026 JiangJunChen。采用 Apache License 2.0，详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
