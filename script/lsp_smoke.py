@@ -606,6 +606,132 @@ def check_imported_hover_documentation(binary, directory):
         }, by_id[2]
 
 
+def check_import_file_definitions(binary, directory):
+    root = Path(directory) / "import navigation"
+    root.mkdir()
+    helper = root / "helper file.jiang"
+    helper.write_text("public Int answer() { 42 }\n", encoding="utf-8")
+    unused = root / "unused.jiang"
+    unused.write_text("public Int unused() { 1 }\n", encoding="utf-8")
+    path = root / "main.jiang"
+    text = ('// 😀\nalias helper = import "./helper file.jiang";\n'
+            'import "./unused.jiang";\nimport std;\n'
+            'alias missing = import "./missing.jiang";\n'
+            'Int main() { helper.answer() }\n')
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": path.as_uri(), "languageId": "jiang", "version": 1, "text": text}}},
+    ]
+    positions = [(1, text.splitlines()[1].index('"')),
+                 (1, text.splitlines()[1].index('./')),
+                 (1, text.splitlines()[1].index('file')),
+                 (2, 9), (3, 8), (4, text.splitlines()[4].index('missing.jiang')),
+                 (1, 0)]
+    for identifier, (line, character) in enumerate(positions, start=2):
+        messages.append({"jsonrpc": "2.0", "id": identifier, "method": "textDocument/definition",
+                         "params": {"textDocument": {"uri": path.as_uri()},
+                                    "position": {"line": line, "character": character}}})
+    messages.extend([{"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+                     {"jsonrpc": "2.0", "method": "exit"}])
+    for _ in range(2):
+        process = subprocess.run([binary, "lsp"], input=b"".join(map(frame, messages)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
+        assert process.returncode == 0 and not process.stderr, process.stderr.decode()
+        by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+        start = {"line": 0, "character": 0}
+        for identifier in range(2, 6):
+            target = unused if identifier == 5 else helper
+            assert by_id[identifier]["result"] == {"uri": target.as_uri(),
+                                                  "range": {"start": start, "end": start}}, by_id[identifier]
+        assert by_id[6]["result"]["uri"].endswith("/src/std/std.jiang"), by_id[6]
+        assert by_id[7]["result"] is None, by_id[7]
+        assert by_id[8]["result"] is None, by_id[8]
+
+
+def check_compiler_source_definitions(binary):
+    root = Path(__file__).resolve().parent.parent
+    path = root / "src/compiler/artifact/source_ji.jiang"
+    text = path.read_text(encoding="utf-8")
+    cases = [
+        ("context.CompilerContext& ctx", "CompilerContext", root / "src/compiler/context.jiang", "public struct CompilerContext"),
+        ("source_artifact.SourceArtifactCache& cache", "SourceArtifactCache", root / "src/compiler/artifact/source.jiang", "public struct SourceArtifactCache"),
+        ("cache.load_import_summary(source_id)", "load_import_summary", root / "src/compiler/artifact/source.jiang", "public ImportSummary&? load_import_summary"),
+        ("cache.load_interface(source_id)", "load_interface", root / "src/compiler/artifact/source.jiang", "public ModuleInterface&? load_interface"),
+    ]
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": path.as_uri(), "languageId": "jiang", "version": 1, "text": text}}},
+    ]
+    expected = {}
+    for identifier, (reference, name, target, declaration) in enumerate(cases, start=2):
+        offset = text.index(reference) + reference.index(name)
+        prefix = text[:offset]
+        position = {"line": prefix.count("\n"), "character": len(prefix.rsplit("\n", 1)[-1])}
+        messages.append({"jsonrpc": "2.0", "id": identifier, "method": "textDocument/definition",
+                         "params": {"textDocument": {"uri": path.as_uri()}, "position": position}})
+        declaration_text = target.read_text(encoding="utf-8")
+        start = declaration_text.index(declaration) + declaration.index(name)
+        before = declaration_text[:start]
+        line = before.count("\n")
+        character = len(before.rsplit("\n", 1)[-1])
+        expected[identifier] = {"uri": target.as_uri(), "range": {
+            "start": {"line": line, "character": character},
+            "end": {"line": line, "character": character + len(name)},
+        }}
+    messages.extend([{"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+                     {"jsonrpc": "2.0", "method": "exit"}])
+    process = subprocess.run([binary, "lsp"], input=b"".join(map(frame, messages)),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
+    assert process.returncode == 0 and not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+    for identifier, target in expected.items():
+        assert by_id[identifier]["result"] == target, by_id[identifier]
+
+
+def check_definition_reuse(binary, directory):
+    root = Path(directory) / "definition reuse"
+    root.mkdir()
+    helper = root / "helper.jiang"
+    original = "public struct Value: Copyable { public Int number; }\n"
+    helper.write_text(original, encoding="utf-8")
+    main = root / "main.jiang"
+    text = ('alias helper = import "./helper.jiang";\n'
+            'Int read(helper.Value& value) { value.number }\nInt main() { 0 }\n')
+    messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}}]
+    for path, source in [(main, text), (helper, original)]:
+        messages.append({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+                         "params": {"textDocument": {"uri": path.as_uri(), "languageId": "jiang",
+                                                     "version": 1, "text": source}}})
+    expected = {}
+    def definition(identifier, path, line, character, target_line):
+        messages.append({"jsonrpc": "2.0", "id": identifier, "method": "textDocument/definition",
+                         "params": {"textDocument": {"uri": path.as_uri()},
+                                    "position": {"line": line, "character": character}}})
+        expected[identifier] = {"uri": helper.as_uri(), "range": {
+            "start": {"line": target_line, "character": 14},
+            "end": {"line": target_line, "character": 19}}}
+    for identifier in range(2, 8):
+        if identifier % 2 == 0:
+            definition(identifier, main, 1, text.splitlines()[1].index("Value"), 0)
+        else:
+            definition(identifier, helper, 0, 14, 0)
+    messages.append({"jsonrpc": "2.0", "method": "textDocument/didChange",
+                     "params": {"textDocument": {"uri": helper.as_uri(), "version": 2},
+                                "contentChanges": [{"text": "// moved declaration\n" + original}]}})
+    definition(8, main, 1, text.splitlines()[1].index("Value"), 1)
+    definition(9, helper, 1, 14, 1)
+    messages.extend([{"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+                     {"jsonrpc": "2.0", "method": "exit"}])
+    process = subprocess.run([binary, "lsp"], input=b"".join(map(frame, messages)),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
+    assert process.returncode == 0 and not process.stderr, process.stderr.decode()
+    by_id = {item["id"]: item for item in responses(process.stdout) if "id" in item}
+    for identifier, target in expected.items():
+        assert by_id[identifier]["result"] == target, by_id[identifier]
+
+
 def check_request_lifecycle(binary, directory):
     uri = (Path(directory) / "lifecycle.jiang").as_uri()
     original = "Int value() { 1 }\nInt main() { value() }\n"
@@ -839,6 +965,9 @@ def main():
         check_overlay_restore(binary, directory)
         check_package_documents(binary, directory)
         check_semantics(binary, directory)
+        check_import_file_definitions(binary, directory)
+        check_compiler_source_definitions(binary)
+        check_definition_reuse(binary, directory)
         check_completion(binary, directory)
         check_dot_completion(binary, directory)
         check_completion_cache_invalidation(binary, directory)
