@@ -344,7 +344,7 @@ type_primary
 type_args   <- "<" named_type_arg ("," named_type_arg)* ","? ">"
 
 named_type_arg
-            <- (literal / type) name?
+            <- (literal / "send"? result_type) name?
 
 type_postfix
             <- "?"
@@ -941,3 +941,6 @@ package_alias_field <- "package" "=" name ";"
                      / "extensions" "=" "[" (expr ("," expr)* ","?)? "]" ";"
                      / name "=" expr ";"
 ```
+
+`send` 只在函数类型首个参数的返回类型修饰位置表达闭包可传递性，例如
+`FnOnce<send Int, Int>`；修饰符顺序为 `send unsafe async [domain] R`。

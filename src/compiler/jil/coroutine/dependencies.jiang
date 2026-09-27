@@ -1,0 +1,101 @@
+#doc(module)
+    协程分析共用的反向调用依赖与去重 worklist。只保存 mono item 索引，不复制 CFG；
+    confinement 与 RTC 分别传播自身格值，只有 child 变化时才重新检查 caller。
+#end
+alias list = import "../../support/list.jiang";
+alias compiler_store = import "../../store.jiang";
+alias jil = import "../model.jiang";
+alias instance_reader = import "../instance_reader.jiang";
+
+public struct Dependencies: Movable {
+    public Int instance_reads! = 0;
+    public Int confinement_evaluations! = 0;
+    public Int rtc_evaluations! = 0;
+
+    public Int edge_count(self) { return self.callers.len(); }
+    list.ArrayList<Int> heads!;
+    list.ArrayList<Int> callers!;
+    list.ArrayList<Int> next!;
+    list.ArrayList<Bool> queued!;
+    list.ArrayList<Int> pending!;
+
+    public init(self, compiler_store.CompilerStore& store, jil.Program& program) {
+        self.heads = list.ArrayList<Int>(program.mono_item_count());
+        self.callers = list.ArrayList<Int>();
+        self.next = list.ArrayList<Int>();
+        self.queued = list.ArrayList<Bool>(program.mono_item_count());
+        self.pending = list.ArrayList<Int>(program.mono_item_count());
+        Int index! = 0;
+        while (index < program.mono_item_count()) {
+            self.heads.add(-1);
+            self.queued.add(false);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.mono_item_count()) {
+            jil.MonoItem item = program.mono_item_at(index);
+            if (item is .source_instance(identity)) {
+                jil.InstanceKey instance = program.function_instance_at(identity);
+                jil.Function source = program.source_function(instance.def_id);
+                if (source.effects.has_async && !source.is_external) {
+                    self.instance_reads += 1;
+                    self.collect(program, index, item,
+                        instance_reader.source_instance_function(store, program, identity));
+                }
+            } else if (item is .generated_function(id)) {
+                self.collect(program, index, item, program.function(id));
+            }
+            index = index + 1;
+        }
+    }
+
+    public Void reset(Self&! self) {
+        self.pending.clear();
+        Int index! = self.heads.len();
+        while (index > 0) {
+            index = index - 1;
+            self.queued.set(index, true);
+            self.pending.add(index);
+        }
+    }
+
+    public Int? pop(Self&! self) {
+        if (self.pending.empty()) { return null; }
+        Int index = self.pending.pop();
+        self.queued.set(index, false);
+        return index;
+    }
+
+    public Void changed(Self&! self, Int child) {
+        Int edge! = self.heads.get(child);
+        while (edge >= 0) {
+            Int caller = self.callers.get(edge);
+            if (!self.queued.get(caller)) {
+                self.queued.set(caller, true);
+                self.pending.add(caller);
+            }
+            edge = self.next.get(edge);
+        }
+    }
+
+    Void add(Self&! self, jil.Program& program, Int caller, jil.FunctionRef child) {
+        guard program.coroutine_source_item_for_ref(child) is .some(item) else { return; }
+        guard program.mono_item_index(item) is .some(index) else { return; }
+        self.callers.add(caller);
+        self.next.add(self.heads.get(index));
+        self.heads.set(index, self.callers.len() - 1);
+    }
+
+    Void collect(Self&! self, jil.Program& program, Int caller, jil.MonoItem item, jil.Function function) {
+        if (!function.is_coroutine || function.is_external) { return; }
+        for block in function.body.blocks {
+            if (block.terminator.kind is .call_term(call) && call.suspend_child is .some(child)) {
+                self.add(program, caller, child);
+            }
+        }
+        guard program.coroutine_frame_for_mono_item(item) is .some(frame) else { return; }
+        for region in frame.task_regions {
+            if (region.child_resume is .some(child)) { self.add(program, caller, child); }
+        }
+    }
+}

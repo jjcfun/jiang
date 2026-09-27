@@ -19,7 +19,7 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
   裁剪取消字段，而不是继续压缩完成协议。
 - `local_serial` 已为 completion word、waiter registration 和结构化 Task 启动生成普通 load/store
   专用路径。JIL 记录每个 suspend 的 direct child、Task child、跨 executor、external、dynamic 来源，
-  并通过递归 SCC 固定点计算传递执行封闭摘要。匹配调用点使用独立 confined
+  并通过反向调用依赖 worklist 计算递归固定点的执行封闭摘要。匹配调用点使用独立 confined
   resume 变体：
   Job schedule、request/handoff、suspend/complete 全部使用无原子协议，标准并发 ABI 保持不变。
 - 静态可追踪的 immutable async lambda 已去虚化并把 child frame 嵌入 parent frame；真正动态的
@@ -28,6 +28,16 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
 
 最后一点说明：只恢复旧 inline Task 不足以解决问题。存储、结构化生命周期、完成协议、
 Job 调度和最终回收必须作为一个整体重构。
+
+## 分析临时存储
+
+frame liveness 先检查 reachable suspend，没有挂起时不分配干涉矩阵。
+固定点只计算 live-in，复用一个 scratch 位图；收敛后一次收集干涉、地址保留与挂起事实。
+deferred executor lease 仍参与固定点。分析结果由 Movable owner 释放，TaskRegion 的可达性查询
+也使用自动释放的临时存储，覆盖提前返回。
+
+TaskState 的 Job storage 同时服务于内置线程队列与自定义 Executor；完整六字布局避免每次入队
+另行分配队列节点。静态 header 裁剪必须同时特化所有消费者，不能仅删除一侧未使用的字段。
 
 ## Domain 与 Executor 边界
 
@@ -143,7 +153,12 @@ frame pool、task-local arena 等 allocator 技术只处理无法静态嵌入的
 当前动态 callable allocator 把 64 到 8192 字节分成 8 个二次幂 size class。local serial 路径只做
 普通 freelist pop/push，不执行锁或原子操作；frame header 保存 class，completion 在 handoff 前归还。
 同 executor serial 热路径优先使用 local pool；跨 executor 或 concurrent 路径使用 ABA-safe shared
-pool。runtime 只依赖 `system.thread.AtomicStackArray` 的 opaque handle，不依赖平台队列头布局或符号。
+pool。每个 executor 的每个 class 最多创建 32 个可缓存 block，local/shared 共用配额，
+8 个 class 的总保留空间上限为 510 KiB。只有 pool miss 的新 block 预留需要原子计数；
+超额分配使用 uncached header，归还时直接释放，不增加热 pop/push 的计数成本。
+自定义串行 Executor 的 drain 同样建立并恢复当前执行身份，允许本地 frame 池和 inline 快路径。
+串行独占入口的 inline depth 使用普通读写，并发入口继续使用原子操作。
+runtime 只依赖 `system.thread.AtomicStackArray` 的 opaque handle，不依赖平台队列头布局或符号。
 macOS provider 暂由 `OSAtomicEnqueue/Dequeue` 保证 ABA safety；最终应由 compiler atomic intrinsic
 提供目标相关的 lock-free tagged CAS，不能退化成未经证明的单指针 Treiber stack。
 
@@ -397,7 +412,12 @@ requires_binding(binding)   // 入口为该 binding 时保持独占
 escaping                    // external/dynamic/冲突 binding，不能去原子化
 ```
 
-递归 SCC 从 `unconstrained` 开始，遇到跨 executor、external、dynamic 或不一致的 binding 约束后
+confinement 与 RTC 共用 mono item 的反向调用依赖图，各自保留独立格值。
+普通函数依据模板中不受泛型替换影响的 async/external 标记跳过实例绑定。
+confinement 一次提取局部约束、声明 Domain 和 child binding；RTC 在 confinement 应用后一次提取
+静态形态及 child mono item 索引。固定点只合并局部事实与 child 格值，不重新读取实例或遍历 CFG。
+初始化后仅在 child 的摘要变化时重新检查 caller；去重 worklist 覆盖循环依赖，不复制 CFG。
+递归调用从 `unconstrained` 开始，遇到跨 executor、external、dynamic 或不一致的 binding 约束后
 单调下降。显式 Domain 函数会用自己的 binding 消去相同约束；不同约束直接变为 `escaping`。
 这使 `Task { same_domain_child() }` wrapper 可在同 binding 调用点专门化，同时不会把跨 binding wrapper
 误判为本地执行。
@@ -592,6 +612,18 @@ heap owner 为 2、detached 为 1。该结构计数与 allocator pool/cache 是�
 remote-free 次数。任何“优化”如果只减少 malloc，
 却增加热路径原子操作、frame cache footprint 或
 跨线程回收，都不能仅凭单项指标合入。
+
+## 阶段测量
+
+开发时用 `--jil-stats` 观察协程模板准备、实例闭包、依赖提取、confinement、RTC、planning、
+resume rewrite 和 finalization。`profile_stage` 按微秒报告这些子阶段以及 whole-package LLVM
+lowering、优化与目标代码生成；它们与已有 `jil_stage` 总阶段有包含关系，不能重复相加。
+`frame_layout_us` 是逻辑 frame layout 构建的累计时间，包含其内部分析，不包含模板布局实例化。
+
+`bound_instance_reads` 只统计依赖/confinement/RTC 三项分析中的泛型实例读取，
+`confinement_evaluations` 与 `rtc_evaluations` 表示传播次数，不能当作 CFG block 访问量。
+编译器源码以普通同步调用为主，性能测量还应包括长 async 链、递归与跨 Domain 输入；
+使用固定源码、相同工具链与输出模式，测量时不并发运行其他构建或测试。
 
 ## 参考实现
 

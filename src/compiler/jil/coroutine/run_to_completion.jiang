@@ -9,80 +9,94 @@ alias compiler_store = import "../../store.jiang";
 alias qid = import "../../id.jiang";
 alias jil = import "../model.jiang";
 alias instance_reader = import "../instance_reader.jiang";
+alias dependencies = import "./dependencies.jiang";
 alias plan = import "./plan.jiang";
 
 public list.ArrayList<Bool> analyze(
     compiler_store.CompilerStore& store,
     jil.Program& program,
-    jil.Storage& storage
+    jil.Storage& storage,
+    dependencies.Dependencies&! worklist
 ) {
-    list.ArrayList<Bool> eligible! = initial_eligibility(store, program, storage);
-    Bool changed! = true;
-    while (changed) {
-        changed = refine_eligibility(
-            store, program, storage, eligible$.mut_ref()
-        );
-    }
-    return eligible;
-}
-
-list.ArrayList<Bool> initial_eligibility(
-    compiler_store.CompilerStore& store,
-    jil.Program& program,
-    jil.Storage& storage
-) {
-    list.ArrayList<Bool> eligible! =
-        list.ArrayList<Bool>(program.mono_item_count());
+    list.ArrayList<Int> offsets! = list.ArrayList<Int>(program.mono_item_count() + 1);
+    list.ArrayList<Int> children! = list.ArrayList<Int>();
+    list.ArrayList<Bool> eligible! = list.ArrayList<Bool>(program.mono_item_count());
     Int index! = 0;
+    offsets.add(0);
     while (index < program.mono_item_count()) {
-        jil.MonoItem item = program.mono_item_at(index);
-        eligible.add(mono_item_has_rtc_shape(
-            store, program, storage, item
-        ));
+        eligible.add(prepare_children(store, program, storage, program.mono_item_at(index),
+            children$.mut_ref(), worklist));
+        offsets.add(children.len());
         index = index + 1;
     }
+    worklist.reset();
+    while (worklist.pop() is .some(index)) {
+        if (!eligible.get(index)) { continue; }
+        worklist.rtc_evaluations += 1;
+        if (!children_are_eligible(offsets.get(index), offsets.get(index + 1), children$.ref(), eligible$.ref())) {
+            eligible.set(index, false);
+            worklist.changed(index);
+        }
+    }
     return eligible;
 }
 
-Bool mono_item_has_rtc_shape(
-    compiler_store.CompilerStore& store,
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.MonoItem item
+Bool prepare_children(
+    compiler_store.CompilerStore& store, jil.Program& program, jil.Storage& storage,
+    jil.MonoItem item, list.ArrayList<Int>&! children, dependencies.Dependencies&! worklist
 ) {
     if (item is .source_instance(identity)) {
-        return function_has_rtc_shape(
-            program,
-            storage,
-            item,
-            instance_reader.source_instance_function(store, program, identity)
-        );
+        jil.InstanceKey instance = program.function_instance_at(identity);
+        jil.Function source = program.source_function(instance.def_id);
+        if (!source.effects.has_async || source.is_external) { return false; }
+        worklist.instance_reads += 1;
+        return prepare_function_children(program, storage, item,
+            instance_reader.source_instance_function(store, program, identity), children);
     }
-    guard item is .generated_function(function_id) else { return false; }
-    return function_has_rtc_shape(
-        program, storage, item, program.function(function_id)
-    );
+    guard item is .generated_function(id) else { return false; }
+    return prepare_function_children(program, storage, item, program.function(id), children);
 }
 
-Bool function_has_rtc_shape(
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.MonoItem item,
-    jil.Function function
+Bool prepare_function_children(
+    jil.Program& program, jil.Storage& storage, jil.MonoItem item,
+    jil.Function function, list.ArrayList<Int>&! children
 ) {
     if (!function.is_coroutine || function.is_external) { return false; }
-    guard program.coroutine_frame_for_mono_item(item) is .some(frame) else {
-        return false;
-    }
+    guard program.coroutine_frame_for_mono_item(item) is .some(frame) else { return false; }
     if (frame.may_defer) { return false; }
-    Int index! = 0;
-    while (index < function.body.blocks.length) {
-        if (!terminator_has_rtc_shape(
-                program, storage, frame$.ref(), function.body.blocks[index].terminator
-            )
-        ) {
-            return false;
-        }
+    for block in function.body.blocks {
+        if (!terminator_has_rtc_shape(program, storage, frame$.ref(), block.terminator)) { return false; }
+        if (!append_terminator_child(program, frame$.ref(), block.terminator, children)) { return false; }
+    }
+    return true;
+}
+
+// 静态形态与 child 解析只在提取阶段完成；ordinary call 不产生依赖。
+Bool append_terminator_child(
+    jil.Program& program, jil.CoroutineFrameLayout& frame,
+    jil.Terminator terminator, list.ArrayList<Int>&! children
+) {
+    jil.FunctionRef? child! = null;
+    if (terminator.kind is .call_term(call)) {
+        Bool observed! = false;
+        if (call.async_start is .some(kind)) { observed = kind == .observed_task; }
+        if (!call.is_suspend_point && !observed) { return true; }
+        child = call.suspend_child;
+    } else if (terminator.kind is .suspend_pending_term(suspend)) {
+        guard task_region(frame, suspend) is .some(region) else { return false; }
+        child = region.child_resume;
+    } else { return true; }
+    guard child is .some(reference) else { return false; }
+    guard program.coroutine_source_item_for_ref(reference) is .some(item) else { return false; }
+    guard program.mono_item_index(item) is .some(index) else { return false; }
+    children.add(index);
+    return true;
+}
+
+Bool children_are_eligible(Int begin, Int end, list.ArrayList<Int>& children, list.ArrayList<Bool>& eligible) {
+    Int index! = begin;
+    while (index < end) {
+        if (!eligible.get(children.get(index))) { return false; }
         index = index + 1;
     }
     return true;
@@ -113,107 +127,6 @@ Bool observed_task_has_static_child(jil.CallTerminator call) {
     if (kind != .observed_task) { return true; }
     guard call.suspend_child is .some(child) else { return false; }
     return call_directly_names_child(call.callee, child);
-}
-
-Bool refine_eligibility(
-    compiler_store.CompilerStore& store,
-    jil.Program& program,
-    jil.Storage& storage,
-    list.ArrayList<Bool>&! eligible
-) {
-    Bool changed! = false;
-    Int index! = 0;
-    while (index < program.mono_item_count()) {
-        jil.MonoItem item = program.mono_item_at(index);
-        if (eligible.get(index) && !children_are_eligible(
-                store, program, storage, item, eligible
-            )
-        ) {
-            eligible.set(index, false);
-            changed = true;
-        }
-        index = index + 1;
-    }
-    return changed;
-}
-
-Bool children_are_eligible(
-    compiler_store.CompilerStore& store,
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.MonoItem item,
-    list.ArrayList<Bool>& eligible
-) {
-    if (item is .source_instance(identity)) {
-        return function_children_are_eligible(
-            program,
-            storage,
-            item,
-            instance_reader.source_instance_function(store, program, identity),
-            eligible
-        );
-    }
-    guard item is .generated_function(function_id) else { return false; }
-    return function_children_are_eligible(
-        program, storage, item, program.function(function_id), eligible
-    );
-}
-
-Bool function_children_are_eligible(
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.MonoItem item,
-    jil.Function function,
-    list.ArrayList<Bool>& eligible
-) {
-    Int index! = 0;
-    while (index < function.body.blocks.length) {
-        jil.Terminator terminator = function.body.blocks[index].terminator;
-        if (terminator.kind is .call_term(call)) {
-            if (!call_child_is_eligible(program, storage, call, eligible)) { return false; }
-        }
-        if (terminator.kind is .suspend_pending_term(suspend)) {
-            if (!task_suspend_child_is_eligible(
-                    program, storage, item, suspend, eligible
-                )
-            ) { return false; }
-        }
-        index = index + 1;
-    }
-    return true;
-}
-
-Bool call_child_is_eligible(
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.CallTerminator call,
-    list.ArrayList<Bool>& eligible
-) {
-    Bool observed! = false;
-    if (call.async_start is .some(kind)) { observed = kind == .observed_task; }
-    if (!call.is_suspend_point && !observed) { return true; }
-    guard call.suspend_child is .some(child) else { return false; }
-    guard program.coroutine_source_item_for_ref(child)
-        is .some(item) else { return false; }
-    return function_is_eligible(program, eligible, item);
-}
-
-Bool task_suspend_child_is_eligible(
-    jil.Program& program,
-    jil.Storage& storage,
-    jil.MonoItem item,
-    jil.SuspendPendingTerminator suspend,
-    list.ArrayList<Bool>& eligible
-) {
-    if (suspend.suspend_wake != .task_child) { return false; }
-    guard program.coroutine_frame_for_mono_item(item) is .some(frame) else {
-        return false;
-    }
-    guard task_region(frame$.ref(), suspend) is .some(region) else { return false; }
-    guard region.child_resume is .some(child) else { return false; }
-    guard program.coroutine_source_item_for_ref(child)
-        is .some(child_item) else { return false; }
-    return function_is_eligible(program, eligible, child_item);
 }
 
 public Bool function_is_eligible(

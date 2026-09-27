@@ -1355,6 +1355,22 @@ unsafe extend SharedHandle: Sendable;
 `unsafe extend` 只支持 `Sendable`。它不会让 raw pointer 本身变成 `Sendable`，也不会补充
 ownership 或 lifetime 保证；这些保证由 handle 的实现负责。
 
+
+闭包类型可在返回类型前使用上下文修饰符 `send`：
+
+```jiang
+FnOnce<send Int, Int> callback;
+Fn<send async Int> asynchronous;
+```
+
+`send` 修饰整个闭包类型及其捕获环境，不修饰返回值，也不隐含 `async` 或具体 Domain。
+构造闭包时，值捕获必须满足 `Sendable`，共享借用遵循 pointee 的 `Sendable` 与 lifetime 规则，
+普通可变借用不能被捕获。`Fn` 与 `FnOnce` 均支持该修饰符。普通闭包不能隐式获得 send 保证；
+直接闭包值可以赋给对应的普通闭包类型，放弃该保证。裸函数没有捕获，可以通过 `Fn(raw)` 转换为 send 闭包。
+
+`async [domain]` 闭包继续隐含 `Sendable` 保证，不要求额外书写 `send`；单独的 `async` 不隐含
+该保证。组合修饰符按 `send unsafe async [domain] R` 的顺序书写。`send` 在其他位置仍可用作值名称。
+
 domain-bound owned closure 也遵守同一规则。创建 `Fn<async [domain] (...)>^` 时，值 capture 必须能
 以对应的 move/copy 方式安全进入目标 Domain；`T&` capture 由 closure environment 的 lifetime shape
 传播，不能活过来源 owner。

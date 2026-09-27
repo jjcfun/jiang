@@ -1,0 +1,135 @@
+// compiler-integration
+// run-pass
+// expected-exit: 0
+#doc(module)
+    验证 executor frame 池的总保留配额、串行本地复用、远端归还与并发路径。
+    检查内部 allocation marker，避免把 allocator 地址碰巧复用误判为池命中。
+#end
+alias executor = import "../../../../src/compiler/runtime/domain_executor.jiang";
+alias descriptor_model = import "../../../../src/compiler/runtime/domain_descriptor.jiang";
+alias thread = import "../../../../src/compiler/system/thread.jiang";
+
+descriptor_model.DomainDescriptor descriptor! = descriptor_model.DomainDescriptor(
+    domain_kind = 0, executor_size = 8, executor_alignment = 8,
+    create = null, enqueue = null, destroy = null
+);
+Void* outer! = null;
+Void* inner! = null;
+thread.Group group! = thread.Group(null);
+Int identity_error! = 0;
+
+Void create_executor(Void* config, Void* storage) {}
+Void destroy_executor(Void* storage) {}
+Void submit_inline(Void* storage, Int job, Int callback) {
+    RawFn<Void, Int> run = unsafe { callback$.as(RawFn<Void, Int>) };
+    run(job);
+}
+Void run_inner(Void* context) {
+    if (!executor.is_current(inner) || executor.is_current(outer)) { identity_error = 1; }
+}
+Void run_outer(Void* context) {
+    if (!executor.is_current(outer)) { identity_error = 2; }
+    RawFn<Void, Void*> callback = run_inner;
+    if (!executor.enqueue(group, inner, null, unsafe { callback$.as(Void*) })) {
+        identity_error = 3;
+    }
+    if (!executor.is_current(outer) || executor.is_current(inner)) { identity_error = 4; }
+}
+
+Int verify_nested_identity() {
+    RawFn<Void, Void*, Void*> create = create_executor;
+    RawFn<Void, Void*> destroy = destroy_executor;
+    RawFn<Void, Void*, Int, Int> submit = submit_inline;
+    descriptor = descriptor_model.DomainDescriptor(
+        domain_kind = 0, executor_size = 8, executor_alignment = 8,
+        create = unsafe { create$.as(Void*) }, enqueue = unsafe { submit$.as(Void*) },
+        destroy = unsafe { destroy$.as(Void*) }
+    );
+    Int outer_slot! = 0;
+    Void* raw_descriptor = unsafe { descriptor$.ptr()$.as(Void*) };
+    outer = executor.materialize(unsafe { outer_slot$.mut_ptr() }, 0, -1003, 0, 0, raw_descriptor, null);
+    inner = executor.create_owned(0, raw_descriptor);
+    executor.borrow_owned(inner, null);
+    group = thread.create_group();
+    RawFn<Void, Void*> callback = run_outer;
+    if (!executor.enqueue_static(group, outer, null, unsafe { callback$.as(Void*) })) { return 5; }
+    if (executor.is_current(outer) || executor.is_current(inner)) { identity_error = 6; }
+    executor.release_owned_owner(inner, null);
+    thread.destroy_group(group);
+    return identity_error;
+}
+
+Int marker(Void* frame) {
+    Int address = unsafe { frame$.as(Int) } - Int$.size();
+    return unsafe { address$.as(Int*)$.get() };
+}
+
+Int verify_depth(Void* handle) {
+    Int index! = 0;
+    while (index < 32) {
+        if (!executor.try_enter_inline(handle)) { return 1; }
+        index = index + 1;
+    }
+    if (executor.try_enter_inline(handle)) { return 2; }
+    while (index > 0) {
+        index = index - 1;
+        if (executor.leave_inline(handle) != (index == 0)) { return 3; }
+    }
+    if (!executor.try_enter_inline(handle) || !executor.leave_inline(handle)) { return 4; }
+    return 0;
+}
+
+Int verify_pool(Void* handle, Bool local) {
+    Void* previous! = null;
+    if (local) { previous = thread.enter_thread_identity(handle); }
+    if (verify_depth(handle) != 0) { return 4; }
+    Void**! frames = unsafe { Void*$.alloc(64) };
+    Int index! = 0;
+    Int result! = 0;
+    while (index < 64) {
+        Void* frame = executor.allocate_coroutine_frame(handle, 32, 8);
+        unsafe { frames[index] = frame; }
+        Int expected! = -1;
+        if (index < 32) { expected = if local { 0 } else { 8 }; }
+        if (marker(frame) != expected) { result = 1; }
+        index = index + 1;
+    }
+    if (local) { thread.leave_thread_identity(previous); }
+    index = 0;
+    while (index < 64) {
+        executor.deallocate_coroutine_frame(handle, unsafe { frames[index] });
+        index = index + 1;
+    }
+    // 远端归还的 block 进入 shared 池，再从当前 serial executor 取出。
+    if (local) { previous = thread.enter_thread_identity(handle); }
+    index = 0;
+    while (index < 64) {
+        Void* frame = executor.allocate_coroutine_frame(handle, 32, 8);
+        unsafe { frames[index] = frame; }
+        Int expected! = -1;
+        if (index < 32) { expected = if local { 0 } else { 8 }; }
+        if (marker(frame) != expected) { result = 2; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < 64) {
+        executor.deallocate_coroutine_frame(handle, unsafe { frames[index] });
+        index = index + 1;
+    }
+    Void* aligned = executor.allocate_coroutine_frame(handle, 32, 64);
+    if (marker(aligned) != -1 || unsafe { aligned$.as(Int) } % 64 != 0) { result = 3; }
+    executor.deallocate_coroutine_frame(handle, aligned);
+    if (local) { thread.leave_thread_identity(previous); }
+    unsafe { frames$.dealloc(); }
+    return result;
+}
+
+Int main() {
+    if (verify_nested_identity() != 0) { return 5; }
+    Void* serial = executor.materialize_uncached(-1001, 0);
+    if (verify_pool(serial, true) != 0) { return 1; }
+    if (executor.is_current(serial)) { return 2; }
+    Void* concurrent = executor.materialize_uncached(-1002, 1);
+    if (verify_pool(concurrent, false) != 0) { return 3; }
+    return 0;
+}

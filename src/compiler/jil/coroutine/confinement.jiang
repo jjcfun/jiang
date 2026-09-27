@@ -7,6 +7,7 @@ alias list = import "../../support/list.jiang";
 alias compiler_store = import "../../store.jiang";
 alias jil = import "../model.jiang";
 alias instance_reader = import "../instance_reader.jiang";
+alias dependencies = import "./dependencies.jiang";
 alias qid = import "../../id.jiang";
 
 public enum SummaryKind {
@@ -21,236 +22,169 @@ public struct Summary: Copyable {
     public Bool may_defer;
 }
 
+// 每个函数只提取一次局部约束；child 的传递约束在 worklist 中读取格值。
+struct FunctionFacts: Copyable {
+    Summary local;
+    qid.DefId? domain;
+    Int child_begin;
+    Int child_end;
+    Bool active;
+}
+
+struct ChildRequirement: Copyable {
+    Int child;
+    qid.DefId? binding;
+}
+
 public list.ArrayList<Summary> analyze(
     compiler_store.CompilerStore& store,
-    jil.Program& output
+    jil.Program& output,
+    dependencies.Dependencies&! worklist
 ) {
-    list.ArrayList<Summary> states! = initial_states(store, output);
-    Bool changed! = true;
-    while (changed) {
-        changed = refine(store, output, states$.mut_ref());
-    }
-    return states;
-}
-
-list.ArrayList<Summary> initial_states(
-    compiler_store.CompilerStore& store,
-    jil.Program& output
-) {
-    list.ArrayList<Summary> states! =
-        list.ArrayList<Summary>(output.mono_item_count());
+    list.ArrayList<FunctionFacts> facts! = list.ArrayList<FunctionFacts>(output.mono_item_count());
+    list.ArrayList<ChildRequirement> children! = list.ArrayList<ChildRequirement>();
+    list.ArrayList<Summary> states! = list.ArrayList<Summary>(output.mono_item_count());
     Int index! = 0;
     while (index < output.mono_item_count()) {
-        jil.MonoItem item = output.mono_item_at(index);
-        Bool coroutine! = false;
-        Bool external! = true;
-        if (item is .source_instance(identity)) {
-            jil.Function function = instance_reader.source_instance_function(
-                store, output, identity
-            );
-            coroutine = function.is_coroutine;
-            external = function.is_external;
-        } else if (item is .generated_function(function_id)) {
-            jil.Function function = output.function(function_id);
-            coroutine = function.is_coroutine;
-            external = function.is_external;
-        }
-        if (coroutine && !external) {
-            states.add(unconstrained());
-        } else {
-            states.add(deferred(escaping()));
-        }
+        FunctionFacts fact = prepare_facts(store, output, output.mono_item_at(index), children$.mut_ref(), worklist);
+        facts.add(fact);
+        states.add(if fact.active { unconstrained() } else { deferred(escaping()) });
         index = index + 1;
     }
-    return states;
-}
-
-Bool refine(
-    compiler_store.CompilerStore& store,
-    jil.Program& output,
-    list.ArrayList<Summary>&! states
-) {
-    Bool changed! = false;
-    Int index! = 0;
-    while (index < output.mono_item_count()) {
-        jil.MonoItem item = output.mono_item_at(index);
-        Summary next = function_summary(store, output, item, states);
+    worklist.reset();
+    while (worklist.pop() is .some(index)) {
+        worklist.confinement_evaluations += 1;
+        Summary next = propagate(facts.get(index), children$.ref(), states$.ref());
         if (!summary_equal(states.get(index), next)) {
             states.set(index, next);
-            changed = true;
+            worklist.changed(index);
         }
-        index = index + 1;
     }
-    return changed;
+    return states;
 }
 
-Summary function_summary(
+FunctionFacts prepare_facts(
     compiler_store.CompilerStore& store,
     jil.Program& output,
     jil.MonoItem item,
-    list.ArrayList<Summary>& states
+    list.ArrayList<ChildRequirement>&! children,
+    dependencies.Dependencies&! worklist
 ) {
     if (item is .source_instance(identity)) {
-        return function_summary_for_value(
-            output,
-            item,
-            instance_reader.source_instance_function(store, output, identity),
-            states
-        );
+        jil.InstanceKey instance = output.function_instance_at(identity);
+        jil.Function source = output.source_function(instance.def_id);
+        if (!source.effects.has_async || source.is_external) {
+            return FunctionFacts(local = deferred(escaping()), domain = null,
+                child_begin = children.len(), child_end = children.len(), active = false);
+        }
+        worklist.instance_reads += 1;
+        return prepare_function(output, item,
+            instance_reader.source_instance_function(store, output, identity), children);
     }
-    guard item is .generated_function(function_id) else {
-        return deferred(escaping());
+    if (item is .generated_function(id)) {
+        return prepare_function(output, item, output.function(id), children);
     }
-    return function_summary_for_value(
-        output, item, output.function(function_id), states
-    );
+    return FunctionFacts(local = deferred(escaping()), domain = null,
+        child_begin = children.len(), child_end = children.len(), active = false);
 }
 
-Summary function_summary_for_value(
-    jil.Program& output,
-    jil.MonoItem item,
-    jil.Function function,
-    list.ArrayList<Summary>& states
+FunctionFacts prepare_function(
+    jil.Program& output, jil.MonoItem item, jil.Function function,
+    list.ArrayList<ChildRequirement>&! children
 ) {
-    if (!function.is_coroutine || function.is_external) { return deferred(escaping()); }
-    Summary result! = unconstrained();
-    Int index! = 0;
-    while (index < function.body.blocks.length) {
-        Summary requirement = terminator_summary(
-            output, item, function, function.body.blocks[index].terminator, states
-        );
-        result = merge(result, requirement);
-        index = index + 1;
+    Bool active = function.is_coroutine && !function.is_external;
+    Int begin = children.len();
+    Summary local! = if active { unconstrained() } else { deferred(escaping()) };
+    if (active) {
+        for block in function.body.blocks {
+            local = merge(local, prepare_terminator(output, item, block.terminator, children));
+        }
     }
-    return normalize_declared_domain(function, result);
+    qid.DefId? domain! = null;
+    if (function.effects.domain is .some(value)) { domain = value.binding; }
+    return FunctionFacts(local = local, domain = domain,
+        child_begin = begin, child_end = children.len(), active = active);
 }
 
-Summary terminator_summary(
-    jil.Program& output,
-    jil.MonoItem item,
-    jil.Function function,
-    jil.Terminator terminator,
-    list.ArrayList<Summary>& states
+Summary prepare_terminator(
+    jil.Program& output, jil.MonoItem item, jil.Terminator terminator,
+    list.ArrayList<ChildRequirement>&! children
 ) {
     if (terminator.kind is .call_term(call)) {
-        return call_summary(output, call, states);
+        return prepare_call(output, call, children);
     }
     if (terminator.kind is .suspend_pending_term(suspend)) {
-        return suspend_summary(output, item, suspend, states);
+        return prepare_suspend(output, item, suspend, children);
     }
     return unconstrained();
 }
 
-Summary call_summary(
-    jil.Program& output,
-    jil.CallTerminator call,
-    list.ArrayList<Summary>& states
+Summary prepare_call(
+    jil.Program& output, jil.CallTerminator call, list.ArrayList<ChildRequirement>&! children
 ) {
-    if (!call.is_suspend_point || call.suspend_wake == .none) {
-        if (!call.is_suspend_point) { return unconstrained(); }
-        return deferred(unconstrained());
-    }
+    if (!call.is_suspend_point) { return unconstrained(); }
+    if (call.suspend_wake == .none) { return deferred(unconstrained()); }
     if (call.suspend_wake == .direct_child) {
-        return direct_child_summary(output, call, states);
+        return append_child(output, call.suspend_child, null, children);
     }
-    if (call.suspend_wake == .cross_executor) {
-        return cross_executor_summary(output, call, states);
-    }
-    return deferred(escaping());
-}
-
-Summary direct_child_summary(
-    jil.Program& output,
-    jil.CallTerminator call,
-    list.ArrayList<Summary>& states
-) {
-    guard call.suspend_child is .some(child) else { return deferred(escaping()); }
-    return child_summary(output, child, states);
-}
-
-Summary cross_executor_summary(
-    jil.Program& output,
-    jil.CallTerminator call,
-    list.ArrayList<Summary>& states
-) {
-    guard call.suspend_child is .some(child) else { return deferred(escaping()); }
+    if (call.suspend_wake != .cross_executor) { return deferred(escaping()); }
     guard call.callee is .domain_enqueue(enqueue) else { return deferred(escaping()); }
-    Summary nested = child_summary(output, child, states);
-    if (nested.kind == .escaping) { return deferred(nested); }
-    if (nested.kind == .binding) {
-        guard nested.binding is .some(binding) else { return deferred(escaping()); }
-        if (binding != enqueue.domain_def) { return deferred(escaping()); }
-    }
-    // 这条边在普通变体中需要 enqueue，但 binding 正是生成 confined 变体的
-    // 前置条件。条件成立时 local_variant 会将 enqueue 改成直接 resume，因此
-    // 这里只传播 child 的真实等待能力，不能把名义上的跨域边算作 defer。
-    return with_defer(requires_binding(enqueue.domain_def), nested.may_defer);
+    return append_child(output, call.suspend_child, enqueue.domain_def, children);
 }
 
-Summary suspend_summary(
-    jil.Program& output,
-    jil.MonoItem item,
-    jil.SuspendPendingTerminator suspend,
-    list.ArrayList<Summary>& states
+Summary prepare_suspend(
+    jil.Program& output, jil.MonoItem item, jil.SuspendPendingTerminator suspend,
+    list.ArrayList<ChildRequirement>&! children
 ) {
     if (suspend.suspend_wake == .none) { return deferred(unconstrained()); }
     if (suspend.suspend_wake != .task_child) { return deferred(escaping()); }
-    guard suspend.task_local is .some(task_local) else { return deferred(escaping()); }
-    guard output.coroutine_frame_for_mono_item(item) is .some(frame) else {
-        return deferred(escaping());
-    }
-    return task_child_summary(output, frame.task_regions, task_local, states);
-}
-
-Summary task_child_summary(
-    jil.Program& output,
-    jil.TaskRegion[]& regions,
-    jil.LocalId task_local,
-    list.ArrayList<Summary>& states
-) {
-    Int index! = 0;
-    while (index < regions.length) {
-        jil.TaskRegion region = regions[index];
-        if (region.task_local == task_local) {
-            return region_summary(output, region, states);
-        }
-        index = index + 1;
+    guard suspend.task_local is .some(task) else { return deferred(escaping()); }
+    guard output.coroutine_frame_for_mono_item(item) is .some(frame) else { return deferred(escaping()); }
+    for region in frame.task_regions {
+        if (region.task_local != task) { continue; }
+        if (region.storage.sync != .local_serial) { return deferred(escaping()); }
+        return append_child(output, region.child_resume, null, children);
     }
     return deferred(escaping());
 }
 
-Summary region_summary(
-    jil.Program& output,
-    jil.TaskRegion region,
-    list.ArrayList<Summary>& states
+Summary append_child(
+    jil.Program& output, jil.FunctionRef? child, qid.DefId? binding,
+    list.ArrayList<ChildRequirement>&! children
 ) {
-    if (region.storage.sync != .local_serial) { return deferred(escaping()); }
-    guard region.child_resume is .some(child) else { return deferred(escaping()); }
-    return child_summary(output, child, states);
+    guard child is .some(reference) else { return deferred(escaping()); }
+    guard output.coroutine_source_item_for_ref(reference) is .some(item) else { return deferred(escaping()); }
+    guard output.mono_item_index(item) is .some(index) else { return deferred(escaping()); }
+    children.add(ChildRequirement(child = index, binding = binding));
+    return unconstrained();
 }
 
-Summary child_summary(
-    jil.Program& output,
-    jil.FunctionRef child,
-    list.ArrayList<Summary>& states
-) {
-    guard output.coroutine_source_item_for_ref(child) is .some(item) else {
-        return deferred(escaping());
+Summary propagate(FunctionFacts facts, list.ArrayList<ChildRequirement>& children, list.ArrayList<Summary>& states) {
+    Summary result! = facts.local;
+    Int index! = facts.child_begin;
+    while (index < facts.child_end) {
+        ChildRequirement edge = children.get(index);
+        result = merge(result, edge_summary(edge, states.get(edge.child)));
+        index = index + 1;
     }
-    guard output.mono_item_index(item) is .some(index) else {
-        return deferred(escaping());
-    }
-    if (index < 0 || index >= states.len()) { return deferred(escaping()); }
-    return states.get(index);
+    return normalize_declared_domain(facts.domain, result);
 }
 
-Summary normalize_declared_domain(jil.Function function, Summary summary) {
+Summary edge_summary(ChildRequirement edge, Summary nested) {
+    guard edge.binding is .some(binding) else { return nested; }
+    if (nested.kind == .escaping) { return deferred(nested); }
+    if (nested.kind == .binding && nested.binding != edge.binding) { return deferred(escaping()); }
+    // 名义跨域边只在相同 binding 的 confined 变体中内联，传播 child 的真实等待能力。
+    return with_defer(requires_binding(binding), nested.may_defer);
+}
+
+Summary normalize_declared_domain(qid.DefId? declared_domain, Summary summary) {
     if (summary.kind != .binding) { return summary; }
-    guard function.effects.domain is .some(domain) else { return summary; }
+    guard declared_domain is .some(domain) else { return summary; }
     guard summary.binding is .some(binding) else {
         return with_defer(escaping(), summary.may_defer);
     }
-    if (binding == domain.binding) {
+    if (binding == domain) {
         return with_defer(unconstrained(), summary.may_defer);
     }
     // 声明域与所需域不同，调用必然真的跨 executor，不能生成消除 enqueue

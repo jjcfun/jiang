@@ -3,6 +3,8 @@
     引用发现与协程派生分步推进，编译层可在两步之间补齐语义需求。
 #end
 
+alias timing = import "../../support/timing.jiang";
+alias io = import "../../system/io.jiang";
 alias context = import "../../context.jiang";
 alias compiler_store = import "../../store.jiang";
 alias database = import "../../db.jiang";
@@ -27,6 +29,7 @@ alias body = import "./body.jiang";
 alias constant = import "./constant.jiang";
 import std;
 alias coroutine_confinement = import "../coroutine/confinement.jiang";
+alias coroutine_dependencies = import "../coroutine/dependencies.jiang";
 alias coroutine_rtc = import "../coroutine/run_to_completion.jiang";
 alias lower_context = import "./context.jiang";
 public alias lower_coroutine = import "./coroutine.jiang";
@@ -80,7 +83,9 @@ public Void begin_runtime_package(context.CompilerContext&! ctx, module_graph.Mo
 }
 
 /// 所需 body 已可用后完成协程和实例派生，复用整包入口的同一套 lowering。
-public Void finish_runtime_package(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph) {
+public Void finish_runtime_package(
+    context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, Bool stats = false
+) {
     qid.SymbolId closure_env_symbol = ctx.store.symbols.intern("__env");
     diagnostic.DiagnosticStore diagnostics! = diagnostic.DiagnosticStore();
     {
@@ -90,7 +95,7 @@ public Void finish_runtime_package(context.CompilerContext&! ctx, module_graph.M
             closure_env_symbol, ctx.jil.storage$.ref(), ctx.jil.program$.mut_ref(),
             ctx.jil.drop_elaboration$.mut_ref(), diagnostics$.mut_ref()
         );
-        lowerer.finish_package(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref());
+        lowerer.finish_package(ctx.query.jil_instance$.ref(), ctx.query.layout$.mut_ref(), stats);
     }
     ctx.store.diagnostics.append(diagnostics$.move());
 }
@@ -482,11 +487,13 @@ public extend lower_context.Context {
 
     /// 引用需要的源码 body 就绪后再做 frame、confinement、resume 和 ABI finalization。
     public Void finish_package(
-        Self&! self, database.JilInstanceQuery& instance_query, database.LayoutQuery&! layouts
+        Self&! self, database.JilInstanceQuery& instance_query, database.LayoutQuery&! layouts, Bool stats = false
     ) {
+        UInt64 started! = timing.start(stats);
         self.materialize_template_async_operations(instance_query, layouts);
         if (self.program.has_errors()) { return; }
         self.prepare_template_coroutine_resume_functions();
+        started = timing.report(stats, "coroutine_templates", started);
         Int referenced_global_cursor! = 0;
         Int mono_item_cursor! = 0;
         Int finalization_cursor! = 0;
@@ -500,15 +507,24 @@ public extend lower_context.Context {
             finalization_cursor$.mut_ref(),
             pending_finalization$.mut_ref()
         );
+        started = timing.report(stats, "coroutine_instances", started);
+        coroutine_dependencies.Dependencies dependencies! =
+            coroutine_dependencies.Dependencies(self.store, self.program);
+        started = timing.report(stats, "coroutine_dependencies", started);
         list.ArrayList<coroutine_confinement.Summary> confinement! =
-            coroutine_confinement.analyze(self.store, self.program);
+            coroutine_confinement.analyze(self.store, self.program, dependencies$.mut_ref());
+        started = timing.report(stats, "coroutine_confinement", started);
         self.apply_coroutine_confinement(confinement$.ref());
+        started = timing.report(stats, "coroutine_apply", started);
         self.rtc_eligible = coroutine_rtc.analyze(
-            self.store, self.program, self.storage
+            self.store, self.program, self.storage, dependencies$.mut_ref()
         );
+        started = timing.report(stats, "coroutine_rtc", started);
         self.prepare_coroutine_plans();
         self.prepare_generated_coroutine_variant_sources();
+        started = timing.report(stats, "coroutine_plans", started);
         self.lower_coroutine_resume_functions();
+        started = timing.report(stats, "coroutine_rewrite", started);
         self.close_referenced_instances(
             instance_query,
             layouts,
@@ -529,6 +545,18 @@ public extend lower_context.Context {
         }
         self.publish_template_coroutine_resume_functions();
         self.source_resume_templates.clear();
+        timing.report(stats, "coroutine_finalize", started);
+        if (stats) {
+            std.StringBuilder line! = std.StringBuilder();
+            line.append("coroutine_mono_items="); line.append(self.program.mono_item_count());
+            line.append(" dependency_edges="); line.append(dependencies.edge_count());
+            line.append(" bound_instance_reads="); line.append(dependencies.instance_reads);
+            line.append(" confinement_evaluations="); line.append(dependencies.confinement_evaluations);
+            line.append(" rtc_evaluations="); line.append(dependencies.rtc_evaluations);
+            line.append(" frame_layout_count="); line.append(self.program.coroutine_frame_count);
+            line.append(" frame_layout_us="); line.append(self.program.coroutine_frame_ns / UInt64(1000));
+            line.append("\n"); io.stderr().write_all(line.slice());
+        }
         if (self.program.has_pending_generated_functions()) {
             self.program.mark_error();
             std.String message! = std.String.from_valid_utf8(

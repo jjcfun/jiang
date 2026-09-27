@@ -22,15 +22,19 @@ struct LiveState: Movable {
     }
 }
 
-public struct FrameLiveness: Copyable {
+public struct FrameLiveness: Movable {
     public Bool*! live_locals;
     public Bool*! address_preserved;
     public UInt64*! interference;
     public Int local_count;
-}
 
-public Bool*! analyze(jil.Body body) {
-    return analyze_frame_liveness(body).live_locals;
+    deinit(self) {
+        unsafe {
+            self.live_locals$.dealloc();
+            self.address_preserved$.dealloc();
+            self.interference$.dealloc();
+        }
+    }
 }
 
 public FrameLiveness analyze_frame_liveness(jil.Body body) {
@@ -39,12 +43,17 @@ public FrameLiveness analyze_frame_liveness(jil.Body body) {
         Bool*! address_preserved = Bool$.alloc(body.locals.length);
         // 每个 local 对应一行位图。记录某个活跃集合时，整行按 word 合并，
         // 避免在每条 statement 上做 O(N²) 的 local 两两枚举。
-        Int interference_words = interference_word_count(body.locals.length);
-        UInt64*! interference = UInt64$.alloc(interference_words);
+        Bool*! reachable = compute_reachable(body);
+        Bool has_suspend = has_suspend_point(body, reachable);
+        Int interference_words! = 0;
+        if (has_suspend) { interference_words = interference_word_count(body.locals.length); }
+        UInt64*! interference! = null;
+        if (interference_words > 0) { interference = UInt64$.alloc(interference_words); }
         init_bool_array(result, body.locals.length);
         init_bool_array(address_preserved, body.locals.length);
         init_uint64_array(interference, interference_words);
-        if (body.blocks.length == 0) {
+        if (!has_suspend) {
+            reachable$.dealloc();
             return FrameLiveness (
                 live_locals = result,
                 address_preserved = address_preserved,
@@ -53,7 +62,6 @@ public FrameLiveness analyze_frame_liveness(jil.Body body) {
             );
         }
 
-        Bool*! reachable = compute_reachable(body);
         LiveState*! in_states = LiveState$.alloc(body.blocks.length);
         init_live_states(in_states, body.blocks.length, body.locals.length);
         FrameLiveness analysis = FrameLiveness (
@@ -64,13 +72,8 @@ public FrameLiveness analyze_frame_liveness(jil.Body body) {
         );
         solve_liveness(body, reachable, in_states, analysis$.ref());
         destroy_live_states(in_states, body.blocks.length);
-        Bool has_suspend = has_suspend_point(body, reachable);
         reachable$.dealloc();
-        if (has_suspend) {
-            merge_bool_arrays(result, address_preserved, body.locals.length);
-        } else {
-            init_bool_array(address_preserved, body.locals.length);
-        }
+        merge_bool_arrays(result, address_preserved, body.locals.length);
         return analysis;
     }
 }
@@ -81,6 +84,7 @@ public Bool locals_interfere(
     jil.LocalId rhs
 ) {
     unsafe {
+        if (analysis.interference == null) { return true; }
         Int row_words = bit_word_count(analysis.local_count);
         Int word_index = lhs.to_index() * row_words + rhs.to_index() / 64;
         UInt64 mask = UInt64(1) << UInt64(rhs.to_index() % 64);
@@ -190,6 +194,7 @@ Void solve_liveness(
     FrameLiveness& analysis
 ) {
     unsafe {
+        LiveState scratch! = LiveState(body.locals.length);
         Bool changed! = true;
         while (changed) {
             changed = false;
@@ -197,9 +202,15 @@ Void solve_liveness(
             while (block_index > 0) {
                 block_index = block_index - 1;
                 changed = solve_liveness_block(
-                    body, block_index, reachable, in_states, analysis
+                    body, block_index, reachable, in_states, analysis, scratch$.mut_ref(), false
                 ) || changed;
             }
+        }
+        // 固定点之后只收集一次干涉、地址和挂起事实。
+        Int block_index! = 0;
+        while (block_index < body.blocks.length) {
+            solve_liveness_block(body, block_index, reachable, in_states, analysis, scratch$.mut_ref(), true);
+            block_index = block_index + 1;
         }
     }
 }
@@ -209,46 +220,57 @@ Bool solve_liveness_block(
     Int block_index,
     Bool*! reachable,
     LiveState*! in_states,
-    FrameLiveness& analysis
+    FrameLiveness& analysis,
+    LiveState&! state,
+    Bool record_facts
 ) {
     unsafe {
         if (!reachable[block_index]) { return false; }
         jil.Block block = body.blocks[block_index];
-        LiveState state! = successor_live_state(body, block, reachable, in_states);
-        mark_live_pairs(state$.ref(), analysis.interference, analysis.local_count);
-        collect_suspend_facts(block.terminator, state$.mut_ref(), analysis);
-        transfer_terminator_backward(body, block.terminator, state$.mut_ref());
-        mark_live_pairs(state$.ref(), analysis.interference, analysis.local_count);
+        fill_successor_live_state(body, block, reachable, in_states, state);
+        // deferred lease 在挂起后仍被使用，必须参与固定点，不能只在事实收集时加入。
+        if (block.terminator.kind is .call_term(call) && call.is_suspend_point
+            && call.deferred_runtime_domain_lease is .some(lease)) {
+            use_operand(state, lease.executor);
+        }
+        if (record_facts) {
+            mark_live_pairs(state, analysis.interference, analysis.local_count);
+            collect_suspend_facts(block.terminator, state, analysis);
+        }
+        transfer_terminator_backward(body, block.terminator, state);
+        if (record_facts) { mark_live_pairs(state, analysis.interference, analysis.local_count); }
         Int statement_index! = block.statements.length;
         while (statement_index > 0) {
             statement_index = statement_index - 1;
             jil.Statement statement = block.statements[statement_index];
-            mark_addressed_in_statement(statement, analysis.address_preserved);
-            transfer_statement_backward(statement, state$.mut_ref());
-            mark_live_pairs(state$.ref(), analysis.interference, analysis.local_count);
+            transfer_statement_backward(statement, state);
+            if (record_facts) {
+                mark_addressed_in_statement(statement, analysis.address_preserved);
+                mark_live_pairs(state, analysis.interference, analysis.local_count);
+            }
         }
-        return merge_state(in_states[block_index]$.mut_ref(), state$.ref());
+        return merge_state(in_states[block_index]$.mut_ref(), state);
     }
 }
 
-LiveState successor_live_state(
+Void fill_successor_live_state(
     jil.Body body,
     jil.Block block,
     Bool*! reachable,
-    LiveState*! in_states
+    LiveState*! in_states,
+    LiveState&! state
 ) {
     unsafe {
-        LiveState state! = LiveState(body.locals.length);
+        init_uint64_array(state.words, state.word_count);
         Int successor_index! = 0;
         while (successor_index < jil.terminator_successor_count(block.terminator)) {
             jil.BlockId successor = jil.terminator_successor_at(block.terminator, successor_index);
             Int block_index = successor.to_index();
             if (valid_block_index(body, block_index) && reachable[block_index]) {
-                merge_state(state$.mut_ref(), in_states[block_index]$.ref());
+                merge_state(state, in_states[block_index]$.ref());
             }
             successor_index = successor_index + 1;
         }
-        return state;
     }
 }
 
@@ -548,16 +570,11 @@ Void use_projection_indices(LiveState&! state, jil.Place place) {
 
 Bool collect_suspend_facts(
     jil.Terminator terminator,
-    LiveState&! live_out,
+    LiveState& live_out,
     FrameLiveness& analysis
 ) {
     if (terminator.kind is .call_term(call_term)) {
         if (!call_term.is_suspend_point) { return false; }
-        if (call_term.deferred_runtime_domain_lease is .some(lease)) {
-            // deferred direct-call materialization uses the executor after the
-            // parent suspends, so the operand must survive in the parent frame.
-            use_operand(live_out, lease.executor);
-        }
         mark_live_state(live_out, analysis.live_locals, analysis.local_count);
         mark_place_local(call_term.destination, analysis.live_locals);
         mark_suspend_destination_interference(call_term, live_out, analysis);

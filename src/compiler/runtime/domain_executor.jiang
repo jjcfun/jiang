@@ -21,8 +21,10 @@ const Int executor_inline_pending_word = 7;
 const Int executor_local_frame_pool_word = 8;
 const Int executor_inline_depth_limit = 32;
 const Int frame_pool_class_count = 8;
-const Int executor_shared_frame_pool_handle_word =
-    executor_local_frame_pool_word + frame_pool_class_count;
+const Int executor_frame_pool_count_word = executor_local_frame_pool_word + frame_pool_class_count;
+const Int executor_shared_frame_pool_handle_word = executor_frame_pool_count_word + frame_pool_class_count;
+// 每个 class 最多保留 32 个 block，总驻留不超过约 510 KiB/executor。
+const Int frame_pool_class_limit = 32;
 const Int executor_descriptor_word = executor_shared_frame_pool_handle_word + 1;
 const Int executor_instance_word = executor_descriptor_word + 1;
 const Int executor_serial_mutex_word = executor_instance_word + 1;
@@ -369,9 +371,7 @@ Void run_custom_job(Int raw_job) {
     Void* executor = begin_custom_drain(job);
     if (executor == null) { return; }
     retain_owned(executor);
-    Bool tracks_thread_identity =
-        load_executor_word(executor, executor_owned_word) != 0
-        && !is_concurrent(executor);
+    Bool tracks_thread_identity = !is_concurrent(executor);
     Void* previous_identity! = null;
     if (tracks_thread_identity) {
         previous_identity = thread.enter_thread_identity(executor);
@@ -393,11 +393,15 @@ Void run_custom_job_static(Int raw_job) {
     UInt8* job = unsafe { raw_job$.as(UInt8*) };
     Void* executor = begin_custom_drain(job);
     if (executor == null) { return; }
+    Bool serial = !is_concurrent(executor);
+    Void* previous_identity! = null;
+    if (serial) { previous_identity = thread.enter_thread_identity(executor); }
     UInt8* current! = job;
     while (current != null) {
         run_claimed_custom_job(current);
         current = take_custom_serial_job(executor);
     }
+    if (serial) { thread.leave_thread_identity(previous_identity); }
 }
 
 Void* begin_custom_drain(UInt8* job) {
@@ -487,7 +491,6 @@ public Bool is_concurrent(Void* executor) {
 public Bool is_current(Void* executor) {
     if (executor == null || is_concurrent(executor)) { return false; }
     if (thread.has_queue_identity(executor)) { return true; }
-    if (load_executor_word(executor, executor_owned_word) == 0) { return false; }
     return thread.has_thread_identity(executor);
 }
 
@@ -499,6 +502,12 @@ public Bool can_inline(Void* executor, Void* context) {
 
 public Bool try_enter_inline(Void* executor) {
     if (executor == null) { return true; }
+    if (!is_concurrent(executor) && is_current(executor)) {
+        Int depth = load_executor_word(executor, executor_inline_depth_word);
+        if (depth >= executor_inline_depth_limit) { return false; }
+        store_executor_word(executor, executor_inline_depth_word, depth + 1);
+        return true;
+    }
     atomic.Atomic<Int>& depth = atomic_executor_word(executor, executor_inline_depth_word);
     while (true) {
         Int observed = depth.get();
@@ -510,6 +519,12 @@ public Bool try_enter_inline(Void* executor) {
 
 public Bool leave_inline(Void* executor) {
     if (executor == null) { return false; }
+    if (!is_concurrent(executor) && is_current(executor)) {
+        Int depth = load_executor_word(executor, executor_inline_depth_word);
+        assert(depth > 0);
+        store_executor_word(executor, executor_inline_depth_word, depth - 1);
+        return depth == 1;
+    }
     atomic.Atomic<Int>& depth = atomic_executor_word(executor, executor_inline_depth_word);
     while (true) {
         Int observed = depth.get();
@@ -574,6 +589,9 @@ public Void* allocate_coroutine_frame(Void* executor, Int size, Int alignment) {
     Bool local = frame_pool_is_local(executor);
     UInt8* block! = pop_frame_block(executor, class_index, local);
     if (block == null) {
+        if (!reserve_frame_pool_block(executor, class_index)) {
+            return allocate_uncached_frame(size, alignment);
+        }
         block = thread.allocate_storage(frame_pool_class_size(class_index));
         assert(block != null);
     }
@@ -927,6 +945,17 @@ Int frame_pool_class_size(Int class_index) {
         index = index + 1;
     }
     return size;
+}
+
+// 只在 pool miss 时预留新 block；热 pop/push 不增加计数原子操作。
+Bool reserve_frame_pool_block(Void* executor, Int class_index) {
+    atomic.Atomic<Int>& count = atomic_executor_word(executor, executor_frame_pool_count_word + class_index);
+    while (true) {
+        Int observed = count.get();
+        if (observed >= frame_pool_class_limit) { return false; }
+        if (count.compare_and_set(observed, observed + 1)) { return true; }
+    }
+    return false;
 }
 
 UInt8* pop_frame_block(Void* executor, Int class_index, Bool local) {
