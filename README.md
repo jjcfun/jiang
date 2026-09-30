@@ -4,9 +4,17 @@
 
 # Jiang 语言
 
-Jiang 编程语言。项目仍处于早期阶段，语言与标准库会持续迭代。
+Jiang 编程语言。
 
 [官网与语言文档](https://jiang-lang.org/) · [发行版](https://github.com/jjcfun/jiang/releases)
+
+## 项目状态
+
+Jiang 语言的语法和编译器架构由作者设计，当前实现由 AI 参与开发，并已实现自举。
+在初步实现 LSP 后，项目已进入下一个里程碑：Next 版本。
+
+Next 版本将在新仓库中开发，重构当前编译器架构，代码将主要由人工编写。
+当前仓库不再新增功能，仅保留作为 Next 编译器的 bootstrap 仓库。
 
 ## 安装
 
