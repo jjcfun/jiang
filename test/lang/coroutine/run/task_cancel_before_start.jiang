@@ -1,5 +1,11 @@
 // run-pass
 // expected-exit: 0
+#doc(module)
+    首次执行前取消不得运行用户函数；堆 capture 必须恰好释放一次。
+#end
+
+alias domains = import "../../../../src/compiler/support/domains.jiang";
+import std;
 
 Int runs! = 0;
 Int outcome! = 0;
@@ -26,6 +32,15 @@ const CancelTargetDomain CancelTargetDomainValue = CancelTargetDomain();
 extern unsafe Void cancel_gate_block();
 extern unsafe Void cancel_gate_wait_ready();
 extern unsafe Void cancel_gate_open_later();
+extern unsafe Void cancel_gate_record_drop(Int value);
+extern unsafe Int cancel_gate_drop_count();
+extern unsafe Int cancel_gate_drop_sum();
+extern unsafe Int cancel_gate_check_drops(Int count, Int sum);
+
+struct Resource: Movable, Sendable {
+    Int value!;
+    deinit(self) { unsafe { cancel_gate_record_drop(self.value); } }
+}
 
 async [CancelTargetDomainValue] Void hold_target_domain() {
     unsafe { cancel_gate_block(); }
@@ -38,11 +53,73 @@ async [CancelTargetDomainValue] Int should_not_start() {
 
 @life()
 Task<Int>^ make_owned_target_task() {
-    new Task(domain = CancelTargetDomainValue) { should_not_start() }
+    Resource^ resource = new Resource(value = 7);
+    new Task(domain = CancelTargetDomainValue) { [resource] =>
+        coroutine.check_cancelled();
+        Resource^ owned! = resource$.move();
+        owned.value += 1;
+        Int value = should_not_start() + owned.value;
+        // 保留真正的 suspend 形态，避免 RTC 优化绕过需要验证的通用状态机。
+        Int wake = coroutine.suspend({ continuation => continuation.resume(0) });
+        value + wake
+    }
+}
+
+Void check_queued_owned_capture() {
+    domains.configure_worker_limit(UInt32(1));
+    Int iteration! = 0;
+    while (iteration < 8) {
+        std.Atomic<Bool> ready = std.Atomic<Bool>(false);
+        std.Atomic<Bool> open = std.Atomic<Bool>(false);
+        Resource^ resource = new Resource(value = 7);
+        Task<Void>^ holder = new Task(domain = domains.worker) { [ref ready, ref open] =>
+            ready.set(true);
+            while (!open.get()) {}
+        };
+        while (!ready.get()) {}
+        Task<Bool>^ cancelled = new Task(domain = domains.worker) { [resource] =>
+            coroutine.check_cancelled();
+            Resource^ owned! = resource$.move();
+            owned.value += 1;
+            true
+        };
+        cancelled.cancel();
+        open.set(true);
+        coroutine.sync(domains.coordinator) { [holder, cancelled] =>
+            cancelled.cancel_and_await();
+            holder.await();
+        };
+        iteration += 1;
+        assert(unsafe { cancel_gate_check_drops(2 + iteration, (2 + iteration) * 7) } == 1);
+    }
+}
+
+async [domains.worker] Int should_not_start_parameter(Resource^ resource) {
+    // 初始取消不得读取此 Task 尚未初始化的局部状态。
+    Task<Int> child = Task(domain = domains.worker) { 1 };
+    runs += 1;
+    child.await() + resource.value
+}
+
+Void check_cancelled_parameter() {
+    std.Atomic<Bool> ready = std.Atomic<Bool>(false);
+    std.Atomic<Bool> open = std.Atomic<Bool>(false);
+    Task<Int>^ task = new Task(domain = domains.worker) { [ref ready, ref open] =>
+        ready.set(true);
+        while (!open.get()) {}
+        // root 已进入用户代码，取消随后进入的 async 调用，验证按值参数的冷清理。
+        should_not_start_parameter(new Resource(value = 11))
+    };
+    while (!ready.get()) {}
+    task.cancel();
+    open.set(true);
+    coroutine.sync(domains.coordinator) { [task] => task.cancel_and_await() };
+    assert(runs == 0);
+    assert(unsafe { cancel_gate_check_drops(11, 81) } == 1);
 }
 
 Int main() {
-    Task(domain = CancelCallerDomainValue) {
+    Task<Void>^ caller = new Task(domain = CancelCallerDomainValue) {
         Task<Int> holder = Task(domain = CancelTargetDomainValue) {
             hold_target_domain();
             0
@@ -50,16 +127,23 @@ Int main() {
         unsafe { cancel_gate_wait_ready(); }
         Task<Int> task = Task(domain = CancelTargetDomainValue) { should_not_start() };
         make_owned_target_task().cancel();
+        Task<Int>^ owned = make_owned_target_task();
+        owned.cancel();
+        task.cancel();
+        task.cancel();
+        // 所有请求先发布，再放行 executor，不能靠取消后续 task 的速度赢过队列。
         unsafe { cancel_gate_open_later(); }
-        make_owned_target_task().cancel_and_await();
-        task.cancel();
-        task.cancel();
+        owned.cancel_and_await();
         task.cancel_and_await();
         Int barrier = coroutine.sync(CancelTargetDomainValue) { 0 };
         if (runs != 0) {
             outcome = 1;
         }
     };
-    Int barrier = coroutine.sync(CancelCallerDomainValue) { 0 };
+    // serial 域上的 barrier 不能替代 join：caller 挂起时其他 Job 仍可进入该域。
+    coroutine.sync(CancelCallerDomainValue) { [caller] => caller.await() };
+    assert(unsafe { cancel_gate_check_drops(2, 14) } == 1);
+    check_queued_owned_capture();
+    check_cancelled_parameter();
     outcome
 }

@@ -19,15 +19,20 @@ The benchmark warms executor and allocator state before measuring these paths:
 - `global_domain`, `main_domain`, and a minimal custom Executor enqueue;
 - a reused runtime inline Domain and per-operation runtime Domain/executor lifecycle;
 - immediate suspend/resume;
-- cancellation before a scoped task starts;
+- cancellation after a scoped RTC task has completed (verified before cancellation);
+- cancellation of a queued task before its first execution (manual executor pump, body count must stay zero);
+- cancellation while suspended (manual pump, one cancellation handler and no post-suspend execution);
 - repeated work spread across eight serial Domains.
 
-Each line reports elapsed monotonic time, nanoseconds per logical operation, and Jiang runtime Job-wrapper allocations.
-The allocation count excludes coroutine frames, explicit `new Task`, and allocations internal to the platform queue.
-It is the structural Job-wrapper allocation count for each path, not allocator instrumentation: Task-backed
-standard/custom enqueue reuses TaskState storage. Compare repeated runs from the same compiler build and machine;
-the numbers are not a correctness gate. The synchronous leaf uses a no-allocation external optimization barrier so
-LLVM cannot fold the entire baseline loop into a constant.
+Each line reports elapsed monotonic time, nanoseconds per logical operation, and a checked result checksum.
+The queued and suspended cases include the deterministic executor's Mutex/vector, pump, and Task lifecycle costs;
+they do not measure only the cancellation instruction. The completed case verifies that its same-Domain RTC
+body ran during construction without consuming the result before cancellation.
+
+Job allocation instrumentation is not connected, so current output omits the former constant `job_allocations=0`.
+The historical tables below retain their original structural estimates; those are not allocator measurements.
+Compare repeated runs from the same compiler build and machine; the timing numbers are not a correctness gate.
+The synchronous leaf uses an external optimization barrier so LLVM cannot fold the baseline loop into a constant.
 
 ### 0.5.3 runtime Domain baseline
 

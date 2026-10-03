@@ -15,10 +15,12 @@ static const char *case_name(int64_t case_id) {
         case 6: return "main-enqueue";
         case 7: return "custom-enqueue";
         case 8: return "immediate-resume";
-        case 9: return "cancel-before-start";
+        case 9: return "cancel-completed";
         case 10: return "many-domains";
         case 11: return "runtime-inline";
         case 12: return "runtime-lifecycle";
+        case 13: return "cancel-queued";
+        case 14: return "cancel-suspended";
         default: return "unknown";
     }
 }
@@ -60,14 +62,14 @@ void coroutine_benchmark_report(
     int64_t checksum,
     int64_t job_allocations
 ) {
+    (void)job_allocations; // 未接入分配计数时不输出误导性的常量。
     double ns_per_op = (double)elapsed_ns / (double)iterations;
     printf(
-        "%-20s iterations=%lld elapsed_ns=%lld ns/op=%.2f checksum=%lld job_allocations=%lld\n",
+        "%-20s iterations=%lld elapsed_ns=%lld ns/op=%.2f checksum=%lld\n",
         case_name(case_id),
         (long long)iterations,
         (long long)elapsed_ns,
         ns_per_op,
-        (long long)checksum,
-        (long long)job_allocations
+        (long long)checksum
     );
 }

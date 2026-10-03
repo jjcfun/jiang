@@ -1,6 +1,7 @@
-// 函数体入口、语句和基础表达式 lowering。
-//
-// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+#doc(module)
+    函数体入口、语句和基础表达式的 Semantic Model 到 JIL lowering。
+    异步入口在 capture 转移前检查取消，冷分支直接清理已持有的输入。
+#end
 
 alias context = import "../../context.jiang";
 alias sem = import "../../sema/model.jiang";
@@ -85,11 +86,71 @@ public extend body_context.BodyLowerer {
     }
 
     public jil.Body lower(Self&! self) {
+        if (self.current_effects.has_async) { self.lower_initial_cancellation_check(); }
         self.initialize_task_local_handles();
         self.initialize_consuming_lambda_env();
         self.initialize_nominal_fields();
         self.lower_model_body();
         return self.finish_body();
+    }
+
+    // 初始取消发生在 ownership 转移前，只清理输入，不读取函数局部的初始化状态。
+    Void lower_initial_cancellation_check(Self&! self) {
+        jil.BlockId common = self.builder.cancellation_entry;
+        jil.BlockId initial = self.builder.reserve_block(self.span);
+        self.builder.cancellation_entry = initial;
+        self.lower_cancellation_checkpoint(self.span);
+        self.builder.cancellation_entry = common;
+        jil.BlockId continuation = self.builder.current_block;
+        self.builder.start_block(initial);
+        list.ArrayList<jil.LocalId> inputs! = list.ArrayList<jil.LocalId>();
+        Int index! = 0;
+        while (index < self.locals.len()) {
+            jil.LocalDecl local = self.locals.get(index);
+            if (local.kind == .param) { inputs.add(local.id); }
+            index += 1;
+        }
+        self.lower_initial_capture_cleanup();
+        self.cleanup_local_range(inputs$.ref(), 0, self.span);
+        self.builder.finish_block(jil.cancel_terminator_kind(jil.CancelTerminator()), self.span);
+        self.builder.start_block(continuation);
+    }
+
+    // consuming capture 仍完整地位于调用方交给 frame 的 environment 中，直接原地析构。
+    Void lower_initial_capture_cleanup(Self&! self) {
+        if (!self.lambda_body_consumes_env()) { return; }
+        qid.TypeId env_type = self.lambda_env_type_for_body(self.span);
+        qid.TypeId pointer_type = self.raw_pointer_type(env_type, self.span);
+        jil.LocalId pointer = self.add_temp(pointer_type, self.span);
+        self.builder.push_assign(
+            self.place_for_local(pointer),
+            jil.cast_rvalue(jil.CastRvalue(
+                kind = self.cast_kind(self.closure_env_type(self.span), pointer_type),
+                value = self.operand_for_place(self.place_for_local(jil.LocalId.from_index(1))),
+                target_type = pointer_type
+            )), self.span
+        );
+        jil.Place environment = self.project_deref(self.place_for_local(pointer), true);
+        list.ArrayList<jil.Place> tasks! = list.ArrayList<jil.Place>();
+        self.append_direct_task_places(environment, env_type, tasks$.mut_ref());
+        Int index! = 0;
+        while (index < tasks.len()) {
+            self.request_scoped_task_cancellation_if_present(tasks.get(index), self.span);
+            index += 1;
+        }
+        index = tasks.len() - 1;
+        while (index >= 0) {
+            self.join_scoped_task_if_present(tasks.get(index), self.span);
+            index -= 1;
+        }
+        jil.BlockId complete = self.builder.reserve_block(self.span);
+        self.builder.finish_block(jil.drop_terminator_kind(jil.DropTerminator(
+            place = environment,
+            projection_flags = self.lowerer.storage.empty_drop_projection_flags(),
+            target = complete,
+            cleanup = null
+        )), self.span);
+        self.builder.start_block(complete);
     }
 
     #doc

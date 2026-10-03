@@ -1,3 +1,9 @@
+#doc(module)
+    测量协程调用、Task 生命周期和调度成本；手动 pump 精确区分取消时的任务状态。
+#end
+
+import std;
+
 // 每个 const binding 都是独立 Domain；复用类型不会合并调度身份。
 struct BenchmarkSerialDomain: Domain<kind = .serial> {
     associated ExecutorType = SerialExecutor;
@@ -33,6 +39,41 @@ struct BenchmarkInlineDomain: Domain<kind = .serial> {
 }
 
 const BenchmarkInlineDomain benchmark_inline = BenchmarkInlineDomain();
+
+Int cancellation_executor_address! = 0;
+Int cancellation_body_runs! = 0;
+Int cancellation_handler_runs! = 0;
+Int cancellation_after_suspend! = 0;
+
+struct BenchmarkQueuedExecutor: !Movable, Executor {
+    Mutex<std.Vector<ExecutorJob>> jobs;
+
+    init(self) {
+        self.jobs = Mutex<std.Vector<ExecutorJob>>(std.Vector<ExecutorJob>());
+    }
+
+    Void enqueue(Self& self, ExecutorJob job) {
+        cancellation_executor_address = unsafe { self$.ptr()$.as(Int) };
+        self.jobs.with_lock<Void>({ [job] jobs => jobs.append(job); });
+    }
+}
+
+struct BenchmarkQueuedDomain: Domain<kind = .serial> {
+    associated ExecutorType = BenchmarkQueuedExecutor;
+    BenchmarkQueuedExecutor make_executor(Self& self) { BenchmarkQueuedExecutor() }
+}
+const BenchmarkQueuedDomain benchmark_queued = BenchmarkQueuedDomain();
+
+Bool pump_cancellation_job() {
+    if (cancellation_executor_address == 0) { return false; }
+    BenchmarkQueuedExecutor& executor = unsafe {
+        cancellation_executor_address$.as(BenchmarkQueuedExecutor&)
+    };
+    if (executor.jobs.with_lock<Int>({ jobs => jobs.length() }) == 0) { return false; }
+    ExecutorJob job = executor.jobs.with_lock({ jobs => jobs.remove_last() });
+    job.run();
+    true
+}
 
 extern unsafe Int coroutine_benchmark_iterations();
 extern unsafe Int coroutine_benchmark_now_ns();
@@ -197,16 +238,68 @@ async [benchmark_caller] Int run_immediate_resume(Int iterations) {
     checksum
 }
 
-async [benchmark_caller] Int run_cancel_before_start(Int iterations) {
-    Int checksum! = 0;
+async [benchmark_caller] Int run_cancel_completed(Int iterations) {
+    cancellation_body_runs = 0;
     Int index! = 0;
     while (index < iterations) {
-        Task<Int> child = Task(domain = benchmark_caller) { 1 };
+        Task<Int> child = Task(domain = benchmark_caller) {
+            cancellation_body_runs += 1;
+            1
+        };
+        // 同域 RTC 在构造时执行，计数验证完成后再取消，不提前消费 Task result。
+        assert(cancellation_body_runs == index + 1);
         child.cancel_and_await();
-        checksum = checksum + 1;
-        index = index + 1;
+        index += 1;
     }
-    checksum
+    index
+}
+
+async [benchmark_caller] Int run_cancel_queued(Int iterations) {
+    cancellation_body_runs = 0;
+    Int index! = 0;
+    while (index < iterations) {
+        Task<Int> child = Task(domain = benchmark_queued) {
+            cancellation_body_runs += 1;
+            // 保留真正的挂起点，覆盖通用状态机的首次取消入口。
+            coroutine.suspend({ continuation => continuation.resume(1) })
+        };
+        child.cancel();
+        assert(pump_cancellation_job());
+        child.cancel_and_await();
+        while (pump_cancellation_job()) {}
+        index += 1;
+    }
+    assert(cancellation_body_runs == 0);
+    index
+}
+
+async [benchmark_caller] Int run_cancel_suspended(Int iterations) {
+    cancellation_body_runs = 0;
+    cancellation_handler_runs = 0;
+    cancellation_after_suspend = 0;
+    Int index! = 0;
+    while (index < iterations) {
+        Task<Int> child = Task(domain = benchmark_queued) {
+            cancellation_body_runs += 1;
+            Int value = coroutine.suspend({ continuation =>
+                continuation.on_cancel({ [continuation] =>
+                    cancellation_handler_runs += 1;
+                    continuation.resume(1);
+                });
+            });
+            cancellation_after_suspend += 1;
+            value
+        };
+        assert(pump_cancellation_job());
+        child.cancel();
+        while (pump_cancellation_job()) {}
+        child.cancel_and_await();
+        index += 1;
+    }
+    assert(cancellation_body_runs == iterations);
+    assert(cancellation_handler_runs == iterations);
+    assert(cancellation_after_suspend == 0);
+    index
 }
 
 async [benchmark_caller] Int run_many_serial_domains(Int iterations) {
@@ -244,7 +337,9 @@ Int main() {
         Int warm_runtime = run_runtime_inline_task(warmup);
         Int warm_runtime_lifecycle = run_runtime_inline_lifecycle(warmup);
         Int warm_resume = run_immediate_resume(warmup);
-        Int warm_cancel = run_cancel_before_start(warmup);
+        Int warm_cancel = run_cancel_completed(warmup);
+        Int warm_queued = run_cancel_queued(warmup);
+        Int warm_suspended = run_cancel_suspended(warmup);
         Int warm_many = run_many_serial_domains(warmup);
         Bool warmup_ok = warm_sync == warm_direct
             && warm_direct == warm_scoped
@@ -256,6 +351,8 @@ Int main() {
             && warm_direct == warm_runtime
             && warm_direct == warm_runtime_lifecycle
             && warm_direct == warm_resume
+            && warm_direct == warm_queued
+            && warm_direct == warm_suspended
             && warm_direct == warm_cancel
             && warm_many == warm_direct * 8;
 
@@ -315,7 +412,7 @@ Int main() {
         unsafe { coroutine_benchmark_report(8, iterations, elapsed, resumed, 0); }
 
         start = unsafe { coroutine_benchmark_now_ns() };
-        Int cancelled = run_cancel_before_start(iterations);
+        Int cancelled = run_cancel_completed(iterations);
         elapsed = unsafe { coroutine_benchmark_now_ns() } - start;
         unsafe { coroutine_benchmark_report(9, iterations, elapsed, cancelled, 0); }
 
@@ -324,13 +421,24 @@ Int main() {
         elapsed = unsafe { coroutine_benchmark_now_ns() } - start;
         unsafe { coroutine_benchmark_report(10, iterations * 8, elapsed, many, 0); }
 
+        start = unsafe { coroutine_benchmark_now_ns() };
+        Int queued = run_cancel_queued(iterations);
+        elapsed = unsafe { coroutine_benchmark_now_ns() } - start;
+        unsafe { coroutine_benchmark_report(13, iterations, elapsed, queued, 0); }
+
+        start = unsafe { coroutine_benchmark_now_ns() };
+        Int suspended = run_cancel_suspended(iterations);
+        elapsed = unsafe { coroutine_benchmark_now_ns() } - start;
+        unsafe { coroutine_benchmark_report(14, iterations, elapsed, suspended, 0); }
+
         if (!warmup_ok) {
             1
         } else if (synchronous != direct || direct != scoped || direct != heap
             || direct != cross || direct != global_value || direct != main_value
             || direct != custom
             || direct != runtime_inline || direct != runtime_lifecycle
-            || direct != resumed || direct != cancelled || many != direct * 8
+            || direct != resumed || direct != cancelled || direct != queued
+            || direct != suspended || many != direct * 8
         ) {
             2
         } else {

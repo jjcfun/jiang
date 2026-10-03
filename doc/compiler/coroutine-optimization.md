@@ -74,6 +74,15 @@ control block。两种形态共享完成、等待与取消状态机：
 因此父 frame 是所有 scoped Task storage 的合法 owner。父 cleanup 只有在所有子任务 join 后才能
 继续销毁局部值和释放父 frame。
 
+首次启动在 consuming capture 转移为局部 owner 之前执行取消 checkpoint。取消分支直接原地
+析构完整的 environment 并清理按值参数，不初始化或访问用户局部；正常分支才建立 Task 局部状态
+与 consuming owner。两条路径各自拥有 capture，不能合流到依赖局部初始化的公共清理块。
+参数的 drop 状态仍由 JIL drop elaboration 在入口建立；恢复执行使用 frame 中已有的清理状态。
+直接 Task capture 的清理复用请求取消、join、drop 顺序，完成通知仍走统一取消完成协议。
+正常 checkpoint 先原子读取 request，只在 request 为待领取取消时执行 CAS；
+direct child 继承的 root 取消上下文仍可能被其他线程修改，不能因同域执行而直接改成普通 load。
+启动前的 capture 尚无部分移动，直接完整析构；启动后的部分移动仍由既有 projection drop flags 管理。
+
 ## 外部实现对照
 
 ### Swift
