@@ -61,20 +61,30 @@ Jiang 0.6.1 从已发布的 0.6.0 stable 自举。获取对应平台的官方种
 | [macOS arm64](https://github.com/jjcfun/jiang/releases/download/0.6.0/jiang-0.6.0-macos-arm64.zip) | `b60a2f6e675c344fc95170d4689edf1ff80ab2e208a1c3c93285548da62dc03c` |
 | [Linux x86_64](https://github.com/jjcfun/jiang/releases/download/0.6.0/jiang-0.6.0-linux-x86_64.tar.gz) | `117ef5f6c28f298cace5395201146a052d487df55260aa66182ed542697d4a5c` |
 
-在源码目录中准备上文的锁定 LLVM SDK，然后运行：
+将锁定的 LLVM SDK 安装到 Jiang home，两个工作树共用该 SDK。将过渡源码检出到独立工作树。
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.6.0 \
-BOOTSTRAP_BIN=/path/to/jiang-0.6.0/bin/jiangc \
-COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=stable VERIFY=full \
+bash ./script/install_llvm.sh --user
+git fetch origin tag 0.6.1-bootstrap
+git worktree add --detach ../jiang-0.6.1-bootstrap 0.6.1-bootstrap
+
+(
+    cd ../jiang-0.6.1-bootstrap
+    BOOTSTRAP_RELEASE_VERSION=0.6.0 \
+    BOOTSTRAP_BIN=/path/to/jiang-0.6.0/bin/jiangc \
+    COMPILER_BUILD_MODE=release BOOTSTRAP_DEPTH=next VERIFY=none \
+    bash ./script/build_next.sh
+)
+
+BOOTSTRAP_RELEASE_VERSION=0.6.1-bootstrap \
+BOOTSTRAP_BIN="$(cd ../jiang-0.6.1-bootstrap && pwd)/build/bin/jiangc.next" \
+COMPILER_BUILD_MODE=release BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-省略 `BOOTSTRAP_BIN` 时使用 `~/.jiang/versions/0.6.0/bin/jiangc`。构建脚本检查种子版本，
-在独立快照里构建过渡编译器，然后生成 `build/bin/jiangc.next` 和 `build/bin/jiangc`。可用 `VERIFY=smoke` 执行冒烟验证，
-或用 `VERIFY=none` 单独验证构建。
-目标版本来自根目录 `package.jiang` 的 `version` 字面量。
+第一阶段也可以使用已安装的 `~/.jiang/versions/0.6.0/bin/jiangc`。第二阶段检查过渡编译器版本，
+并在正式工作目录生成 `build/bin/jiangc.next` 和 `build/bin/jiangc`。可用 `VERIFY=smoke` 执行冒烟验证，
+或用 `VERIFY=none` 单独验证构建。目标版本来自根目录 `package.jiang` 的 `version` 字面量。
 
 完整阶段和输入记录见 [编译器开发流程](develop.md)。
 
