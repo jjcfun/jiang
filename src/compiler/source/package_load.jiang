@@ -6,8 +6,10 @@ import std;
 alias context = import "../context.jiang";
 alias source = import "../source.jiang";
 alias entry = import "./entry.jiang";
-alias syntax = import "../syntax.jiang";
-alias token = import "../syntax/token.jiang";
+alias syntax = import "../syntax";
+alias syntax_package = import "../syntax";
+alias lexer = syntax_package.lexer;
+alias token = syntax_package.token;
 alias resolve = import "../resolve/module_resolver.jiang";
 alias def = import "../resolve/def.jiang";
 alias qid = import "../id.jiang";
@@ -44,10 +46,54 @@ public qid.PackageId? registered_for_path(context.CompilerContext&! ctx, UInt8[]
     return null;
 }
 
+/// 查找源码最近的配置目录，可按是否为目录模块筛选。
+public qid.SymbolId? source_boundary(context.CompilerContext&! ctx, UInt8[]& path, Bool? directory_module = null) {
+    UInt8[]^ absolute = identity.absolute_path(path);
+    Path directory! = std.path.normalize(std.path.dirname(absolute[..]));
+    while (true) {
+        qid.SymbolId symbol = ctx.store.symbols.intern(directory.bytes());
+        if (package_header(ctx, symbol) is .some(is_module)) {
+            if (directory_module == null || directory_module == is_module) { return symbol; }
+        }
+        Path parent = std.path.normalize(std.path.dirname(directory.bytes()));
+        if (string.equal(parent.bytes(), directory.bytes())) { return null; }
+        directory = parent;
+    }
+    return null;
+}
+
+/// 探测指定目录的包头，不加载依赖或求值配置。
+public Bool is_directory_module(context.CompilerContext&! ctx, UInt8[]& directory) {
+    UInt8[]^ absolute = identity.absolute_path(directory);
+    return package_header(ctx, ctx.store.symbols.intern(absolute[..])) == true;
+}
+
+/// .some 的值表示是否为目录模块；无配置目录的结果也在本轮编译内复用。
+Bool? package_header(context.CompilerContext&! ctx, qid.SymbolId directory) {
+    if (ctx.store.resolve.package_headers.get(directory) is .some(cached)) { return cached$.get(); }
+    Path configuration = std.path.join(ctx.store.symbols.text(directory), "package.jiang");
+    Bool? kind! = null;
+    if (ctx.store.sources.load_path_text(configuration.bytes()) is .some(text)) {
+        source.SourceId source_id = ctx.store.intern_source_path(configuration.bytes(), text[..]);
+        kind = lexer.package_header(ctx.store$.mut_ref(), text[..], source_id);
+    }
+    ctx.store.resolve.package_headers.set(directory, kind);
+    return kind;
+}
+
 public entry.PackageHandle load(
     context.CompilerContext&! ctx, resolve.ModuleResolver&! resolver, UInt8[]& directory
 ) {
-    UInt8[]^ absolute = identity.absolute_path(directory);
+    UInt8[]^ lexical = identity.absolute_path(directory);
+    Bool directory_module = is_directory_module(ctx, lexical[..]);
+    UInt8[]^ absolute = if directory_module {
+        UInt8[]^ actual = try fs.canonical_path(lexical[..]) catch { identity.absolute_path(lexical[..]) };
+        if (!string.equal(lexical[..], actual[..])) {
+            Path alias_path = std.path.join(lexical[..], "package.jiang");
+            ctx.store.resolve.directory_alias_sources.add(ctx.store.sources.reserve_path(alias_path.bytes()));
+        }
+        actual
+    } else { lexical$.move() };
     qid.SymbolId directory_symbol = ctx.store.symbols.intern(absolute[..]);
     if (ctx.store.resolve.package_for_dir(directory_symbol) is .some(known)) {
         if (ctx.store.resolve.package_ref(known).configuration_info != null) {
@@ -58,6 +104,11 @@ public entry.PackageHandle load(
         return entry.PackageHandle(Path(""), false);
     }
     Path configuration = std.path.join(absolute[..], "package.jiang");
+    if (directory_module && !configuration_in_directory(configuration.bytes(), absolute[..])) {
+        diagnostics.add_package_error(ctx.store.diagnostics$.mut_ref(),
+            "directory module entry must be in its own directory", "package_root_invalid");
+        return entry.PackageHandle(Path(""), false);
+    }
     entry.PackageHandle input = entry.PackageHandle(configuration, true);
     entry.Entry text! = entry.read_root(ctx, input$.ref());
     if (!text.ok) { return entry.PackageHandle(Path(""), false); }
@@ -69,7 +120,7 @@ public entry.PackageHandle load(
         return entry.PackageHandle(Path(""), false);
     }
     token.Span declaration_span = parsed.unit.get(parsed.unit.package_declaration$.some()).span;
-    qid.PackageId package = register_package(ctx, absolute[..], text.source_id, declaration_span);
+    qid.PackageId package = register_package(ctx, absolute[..], text.source_id, declaration_span, directory_module);
     if (!validate_registered_modules(ctx, package)) { return entry.PackageHandle(Path(""), false); }
     _ graph! = resolver.begin_module_graph(ctx, parsed.take_unit());
     if (!resolver.prepare_root_entry_environment(ctx, graph$.mut_ref())
@@ -92,7 +143,7 @@ public entry.PackageHandle load(
         if (!string.equal(ctx.store.symbols.text(ctx.store.defs.get(member).name.symbol), "info")) { continue; }
         guard ctx.store.comptime_store.const_value(member) is .some(info) else { break; }
         entry.PackageHandle result = finish_package(ctx, package, absolute[..], info);
-        if (!result.ok || !validate_initialization_root(ctx, package, graph$.ref(), result.root_path.bytes())
+        if (!result.ok || !validate_initialization_root(ctx, graph$.ref(), result.root_path.bytes())
             || !load_dependencies(ctx, resolver, package, absolute[..], info)
             || !validate_generate(ctx, package, info) || !validate_lang(ctx, package, info)) {
             return entry.PackageHandle(Path(""), false);
@@ -109,7 +160,12 @@ public entry.PackageHandle load(
     return entry.PackageHandle(Path(""), false);
 }
 
-/// 编辑器配置阶段仅求值 info 的实际依赖；完整源码诊断由随后主包的统一检查发布。
+Bool configuration_in_directory(UInt8[]& configuration, UInt8[]& directory) {
+    UInt8[]^ actual = try fs.canonical_path(configuration) catch { return true; };
+    return string.equal(std.path.dirname(actual[..]), directory);
+}
+
+/// 按需准备 info 的初始化表达式；入口其余声明在包配置完成后检查。
 Bool prepare_configuration_info(context.CompilerContext&! ctx, resolve.ModuleResolver&! resolver,
     module_graph.ModuleGraph&! graph
 ) {
@@ -129,7 +185,8 @@ Bool prepare_configuration_info(context.CompilerContext&! ctx, resolve.ModuleRes
 }
 
 qid.PackageId register_package(
-    context.CompilerContext&! ctx, UInt8[]& directory, source.SourceId source_id, token.Span span
+    context.CompilerContext&! ctx, UInt8[]& directory, source.SourceId source_id, token.Span span,
+    Bool directory_module
 ) {
     qid.SymbolId symbol = ctx.store.symbols.intern(directory);
     qid.NamespaceId namespace = ctx.store.resolve.create_namespace(.package_namespace, null, null, null, span);
@@ -140,7 +197,8 @@ qid.PackageId register_package(
     ctx.store.incremental.record_symbol(ctx.store.symbols$.ref(), key.StableSymbolKey(
         kind = .package_symbol, package_name = symbol, module_path = symbol,
         owner = null, name = symbol, domain = .namespace_name), definition);
-    qid.PackageId package = ctx.store.resolve.create_package(definition, symbol, symbol, symbol, .ordinary, namespace);
+    resolve_store.PackageKind kind = if directory_module { .directory_module } else { .ordinary };
+    qid.PackageId package = ctx.store.resolve.create_package(definition, symbol, symbol, symbol, kind, namespace);
     ctx.store.resolve.package_mut_ref(package).configuration_source = source_id;
     if (ctx.store.resolve.root_package == null) { ctx.store.resolve.set_root_package(package); }
     return package;
@@ -154,23 +212,19 @@ entry.PackageHandle finish_package(
     }
     _ name = if ctx.store.symbols.text(configured_name).length > 0 { configured_name }
         else { ctx.store.symbols.intern(directory_name(directory)) };
-    guard string_field(ctx, info, "root") is .some(root) else { return entry.PackageHandle(Path(""), false); }
-    if (!ident.is_ident_name(ctx.store.symbols.text(name))) {
+    if (!ident.is_ident_name(ctx.store.symbols.text(name))
+        && (ctx.store.resolve.package_ref(package).kind != .directory_module
+            || ctx.store.symbols.text(configured_name).length > 0)) {
         package_error(ctx, package, "package_name_invalid", "package name must follow identifier rules");
         return entry.PackageHandle(Path(""), false);
     }
-    _ version = string_field(ctx, info, "version")$.some();
-    if (!version_valid(ctx.store.symbols.text(version))) {
-        package_error(ctx, package, "package_version_invalid",
-            "package version only allows ASCII letters, digits, '.', '_', '+' and '-'");
+    ctx.store.resolve.package_mut_ref(package).name = name;
+    guard string_field(ctx, info, "root") is .some(root) else { return entry.PackageHandle(Path(""), false); }
+    UInt8[]& root_name = ctx.store.symbols.text(root);
+    if (root_name.length == 0) {
+        package_error(ctx, package, "package_root_required", "package root must be specified and non-empty");
         return entry.PackageHandle(Path(""), false);
     }
-    std.StringBuilder default_root! = std.StringBuilder();
-    default_root.append(ctx.store.symbols.text(name));
-    default_root.append(".jiang");
-    UInt8[]& configured_root = ctx.store.symbols.text(root);
-    std.String fallback = default_root.into_string();
-    UInt8[]& root_name = if configured_root.length == 0 { fallback.bytes() } else { configured_root };
     Path local = std.path.normalize(root_name);
     if (!path_valid(root_name) || std.path.is_absolute(local.bytes()) || string.equal(local.bytes(), ".")
         || string.equal(local.bytes(), "..")
@@ -183,20 +237,42 @@ entry.PackageHandle finish_package(
         package_error(ctx, package, "package_root_invalid", "package root must be a file inside the package");
         return entry.PackageHandle(Path(""), false);
     }
-    qid.SymbolId path_symbol = ctx.store.symbols.intern(path.bytes());
-    ctx.store.resolve.package_mut_ref(package).name = name;
-    ctx.store.resolve.package_mut_ref(package).root_path = path_symbol;
-    _ package_type = field(ctx, info, "type")$.some();
-    if (package_type.data is .enum_case_value(case_id)) {
-        UInt8[]& type_name = ctx.store.symbols.text(ctx.store.defs.get(case_id).name.symbol);
-        if (string.equal(type_name, "lang")) {
-            ctx.store.resolve.package_mut_ref(package).kind = .lang;
-            ctx.store.resolve.package_mut_ref(package).info = .lang(resolve_store.LangPackageInfo());
-        } else if (string.equal(type_name, "bin")) {
-            ctx.store.resolve.package_mut_ref(package).info = .binary(resolve_store.BinaryPackageInfo());
-        }
+    Path configuration = std.path.join(directory, "package.jiang");
+    if (string.equal(path.bytes(), configuration.bytes()) || same_file(path.bytes(), configuration.bytes())) {
+        package_error(ctx, package, "package_root_invalid", "package root must differ from package.jiang");
+        return entry.PackageHandle(Path(""), false);
     }
-    return entry.PackageHandle(std.path.normalize(path.bytes()), true, directory);
+    qid.SymbolId path_symbol = ctx.store.symbols.intern(path.bytes());
+    ctx.store.resolve.package_mut_ref(package).root_path = path_symbol;
+    if (!configure_target(ctx, package, info)) {
+        return entry.PackageHandle(Path(""), false);
+    }
+    return entry.PackageHandle(path, true, directory);
+}
+
+Bool same_file(UInt8[]& left, UInt8[]& right) {
+    UInt8[]^ actual_left = try fs.canonical_path(left) catch { return false; };
+    UInt8[]^ actual_right = try fs.canonical_path(right) catch { return false; };
+    return string.equal(actual_left[..], actual_right[..]);
+}
+
+Bool configure_target(context.CompilerContext&! ctx, qid.PackageId package, value.ComptimeValue info) {
+    _ package_type = field(ctx, info, "type")$.some();
+    guard package_type.data is .enum_case_value(case_id) else { return false; }
+    guard string_field(ctx, info, "version") is .some(version) else { return false; }
+    if (!version_valid(ctx.store.symbols.text(version))) {
+        package_error(ctx, package, "package_version_invalid",
+            "package version only allows ASCII letters, digits, '.', '_', '+' and '-'");
+        return false;
+    }
+    UInt8[]& type_name = ctx.store.symbols.text(ctx.store.defs.get(case_id).name.symbol);
+    if (string.equal(type_name, "lang")) {
+        ctx.store.resolve.package_mut_ref(package).kind = .lang;
+        ctx.store.resolve.package_mut_ref(package).info = .lang(resolve_store.LangPackageInfo());
+    } else if (string.equal(type_name, "bin")) {
+        ctx.store.resolve.package_mut_ref(package).info = .binary(resolve_store.BinaryPackageInfo());
+    }
+    return true;
 }
 
 /// 输入已是规范化绝对目录，末段作为未配置包名的加载默认值。
@@ -245,8 +321,7 @@ Bool validate_registered_modules(context.CompilerContext&! ctx, qid.PackageId pa
 }
 
 /// 检查初始化图；标准库入口预先提供构造类型，其余 root 不允许参与包信息初始化。
-Bool validate_initialization_root(context.CompilerContext&! ctx, qid.PackageId package,
-    module_graph.ModuleGraph& graph, UInt8[]& root) {
+Bool validate_initialization_root(context.CompilerContext&! ctx, module_graph.ModuleGraph& graph, UInt8[]& root) {
     guard ctx.store.sources.find(.file(root)) is .some(source_id) else { return true; }
     guard ctx.store.resolve.module_for_source(source_id) is .some(root_module) else { return true; }
     Path standard = ctx.store.sources.builtin_path("src/std/std.jiang");
@@ -266,10 +341,6 @@ Bool validate_initialization_root(context.CompilerContext&! ctx, qid.PackageId p
             cursor = graph.next_import(cursor);
         }
         index = index + 1;
-    }
-    if (root_module == graph.root_module) {
-        package_error(ctx, package, "package_root_invalid", "package root must differ from package.jiang");
-        return false;
     }
     return true;
 }
@@ -315,10 +386,9 @@ Bool load_dependencies(
             return false;
         }
         Path joined = std.path.join(directory, ctx.store.symbols.text(path));
-        UInt8[]^ absolute = identity.absolute_path(joined.bytes());
-        qid.SymbolId path_symbol = ctx.store.symbols.intern(absolute[..]);
-        entry.PackageHandle loaded = load(ctx, resolver, absolute[..]);
+        entry.PackageHandle loaded = load(ctx, resolver, joined.bytes());
         if (!loaded.ok) { return false; }
+        qid.SymbolId path_symbol = ctx.store.symbols.intern(loaded.configuration_directory.bytes());
         ctx.store.resolve.add_package_dependency(package,
             resolve_store.PackageDependencyRecord(alias_symbol = name, path_symbol = path_symbol));
     }

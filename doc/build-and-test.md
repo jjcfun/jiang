@@ -53,34 +53,30 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiang`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前 0.6.0 源码直接使用已发布的 0.5.6 stable。严格冷启动链为：
+Jiang 0.6.1 从已发布的 0.6.0 stable 自举。获取对应平台的官方种子归档，并在解压前核对 SHA-256。
+可直接使用解压目录里的 `bin/jiangc`。
 
-```text
-0.5.6 stable
-  -> 0.6.0 next
-  -> 0.6.0 stable
-```
+| 种子归档 | SHA-256 |
+| --- | --- |
+| [macOS arm64](https://github.com/jjcfun/jiang/releases/download/0.6.0/jiang-0.6.0-macos-arm64.zip) | `b60a2f6e675c344fc95170d4689edf1ff80ab2e208a1c3c93285548da62dc03c` |
+| [Linux x86_64](https://github.com/jjcfun/jiang/releases/download/0.6.0/jiang-0.6.0-linux-x86_64.tar.gz) | `117ef5f6c28f298cace5395201146a052d487df55260aa66182ed542697d4a5c` |
 
-安装 0.5.6 stable 后，在源码 worktree 中运行：
+在源码目录中准备上文的锁定 LLVM SDK，然后运行：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.6 \
+BOOTSTRAP_RELEASE_VERSION=0.6.0 \
+BOOTSTRAP_BIN=/path/to/jiang-0.6.0/bin/jiangc \
 COMPILER_BUILD_MODE=release \
 BOOTSTRAP_DEPTH=stable VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-产出 `build/bin/jiangc.next` 与 `build/bin/jiangc`，并运行完整验证。
+省略 `BOOTSTRAP_BIN` 时使用 `~/.jiang/versions/0.6.0/bin/jiangc`。构建脚本检查种子版本，
+在独立快照里构建过渡编译器，然后生成 `build/bin/jiangc.next` 和 `build/bin/jiangc`。可用 `VERIFY=smoke` 执行冒烟验证，
+或用 `VERIFY=none` 单独验证构建。
+目标版本来自根目录 `package.jiang` 的 `version` 字面量。
 
-构建脚本默认读取 `~/.jiang/versions/0.5.6/bin/jiangc` 并校验版本。如只想构建不跑验证，
-可设置 `VERIFY=none`；
-只跑 smoke 可设置 `VERIFY=smoke`。
-
-构建脚本默认从根目录 `package.jiang` 的 `version` 字面量 读取编译器版本，并校验
-`build/bin/jiangc.next --version` 的输出。
-
-破坏性升级版本的开发流程见 [编译器开发流程](develop.md)。其中记录各版本的完整
-冷启动链、各阶段产物边界和历史版本复现流程。
+完整阶段和输入记录见 [编译器开发流程](develop.md)。
 
 正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
 glibc、pthread、dl 和 C++ runtime；安装包内的 `ABI.txt` 根据最终 ELF symbol version requirements

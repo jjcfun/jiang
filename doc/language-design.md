@@ -807,13 +807,12 @@ import dep;
 alias dep = import "foo/bar.jiang";
 ```
 
-`import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它会优先按当前 package
-配置的 `dependencies` alias 解析到依赖 package root；未命中 dependency 时，再按当前
-编译上下文中已登记的 module/package 名称解析。
+`import dep;` 按当前包的 `dependencies` 别名解析到依赖入口。`std` 等内置入口由编译上下文提供。
+裸名字没有目录查找或递归搜索。
 
-`alias dep = import "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
-当前 import 所在源文件的目录为基准，绝对路径按原路径规范化。编译器只加载字面路径
-本身，不隐式补 `.jiang`，也不尝试目录入口 `mod.jiang`。
+带引号的路径以当前 import 所在源文件的目录为基准。普通文件导入需要完整路径，包括文件后缀。
+字符串路径也可指向当前包内的目录模块，例如 `import "geometry/math";`。编译器读取目标目录的
+`package.jiang`，并导入 `root` 指定的源码入口的公开接口。
 
 如果当前 source 是 virtual/buffer，没有真实文件路径，相对 file import 暂按字符串本身规范化；
 后续如果需要 IDE buffer 的相对文件 import，需要给 virtual source 增加 base directory。
@@ -844,19 +843,21 @@ namespace validation 会枚举直接目标的 public binding，使未引用的�
 枚举会沿 public wildcard edge 继续读取传递 re-export surface。import cycle 只复用已经登记的 module
 namespace skeleton，并由 import 状态截断，不复制或递归展开 wildcard alias。
 
-file import 只允许引用当前 package 内的 source file。跨 package 源码依赖必须通过
-`dependencies` 和 `import dep;` 进入；直接用字符串路径导入另一个 package 的 source 会报错。
+文件导入可以访问当前包中的文件。目录模块也可以按文件路径导入所属宿主包的普通源码。
+独立源码包之间通过 `dependencies` 和 `import dep;` 连接。
+字符串目录导入只能进入同一包边界内、由目标声明为 `type = .module` 的目录模块。
+目录模块的实现文件和 `package.jiang` 禁止从目录外直接按文件导入，边界检查也适用于尚未加载的配置。
 
 ### 包信息声明
 
-内置 `#package { ... }`（也可写作 `#jiang.package`）生成公开的 `info` 常量，类型为
-`std.jiang.PackageInfo`。它使用普通构造表达式、类型检查和编译期求值，不定义每包独有的 struct。
+内置 `#package { ... }`（完整名称为 `#jiang.package`）生成公开的 `info` 常量，类型为
+`std.jiang.PackageInfo`。字段值使用普通构造表达式、类型检查和编译期求值。
 
 ```jiang
 #package {
+    type = .bin;
     name = "app";
     version = "0.5.6";
-    type = .bin;
     root = "src/main.jiang";
     dependencies {
         tools = "../tools";
@@ -873,7 +874,8 @@ file import 只允许引用当前 package 内的 source file。跨 package 源�
 
 普通字段值使用 Jiang 表达式；依赖名和 `package = tools` 中的 `tools` 是配置别名，后者不执行
 模块导入。扩展名使用字符串表达式列表。无别名的 `lang { extensions = [...] ; }` 描述 Provider
-自身的扩展名。`type` 使用 `.lib`、`.bin` 或 `.lang`，默认 `.lib`；未填写的文本和列表为空。
+自身的扩展名。所有包必须声明 `root`。`type` 可取 `.lib`、`.bin`、`.lang` 或 `.module`，
+省略时默认为 `.lib`。
 
 `.lang` 依赖默认以依赖别名注册；Provider 未声明扩展名时使用该别名作为扩展名。宿主可用
 `lang <name> { package = <dependency>; }` 指定语言别名，非空 `extensions` 列表覆盖 Provider 的
@@ -883,10 +885,12 @@ file import 只允许引用当前 package 内的 source file。跨 package 源�
 内部相对文件路径。包加载阶段校验来源和重复名称，只有被选择的生成器源码才加入编译图。
 `--name` 选择对应入口，生成器接收的反射输入仍为本包 root；不指定名称时使用 root 自身的入口。
 
-把声明放在 `package.jiang` 后，其他源码可用 `import "../package.jiang";` 导入，再通过
-`package.info.version` 读取版本，或把 `package.info` 整体传给接受 `std.jiang.PackageInfo` 的函数。
-不提供默认导出或隐式的包信息全局绑定；`info` 与用户同名声明冲突时遵循普通重名诊断。
-生成的数组使用私有常量提供只读存储，不进入公开导出面。
+`PackageInfo` 保存 `name`、`root`、`version`、`dependencies`、`lang`、`generate` 和 `type`。
+所有类型均可省略 `version`，默认值为空字符串。
+
+本包源码可用普通导入读取自己的 `package.jiang`，例如用 `package.info.version` 读取版本。
+`info` 也可整体传给接受 `std.jiang.PackageInfo`
+的函数。同名声明遵循普通重名诊断，生成的数组由私有常量提供只读存储。
 
 包信息初始化可使用基础类型、标准库及本包独立 helper；不能直接或间接导入正在声明的 root，
 也不能先把依赖源码当成本包 helper 加载、再把它登记为另一个包。root 必须是本包内部文件。
@@ -896,11 +900,13 @@ file import 只允许引用当前 package 内的 source file。跨 package 源�
 
 ### Package
 
-目录或依赖路径显式加载固定入口 `package.jiang`。`#package` 展开为普通 `PackageInfo`
-常量，求值后登记依赖、选择 root，再构建源码模块图；不通过向上搜索配置来自动发现子包。
+包目录、显式依赖和目录导入以 `package.jiang` 加载包配置。加载器先求值 `info` 的实际初始化
+依赖，再登记包依赖。所有包的 `root` 必须指向独立于 `package.jiang` 的包内文件。
+依赖登记完成后才解析源码入口的公开接口。目录模块随宿主进入同一编译闭包。
 
 ```jiang
 #package {
+    type = .bin;
     name = "frontend";
     root = "src/main.jiang";
     dependencies {
@@ -909,14 +915,14 @@ file import 只允许引用当前 package 内的 source file。跨 package 源�
 }
 ```
 
-`PackageInfo` 的字符串字段默认留空，包种类默认 `.lib`，配置列表默认为空。
-加载时，空 name 使用配置所在目录名，空 root 使用 `<有效包名>.jiang`；这两个加载默认值
-不回写普通常量。空 version 表示未指定，非空版本只允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
+`PackageInfo` 的 `name` 和 `version` 默认留空，配置列表默认为空。
+加载时，空 name 使用配置所在目录名，`info.name` 保留声明的值。
+空 version 表示未指定，非空版本只允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
 有效包名及依赖别名复用 Jiang lexer 的标识符规则，包括其 Unicode 标识符规则。
 
 依赖路径相对声明它的包目录解释，递归加载后进入同一编译闭包。包依赖环必须诊断；
-同一包内的模块导入环仍允许。已登记的包形成源码边界，跨包通过依赖别名导入 root，
-不能使用相对源码路径绕过边界。普通导入与包初始化复用配置模块、声明和常量结果。
+同一包内的文件导入环仍允许。每个源码文件保有自己的作用域。不同路径的同名目录模块有独立的
+包身份，可通过导入路径或依赖别名区分。配置模块、声明和 `info` 常量在编译图中共用。
 
 package 对外导出面固定为 root file 的 public namespace：
 
@@ -924,6 +930,7 @@ package 对外导出面固定为 root file 的 public namespace：
 - root file 的 `public import` 可以重新导出一个 module namespace，但不 flatten 目标 module
   的 declarations。
 - root file 的 `public alias` 可以重新导出 public symbol；函数 alias 保留目标 overload family。
+- root file 可以导入自己的 `package.jiang`，并通过公开常量选取需要提供给下游的字段。
 - 非 root module 的 public declaration 不会自动暴露为 package API。
 - dependency package 中的 `main` 不参与当前 package 的 hosted entry wrapper 选择。
 

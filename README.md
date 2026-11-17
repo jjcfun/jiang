@@ -66,7 +66,7 @@ Jiang 0.6.0 及更新版本提供诊断、补全、悬停文档和定义跳转�
 ## 文档
 
 - [语言指南](doc/jiang.md)
-- [版本说明](doc/releases/0.6.0.md)
+- [版本说明](doc/releases/0.6.1.md)
 - [构建、测试与发布](doc/build-and-test.md)
 - [编译器开发流程](doc/develop.md)
 - [架构](doc/architecture.md) · [语法](doc/grammar.md) · [语言设计](doc/language-design.md)

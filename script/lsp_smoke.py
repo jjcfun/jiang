@@ -649,6 +649,84 @@ def check_import_file_definitions(binary, directory):
         assert by_id[8]["result"] is None, by_id[8]
 
 
+def check_directory_modules(binary, directory):
+    root = Path(directory).resolve() / "directory modules"
+    geometry = root / "geometry" / "math"
+    algebra = root / "algebra" / "math"
+    geometry.mkdir(parents=True)
+    algebra.mkdir(parents=True)
+    (root / "package.jiang").write_text(
+        '#package { type = .bin; name = "lsp_directory_modules"; root = "main.jiang"; '
+        'dependencies { geometry = "geometry/math"; } }\n', encoding="utf-8")
+    (geometry / "package.jiang").write_text(
+        '#package { type = .module; root = "root.jiang"; }\n', encoding="utf-8")
+    geometry_entry = geometry / "root.jiang"
+    geometry_entry.write_text(
+        'alias impl = import "implementation.jiang";\n'
+        'public alias answer = impl.answer;\nalias hidden = impl.hidden;\n', encoding="utf-8")
+    (algebra / "package.jiang").write_text(
+        '#package { type = .module; root = "root.jiang"; }\n', encoding="utf-8")
+    algebra_entry = algebra / "root.jiang"
+    algebra_entry.write_text('public Int value() { 2 }\n', encoding="utf-8")
+    implementation = geometry / "implementation.jiang"
+    implementation_text = 'public Int answer() { 1 }\npublic Int hidden() { 3 }\n'
+    implementation.write_text(implementation_text, encoding="utf-8")
+    main = root / "main.jiang"
+    imports = 'import geometry;\nalias algebra = import "algebra/math";\n'
+    main_text = imports + 'Int main() { geometry.answer() }\n'
+    main.write_text(main_text, encoding="utf-8")
+    blocked_text = 'alias blocked = import "geometry/math/implementation.jiang";\n'
+    blocked = root / "blocked.jiang"
+
+    def open_source(path, text):
+        return {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+            "textDocument": {"uri": path.as_uri(), "languageId": "jiang", "version": 1, "text": text}}}
+
+    def change(path, text):
+        return {"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            "textDocument": {"uri": path.as_uri(), "version": 2}, "contentChanges": [{"text": text}]}}
+
+    def request(identifier, kind, path, line, character):
+        return {"jsonrpc": "2.0", "id": identifier, "method": f"textDocument/{kind}", "params": {
+            "textDocument": {"uri": path.as_uri()}, "position": {"line": line, "character": character}}}
+
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}},
+        open_source(main, main_text),
+        request(2, "definition", main, 0, len('import ')),
+        request(3, "definition", main, 1, imports.splitlines()[1].index('algebra/math')),
+        request(4, "definition", main, 2, main_text.splitlines()[2].index('answer')),
+        change(main, imports + 'Int main() {\n    geometry.\n    return 0;\n}\n'),
+        request(5, "completion", main, 3, len('    geometry.')),
+        open_source(blocked, blocked_text),
+        request(6, "definition", blocked, 0, blocked_text.index('implementation')),
+        open_source(implementation, implementation_text.replace('{ 1 }', '{ "wrong" }')),
+        change(implementation, implementation_text),
+        {"jsonrpc": "2.0", "id": 7, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ]
+    process = subprocess.run([binary, "lsp"], input=b"".join(map(frame, messages)),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
+    assert process.returncode == 0 and not process.stderr, process.stderr.decode()
+    items = responses(process.stdout)
+    by_id = {item["id"]: item["result"] for item in items if "id" in item}
+    start = {"line": 0, "character": 0}
+    for identifier, path in [(2, geometry_entry), (3, algebra_entry)]:
+        assert by_id[identifier] == {"uri": path.as_uri(), "range": {"start": start, "end": start}}, by_id
+    assert by_id[4]["uri"] == implementation.as_uri(), by_id[4]
+    labels = {item["label"] for item in by_id[5]}
+    assert "answer" in labels and not ({"hidden", "impl", "info"} & labels), labels
+    assert by_id[6] is None, by_id[6]
+    diagnostics = [item["params"] for item in items
+                   if item.get("method") == "textDocument/publishDiagnostics"]
+    blocked_diagnostics = [item for item in diagnostics if item["uri"] == blocked.as_uri()]
+    assert len(blocked_diagnostics) == 1, blocked_diagnostics
+    assert [item["code"] for item in blocked_diagnostics[0]["diagnostics"]] == ["cross_package_file_import"]
+    implementation_diagnostics = [item for item in diagnostics if item["uri"] == implementation.as_uri()]
+    assert [item["version"] for item in implementation_diagnostics] == [1, 2], implementation_diagnostics
+    assert implementation_diagnostics[0]["diagnostics"] and not implementation_diagnostics[1]["diagnostics"]
+
+
 def check_compiler_source_definitions(binary):
     root = Path(__file__).resolve().parent.parent
     path = root / "src/compiler/artifact/source_ji.jiang"
@@ -943,6 +1021,9 @@ def main():
         assert not process.stderr, process.stderr.decode()
         items = responses(process.stdout)
         assert len(items) == 7, items
+        version_line = subprocess.check_output([binary, "--version"], text=True, timeout=10).splitlines()[0]
+        assert version_line.startswith("jiang "), version_line
+        assert items[0]["result"]["serverInfo"] == {"name": "Jiang", "version": version_line.split(" ", 1)[1]}
         capabilities = items[0]["result"]["capabilities"]
         assert capabilities["positionEncoding"] == "utf-16"
         assert capabilities["textDocumentSync"] == {"openClose": True, "change": 1,
@@ -966,6 +1047,7 @@ def main():
         check_package_documents(binary, directory)
         check_semantics(binary, directory)
         check_import_file_definitions(binary, directory)
+        check_directory_modules(binary, directory)
         check_compiler_source_definitions(binary)
         check_definition_reuse(binary, directory)
         check_completion(binary, directory)

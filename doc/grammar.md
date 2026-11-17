@@ -927,12 +927,15 @@ pattern_list
 
 ## 内置包信息语法
 
-`#package` 的 body 由内置 Provider 解析；字段表达式复用 Jiang parser。
-以下规则描述 Provider 内部语法，展开结果是普通声明集合。
+包体由内置 Provider 解析，字段表达式复用 Jiang parser，展开结果是普通声明集合。
+所有包声明都必须提供 `root`。缺省 `type` 使用 `.lib`，缺省 `version` 使用空字符串。
 
 ```peg
-package_decl <- ("#package" / "#jiang.package") "{" package_item* "}"
-package_item <- "dependencies" "{" package_dependency* "}"
+package_decl <- ("#package" / "#jiang.package") package_body
+package_kind <- "lib" / "bin" / "lang" / "module"
+package_body <- "{" package_item* "}"
+package_item <- "type" "=" "." package_kind ";"
+              / "dependencies" "{" package_dependency* "}"
               / "lang" name? "{" package_alias_field* "}"
               / "generate" name "{" package_alias_field* "}"
               / name "=" expr ";"

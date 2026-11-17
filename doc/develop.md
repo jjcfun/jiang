@@ -3,42 +3,36 @@
 本文记录 Jiang 的自举和验证流程。常规开发使用上一版正式 release 编译器；只有该编译器
 无法直接编译新源码时，才建立一个或多个最小 bootstrap 过渡阶段。
 
-## 常规开发
+## 0.6.1 自举
 
-0.6.0 直接使用已发布的 0.5.6 stable，不需要 bootstrap 过渡分支。默认种子为
-`~/.jiang/versions/0.5.6/bin/jiangc`；构建脚本会检查其版本，随后完成
-`0.5.6 stable -> 0.6.0 next -> 0.6.0 stable`。不得使用旧 0.6.0 实验产物或临时编译器替代该输入。
+0.6.1 使用已发布的 0.6.0 stable 自举。0.6.0 需要用普通文件导入语法前端。
 
-开发期间保留功能分支；功能冻结后再建立 release 分支，bootstrap 改动仅在自己的分支提交。
-每轮使用独立 BUILD_DIR，构建期间保持源码不变，并记录源码、种子和工具链身份。
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.6 \
-COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=next VERIFY=none \
-bash ./script/build_next.sh
+```text
+0.6.0 stable
+  -> 0.6.1-bootstrap next
+  -> 0.6.1 next
+  -> 0.6.1 stable
 ```
 
-bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
-清理该目录；current compiler 使用独立的
-`build/artifact-cache/next/<version>`，不会随 bootstrap cache 一起删除。需要自定义时可设置
-`NEXT_ARTIFACT_CACHE_DIR`，但它不能包含 `build/cache`，也不能位于 `build/cache` 内。
+过渡源码可放在独立的 `bootstrap/0.6.1` worktree 中，使用 0.6.0 stable 和
+`BOOTSTRAP_DEPTH=next` 构建。正式工作区通过 `BOOTSTRAP_RELEASE_VERSION=0.6.1-bootstrap`
+和 `BOOTSTRAP_BIN` 选用该 worktree 的 `build/bin/jiangc.next`。
 
-提交功能前优先运行相关语言测试。需要检查完整语言测试时：
+直接提供 0.6.0 stable 时，`script/build_next.sh` 创建独立源码快照，在快照内把语法前端的
+目录导入改为文件导入，再构建过渡编译器。过渡编译器编译正式源码，生成 next 和 stable。
+每一阶段使用独立的缓存并记录产物的 build ID。
+此流程适用于同一源码版本的 Git 检出和源码归档。种子归档、校验和及运行命令见 [构建指南](build-and-test.md)。
+
+复现时固定源码版本、0.6.0 种子归档及 LLVM SDK，使用新的 `BUILD_DIR`。
+发布前固定过渡源码对应的 `0.6.1-bootstrap` tag，并在最终发布源码上执行 `next → stable` 和完整验证。
+
+日常开发可用 `BOOTSTRAP_DEPTH=next VERIFY=none`，再对生成的编译器运行聚焦测试，例如：
 
 ```bash
-JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
+JIANGC=./build/bin/jiangc.next TEST_ROOT=test/lang/package bash ./script/test.sh
 ```
 
-正式 release 前生成 stable，并执行完整验证：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.5.6 \
-COMPILER_BUILD_MODE=release \
-BOOTSTRAP_DEPTH=stable \
-VERIFY=full \
-bash ./script/build_next.sh
-```
+0.6.0 历史源码的自举链为 `0.5.6 stable → 0.6.0 next → 0.6.0 stable`。
 
 ## 0.5.6 发布收尾
 

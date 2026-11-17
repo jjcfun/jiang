@@ -2840,14 +2840,14 @@ extend User: HasValue {
 
 ### 包信息声明
 
-内置 `#package { ... }`（也可写作 `#jiang.package`）生成公开的 `info` 常量，类型为
-`std.jiang.PackageInfo`。它使用普通构造表达式、类型检查和编译期求值，不定义每包独有的 struct。
+内置 `#package { ... }`（完整名称为 `#jiang.package`）生成公开的 `info` 常量，类型为
+`std.jiang.PackageInfo`。字段值使用普通构造表达式、类型检查和编译期求值。
 
 ```jiang
 #package {
+    type = .bin;
     name = "app";
     version = "0.5.6";
-    type = .bin;
     root = "src/main.jiang";
     dependencies {
         tools = "../tools";
@@ -2864,7 +2864,8 @@ extend User: HasValue {
 
 普通字段值使用 Jiang 表达式；依赖名和 `package = tools` 中的 `tools` 是配置别名，后者不执行
 模块导入。扩展名使用字符串表达式列表。无别名的 `lang { extensions = [...] ; }` 描述 Provider
-自身的扩展名。`type` 使用 `.lib`、`.bin` 或 `.lang`，默认 `.lib`；未填写的文本和列表为空。
+自身的扩展名。所有包必须声明 `root`。`type` 可取 `.lib`、`.bin`、`.lang` 或 `.module`，
+省略时默认为 `.lib`。
 
 `.lang` 依赖默认以依赖别名注册；Provider 未声明扩展名时使用该别名作为扩展名。宿主可用
 `lang <name> { package = <dependency>; }` 指定语言别名，非空 `extensions` 列表覆盖 Provider 的
@@ -2874,10 +2875,12 @@ extend User: HasValue {
 内部相对文件路径。包加载阶段校验来源和重复名称，只有被选择的生成器源码才加入编译图。
 `--name` 选择对应入口，生成器接收的反射输入仍为本包 root；不指定名称时使用 root 自身的入口。
 
-把声明放在 `package.jiang` 后，其他源码可用 `import "../package.jiang";` 导入，再通过
-`package.info.version` 读取版本，或把 `package.info` 整体传给接受 `std.jiang.PackageInfo` 的函数。
-不提供默认导出或隐式的包信息全局绑定；`info` 与用户同名声明冲突时遵循普通重名诊断。
-生成的数组使用私有常量提供只读存储，不进入公开导出面。
+`PackageInfo` 保存 `name`、`root`、`version`、`dependencies`、`lang`、`generate` 和 `type`。
+所有类型均可省略 `version`，默认值为空字符串。
+
+本包源码可用普通导入读取自己的 `package.jiang`，例如用 `package.info.version` 读取版本。
+`info` 也可整体传给接受 `std.jiang.PackageInfo`
+的函数。同名声明遵循普通重名诊断，生成的数组由私有常量提供只读存储。
 
 包信息初始化可使用基础类型、标准库及本包独立 helper；不能直接或间接导入正在声明的 root，
 也不能先把依赖源码当成本包 helper 加载、再把它登记为另一个包。root 必须是本包内部文件。
@@ -2893,7 +2896,7 @@ extend User: HasValue {
 
 ### 模块（Module）
 
-Jiang语言的模块以文件为单位，文件内的所有定义都属于该模块
+每个 Jiang 源文件有自己的模块作用域。目录可用 `package.jiang` 声明为目录模块，由 `root` 指定的文件选择对外公开的接口。
 
 #### 模块导入
 
@@ -3010,11 +3013,11 @@ jiang --artifact-cache-dir path/to/cache --clean-artifact-cache
 `--artifact-stats`，编译器会在标准错误输出接口与对象的命中、缺失、失效、生成、复用、
 最终链接和无修改快速命中数量。
 
-当输入路径是目录时，编译器加载该目录的 `package.jiang`，先求值包信息，再编译 root。
-包声明使用普通表达式、字段赋值、分号和具名子块：
+当输入路径是目录时，编译器读取该目录的 `package.jiang` 并求值包信息，再按显式声明的 `root` 选择源码入口。
 
 ```jiang
 #package {
+    type = .bin;
     name = "frontend";
     root = "src/main.jiang";
     version = "1.0.0";
@@ -3024,37 +3027,51 @@ jiang --artifact-cache-dir path/to/cache --clean-artifact-cache
 }
 ```
 
-字段均可省略。`PackageInfo` 中 `name`、`root`、`version` 默认是空字符串，`type` 默认是 `.lib`，
-依赖及 Lang／generate 列表默认为空。加载器按以下规则解释配置：
+- `name` 默认使用包目录名，显式包名必须是有效的 Jiang 标识符。
+- `root` 必须指向独立于 `package.jiang` 的包内文件。
+- `version` 为空表示未指定，非空值允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
+- 包名的加载默认值只影响包身份，`info.name` 保留声明的值。
 
-- `name` 为空时使用包目录名；有效包名必须满足 Jiang 标识符规则。
-- `root` 为空时使用 `<有效包名>.jiang`；显式 root 必须指向包内文件。
-- `.bin` 表示可执行包，`.lang` 表示提供自定义语法 Provider 的包。
-- `version` 为空表示未指定；非空值允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
-- 默认路径和名称只用于加载，不改写公开的 `info` 常量。需要读取具体名称或入口时应显式配置。
+`dependencies` 的路径相对包目录解释。`import util;` 通过已声明的别名导入 `util` 的入口，
+包括 `lib` 和 `module` 的入口。依赖包对外提供其入口文件的 public namespace。入口可通过
+`public import` 重新导出模块 namespace，或通过 `public alias` 选取具体的 public symbol。
+包依赖环会报错，同一包内可以有文件导入环。
 
-例如，`lexer/package.jiang` 只写 `#package {}`，目录编译便以 `lexer/lexer.jiang` 为入口。
-`dependencies` 的值是相对包目录的本地依赖路径；每个依赖目录显式加载自己的 `package.jiang`。
-编译器不会因普通源码附近存在同名文件就自动登记子包。
+入口只需公开下游会使用的字段。若入口与 `package.jiang` 同目录，可以这样公开版本。
 
-在 package 内部，可以直接：
+```jiang
+import "package.jiang";
 
-```c
-import util;
+public const UInt8[]& version = package.info.version;
 ```
 
-这会导入依赖 package 的入口模块。当前本地依赖只支持这种“按依赖名导入 package root”的形式；还不支持 `dep/submodule` 这类更细路径。
+依赖方使用 `util.version` 读取该值。
 
-注意：
+#### 目录模块
 
-- package import 不能加引号，必须写成 `import util;`
-- 带引号的 `import "..."` 只用于当前 package 内的文件路径导入
-- 跨 package 不能用字符串路径直接导入 source，必须通过 `dependencies` 中声明的别名
-- package dependency cycle 不允许；同一 package 内的 module import cycle 允许
-- package 对外只暴露 root file 的 public namespace
-- root file 可以通过 `public import` 重新导出模块 namespace，也可以通过 `public alias`
-  重新导出具体 public symbol
-- 非 root module 的 public 声明不会自动成为 package API
+在 `geometry/math/package.jiang` 中声明目录模块入口。
+
+```jiang
+#package { type = .module; root = "math.jiang"; }
+```
+
+在 `geometry/math/math.jiang` 中组织公开接口。
+
+```jiang
+alias arithmetic = import "arithmetic.jiang";
+public alias add = arithmetic.add;
+```
+
+目录模块随宿主一起编译。`arithmetic.jiang` 等实现文件各有作用域，可在本目录模块内部显式导入。
+`package.jiang` 可以用 `dependencies` 声明依赖，加载器先登记这些依赖，再解析入口的公开接口。
+
+- `import math;` 使用宿主 `package.jiang` 中显式声明的 `math` 依赖。裸名字没有目录搜索。
+- `import "geometry/math";` 相对当前源码文件定位目录，目标必须声明为 `module`。路径可以用于
+  当前包内的目录模块。若中间存在另一个显式包边界，须通过依赖别名进入该包的入口。
+- 用不同的依赖别名或显式的导入别名区分同名目录，例如 `alias algebra = import "algebra/math";`。
+- 目录模块可按相对文件路径导入宿主包中的普通源码，例如 `import "../shared.jiang";`。
+- 目录外的源码只能通过这两种入口导入模块。直接文件导入 `arithmetic.jiang` 或 `package.jiang`
+  会报错，即使该目录模块尚未加载。嵌套目录模块也各自有边界。
 
 #### API 文档
 

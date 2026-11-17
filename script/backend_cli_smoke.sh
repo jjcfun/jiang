@@ -140,6 +140,8 @@ printf '== backend cli smoke: test %s (%s) ==\n' "$compiler_bin" "$COMPILER_VERS
 # smoke 必须从当前源码重新生成目标产物，不能复用上一次运行留下的 source artifact。
 rm -rf "$BUILD_DIR/cache"
 
+"$compiler_bin" --artifact-cache-dir "$SMOKE_BUILD_DIR/syntax-package-cache" --check "$ROOT_DIR/src/compiler/syntax"
+
 "$compiler_bin" --emit-llvm -o "$sample_ll" "$sample"
 test -s "$sample_ll"
 "$clang_bin" "${host_clang_link_args[@]}" "$sample_ll" -o "$sample_from_ll" \

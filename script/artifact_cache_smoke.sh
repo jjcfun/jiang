@@ -274,14 +274,20 @@ check_build_context_lookup() {
   local lookup
   mkdir -p "$fixture"
   printf '%s\n' \
-    '#doc(module) 目标索引回归的配置；版本变化属于构建输入。' \
-    '#package { name = "lookup"; root = "main.jiang"; version = "1"; }' >"$fixture/package.jiang"
+    '#doc(module)' '    目标索引回归的配置，版本变化属于构建输入。' '#end' \
+    '#package { name = "lookup"; root = "main.jiang"; version = "1";' \
+    '    generate docs { module = "unused-package-metadata-probe.jiang"; }' \
+    '}' >"$fixture/package.jiang"
   printf '%s\n' \
-    '#doc(module) 通过普通导入把配置版本用于运行结果。' \
+    '#doc(module)' '    通过普通导入把配置版本用于运行结果。' '#end' \
     'import "package.jiang";' \
-    'Int main() { package.info.version.length - 1 }' >"$fixture/main.jiang"
+    'public const UInt8[]& version = package.info.version;' \
+    'Int main() { version.length - 1 }' >"$fixture/main.jiang"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/lookup-cold.log" "$output" "$fixture"
   expect_exit "$output" 0
+  if grep -aFq 'unused-package-metadata-probe.jiang' "$output"; then
+    fail "compile-time package metadata leaked into the executable"
+  fi
   lookup="$(find "$cache/targets" -type f -name '*.context' -print | head -n 1)"
   [ -n "$lookup" ] || fail "build context lookup was not published"
   printf 'broken' >"$lookup"
@@ -745,7 +751,7 @@ check_global_only_dependency() {
   local cache="$WORK_DIR/global-only-cache"
   mkdir -p "$app" "$dependency"
   printf '%s\n' \
-    '#doc(module) 显式加载只包含全局变量的依赖包。' \
+    '#doc(module)' '    显式加载只包含全局变量的依赖包。' '#end' \
     '#package {' \
     '    name = "app"; root = "main.jiang";' \
     '    dependencies { globals = "../globals"; }' \
@@ -757,7 +763,7 @@ check_global_only_dependency() {
     '    globals.value - 7' \
     '}' >"$app/main.jiang"
   printf '%s\n' \
-    '#doc(module) 声明缓存回归的包入口。' \
+    '#doc(module)' '    声明缓存回归的包入口。' '#end' \
     '#package { name = "globals"; root = "globals.jiang"; }' >"$dependency/package.jiang"
   printf '%s\n' 'public Int value! = 7;' >"$dependency/globals.jiang"
 
@@ -776,7 +782,7 @@ check_public_alias_dependency() {
   local cache="$WORK_DIR/public-alias-cache"
   mkdir -p "$fixture"
   printf '%s\n' \
-    '#doc(module) 声明缓存回归的包入口。' \
+    '#doc(module)' '    声明缓存回归的包入口。' '#end' \
     '#package { name = "public_alias"; root = "main.jiang"; }' >"$fixture/package.jiang"
   printf '%s\n' \
     'import dep = "./dep.jiang";' \
