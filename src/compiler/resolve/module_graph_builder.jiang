@@ -27,10 +27,11 @@ alias fs = import "../system/fs.jiang";
 alias target = import "../system/target.jiang";
 alias string = import "../support/string.jiang";
 alias table = import "../support/table.jiang";
-alias ast = import "../syntax/ast.jiang";
+alias syntax_package = import "../syntax/syntax.jiang";
+alias ast = syntax_package.ast;
 import std;
-alias syntax = import "../syntax.jiang";
-alias token = import "../syntax/token.jiang";
+alias syntax = import "../syntax/syntax.jiang";
+alias token = syntax_package.token;
 alias def = import "./def.jiang";
 alias diagnostics = import "./diagnostics.jiang";
 alias import_path_resolver = import "./import_path_resolver.jiang";
@@ -378,7 +379,8 @@ public struct ModuleGraphBuilder: Movable {
     qid.SymbolId import_alias_symbol(Self&! self, store.ImportRecord& import_record) {
         if (import_record.alias_symbol is .some(explicit_alias)) { return explicit_alias; }
         if (import_record.kind != .file_import) { return import_record.path_symbol; }
-        UInt8[]& text = self.ctx.store.symbols.text(import_record.path_symbol);
+        Path normalized = std.path.normalize(self.ctx.store.symbols.text(import_record.path_symbol));
+        UInt8[]& text = normalized.bytes();
         Int name_start! = 0;
         Int index! = 0;
         while (index < text.length) {
@@ -683,7 +685,8 @@ public struct ModuleGraphBuilder: Movable {
         module_graph.ModuleGraph&! graph,
         qid.ModuleId module_id,
         Int import_index,
-        Bool required = true
+        Bool required = true,
+        qid.SymbolId? directory_entry = null
     ) {
         source.SourceId module_source = self.ctx.store.resolve.module_ref(module_id).source_id;
         // 这里复制 ImportRecord 是有意的：解析 target 可能递归加载/创建
@@ -713,7 +716,12 @@ public struct ModuleGraphBuilder: Movable {
             graph.mark_error();
             return false;
         }
-        guard self.resolve_import_target(module_id, import_record$.ref()) is .some(target_module) else {
+        qid.ModuleId? target = if directory_entry is .some(path) {
+            if (self.load_file_import(self.ctx.store.symbols.text(path), true) is .some(source_id)) {
+                self.ensure_module(source_id)
+            } else { null }
+        } else { self.resolve_import_target(module_id, import_record$.ref()) };
+        guard target is .some(target_module) else {
             // 扩展扫描不消费缺失 import；实际名字读取和完整模块图检查仍必须报错。
             if (!required && !self.ctx.store.model.has_errors()) {
                 self.ctx.store.resolve.set_import_state(module_id, import_index, .unresolved);
@@ -726,7 +734,8 @@ public struct ModuleGraphBuilder: Movable {
             graph.mark_error();
             return false;
         }
-        if (self.file_import_crosses_package(module_id, target_module, import_record$.ref())) {
+        if (directory_entry == null
+            && self.file_import_crosses_package(module_id, target_module, import_record$.ref())) {
             self.add_cross_package_file_import_diagnostic(module_source, import_record);
             self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
             graph.mark_error();
@@ -870,7 +879,9 @@ public struct ModuleGraphBuilder: Movable {
         qid.PackageId package_id = module.package_id;
         store.ModuleRecord& target = self.ctx.store.resolve.module_ref(target_module);
         qid.PackageId target_package_id = target.package_id;
-        if (self.repository_internal_import(module, target)) {
+        // 目录模块的文件路径已在加载前检查，包括仍须遵守的宿主包边界。
+        if (self.ctx.store.resolve.package_ref(package_id).kind == .directory_module
+            || self.repository_internal_import(module, target)) {
             return false;
         }
         return package_id.index != target_package_id.index;
@@ -1036,11 +1047,43 @@ public struct ModuleGraphBuilder: Movable {
         Int target_layer = self.repository_source_layer(primary.bytes());
         Bool internal_source = owner_layer >= 0 && owner_layer <= 3 && target_layer >= 0 && target_layer <= 3
             && self.repository_internal_paths(owner_path, primary.bytes());
-        if (crosses && !internal_core && !internal_source) {
+        Bool owner_is_file = self.ctx.store.sources.entry(owner.source_id).key.is_file();
+        Bool internal_import = internal_core || internal_source;
+        Bool? directory_access = self.directory_file_access(owner_path, primary.bytes(), owner_is_file, internal_import);
+        if (directory_access == false || (directory_access == null && crosses && !internal_import)) {
             self.add_cross_package_file_import_diagnostic(owner.source_id, import_record$.get());
             return null;
         }
         return self.load_file_import(primary.bytes(), true);
+    }
+
+    /// 目录模块的入口保护同样适用于符号链接所指向的源码路径。
+    Bool? directory_file_access(Self&! self, UInt8[]& owner, UInt8[]& target, Bool owner_is_file, Bool internal_import) {
+        Bool? lexical = self.directory_file_path_access(owner, target, owner_is_file, internal_import);
+        if (lexical == false) { return false; }
+        UInt8[]^ actual_target = try fs.canonical_path(target) catch { return lexical; };
+        UInt8[]^ actual_owner = try fs.canonical_path(owner) catch { cache_identity.absolute_path(owner) };
+        Bool? physical = self.directory_file_path_access(actual_owner[..], actual_target[..], owner_is_file,
+            internal_import && self.repository_internal_paths(actual_owner[..], actual_target[..]));
+        if (physical == false) { return false; }
+        if (lexical == true || physical == true) { return true; }
+        return null;
+    }
+
+    /// 外部文件不能进入目录模块，目录模块可读取所属源码包中的普通文件。
+    Bool? directory_file_path_access(
+        Self&! self, UInt8[]& owner, UInt8[]& target, Bool owner_is_file, Bool internal_import
+    ) {
+        qid.SymbolId? owner_module = if owner_is_file { package_load.source_boundary(self.ctx, owner, true) }
+            else { null };
+        qid.SymbolId? target_module = package_load.source_boundary(self.ctx, target, true);
+        if (target_module != null) {
+            return owner_module == target_module
+                && package_load.source_boundary(self.ctx, owner) == package_load.source_boundary(self.ctx, target);
+        }
+        if (owner_module == null || package_load.source_boundary(self.ctx, owner) != owner_module) { return null; }
+        return internal_import
+            || package_load.source_boundary(self.ctx, owner, false) == package_load.source_boundary(self.ctx, target);
     }
 
     Bool text_ends_with(Self&! self, UInt8[]& text, UInt8[]& suffix) {
@@ -1471,7 +1514,7 @@ public struct ModuleGraphBuilder: Movable {
         source.SourceId owner_source = owner_module_record.source_id;
         store.ModuleRecord& target_module_record = self.ctx.store.resolve.module_ref(edge.target_module);
         qid.PackageId target_package = target_module_record.package_id;
-        if (self.repository_internal_import(owner_module_record, target_module_record)) {
+        if (self.package_dependency_is_internal(owner_module_record, target_module_record)) {
             return;
         }
         if (self.is_core_package(owner_package) || self.is_core_package(target_package)) {
@@ -1534,7 +1577,7 @@ public struct ModuleGraphBuilder: Movable {
         while (cursor.valid()) {
             module_graph.ModuleGraphEdge edge = graph.import_edge(cursor);
             store.ModuleRecord& target_module = self.ctx.store.resolve.module_ref(edge.target_module);
-            if (self.repository_internal_import(owner_module, target_module)) {
+            if (self.package_dependency_is_internal(owner_module, target_module)) {
                 cursor = graph.next_import(cursor);
                 continue;
             }
@@ -1551,6 +1594,19 @@ public struct ModuleGraphBuilder: Movable {
             cursor = graph.next_import(cursor);
         }
         return false;
+    }
+
+    /// 从目录模块读取宿主包的源码属于宿主内部引用。
+    Bool package_dependency_is_internal(Self&! self, store.ModuleRecord& owner, store.ModuleRecord& target) {
+        if (self.repository_internal_import(owner, target)) { return true; }
+        if (self.ctx.store.resolve.package_ref(owner.package_id).kind != .directory_module
+            || self.ctx.store.resolve.package_ref(target.package_id).kind == .directory_module) {
+            return false;
+        }
+        UInt8[]& owner_path = self.ctx.store.sources.entry(owner.source_id).name();
+        UInt8[]& target_path = self.ctx.store.sources.entry(target.source_id).name();
+        return package_load.source_boundary(self.ctx, owner_path, false)
+            == package_load.source_boundary(self.ctx, target_path);
     }
 
     Bool is_core_package(Self&! self, qid.PackageId package_id) {
@@ -1713,7 +1769,7 @@ public struct ModuleGraphBuilder: Movable {
         if (self.ctx.store.resolve.root_package is .some(package_id)) {
             return package_id;
         }
-        return self.create_root_package();
+        return self.ensure_implicit_package();
     }
 
     qid.PackageId ensure_package_for_source(Self&! self, source.SourceId source_id) {
@@ -1729,12 +1785,18 @@ public struct ModuleGraphBuilder: Movable {
             return self.ensure_system_package(source_id);
         }
         if (package_load.registered_for_path(self.ctx, source_path.bytes()) is .some(package_id)) { return package_id; }
-        return self.ensure_root_package();
+        qid.PackageId root = self.ensure_root_package();
+        // 检查独立的目录模块入口时，未显式登记的宿主源码仍属于普通包。
+        if (self.ctx.store.resolve.package_ref(root).kind == .directory_module) {
+            return self.ensure_implicit_package();
+        }
+        return root;
     }
 
-    qid.PackageId create_root_package(Self&! self) {
+    qid.PackageId ensure_implicit_package(Self&! self) {
         token.Span span = token.Span();
         qid.SymbolId package_symbol = self.ctx.store.symbols.intern("__main_package");
+        if (self.ctx.store.resolve.package_for_dir(package_symbol) is .some(existing)) { return existing; }
         qid.NamespaceId package_namespace = self.ctx.store.resolve.create_namespace(
             .package_namespace,
             null,
@@ -1762,7 +1824,7 @@ public struct ModuleGraphBuilder: Movable {
             .ordinary,
             package_namespace
         );
-        self.ctx.store.resolve.set_root_package(package_id);
+        if (self.ctx.store.resolve.root_package == null) { self.ctx.store.resolve.set_root_package(package_id); }
         return package_id;
     }
 

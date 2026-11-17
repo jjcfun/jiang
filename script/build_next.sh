@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 BUILD_BIN_DIR="${BUILD_BIN_DIR:-$BUILD_DIR/bin}"
 NEXT_BIN="${NEXT_BIN:-$BUILD_BIN_DIR/jiangc.next}"
@@ -11,12 +12,15 @@ BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 COMPILER_BUILD_MODE="${COMPILER_BUILD_MODE:-debug}"
 PACKAGE_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([A-Za-z0-9._+-]+)"[[:space:]]*;[[:space:]]*$/\1/p' "$ROOT_DIR/package.jiang" | head -n 1)"
 JIANG_VERSION="$PACKAGE_VERSION"
-BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.6}"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.6.0}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
+case "$BOOTSTRAP_BIN" in
+  /*) ;;
+  *) BOOTSTRAP_BIN="$ROOT_DIR/$BOOTSTRAP_BIN" ;;
+esac
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -43,13 +47,6 @@ validate_cache_layout() {
       ;;
   esac
 }
-
-validate_cache_layout
-mkdir -p \
-  "$BUILD_DIR" \
-  "$BUILD_BIN_DIR" \
-  "$NEXT_ARTIFACT_CACHE_DIR"
-cd "$ROOT_DIR"
 
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
   echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION stable compiler: $BOOTSTRAP_BIN" >&2
@@ -128,17 +125,12 @@ write_compiler_build_id() {
   printf '%s\n' "$build_id" >"$compiler_bin.build-id"
 }
 
-clear_bootstrap_artifact_cache() {
-  # bootstrap 构建固定使用默认 build/cache；stable 前后只清理它自己的目录。
-  # current compiler cache 位于不相交的 root，不能被 bootstrap 清理影响。
-  rm -rf "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
-}
-
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   "$BOOTSTRAP_BIN" \
     --mode "$COMPILER_BUILD_MODE" \
+    --artifact-cache-dir "$BOOTSTRAP_ARTIFACT_CACHE_DIR" \
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
     -o "$output_bin" \
@@ -146,6 +138,31 @@ emit_next_from_bootstrap() {
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
+}
+
+prepare_syntax_bootstrap() {
+  local stage snapshot
+  stage="$(mktemp -d "$(canonical_cache_dir "$BUILD_DIR")/syntax-bootstrap.XXXXXXXX")"
+  snapshot="$stage/source"
+  mkdir -p "$snapshot"
+  tar -cf - package.jiang src | tar -xf - -C "$snapshot"
+  find "$snapshot/src/compiler" -type f -name '*.jiang' -exec sed -E -i.bootstrap \
+    's@(import[[:space:]]+([[:alnum:]_]+[[:space:]]*=[[:space:]]*)?"(\.\.?/)*syntax)"@\1/syntax.jiang"@g' {} +
+  find "$snapshot/src/compiler" -type f -name '*.jiang.bootstrap' -delete
+  rm "$snapshot/src/compiler/syntax/package.jiang"
+  awk -v version="$PACKAGE_VERSION-bootstrap" '
+    /^[[:space:]]*version[[:space:]]*=/ { sub(/"[^"]+"/, "\"" version "\""); }
+    { print }
+  ' "$snapshot/package.jiang" >"$stage/package.jiang"
+  mv "$stage/package.jiang" "$snapshot/package.jiang"
+  printf '== syntax bootstrap source: %s ==\n' "$snapshot"
+  (
+    cd "$snapshot"
+    BOOTSTRAP_ARTIFACT_CACHE_DIR="$stage/seed-cache" emit_next_from_bootstrap "$stage/jiangc.next"
+  )
+  BOOTSTRAP_BIN="$stage/jiangc.next"
+  BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
+  [ "$BOOTSTRAP_VERSION" = "jiang $PACKAGE_VERSION-bootstrap" ]
 }
 
 emit_compiler_with_compiler() {
@@ -165,16 +182,20 @@ emit_compiler_with_compiler() {
   printf 'OK %s\n' "$output_bin"
 }
 
+mkdir -p "$BUILD_DIR" "$BUILD_BIN_DIR"
+BOOTSTRAP_ARTIFACT_CACHE_DIR="$(mktemp -d "$(canonical_cache_dir "$BUILD_DIR")/seed-cache.XXXXXXXX")"
+trap 'rm -rf "$BOOTSTRAP_ARTIFACT_CACHE_DIR"' EXIT
+validate_cache_layout
 collect_llvm_link_args
+if [ "$BOOTSTRAP_RELEASE_VERSION" = "0.6.0" ] && [ -f "$ROOT_DIR/src/compiler/syntax/package.jiang" ]; then
+  prepare_syntax_bootstrap
+fi
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
 printf '== stable compiler build mode: %s ==\n' "$COMPILER_BUILD_MODE"
 printf '== bootstrap cache: %s ==\n' "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
 printf '== current cache: %s ==\n' "$NEXT_ARTIFACT_CACHE_DIR"
-clear_bootstrap_artifact_cache
 emit_next_from_bootstrap "$NEXT_BIN"
-clear_bootstrap_artifact_cache
-mkdir -p "$NEXT_ARTIFACT_CACHE_DIR"
 
 VERIFY_BIN="$NEXT_BIN"
 if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then

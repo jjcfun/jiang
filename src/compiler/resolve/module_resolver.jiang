@@ -22,13 +22,16 @@ alias qid = import "../id.jiang";
 alias qkey = import "../incremental/key.jiang";
 alias source = import "../source.jiang";
 alias package_load = import "../source/package_load.jiang";
+alias fs = import "../system/fs.jiang";
+alias import_path_resolver = import "./import_path_resolver.jiang";
 alias list = import "../support/list.jiang";
 alias map = import "../support/map.jiang";
 alias set = import "../support/set.jiang";
 alias string = import "../support/string.jiang";
 alias table = import "../support/table.jiang";
-alias ast = import "../syntax/ast.jiang";
-alias token = import "../syntax/token.jiang";
+alias syntax_package = import "../syntax/syntax.jiang";
+alias ast = syntax_package.ast;
+alias token = syntax_package.token;
 alias def = import "./def.jiang";
 alias diagnostics = import "./diagnostics.jiang";
 alias reference_resolver = import "./reference_resolver.jiang";
@@ -2385,17 +2388,13 @@ struct ModuleResolvePhase: Movable {
         Int import_index,
         Bool required = true
     ) {
-        qid.ModuleId target_module!;
         {
             module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
             builder.discover_module_imports(graph, module_id);
-            if (!builder.ensure_import_target(graph, module_id, import_index, required)) {
-                return null;
-            }
-            guard self.ctx.store.resolve.module_ref(module_id).imports.get(import_index).target_module
-                is .some(resolved_target) else { return null; }
-            target_module = resolved_target;
         }
+        if (!self.ensure_import_target(graph, module_id, import_index, required)) { return null; }
+        guard self.ctx.store.resolve.module_ref(module_id).imports.get(import_index).target_module
+            is .some(target_module) else { return null; }
         module_graph_builder.ModuleResolvePassState progress = self.module_state(target_module);
         if (progress == .resolved || progress == .interface_loaded) {
             return target_module;
@@ -3877,10 +3876,74 @@ struct ModuleResolvePhase: Movable {
         Self&! self,
         module_graph.ModuleGraph&! graph,
         qid.ModuleId module_id,
-        Int import_index
+        Int import_index,
+        Bool required = true
     ) {
+        store.ImportRecord record = self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
+        qid.SymbolId? directory_entry! = null;
+        _ paths = import_path_resolver.ImportPathResolver(self.ctx.store$.ref());
+        if (record.state == .unresolved && record.kind == .file_import && paths.valid_import_path(record$.ref())) {
+            Path path = paths.primary_file_import_path(module_id, self.ctx.store.symbols.text(record.path_symbol));
+            if (fs.dir_exists(path.bytes())) {
+                directory_entry = self.load_directory_import(module_id, record, path.bytes());
+                if (directory_entry == null) {
+                    self.ctx.store.resolve.set_import_state(module_id, import_index, .failed);
+                    graph.mark_error();
+                    return false;
+                }
+            }
+        }
         module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
-        return builder.ensure_import_target(graph, module_id, import_index);
+        return builder.ensure_import_target(graph, module_id, import_index, required, directory_entry);
+    }
+
+    /// 字符串目录只能进入当前包边界下的显式目录模块入口。
+    qid.SymbolId? load_directory_import(Self&! self, qid.ModuleId module_id, store.ImportRecord record,
+        UInt8[]& directory
+    ) {
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        _ source_key = self.ctx.store.sources.entry(source_id).key;
+        UInt8[]& import_path = self.ctx.store.symbols.text(record.path_symbol);
+        if (!source_key.is_file() || std.path.is_absolute(import_path)) {
+            self.directory_import_error(source_id, record, "directory import requires a relative source path",
+                "import_directory_relative");
+            return null;
+        }
+        UInt8[]& owner = self.ctx.store.sources.entry(source_id).name();
+        if (!self.directory_import_in_scope(owner, directory)) {
+            self.directory_import_error(source_id, record, "directory import crosses a package boundary",
+                "cross_package_file_import");
+            return null;
+        }
+        if (!package_load.is_directory_module(self.ctx, directory)) {
+            self.directory_import_error(source_id, record, "directory import requires a package with type = .module",
+                "import_directory_not_module");
+            return null;
+        }
+        _ loaded = package_load.load(self.ctx, self.owner, directory);
+        if (!loaded.ok) { return null; }
+        qid.SymbolId symbol = self.ctx.store.symbols.intern(loaded.configuration_directory.bytes());
+        _ package = self.ctx.store.resolve.package_for_dir(symbol)$.some();
+        return self.ctx.store.resolve.package_ref(package).root_path;
+    }
+
+    Bool directory_import_in_scope(Self&! self, UInt8[]& owner, UInt8[]& directory) {
+        if (package_load.source_boundary(self.ctx, owner) != package_load.source_boundary(self.ctx, directory)) {
+            return false;
+        }
+        UInt8[]^ actual_directory = try fs.canonical_path(directory) catch { return true; };
+        UInt8[]^ actual_owner = try fs.canonical_path(owner) catch {
+            cache_identity.absolute_path(owner)
+        };
+        return package_load.source_boundary(self.ctx, actual_owner[..])
+            == package_load.source_boundary(self.ctx, actual_directory[..]);
+    }
+
+    Void directory_import_error(Self&! self, source.SourceId source_id, store.ImportRecord record,
+        UInt8[]& message, UInt8[]& code
+    ) {
+        diagnostics.add_error(self.ctx.store.diagnostics$.mut_ref(), source_id, record.span, message, code);
+        self.ctx.store.model.mark_error();
     }
 
     module_graph_builder.ModuleResolvePassState module_state(Self&! self, qid.ModuleId module_id) {
